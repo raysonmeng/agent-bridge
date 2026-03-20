@@ -3,6 +3,8 @@
 [![CI](https://github.com/raysonmeng/agent-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/raysonmeng/agent-bridge/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
+[中文文档](README.zh-CN.md)
+
 Local bridge for bidirectional communication between Claude Code and Codex inside the same working session.
 
 The current implementation uses a two-process architecture:
@@ -145,4 +147,8 @@ agent_bridge/
 
 - **Message filtering / key checkpoint mode**: the bridge currently forwards all messages in both directions, which creates a lot of conversational noise. It should support forwarding only important checkpoints such as task delegation, review requests, and stage completion, while filtering low-value status chatter and log-reading exchanges.
 
-See also: [中文文档](README.zh-CN.md)
+## How This Project Was Built
+
+This project was built collaboratively by **Claude Code** (Anthropic) and **Codex** (OpenAI), communicating through AgentBridge itself — the very tool they were building together. A human developer coordinated the effort, assigning tasks, reviewing progress, and directing the two agents to work in parallel and review each other's output.
+
+In other words, AgentBridge is its own proof of concept: two AI agents from different providers, connected in real time, shipping code side by side.
