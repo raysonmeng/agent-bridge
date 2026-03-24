@@ -3,6 +3,12 @@
 import { appendFileSync, unlinkSync, writeFileSync } from "node:fs";
 import type { ServerWebSocket } from "bun";
 import { CodexAdapter } from "./codex-adapter";
+import {
+  BRIDGE_CONTRACT_REMINDER,
+  StatusBuffer,
+  classifyMessage,
+  type FilterMode,
+} from "./message-filter";
 import { TuiConnectionState } from "./tui-connection-state";
 import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
 import type { BridgeMessage } from "./types";
@@ -19,6 +25,8 @@ const PID_FILE = process.env.AGENTBRIDGE_PID_FILE ?? `/tmp/agentbridge-daemon-${
 const LOG_FILE = "/tmp/agentbridge.log";
 const TUI_DISCONNECT_GRACE_MS = parseInt(process.env.TUI_DISCONNECT_GRACE_MS ?? "2500", 10);
 const MAX_BUFFERED_MESSAGES = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
+const FILTER_MODE: FilterMode =
+  (process.env.AGENTBRIDGE_FILTER_MODE as FilterMode) === "full" ? "full" : "filtered";
 
 const codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT);
 const attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
@@ -54,14 +62,30 @@ const tuiConnectionState = new TuiConnectionState({
   },
 });
 
+const statusBuffer = new StatusBuffer((summary) => emitToClaude(summary));
+
 codex.on("agentMessage", (msg: BridgeMessage) => {
   if (msg.source !== "codex") return;
-  log(`Forwarding Codex → Claude (${msg.content.length} chars)`);
-  emitToClaude(msg);
+  const result = classifyMessage(msg.content, FILTER_MODE);
+  log(`Codex → Claude [${result.marker}/${result.action}] (${msg.content.length} chars)`);
+  switch (result.action) {
+    case "forward":
+      if (result.marker === "important" && statusBuffer.size > 0) {
+        statusBuffer.flush("important message arrived");
+      }
+      emitToClaude(msg);
+      break;
+    case "buffer":
+      statusBuffer.add(msg);
+      break;
+    case "drop":
+      break;
+  }
 });
 
 codex.on("turnCompleted", () => {
   log("Codex turn completed");
+  statusBuffer.flush("turn completed");
 });
 
 codex.on("ready", (threadId: string) => {
@@ -96,6 +120,7 @@ codex.on("error", (err: Error) => {
 
 codex.on("exit", (code: number | null) => {
   log(`Codex process exited (code ${code})`);
+  statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
   emitToClaude(
     systemMessage(
@@ -182,8 +207,9 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
         return;
       }
 
+      const contentWithReminder = message.message.content + "\n\n" + BRIDGE_CONTRACT_REMINDER;
       log(`Forwarding Claude → Codex (${message.message.content.length} chars)`);
-      const injected = codex.injectMessage(message.message.content);
+      const injected = codex.injectMessage(contentWithReminder);
       if (!injected) {
         const reason = codex.turnInProgress
           ? "Codex is busy executing a turn. Wait for it to finish before sending another message."
@@ -216,6 +242,7 @@ function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
   ws.data.attached = true;
   log(`Claude frontend attached (#${ws.data.clientId})`);
 
+  statusBuffer.flush("claude reconnected");
   sendStatus(ws);
 
   if (bufferedMessages.length > 0) {
@@ -245,8 +272,9 @@ function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
 
 function emitToClaude(message: BridgeMessage) {
   if (attachedClaude && attachedClaude.readyState === WebSocket.OPEN) {
-    sendBridgeMessage(attachedClaude, message);
-    return;
+    if (trySendBridgeMessage(attachedClaude, message)) return;
+    // Send failed — fall through to buffer
+    log("Send to Claude failed, buffering message for retry on reconnect");
   }
 
   bufferedMessages.push(message);
@@ -257,15 +285,36 @@ function emitToClaude(message: BridgeMessage) {
   }
 }
 
+function trySendBridgeMessage(ws: ServerWebSocket<ControlSocketData>, message: BridgeMessage): boolean {
+  try {
+    const result = ws.send(JSON.stringify({ type: "codex_to_claude", message } satisfies ControlServerMessage));
+    if (typeof result === "number" && result <= 0) {
+      log(`Bridge message send returned ${result} (0=dropped, -1=backpressure)`);
+      return false;
+    }
+    return true;
+  } catch (err: any) {
+    log(`Failed to send bridge message: ${err.message}`);
+    return false;
+  }
+}
+
 function flushBufferedMessages(ws: ServerWebSocket<ControlSocketData>) {
   const messages = bufferedMessages.splice(0, bufferedMessages.length);
   for (const message of messages) {
-    sendBridgeMessage(ws, message);
+    if (!trySendBridgeMessage(ws, message)) {
+      // Re-buffer this and all remaining messages on failure
+      const failedIndex = messages.indexOf(message);
+      const remaining = messages.slice(failedIndex);
+      bufferedMessages.unshift(...remaining);
+      log(`Flush interrupted: re-buffered ${remaining.length} message(s) after send failure`);
+      return;
+    }
   }
 }
 
 function sendBridgeMessage(ws: ServerWebSocket<ControlSocketData>, message: BridgeMessage) {
-  sendProtocolMessage(ws, { type: "codex_to_claude", message });
+  trySendBridgeMessage(ws, message);
 }
 
 function sendStatus(ws: ServerWebSocket<ControlSocketData>) {
@@ -291,7 +340,7 @@ function currentStatus(): DaemonStatus {
     bridgeReady: tuiConnectionState.canReply(),
     tuiConnected: snapshot.tuiConnected,
     threadId: codex.activeThreadId,
-    queuedMessageCount: bufferedMessages.length,
+    queuedMessageCount: bufferedMessages.length + statusBuffer.size,
     proxyUrl: codex.proxyUrl,
     appServerUrl: codex.appServerUrl,
     pid: process.pid,
