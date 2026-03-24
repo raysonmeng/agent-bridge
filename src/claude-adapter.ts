@@ -78,9 +78,21 @@ export class ClaudeAdapter extends EventEmitter {
 
   async start() {
     const transport = new StdioServerTransport();
+
+    // Resolve explicit modes before connect; auto-detect after initialization
+    if (this.configuredMode !== "auto") {
+      this.resolveMode();
+    }
+
+    this.server.oninitialized = () => {
+      if (!this.resolvedMode) {
+        this.resolveMode();
+      }
+      this.log(`MCP initialization complete (mode: ${this.resolvedMode})`);
+    };
+
     await this.server.connect(transport);
-    this.resolveMode();
-    this.log(`MCP server connected (mode: ${this.resolvedMode})`);
+    this.log(`MCP server connected (mode: ${this.resolvedMode ?? "pending auto-detect"})`);
     this.emit("ready");
   }
 
@@ -150,8 +162,9 @@ export class ClaudeAdapter extends EventEmitter {
       });
       this.log(`Pushed notification: ${msgId}`);
     } catch (e: any) {
-      this.log(`Push failed, falling back to queue: ${e.message}`);
-      this.queueForPull(message);
+      this.log(`Push notification failed: ${e.message}`);
+      // Do NOT fall back to queue — the notification may have been partially
+      // delivered, and queuing would risk duplicate messages when Claude polls.
     }
   }
 
@@ -173,15 +186,17 @@ export class ClaudeAdapter extends EventEmitter {
       };
     }
 
-    const count = this.pendingMessages.length;
-    const formatted = this.pendingMessages
+    // Snapshot and clear atomically to avoid issues with concurrent writes
+    const messages = this.pendingMessages;
+    this.pendingMessages = [];
+
+    const count = messages.length;
+    const formatted = messages
       .map((msg, i) => {
         const ts = new Date(msg.timestamp).toISOString();
         return `---\n[${i + 1}] ${ts}\nCodex: ${msg.content}`;
       })
       .join("\n\n");
-
-    this.pendingMessages = [];
 
     return {
       content: [
