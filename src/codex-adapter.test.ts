@@ -205,16 +205,23 @@ describe("CodexAdapter turn state machine", () => {
     expect(adapter.injectMessage("hello")).toBe(true);
   });
 
-  test("app-server disconnect resets turn state", () => {
+  test("clearResponseTrackingState + turn reset simulates onclose behavior", () => {
     const adapter = createAdapter();
+    // Start a turn and track a response
     adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
     expect(adapter.turnInProgress).toBe(true);
 
-    // Simulate the state that onclose would reset
+    // The onclose handler calls clearResponseTrackingState() then resets turn state.
+    // We verify the reset logic directly since we can't trigger a real WebSocket close.
+    adapter.clearResponseTrackingState();
     adapter.activeTurnIds.clear();
     adapter.turnInProgress = false;
 
     expect(adapter.turnInProgress).toBe(false);
     expect(adapter.activeTurnIds.size).toBe(0);
+    // After reset, injection should work again
+    adapter.threadId = "thread-1";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+    expect(adapter.injectMessage("hello after reset")).toBe(true);
   });
 });

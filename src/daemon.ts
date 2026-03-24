@@ -97,7 +97,7 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
         statusBuffer.flush("important message arrived");
       }
       emitToClaude(msg);
-      // IMPORTANT or untagged message from Codex — give Claude attention
+      // IMPORTANT message — give Claude an attention window to respond
       if (result.marker === "important") {
         startAttentionWindow();
       }
