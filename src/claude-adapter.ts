@@ -126,11 +126,13 @@ export class ClaudeAdapter extends EventEmitter {
       this.resolvedMode = this.configuredMode;
       this.log(`Delivery mode set by AGENTBRIDGE_MODE: ${this.resolvedMode}`);
     } else {
-      // Auto-detect from client capabilities
-      const clientCaps = this.server.getClientCapabilities();
-      const supportsChannel = !!(clientCaps?.experimental && "claude/channel" in clientCaps.experimental);
-      this.resolvedMode = supportsChannel ? "push" : "pull";
-      this.log(`Delivery mode auto-detected: ${this.resolvedMode} (client channel support: ${supportsChannel})`);
+      // Default to push — Claude Code doesn't declare channel support in
+      // client capabilities, so we can't detect it. Push is the better default
+      // because it's real-time; if channels aren't available, notifications
+      // are silently ignored (no error), and users can set AGENTBRIDGE_MODE=pull
+      // explicitly for API key setups.
+      this.resolvedMode = "push";
+      this.log("Delivery mode defaulting to push (set AGENTBRIDGE_MODE=pull for API key mode)");
     }
 
     // If resolved to push, flush any messages queued before mode was known
