@@ -125,6 +125,32 @@ describe("CodexAdapter app-server response handling", () => {
     adapter.clearResponseTrackingState();
   });
 
+  test("treats empty string and non-integer string IDs as unmatched (not coerced to 0)", () => {
+    const adapter = createAdapter();
+    const intercepted: Array<{ message: any; connId?: number }> = [];
+    adapter.interceptServerMessage = (message: any, connId?: number) => intercepted.push({ message, connId });
+
+    // Map id 0 — if empty string were coerced to 0 via Number(""), it would falsely match
+    adapter.tuiConnId = 1;
+    adapter.upstreamToClient.set(0, { connId: 1, clientId: "client-zero" });
+
+    // Empty string id: should NOT match id 0
+    const empty = adapter.handleAppServerPayload(JSON.stringify({ id: "", result: {} }));
+    expect(empty).toBeNull();
+    expect(adapter.upstreamToClient.has(0)).toBe(true); // still there, not consumed
+
+    // Float string id: should NOT match
+    const float = adapter.handleAppServerPayload(JSON.stringify({ id: "1.5", result: {} }));
+    expect(float).toBeNull();
+
+    // Hex string id: should NOT match
+    const hex = adapter.handleAppServerPayload(JSON.stringify({ id: "0xff", result: {} }));
+    expect(hex).toBeNull();
+
+    expect(intercepted).toEqual([]);
+    adapter.clearResponseTrackingState();
+  });
+
   test("still forwards notifications with no response id", () => {
     const adapter = createAdapter();
     const intercepted: Array<{ message: any; connId?: number }> = [];

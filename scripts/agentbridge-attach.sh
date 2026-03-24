@@ -33,17 +33,26 @@ restore_terminal() {
   fi
 
   # Disable terminal modes that Codex TUI enables
-  # These are safe no-ops if the modes were never enabled
-  printf '\e[<u' 2>/dev/null || true        # Disable keyboard enhancement
-  printf '\e[?2004l' 2>/dev/null || true     # Disable bracketed paste
-  printf '\e[?1004l' 2>/dev/null || true     # Disable focus tracking
-  printf '\e[?1049l' 2>/dev/null || true     # Leave alternate screen
-  printf '\e[?25h' 2>/dev/null || true       # Show cursor
-  printf '\e[0m' 2>/dev/null || true         # Reset character attributes
+  # Write to /dev/tty when available to ensure sequences reach the terminal
+  # even if stdout has been redirected
+  local tty_target="/dev/tty"
+  if ! [ -w "$tty_target" ]; then
+    if [ -t 1 ]; then
+      tty_target="/dev/stdout"
+    else
+      return
+    fi
+  fi
+  printf '\e[<u' >"$tty_target" 2>/dev/null || true        # Disable keyboard enhancement
+  printf '\e[?2004l' >"$tty_target" 2>/dev/null || true     # Disable bracketed paste
+  printf '\e[?1004l' >"$tty_target" 2>/dev/null || true     # Disable focus tracking
+  printf '\e[?1049l' >"$tty_target" 2>/dev/null || true     # Leave alternate screen
+  printf '\e[?25h' >"$tty_target" 2>/dev/null || true       # Show cursor
+  printf '\e[0m' >"$tty_target" 2>/dev/null || true         # Reset character attributes
 }
 
 # Register cleanup on any exit
-trap restore_terminal EXIT
+trap restore_terminal EXIT INT TERM
 
 echo "Attaching Codex TUI to AgentBridge proxy at ${PROXY_URL}..."
 echo "(Terminal state saved — will be restored on exit)"

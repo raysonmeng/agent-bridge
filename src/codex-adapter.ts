@@ -361,7 +361,7 @@ export class CodexAdapter extends EventEmitter {
     // Handle response IDs that may arrive as numeric strings (e.g. "100005"
     // instead of 100005). Non-numeric string IDs like "initialize" stay NaN
     // and fall through to the unmatched response log at the end of this method.
-    const numericId = typeof responseId === "number" ? responseId : (typeof responseId === "string" ? Number(responseId) : NaN);
+    const numericId = typeof responseId === "number" ? responseId : (typeof responseId === "string" && /^-?\d+$/.test(responseId) ? Number(responseId) : NaN);
     const mapping = !isNaN(numericId) ? this.upstreamToClient.get(numericId) : undefined;
 
     if (mapping) {
