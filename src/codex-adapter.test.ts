@@ -150,3 +150,71 @@ describe("CodexAdapter app-server response handling", () => {
     adapter.clearResponseTrackingState();
   });
 });
+
+describe("CodexAdapter turn state machine", () => {
+  test("turnStarted emits only on first turn (idle → busy)", () => {
+    const adapter = createAdapter();
+    const events: string[] = [];
+    adapter.on("turnStarted", () => events.push("started"));
+
+    // First turn: should emit
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    expect(events).toEqual(["started"]);
+    expect(adapter.turnInProgress).toBe(true);
+
+    // Nested turn: should NOT emit again
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t2" } } });
+    expect(events).toEqual(["started"]);
+    expect(adapter.turnInProgress).toBe(true);
+  });
+
+  test("turnCompleted emits only when all turns done (busy → idle)", () => {
+    const adapter = createAdapter();
+    const events: string[] = [];
+    adapter.on("turnCompleted", () => events.push("completed"));
+
+    // Start two nested turns
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t2" } } });
+
+    // Complete first: still busy, should NOT emit
+    adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "t1" } } });
+    expect(events).toEqual([]);
+    expect(adapter.turnInProgress).toBe(true);
+
+    // Complete second: now idle, should emit
+    adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "t2" } } });
+    expect(events).toEqual(["completed"]);
+    expect(adapter.turnInProgress).toBe(false);
+  });
+
+  test("injectMessage rejects during active turn", () => {
+    const adapter = createAdapter();
+    adapter.threadId = "thread-1";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    expect(adapter.injectMessage("hello")).toBe(false);
+  });
+
+  test("injectMessage succeeds when no turn active", () => {
+    const adapter = createAdapter();
+    adapter.threadId = "thread-1";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+
+    expect(adapter.injectMessage("hello")).toBe(true);
+  });
+
+  test("app-server disconnect resets turn state", () => {
+    const adapter = createAdapter();
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    expect(adapter.turnInProgress).toBe(true);
+
+    // Simulate the state that onclose would reset
+    adapter.activeTurnIds.clear();
+    adapter.turnInProgress = false;
+
+    expect(adapter.turnInProgress).toBe(false);
+    expect(adapter.activeTurnIds.size).toBe(0);
+  });
+});

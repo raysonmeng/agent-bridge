@@ -125,6 +125,68 @@ describe("StatusBuffer", () => {
   });
 });
 
+describe("StatusBuffer pause/resume", () => {
+  test("pause suppresses threshold flush", () => {
+    const flushed: BridgeMessage[] = [];
+    const buf = new StatusBuffer((m) => flushed.push(m), { flushThreshold: 2, flushTimeoutMs: 60000 });
+    buf.pause();
+    buf.add(makeMsg("[STATUS] a"));
+    buf.add(makeMsg("[STATUS] b"));
+    buf.add(makeMsg("[STATUS] c"));
+    expect(flushed).toHaveLength(0);
+    expect(buf.size).toBe(3);
+    buf.dispose();
+  });
+
+  test("pause suppresses timeout flush", async () => {
+    const flushed: BridgeMessage[] = [];
+    const buf = new StatusBuffer((m) => flushed.push(m), { flushThreshold: 10, flushTimeoutMs: 20 });
+    buf.pause();
+    buf.add(makeMsg("[STATUS] a"));
+    await sleep(40);
+    expect(flushed).toHaveLength(0);
+    buf.dispose();
+  });
+
+  test("manual flush still works while paused", () => {
+    const flushed: BridgeMessage[] = [];
+    const buf = new StatusBuffer((m) => flushed.push(m), { flushThreshold: 10, flushTimeoutMs: 60000 });
+    buf.pause();
+    buf.add(makeMsg("[STATUS] a"));
+    buf.flush("important message arrived");
+    expect(flushed).toHaveLength(1);
+    expect(flushed[0].content).toContain("flushed: important message arrived");
+    buf.dispose();
+  });
+
+  test("resume triggers threshold flush if buffer is full", () => {
+    const flushed: BridgeMessage[] = [];
+    const buf = new StatusBuffer((m) => flushed.push(m), { flushThreshold: 2, flushTimeoutMs: 60000 });
+    buf.pause();
+    buf.add(makeMsg("[STATUS] a"));
+    buf.add(makeMsg("[STATUS] b"));
+    buf.add(makeMsg("[STATUS] c"));
+    expect(flushed).toHaveLength(0);
+    buf.resume();
+    expect(flushed).toHaveLength(1);
+    expect(flushed[0].content).toContain("3 update(s)");
+    buf.dispose();
+  });
+
+  test("resume restarts timeout timer", async () => {
+    const flushed: BridgeMessage[] = [];
+    const buf = new StatusBuffer((m) => flushed.push(m), { flushThreshold: 10, flushTimeoutMs: 20 });
+    buf.pause();
+    buf.add(makeMsg("[STATUS] a"));
+    await sleep(40);
+    expect(flushed).toHaveLength(0); // still paused
+    buf.resume();
+    await sleep(30);
+    expect(flushed).toHaveLength(1); // timer restarted on resume
+    buf.dispose();
+  });
+});
+
 describe("BRIDGE_CONTRACT_REMINDER", () => {
   test("contains marker instructions", () => {
     expect(BRIDGE_CONTRACT_REMINDER).toContain("[IMPORTANT]");
