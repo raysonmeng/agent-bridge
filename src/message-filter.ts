@@ -47,6 +47,7 @@ export class StatusBuffer {
   private flushTimer: ReturnType<typeof setTimeout> | null = null;
   private readonly flushThreshold: number;
   private readonly flushTimeoutMs: number;
+  private paused = false;
 
   constructor(
     private readonly onFlush: (summary: BridgeMessage) => void,
@@ -60,8 +61,26 @@ export class StatusBuffer {
     return this.buffer.length;
   }
 
+  /** Pause automatic flushing (threshold + timeout). Manual flush() still works. */
+  pause(): void {
+    this.paused = true;
+    this.clearTimer();
+  }
+
+  /** Resume automatic flushing. Restarts timer if buffer has content. */
+  resume(): void {
+    this.paused = false;
+    if (this.buffer.length > 0) {
+      this.resetTimer();
+      if (this.buffer.length >= this.flushThreshold) {
+        this.flush("threshold reached after resume");
+      }
+    }
+  }
+
   add(message: BridgeMessage): void {
     this.buffer.push(message);
+    if (this.paused) return; // Don't auto-flush while paused
     this.resetTimer();
     if (this.buffer.length >= this.flushThreshold) {
       this.flush("threshold reached");

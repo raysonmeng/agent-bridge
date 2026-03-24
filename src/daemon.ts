@@ -223,7 +223,6 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
       sendStatus(ws);
       return;
     case "claude_to_codex": {
-      clearAttentionWindow(); // Claude responded, end attention window
       if (message.message.source !== "claude") {
         sendProtocolMessage(ws, {
           type: "claude_to_codex_result",
@@ -260,6 +259,7 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
         });
         return;
       }
+      clearAttentionWindow(); // Claude successfully replied, end attention window
       sendProtocolMessage(ws, {
         type: "claude_to_codex_result",
         requestId: message.requestId,
@@ -313,10 +313,12 @@ function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
 function startAttentionWindow() {
   clearAttentionWindow();
   inAttentionWindow = true;
+  statusBuffer.pause();
   log(`Attention window started (${ATTENTION_WINDOW_MS}ms)`);
   attentionWindowTimer = setTimeout(() => {
     attentionWindowTimer = null;
     inAttentionWindow = false;
+    statusBuffer.resume();
     log("Attention window ended");
   }, ATTENTION_WINDOW_MS);
 }
@@ -325,6 +327,9 @@ function clearAttentionWindow() {
   if (attentionWindowTimer) {
     clearTimeout(attentionWindowTimer);
     attentionWindowTimer = null;
+  }
+  if (inAttentionWindow) {
+    statusBuffer.resume();
   }
   inAttentionWindow = false;
 }
