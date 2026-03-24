@@ -5,7 +5,7 @@
  *   - Push mode (OAuth): real-time via notifications/claude/channel
  *   - Pull mode (API key): message queue + get_messages tool
  *
- * Mode is auto-detected from client capabilities, or set via AGENTBRIDGE_MODE env var.
+ * Mode defaults to push in auto mode, or set explicitly via AGENTBRIDGE_MODE env var.
  *
  * Emits:
  *   - "ready"   ()                   — MCP connected, mode resolved
@@ -84,21 +84,9 @@ export class ClaudeAdapter extends EventEmitter {
 
   async start() {
     const transport = new StdioServerTransport();
-
-    // Resolve explicit modes before connect; auto-detect after initialization
-    if (this.configuredMode !== "auto") {
-      this.resolveMode();
-    }
-
-    this.server.oninitialized = () => {
-      if (!this.resolvedMode) {
-        this.resolveMode();
-      }
-      this.log(`MCP initialization complete (mode: ${this.resolvedMode})`);
-    };
-
+    this.resolveMode();
     await this.server.connect(transport);
-    this.log(`MCP server connected (mode: ${this.resolvedMode ?? "pending auto-detect"})`);
+    this.log(`MCP server connected (mode: ${this.resolvedMode})`);
     this.emit("ready");
   }
 
@@ -134,27 +122,11 @@ export class ClaudeAdapter extends EventEmitter {
       this.resolvedMode = "push";
       this.log("Delivery mode defaulting to push (set AGENTBRIDGE_MODE=pull for API key mode)");
     }
-
-    // If resolved to push, flush any messages queued before mode was known
-    if (this.resolvedMode === "push" && this.pendingMessages.length > 0) {
-      this.log(`Flushing ${this.pendingMessages.length} pre-init queued message(s) via push`);
-      const queued = this.pendingMessages;
-      this.pendingMessages = [];
-      for (const msg of queued) {
-        void this.pushViaChannel(msg);
-      }
-    }
   }
 
   // ── Message Delivery ───────────────────────────────────────
 
   async pushNotification(message: BridgeMessage) {
-    // Before mode is resolved (auto-detect pending), always queue
-    if (!this.resolvedMode) {
-      this.queueForPull(message);
-      return;
-    }
-
     if (this.resolvedMode === "push") {
       await this.pushViaChannel(message);
     } else {

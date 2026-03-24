@@ -59,10 +59,11 @@ describe("Dual-mode transport: mode resolution", () => {
     expect(adapter.configuredMode).toBe("auto");
   });
 
-  test("getDeliveryMode returns 'pull' as safe default before mode is resolved", () => {
+  test("auto mode defaults to push", () => {
     const adapter = createAdapter();
-    // resolvedMode is null before start(), getDeliveryMode returns 'pull'
-    expect(adapter.getDeliveryMode()).toBe("pull");
+    adapter.resolveMode();
+    expect(adapter.resolvedMode).toBe("push");
+    expect(adapter.getDeliveryMode()).toBe("push");
   });
 
   test("resolveMode sets 'push' when configuredMode is 'push'", () => {
@@ -112,12 +113,12 @@ describe("Dual-mode transport: pull mode message queue", () => {
     expect(adapter.droppedMessageCount).toBe(1);
   });
 
-  test("pushNotification queues before mode is resolved", async () => {
-    const adapter = createAdapter();
-    // resolvedMode is null (auto, not yet resolved)
-    await adapter.pushNotification(makeBridgeMessage("early msg"));
+  test("pushNotification queues in pull mode", async () => {
+    const adapter = createAdapter("pull");
+    adapter.resolveMode();
+    await adapter.pushNotification(makeBridgeMessage("pull msg"));
     expect(adapter.pendingMessages).toHaveLength(1);
-    expect(adapter.pendingMessages[0].content).toBe("early msg");
+    expect(adapter.pendingMessages[0].content).toBe("pull msg");
   });
 });
 
