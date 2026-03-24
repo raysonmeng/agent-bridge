@@ -48,7 +48,7 @@ export class CodexAdapter extends EventEmitter {
   private agentMessageBuffers = new Map<string, string[]>();
   private pendingRequests = new Map<string, PendingRequest>();
   private activeTurnIds = new Set<string>();
-  private turnInProgress = false;
+  turnInProgress = false;
 
   // Proxy-layer id rewriting: upstream uses globally unique ids
   private nextProxyId = 100000;
@@ -139,7 +139,8 @@ export class CodexAdapter extends EventEmitter {
       return false;
     }
     if (this.turnInProgress) {
-      this.log(`WARNING: injecting while a turn is already active (thread ${this.threadId})`);
+      this.log(`Rejected injection: Codex turn is in progress (thread ${this.threadId})`);
+      return false;
     }
     this.log(`Injecting message into Codex (${text.length} chars)`);
     const requestId = this.nextInjectionId--;

@@ -184,11 +184,23 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
 
       log(`Forwarding Claude → Codex (${message.message.content.length} chars)`);
       const injected = codex.injectMessage(message.message.content);
+      if (!injected) {
+        const reason = codex.turnInProgress
+          ? "Codex is busy executing a turn. Wait for it to finish before sending another message."
+          : "Injection failed: no active thread or WebSocket not connected.";
+        log(`Injection rejected: ${reason}`);
+        sendProtocolMessage(ws, {
+          type: "claude_to_codex_result",
+          requestId: message.requestId,
+          success: false,
+          error: reason,
+        });
+        return;
+      }
       sendProtocolMessage(ws, {
         type: "claude_to_codex_result",
         requestId: message.requestId,
-        success: injected,
-        error: injected ? undefined : "Injection failed: no active thread or WebSocket not connected.",
+        success: true,
       });
       return;
     }
