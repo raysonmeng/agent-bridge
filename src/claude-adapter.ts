@@ -1,16 +1,14 @@
 /**
- * Claude Code Channel Plugin — MCP Server (official SDK + channel contract)
+ * Claude Code MCP Server — Dual-Mode Message Transport
  *
- * Follows the channel spec: https://code.claude.com/docs/en/channels-reference
+ * Supports two delivery modes:
+ *   - Push mode (OAuth): real-time via notifications/claude/channel
+ *   - Pull mode (API key): message queue + get_messages tool
  *
- * Key requirements:
- *   1. capabilities.experimental["claude/channel"] = {} — registers the listener
- *   2. instructions — tells Claude how to handle events and reply
- *   3. notifications/claude/channel with { content, meta } — event format
- *   4. reply tool — lets Claude send messages back
+ * Mode is auto-detected from client capabilities, or set via AGENTBRIDGE_MODE env var.
  *
  * Emits:
- *   - "ready"   ()                   — MCP connected
+ *   - "ready"   ()                   — MCP connected, mode resolved
  *   - "reply"   (msg: BridgeMessage) — Claude used the reply tool
  */
 
@@ -25,6 +23,7 @@ import { appendFileSync } from "node:fs";
 import type { BridgeMessage } from "./types";
 
 export type ReplySender = (msg: BridgeMessage) => Promise<{ success: boolean; error?: string }>;
+export type DeliveryMode = "push" | "pull" | "auto";
 
 const LOG_FILE = "/tmp/agentbridge.log";
 
@@ -34,9 +33,19 @@ export class ClaudeAdapter extends EventEmitter {
   private sessionId: string;
   private replySender: ReplySender | null = null;
 
+  // Dual-mode transport
+  private readonly configuredMode: DeliveryMode;
+  private resolvedMode: "push" | "pull" | null = null;
+  private pendingMessages: BridgeMessage[] = [];
+  private readonly maxBufferedMessages: number;
+
   constructor() {
     super();
     this.sessionId = `codex_${Date.now()}`;
+
+    const envMode = process.env.AGENTBRIDGE_MODE as DeliveryMode | undefined;
+    this.configuredMode = envMode && ["push", "pull", "auto"].includes(envMode) ? envMode : "auto";
+    this.maxBufferedMessages = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
 
     this.server = new Server(
       { name: "agentbridge", version: "0.1.0" },
@@ -46,10 +55,18 @@ export class ClaudeAdapter extends EventEmitter {
           tools: {},
         },
         instructions: [
-          "Messages from the Codex agent arrive as <channel source=\"agentbridge\" chat_id=\"...\" user=\"Codex\" ...>.",
           "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
-          "When Codex sends a message, review it and respond using the reply tool — pass chat_id back.",
-          "Use the reply tool to send instructions, code review feedback, or follow-up tasks to Codex.",
+          "",
+          "## Message delivery",
+          "Messages from Codex may arrive in two ways depending on the connection mode:",
+          "- As <channel source=\"agentbridge\" chat_id=\"...\" user=\"Codex\" ...> tags (push mode)",
+          "- Via the get_messages tool (pull mode)",
+          "",
+          "## How to interact",
+          "- Use the reply tool to send messages back to Codex — pass chat_id back.",
+          "- Use the get_messages tool to check for pending messages from Codex.",
+          "- After sending a reply, call get_messages to check for responses.",
+          "- When the user asks about Codex status or progress, call get_messages.",
         ].join("\n"),
       },
     );
@@ -62,7 +79,8 @@ export class ClaudeAdapter extends EventEmitter {
   async start() {
     const transport = new StdioServerTransport();
     await this.server.connect(transport);
-    this.log("MCP server connected (channel capability registered)");
+    this.resolveMode();
+    this.log(`MCP server connected (mode: ${this.resolvedMode})`);
     this.emit("ready");
   }
 
@@ -71,9 +89,47 @@ export class ClaudeAdapter extends EventEmitter {
     this.replySender = sender;
   }
 
-  // ── Push notification to Claude ────────────────────────────
+  /** Returns the resolved delivery mode. */
+  getDeliveryMode(): "push" | "pull" {
+    return this.resolvedMode ?? "pull";
+  }
+
+  /** Returns the number of messages waiting in the pull queue. */
+  getPendingMessageCount(): number {
+    return this.pendingMessages.length;
+  }
+
+  // ── Mode Detection ─────────────────────────────────────────
+
+  private resolveMode(): void {
+    if (this.resolvedMode) return;
+
+    if (this.configuredMode === "push" || this.configuredMode === "pull") {
+      this.resolvedMode = this.configuredMode;
+      this.log(`Delivery mode set by AGENTBRIDGE_MODE: ${this.resolvedMode}`);
+      return;
+    }
+
+    // Auto-detect from client capabilities
+    const clientCaps = this.server.getClientCapabilities();
+    const supportsChannel = !!(clientCaps?.experimental && "claude/channel" in clientCaps.experimental);
+    this.resolvedMode = supportsChannel ? "push" : "pull";
+    this.log(`Delivery mode auto-detected: ${this.resolvedMode} (client channel support: ${supportsChannel})`);
+  }
+
+  // ── Message Delivery ───────────────────────────────────────
 
   async pushNotification(message: BridgeMessage) {
+    const mode = this.getDeliveryMode();
+
+    if (mode === "push") {
+      await this.pushViaChannel(message);
+    } else {
+      this.queueForPull(message);
+    }
+  }
+
+  private async pushViaChannel(message: BridgeMessage) {
     const msgId = `codex_msg_${++this.notificationSeq}`;
     const ts = new Date(message.timestamp).toISOString();
 
@@ -94,8 +150,47 @@ export class ClaudeAdapter extends EventEmitter {
       });
       this.log(`Pushed notification: ${msgId}`);
     } catch (e: any) {
-      this.log(`Failed to push notification: ${e.message}`);
+      this.log(`Push failed, falling back to queue: ${e.message}`);
+      this.queueForPull(message);
     }
+  }
+
+  private queueForPull(message: BridgeMessage) {
+    if (this.pendingMessages.length >= this.maxBufferedMessages) {
+      this.pendingMessages.shift();
+      this.log("Message queue full, dropped oldest message");
+    }
+    this.pendingMessages.push(message);
+    this.log(`Queued message for pull (${this.pendingMessages.length} pending)`);
+  }
+
+  // ── get_messages ───────────────────────────────────────────
+
+  private drainMessages(): { content: Array<{ type: "text"; text: string }> } {
+    if (this.pendingMessages.length === 0) {
+      return {
+        content: [{ type: "text" as const, text: "No new messages from Codex." }],
+      };
+    }
+
+    const count = this.pendingMessages.length;
+    const formatted = this.pendingMessages
+      .map((msg, i) => {
+        const ts = new Date(msg.timestamp).toISOString();
+        return `---\n[${i + 1}] ${ts}\nCodex: ${msg.content}`;
+      })
+      .join("\n\n");
+
+    this.pendingMessages = [];
+
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `[${count} new message${count > 1 ? "s" : ""} from Codex]\n\n${formatted}`,
+        },
+      ],
+    };
   }
 
   // ── MCP Tool Handlers ─────────────────────────────────────
@@ -122,6 +217,16 @@ export class ClaudeAdapter extends EventEmitter {
             required: ["chat_id", "text"],
           },
         },
+        {
+          name: "get_messages",
+          description:
+            "Check for new messages from Codex. Call this after sending a reply or when you expect a response from Codex.",
+          inputSchema: {
+            type: "object" as const,
+            properties: {},
+            required: [],
+          },
+        },
       ],
     }));
 
@@ -129,41 +234,11 @@ export class ClaudeAdapter extends EventEmitter {
       const { name, arguments: args } = request.params;
 
       if (name === "reply") {
-        const text = (args as any)?.text;
-        if (!text) {
-          return {
-            content: [{ type: "text" as const, text: "Error: missing required parameter 'text'" }],
-            isError: true,
-          };
-        }
+        return this.handleReply(args as Record<string, unknown>);
+      }
 
-        const bridgeMsg: BridgeMessage = {
-          id: (args as any)?.chat_id ?? `reply_${Date.now()}`,
-          source: "claude",
-          content: text,
-          timestamp: Date.now(),
-        };
-
-        if (!this.replySender) {
-          this.log("No reply sender registered");
-          return {
-            content: [{ type: "text" as const, text: "Error: bridge not initialized, cannot send reply." }],
-            isError: true,
-          };
-        }
-
-        const result = await this.replySender(bridgeMsg);
-        if (!result.success) {
-          this.log(`Reply delivery failed: ${result.error}`);
-          return {
-            content: [{ type: "text" as const, text: `Error: ${result.error}` }],
-            isError: true,
-          };
-        }
-
-        return {
-          content: [{ type: "text" as const, text: "Reply sent to Codex." }],
-        };
+      if (name === "get_messages") {
+        return this.drainMessages();
       }
 
       return {
@@ -173,9 +248,56 @@ export class ClaudeAdapter extends EventEmitter {
     });
   }
 
+  private async handleReply(args: Record<string, unknown>) {
+    const text = args?.text as string | undefined;
+    if (!text) {
+      return {
+        content: [{ type: "text" as const, text: "Error: missing required parameter 'text'" }],
+        isError: true,
+      };
+    }
+
+    const bridgeMsg: BridgeMessage = {
+      id: (args?.chat_id as string) ?? `reply_${Date.now()}`,
+      source: "claude",
+      content: text,
+      timestamp: Date.now(),
+    };
+
+    if (!this.replySender) {
+      this.log("No reply sender registered");
+      return {
+        content: [{ type: "text" as const, text: "Error: bridge not initialized, cannot send reply." }],
+        isError: true,
+      };
+    }
+
+    const result = await this.replySender(bridgeMsg);
+    if (!result.success) {
+      this.log(`Reply delivery failed: ${result.error}`);
+      return {
+        content: [{ type: "text" as const, text: `Error: ${result.error}` }],
+        isError: true,
+      };
+    }
+
+    // Include pending message hint
+    const pending = this.pendingMessages.length;
+    let responseText = "Reply sent to Codex.";
+    if (pending > 0) {
+      responseText += ` Note: ${pending} pending message${pending > 1 ? "s" : ""} from Codex \u2014 call get_messages to read them.`;
+    }
+
+    return {
+      content: [{ type: "text" as const, text: responseText }],
+    };
+  }
+
   private log(msg: string) {
     const line = `[${new Date().toISOString()}] [ClaudeAdapter] ${msg}\n`;
     process.stderr.write(line);
-    try { appendFileSync(LOG_FILE, line); } catch {}
+    try {
+      appendFileSync(LOG_FILE, line);
+    } catch {}
   }
 }

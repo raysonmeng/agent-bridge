@@ -49,7 +49,7 @@ daemonClient.on("disconnect", () => {
 });
 
 claude.on("ready", async () => {
-  log("MCP server ready — ensuring AgentBridge daemon...");
+  log(`MCP server ready (delivery mode: ${claude.getDeliveryMode()}) — ensuring AgentBridge daemon...`);
 
   try {
     await ensureDaemonRunning();
