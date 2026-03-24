@@ -27,6 +27,7 @@ const TUI_DISCONNECT_GRACE_MS = parseInt(process.env.TUI_DISCONNECT_GRACE_MS ?? 
 const MAX_BUFFERED_MESSAGES = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
 const FILTER_MODE: FilterMode =
   (process.env.AGENTBRIDGE_FILTER_MODE as FilterMode) === "full" ? "full" : "filtered";
+const IDLE_SHUTDOWN_MS = parseInt(process.env.AGENTBRIDGE_IDLE_SHUTDOWN_MS ?? "30000", 10);
 
 const codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT);
 const attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
@@ -37,6 +38,7 @@ let nextControlClientId = 0;
 let nextSystemMessageId = 0;
 let codexBootstrapped = false;
 let shuttingDown = false;
+let idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
 
 const bufferedMessages: BridgeMessage[] = [];
 
@@ -104,6 +106,7 @@ codex.on("ready", (threadId: string) => {
 
 codex.on("tuiConnected", (connId: number) => {
   tuiConnectionState.handleTuiConnected(connId);
+  cancelIdleShutdown();
   log(`Codex TUI connected (conn #${connId})`);
   broadcastStatus();
 });
@@ -112,6 +115,7 @@ codex.on("tuiDisconnected", (connId: number) => {
   tuiConnectionState.handleTuiDisconnected(connId);
   log(`Codex TUI disconnected (conn #${connId})`);
   broadcastStatus();
+  scheduleIdleShutdown();
 });
 
 codex.on("error", (err: Error) => {
@@ -240,6 +244,7 @@ function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
 
   attachedClaude = ws;
   ws.data.attached = true;
+  cancelIdleShutdown();
   log(`Claude frontend attached (#${ws.data.clientId})`);
 
   statusBuffer.flush("claude reconnected");
@@ -267,6 +272,33 @@ function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
 
   if (tuiConnectionState.canReply()) {
     codex.injectMessage("⚠️ Claude Code went offline. AgentBridge is still running in the background; it will reconnect automatically when Claude reopens.");
+  }
+
+  scheduleIdleShutdown();
+}
+
+function scheduleIdleShutdown() {
+  cancelIdleShutdown();
+  if (attachedClaude) return; // still has a client
+
+  const snapshot = tuiConnectionState.snapshot();
+  if (snapshot.tuiConnected) return; // TUI still connected
+
+  log(`No clients connected. Daemon will shut down in ${IDLE_SHUTDOWN_MS}ms if no one reconnects.`);
+  idleShutdownTimer = setTimeout(() => {
+    // Re-check before shutting down
+    if (attachedClaude || tuiConnectionState.snapshot().tuiConnected) {
+      log("Idle shutdown cancelled: client reconnected during grace period");
+      return;
+    }
+    shutdown("idle — no clients connected");
+  }, IDLE_SHUTDOWN_MS);
+}
+
+function cancelIdleShutdown() {
+  if (idleShutdownTimer) {
+    clearTimeout(idleShutdownTimer);
+    idleShutdownTimer = null;
   }
 }
 
