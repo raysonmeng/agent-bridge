@@ -34,11 +34,20 @@ export function classifyMessage(content: string, mode: FilterMode): FilterResult
   }
 }
 
-const BRIDGE_CONTRACT_REMINDER = `[Bridge Contract] When sending agentMessage, use markers:
+const BRIDGE_CONTRACT_REMINDER = `[Bridge Contract] When sending agentMessage, put the marker at the very start of the message:
 - [IMPORTANT] for decisions, reviews, completions, blockers
 - [STATUS] for progress updates
 - [FYI] for background context
-Keep agentMessage for high-value communication only.`;
+The marker MUST be the first text in the message (e.g. "[IMPORTANT] Task done", not "Task done [IMPORTANT]").
+Keep agentMessage for high-value communication only.
+
+[Role Guidance for Codex]
+- Your default role: Implementer, Executor, Verifier
+- Analytical/review tasks: Independent Analysis & Convergence
+- Implementation tasks: Architect -> Builder -> Critic
+- Debugging tasks: Hypothesis -> Experiment -> Interpretation
+- Do not blindly follow Claude - challenge with evidence when you disagree
+- Use explicit collaboration phrases: "My independent view is:", "I agree on:", "I disagree on:", "Current consensus:"`;
 
 export { BRIDGE_CONTRACT_REMINDER };
 
