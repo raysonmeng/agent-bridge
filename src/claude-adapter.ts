@@ -38,6 +38,7 @@ export class ClaudeAdapter extends EventEmitter {
   private resolvedMode: "push" | "pull" | null = null;
   private pendingMessages: BridgeMessage[] = [];
   private readonly maxBufferedMessages: number;
+  private droppedMessageCount = 0;
 
   constructor() {
     super();
@@ -119,22 +120,35 @@ export class ClaudeAdapter extends EventEmitter {
     if (this.configuredMode === "push" || this.configuredMode === "pull") {
       this.resolvedMode = this.configuredMode;
       this.log(`Delivery mode set by AGENTBRIDGE_MODE: ${this.resolvedMode}`);
-      return;
+    } else {
+      // Auto-detect from client capabilities
+      const clientCaps = this.server.getClientCapabilities();
+      const supportsChannel = !!(clientCaps?.experimental && "claude/channel" in clientCaps.experimental);
+      this.resolvedMode = supportsChannel ? "push" : "pull";
+      this.log(`Delivery mode auto-detected: ${this.resolvedMode} (client channel support: ${supportsChannel})`);
     }
 
-    // Auto-detect from client capabilities
-    const clientCaps = this.server.getClientCapabilities();
-    const supportsChannel = !!(clientCaps?.experimental && "claude/channel" in clientCaps.experimental);
-    this.resolvedMode = supportsChannel ? "push" : "pull";
-    this.log(`Delivery mode auto-detected: ${this.resolvedMode} (client channel support: ${supportsChannel})`);
+    // If resolved to push, flush any messages queued before mode was known
+    if (this.resolvedMode === "push" && this.pendingMessages.length > 0) {
+      this.log(`Flushing ${this.pendingMessages.length} pre-init queued message(s) via push`);
+      const queued = this.pendingMessages;
+      this.pendingMessages = [];
+      for (const msg of queued) {
+        void this.pushViaChannel(msg);
+      }
+    }
   }
 
   // ── Message Delivery ───────────────────────────────────────
 
   async pushNotification(message: BridgeMessage) {
-    const mode = this.getDeliveryMode();
+    // Before mode is resolved (auto-detect pending), always queue
+    if (!this.resolvedMode) {
+      this.queueForPull(message);
+      return;
+    }
 
-    if (mode === "push") {
+    if (this.resolvedMode === "push") {
       await this.pushViaChannel(message);
     } else {
       this.queueForPull(message);
@@ -171,7 +185,8 @@ export class ClaudeAdapter extends EventEmitter {
   private queueForPull(message: BridgeMessage) {
     if (this.pendingMessages.length >= this.maxBufferedMessages) {
       this.pendingMessages.shift();
-      this.log("Message queue full, dropped oldest message");
+      this.droppedMessageCount++;
+      this.log(`Message queue full, dropped oldest message (total dropped: ${this.droppedMessageCount})`);
     }
     this.pendingMessages.push(message);
     this.log(`Queued message for pull (${this.pendingMessages.length} pending)`);
@@ -180,7 +195,7 @@ export class ClaudeAdapter extends EventEmitter {
   // ── get_messages ───────────────────────────────────────────
 
   private drainMessages(): { content: Array<{ type: "text"; text: string }> } {
-    if (this.pendingMessages.length === 0) {
+    if (this.pendingMessages.length === 0 && this.droppedMessageCount === 0) {
       return {
         content: [{ type: "text" as const, text: "No new messages from Codex." }],
       };
@@ -189,8 +204,16 @@ export class ClaudeAdapter extends EventEmitter {
     // Snapshot and clear atomically to avoid issues with concurrent writes
     const messages = this.pendingMessages;
     this.pendingMessages = [];
+    const dropped = this.droppedMessageCount;
+    this.droppedMessageCount = 0;
 
     const count = messages.length;
+    let header = `[${count} new message${count > 1 ? "s" : ""} from Codex]`;
+    if (dropped > 0) {
+      header += ` (${dropped} older message${dropped > 1 ? "s" : ""} were dropped due to queue overflow)`;
+    }
+    header += `\nchat_id: ${this.sessionId}`;
+
     const formatted = messages
       .map((msg, i) => {
         const ts = new Date(msg.timestamp).toISOString();
@@ -202,7 +225,7 @@ export class ClaudeAdapter extends EventEmitter {
       content: [
         {
           type: "text" as const,
-          text: `[${count} new message${count > 1 ? "s" : ""} from Codex]\n\n${formatted}`,
+          text: `${header}\n\n${formatted}`,
         },
       ],
     };
@@ -229,7 +252,7 @@ export class ClaudeAdapter extends EventEmitter {
                 description: "The message to send to Codex.",
               },
             },
-            required: ["chat_id", "text"],
+            required: ["text"],
           },
         },
         {
@@ -300,7 +323,7 @@ export class ClaudeAdapter extends EventEmitter {
     const pending = this.pendingMessages.length;
     let responseText = "Reply sent to Codex.";
     if (pending > 0) {
-      responseText += ` Note: ${pending} pending message${pending > 1 ? "s" : ""} from Codex \u2014 call get_messages to read them.`;
+      responseText += ` Note: ${pending} unread Codex message${pending > 1 ? "s" : ""} already waiting \u2014 call get_messages to read them.`;
     }
 
     return {

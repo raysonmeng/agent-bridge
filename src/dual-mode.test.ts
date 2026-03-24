@@ -109,6 +109,15 @@ describe("Dual-mode transport: pull mode message queue", () => {
     expect(adapter.pendingMessages).toHaveLength(3);
     expect(adapter.pendingMessages[0].content).toBe("msg2");
     expect(adapter.pendingMessages[2].content).toBe("msg4");
+    expect(adapter.droppedMessageCount).toBe(1);
+  });
+
+  test("pushNotification queues before mode is resolved", async () => {
+    const adapter = createAdapter();
+    // resolvedMode is null (auto, not yet resolved)
+    await adapter.pushNotification(makeBridgeMessage("early msg"));
+    expect(adapter.pendingMessages).toHaveLength(1);
+    expect(adapter.pendingMessages[0].content).toBe("early msg");
   });
 });
 
@@ -133,6 +142,7 @@ describe("Dual-mode transport: drainMessages (get_messages)", () => {
     const text = result.content[0].text;
 
     expect(text).toContain("[2 new messages from Codex]");
+    expect(text).toContain("chat_id:");
     expect(text).toContain("[1]");
     expect(text).toContain("first message");
     expect(text).toContain("[2]");
@@ -141,6 +151,24 @@ describe("Dual-mode transport: drainMessages (get_messages)", () => {
     // Queue should be cleared
     expect(adapter.pendingMessages).toHaveLength(0);
     expect(adapter.getPendingMessageCount()).toBe(0);
+  });
+
+  test("includes dropped count when messages were lost", () => {
+    const orig = process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES;
+    process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES = "2";
+    const adapter = createAdapter("pull");
+    process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES = orig;
+    adapter.resolveMode();
+
+    adapter.queueForPull(makeBridgeMessage("a"));
+    adapter.queueForPull(makeBridgeMessage("b"));
+    adapter.queueForPull(makeBridgeMessage("c")); // drops "a"
+
+    const result = adapter.drainMessages();
+    const text = result.content[0].text;
+    expect(text).toContain("1 older message");
+    expect(text).toContain("dropped due to queue overflow");
+    expect(adapter.droppedMessageCount).toBe(0); // reset after drain
   });
 
   test("singular message uses correct grammar", () => {
@@ -167,7 +195,7 @@ describe("Dual-mode transport: reply pending hint", () => {
     const text = result.content[0].text;
 
     expect(text).toContain("Reply sent to Codex.");
-    expect(text).toContain("2 pending messages");
+    expect(text).toContain("2 unread Codex message");
     expect(text).toContain("get_messages");
   });
 
