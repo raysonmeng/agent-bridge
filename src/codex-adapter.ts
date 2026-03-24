@@ -566,6 +566,7 @@ export class CodexAdapter extends EventEmitter {
   }
 
   private markTurnStarted(turnId?: string) {
+    const wasInProgress = this.turnInProgress;
     if (typeof turnId === "string" && turnId.length > 0) {
       this.activeTurnIds.add(turnId);
     } else {
@@ -573,6 +574,9 @@ export class CodexAdapter extends EventEmitter {
     }
 
     this.turnInProgress = this.activeTurnIds.size > 0;
+    if (!wasInProgress && this.turnInProgress) {
+      this.emit("turnStarted");
+    }
   }
 
   private markTurnCompleted(turnId?: string) {

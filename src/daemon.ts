@@ -28,6 +28,7 @@ const MAX_BUFFERED_MESSAGES = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESS
 const FILTER_MODE: FilterMode =
   (process.env.AGENTBRIDGE_FILTER_MODE as FilterMode) === "full" ? "full" : "filtered";
 const IDLE_SHUTDOWN_MS = parseInt(process.env.AGENTBRIDGE_IDLE_SHUTDOWN_MS ?? "30000", 10);
+const ATTENTION_WINDOW_MS = parseInt(process.env.AGENTBRIDGE_ATTENTION_WINDOW_MS ?? "15000", 10);
 
 const codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT);
 const attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
@@ -37,6 +38,8 @@ let attachedClaude: ServerWebSocket<ControlSocketData> | null = null;
 let nextControlClientId = 0;
 let nextSystemMessageId = 0;
 let codexBootstrapped = false;
+let attentionWindowTimer: ReturnType<typeof setTimeout> | null = null;
+let inAttentionWindow = false;
 let shuttingDown = false;
 let idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -66,9 +69,27 @@ const tuiConnectionState = new TuiConnectionState({
 
 const statusBuffer = new StatusBuffer((summary) => emitToClaude(summary));
 
+codex.on("turnStarted", () => {
+  log("Codex turn started");
+  emitToClaude(
+    systemMessage(
+      "system_turn_started",
+      "⏳ Codex is working on the current task. Wait for completion before sending a reply.",
+    ),
+  );
+});
+
 codex.on("agentMessage", (msg: BridgeMessage) => {
   if (msg.source !== "codex") return;
   const result = classifyMessage(msg.content, FILTER_MODE);
+
+  // During attention window, suppress STATUS to give Claude space to respond
+  if (inAttentionWindow && result.marker === "status") {
+    log(`Codex → Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
+    statusBuffer.add(msg);
+    return;
+  }
+
   log(`Codex → Claude [${result.marker}/${result.action}] (${msg.content.length} chars)`);
   switch (result.action) {
     case "forward":
@@ -76,6 +97,10 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
         statusBuffer.flush("important message arrived");
       }
       emitToClaude(msg);
+      // IMPORTANT or untagged message from Codex — give Claude attention
+      if (result.marker === "important") {
+        startAttentionWindow();
+      }
       break;
     case "buffer":
       statusBuffer.add(msg);
@@ -88,6 +113,13 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
 codex.on("turnCompleted", () => {
   log("Codex turn completed");
   statusBuffer.flush("turn completed");
+  emitToClaude(
+    systemMessage(
+      "system_turn_completed",
+      "✅ Codex finished the current turn. You can reply now if needed.",
+    ),
+  );
+  startAttentionWindow();
 });
 
 codex.on("ready", (threadId: string) => {
@@ -191,6 +223,7 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
       sendStatus(ws);
       return;
     case "claude_to_codex": {
+      clearAttentionWindow(); // Claude responded, end attention window
       if (message.message.source !== "claude") {
         sendProtocolMessage(ws, {
           type: "claude_to_codex_result",
@@ -275,6 +308,25 @@ function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
   }
 
   scheduleIdleShutdown();
+}
+
+function startAttentionWindow() {
+  clearAttentionWindow();
+  inAttentionWindow = true;
+  log(`Attention window started (${ATTENTION_WINDOW_MS}ms)`);
+  attentionWindowTimer = setTimeout(() => {
+    attentionWindowTimer = null;
+    inAttentionWindow = false;
+    log("Attention window ended");
+  }, ATTENTION_WINDOW_MS);
+}
+
+function clearAttentionWindow() {
+  if (attentionWindowTimer) {
+    clearTimeout(attentionWindowTimer);
+    attentionWindowTimer = null;
+  }
+  inAttentionWindow = false;
 }
 
 function scheduleIdleShutdown() {

@@ -68,6 +68,11 @@ export class ClaudeAdapter extends EventEmitter {
           "- Use the get_messages tool to check for pending messages from Codex.",
           "- After sending a reply, call get_messages to check for responses.",
           "- When the user asks about Codex status or progress, call get_messages.",
+          "",
+          "## Turn coordination",
+          "- When you see '⏳ Codex is working', do NOT call the reply tool — wait for '✅ Codex finished'.",
+          "- After Codex finishes a turn, you have an attention window to review and respond before new messages arrive.",
+          "- If the reply tool returns a busy error, Codex is still executing — wait and try again later.",
         ].join("\n"),
       },
     );
