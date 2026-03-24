@@ -197,6 +197,8 @@ export class CodexAdapter extends EventEmitter {
           try { this.tuiWs.send(forwarded); } catch (e: any) {
             this.log(`Failed to forward message to TUI: ${e.message}`);
           }
+        } else {
+          this.log("WARNING: response from app-server but no TUI connected, message dropped");
         }
       };
 
@@ -356,10 +358,14 @@ export class CodexAdapter extends EventEmitter {
 
   private handleAppServerResponse(parsed: any, raw: string): string | null {
     const responseId = parsed.id;
-    const mapping = typeof responseId === "number" ? this.upstreamToClient.get(responseId) : undefined;
+    // Handle response IDs that may arrive as numeric strings (e.g. "100005"
+    // instead of 100005). Non-numeric string IDs like "initialize" stay NaN
+    // and fall through to the unmatched response log at the end of this method.
+    const numericId = typeof responseId === "number" ? responseId : (typeof responseId === "string" ? Number(responseId) : NaN);
+    const mapping = !isNaN(numericId) ? this.upstreamToClient.get(numericId) : undefined;
 
     if (mapping) {
-      this.upstreamToClient.delete(responseId);
+      this.upstreamToClient.delete(numericId);
 
       if (mapping.connId !== this.tuiConnId) {
         this.log(`Dropping stale response (upstream id ${responseId}, from conn #${mapping.connId}, current #${this.tuiConnId})`);
@@ -372,7 +378,7 @@ export class CodexAdapter extends EventEmitter {
       return forwarded;
     }
 
-    if (typeof responseId === "number" && this.consumeBridgeRequestId(responseId)) {
+    if (!isNaN(numericId) && this.consumeBridgeRequestId(numericId)) {
       if (parsed.error) {
         this.log(`Bridge-originated request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
       } else {
@@ -381,7 +387,7 @@ export class CodexAdapter extends EventEmitter {
       return null;
     }
 
-    if (typeof responseId === "number" && this.consumeStaleProxyId(responseId)) {
+    if (!isNaN(numericId) && this.consumeStaleProxyId(numericId)) {
       this.log(`Dropping stale response for retired upstream id ${responseId}`);
       return null;
     }
