@@ -34,6 +34,20 @@ Guiding principles:
 
 In short, v1 should make the bridge feel smoother every day, while v2 remains the milestone for deeper architectural change.
 
+## Status Update (March 2026)
+
+The current codebase has now shipped most of the v1 roadmap ideas in concrete form.
+
+Notable shipped status:
+
+- marker-aware filtering, buffering, and summaries are implemented
+- turn coordination and busy-guard behavior are implemented
+- role-aware collaboration guidance is implemented
+- dual-mode Claude delivery (`push` and `pull`) is implemented
+- Phase 3, the CLI/distribution milestone, is complete
+
+For the concrete Phase 3 outcome, see [docs/phase3-spec.md](phase3-spec.md). The rest of this roadmap is still useful as design rationale, but §6 below should now be read as implemented product status rather than a future recommendation.
+
 ## 3. v1.1 Smart Message Filtering
 
 ### Problem
@@ -282,66 +296,94 @@ This preserves flexibility without requiring the user to constantly switch expli
 - Implementation and debugging flows feel more intentional and less ad hoc.
 - The bridge feels more structured without becoming a workflow engine.
 
-## 6. Distribution and Quick Start
+## 6. Distribution and CLI Status
 
-Making AgentBridge easy to try should not wait for the larger v2 architecture. The right v1 direction is to package the current single-bridge experience as a local CLI product rather than leaving it as a repository-first developer setup.
+Phase 3 shipped the v1 distribution milestone as a local CLI-first workflow.
 
-### Recommended product shape
+The product shape that actually landed is:
 
-The preferred distribution model for v1 is:
+- a repository-local `agentbridge` CLI exposed through the package `bin`
+- a plugin-oriented Claude integration path
+- a persistent daemon reused across Claude restarts
+- project config generation plus machine-local runtime state management
 
-- an `npm` package for distribution
-- an `agentbridge` CLI as the primary product interface
+### What shipped
 
-This keeps installation, diagnostics, configuration, and lifecycle management in one place. It also fits the current system better than trying to start with an extension-first design.
-
-Recommended core commands:
+The current command set is:
 
 - `agentbridge init`
+- `agentbridge dev`
+- `agentbridge claude`
+- `agentbridge codex`
+- `agentbridge kill`
+
+What those commands do in practice:
+
+- `init`
+  - checks `bun`, `claude`, and `codex`
+  - enforces the minimum Claude version
+  - creates `.agentbridge/config.json`
+  - creates `.agentbridge/collaboration.md`
+  - attempts plugin installation as a best-effort step
+- `dev`
+  - developer-only local marketplace and plugin-cache workflow
+- `claude`
+  - launches Claude with `--dangerously-load-development-channels server:agentbridge`
+- `codex`
+  - ensures the daemon is running
+  - launches Codex with the injected proxy arguments
+- `kill`
+  - stops the daemon precisely and writes a killed sentinel to prevent reconnect races
+
+### Actual quick-start flow
+
+The real first-run flow in the current codebase is:
+
+1. Clone the repository and run `bun install`
+2. Run `agentbridge init`
+3. Start Claude Code with `agentbridge claude`
+4. Start Codex with `agentbridge codex`
+5. Stop the daemon later with `agentbridge kill`
+
+This is simpler and more opinionated than the original proposal. Instead of generic `start` and `attach` commands, the CLI now encodes the actual Claude-side and Codex-side entrypoints directly.
+
+### What did not ship from the earlier proposal
+
+The original recommended command set included:
+
 - `agentbridge doctor`
 - `agentbridge start`
 - `agentbridge stop`
 - `agentbridge status`
 - `agentbridge attach`
 
-### Quick-start model
+Those commands did not ship in Phase 3.
 
-In this model, `npx` should be treated as an installer or bootstrap entrypoint, not the long-term runtime entrypoint.
+The implemented CLI chose task-specific commands instead because they map more directly to the real workflow:
 
-The expected first-run flow is:
+- `claude` replaces a generic frontend startup command
+- `codex` replaces a generic daemon-plus-attach flow
+- `kill` replaces a generic stop path, while also handling the reconnect sentinel correctly
 
-1. Run `npx agentbridge init`
-2. Let the CLI check local prerequisites and environment health
-3. Let the CLI write or update MCP configuration
-4. Let the CLI generate project-level context files or prompt skeletons
-5. Start Claude Code with the configured AgentBridge integration
+### Important deviations from the original distribution plan
 
-The `init` command should do the most work because it is the highest-friction step in adoption. It should:
+- The CLI exists, but the package is not yet published as a public npm artifact.
+  - The package is still marked `private`.
+- `init` does not patch a global Claude MCP config file.
+  - It generates project config and attempts plugin installation instead.
+- Claude startup still depends on the development-channel flag rather than a stable marketplace `--channels` flow.
 
-- verify required tools and versions
-- detect Codex availability
-- validate local ports and startup assumptions
-- write or patch MCP configuration
-- generate project file skeletons for shared context and agent overlays
+### Why this still counts as a successful v1 outcome
 
-### Why v1 should not start with an extension or plugin
+Phase 3 solved the operational problems that mattered most for v1:
 
-An extension or plugin may still be useful later, but it should not be the first product shape.
+- repeatable local setup
+- explicit Claude and Codex startup commands
+- reliable daemon reuse and shutdown
+- project-level collaboration defaults
+- a clean place to centralize runtime lifecycle logic
 
-- The hardest current problems are local bootstrap, process lifecycle, health checks, and configuration.
-- Those are CLI problems first, not UI shell problems.
-- A plugin can later wrap or invoke the CLI, but it should not replace the CLI as the base layer.
-
-### Technical challenges
-
-The main delivery challenges for this direction are:
-
-- reducing or packaging the current Bun runtime dependency for easier installation
-- safely writing or merging MCP configuration
-- discovering and validating the local Codex installation
-- handling platform differences across local environments
-
-These are practical productization challenges, but they are still much smaller than introducing a full plugin platform or a v2-style architecture migration.
+That gives AgentBridge a real product surface now, even though public packaging and marketplace polish remain follow-up work.
 
 ## 7. Collaboration Awareness Injection
 

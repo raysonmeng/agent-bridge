@@ -7,12 +7,12 @@
 
 Local bridge for bidirectional communication between Claude Code and Codex inside the same working session.
 
-The current implementation uses a two-process architecture:
+AgentBridge uses a two-process architecture:
 
-- `bridge.ts` is the foreground MCP client started by Claude Code
-- `daemon.ts` is a persistent local background process that owns the Codex app-server proxy and bridge state
+- **bridge.ts** is the foreground MCP client started by Claude Code via the AgentBridge plugin
+- **daemon.ts** is a persistent local background process that owns the Codex app-server proxy and bridge state
 
-This means the foreground MCP process can exit when Claude Code closes, while the background daemon and Codex proxy keep running. When Claude Code starts again, it can reuse the existing daemon automatically.
+When Claude Code closes, the foreground MCP process exits while the background daemon and Codex proxy keep running. When Claude Code starts again, it reconnects automatically with exponential backoff.
 
 ## What this project is / is not
 
@@ -31,32 +31,32 @@ This means the foreground MCP process can exit when Claude Code closes, while th
 ## Architecture
 
 ```
-┌──────────────┐          MCP stdio          ┌────────────────────┐
-│ Claude Code  │ ───────────────────────────▶ │ bridge.ts          │
-│ Session      │ ◀─────────────────────────── │ foreground client  │
-└──────────────┘                              └─────────┬──────────┘
-                                                        │
-                                                        │ local control WS
-                                                        ▼
-                                              ┌────────────────────┐
-                                              │ daemon.ts          │
-                                              │ bridge daemon      │
-                                              └─────────┬──────────┘
-                                                        │
-                                      ws://127.0.0.1:4501 proxy
-                                                        │
-                                                        ▼
-                                              ┌────────────────────┐
-                                              │ Codex app-server   │
-                                              └────────────────────┘
+┌──────────────┐     MCP stdio / plugin     ┌────────────────────┐
+│ Claude Code  │ ──────────────────────────▶ │ bridge.ts          │
+│ Session      │ ◀──────────────────────────  │ foreground client  │
+└──────────────┘                             └─────────┬──────────┘
+                                                       │
+                                                       │ control WS (:4502)
+                                                       ▼
+                                             ┌────────────────────┐
+                                             │ daemon.ts          │
+                                             │ bridge daemon      │
+                                             └─────────┬──────────┘
+                                                       │
+                                     ws://127.0.0.1:4501 proxy
+                                                       │
+                                                       ▼
+                                             ┌────────────────────┐
+                                             │ Codex app-server   │
+                                             └────────────────────┘
 ```
 
 ### Data flow
 
 | Direction | Path |
-|------|------|
-| **Codex → Claude** | `daemon.ts` captures `agentMessage` → control WS → `bridge.ts` → `notifications/claude/channel` |
-| **Claude → Codex** | Claude calls the `reply` tool → `bridge.ts` → control WS → `daemon.ts` → `turn/start` injects into the Codex thread |
+|-----------|------|
+| **Codex -> Claude** | `daemon.ts` captures `agentMessage` -> control WS -> `bridge.ts` -> `notifications/claude/channel` |
+| **Claude -> Codex** | Claude calls the `reply` tool -> `bridge.ts` -> control WS -> `daemon.ts` -> `turn/start` injects into the Codex thread |
 
 ### Loop prevention
 
@@ -64,7 +64,7 @@ Each message carries a `source` field (`"claude"` or `"codex"`). The bridge neve
 
 ## Prerequisites
 
-- [Bun](https://bun.sh)
+- [Bun](https://bun.sh) v1.0+
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) v2.1.80+
 - [Codex CLI](https://github.com/openai/codex) with the `codex` command available
 
@@ -74,51 +74,102 @@ Each message carries a `source` field (`"claude"` or `"codex"`). The bridge neve
 # 1. Install dependencies
 cd agent_bridge
 bun install
+bun link    # Makes the 'agentbridge' command available globally
 
-# 2. Register the MCP server
-# Merge .mcp.json.example into ~/.claude/.mcp.json and replace the path
-# with your local absolute path:
-#   "agentbridge": { "command": "bun", "args": ["run", "/absolute/path/to/agent_bridge/src/bridge.ts"] }
+# 2. Initialize project (installs plugin, checks dependencies, generates config)
+agentbridge init
 
-# 3. Start Claude Code and load AgentBridge as a channel (development mode)
-claude --dangerously-load-development-channels server:agentbridge
+# 3. Start Claude Code with AgentBridge plugin loaded
+agentbridge claude
+
+# 4. Start Codex TUI connected to the bridge (in another terminal)
+agentbridge codex
 ```
 
-> Warning: `--dangerously-load-development-channels` loads a local development channel into Claude Code. This is currently a Research Preview workflow. Only enable channels and MCP servers you trust, because that local process can push messages into your Claude session and participate in the same workspace flow. AgentBridge is intended for local experimentation and development, not for untrusted environments.
+That's it. The daemon starts automatically when needed and reconnects if restarted.
 
-`bridge.ts` checks whether a local daemon already exists before continuing.
+> **Note:** `agentbridge claude` injects `--dangerously-load-development-channels server:agentbridge` automatically. This loads a local development channel into Claude Code (currently a Research Preview workflow). Only enable channels and MCP servers you trust.
 
-- If no daemon exists, it starts `daemon.ts`
-- If a daemon is already running, it reuses it
+### For plugin developers
 
-`daemon.ts` automatically spawns `codex app-server` in WebSocket mode and can surface the attach command through the Claude channel when needed.
+If you're working on AgentBridge itself, use the dev command to sync local changes to the plugin cache:
 
 ```bash
-# 4. Attach to the Codex proxy from another terminal to watch the Codex TUI
-codex --enable tui_app_server --remote ws://127.0.0.1:4501
+agentbridge dev     # Register local marketplace + sync plugin files
+agentbridge claude  # Start Claude Code (plugin auto-loaded)
 ```
 
-> Note: the TUI connects to the bridge proxy port (default `4501`), not the app-server port (`4500`). The bridge transparently forwards traffic and intercepts `agentMessage`.
+## CLI Reference
 
-Codex `agentMessage` items are pushed into the Claude session automatically. Claude can reply back through the `reply` tool.
+| Command | Description |
+|---------|-------------|
+| `agentbridge init` | Install plugin, check dependencies (bun/claude/codex), generate `.agentbridge/config.json` and `collaboration.md` |
+| `agentbridge claude [args...]` | Start Claude Code with push channel enabled. Pass-through args are forwarded to `claude` |
+| `agentbridge codex [args...]` | Start Codex TUI connected to AgentBridge daemon. Pass-through args forwarded to `codex` |
+| `agentbridge kill` | Gracefully stop daemon, clean up state files, write killed sentinel to prevent auto-reconnect |
+| `agentbridge dev` | (Dev only) Register local marketplace + force-sync plugin to cache |
+| `agentbridge --help` | Show help |
+| `agentbridge --version` | Show version |
+
+### Owned flags
+
+Some flags are automatically injected and cannot be manually specified:
+
+- `agentbridge claude` owns: `--channels`, `--dangerously-load-development-channels`
+- `agentbridge codex` owns: `--remote`, `--enable tui_app_server`
+
+Passing these flags manually will result in a hard error with guidance to use the native command directly.
+
+## Project Config
+
+Running `agentbridge init` creates a `.agentbridge/` directory in your project root:
+
+| File | Purpose |
+|------|---------|
+| `config.json` | Machine-readable project config (ports, agent roles, markers, turn coordination) |
+| `collaboration.md` | Human/agent-readable collaboration rules (roles, thinking patterns, communication style) |
+
+The config is loaded by the CLI and daemon at startup. Re-running `init` is idempotent and will not overwrite existing files.
 
 ## File Structure
 
 ```
 agent_bridge/
 ├── .github/
-│   ├── ISSUE_TEMPLATE/       # Bug report and feature request templates
+│   ├── ISSUE_TEMPLATE/           # Bug report and feature request templates
 │   ├── pull_request_template.md
-│   └── workflows/ci.yml      # GitHub Actions CI
-├── assets/                    # Static assets (images, etc.)
+│   └── workflows/ci.yml          # GitHub Actions CI
+├── assets/                        # Static assets (images, etc.)
+├── docs/
+│   ├── phase3-spec.md            # Phase 3 design spec (CLI + Plugin)
+│   ├── v1-roadmap.md             # v1 feature roadmap
+│   └── v2-architecture.md        # v2 multi-agent architecture design
+├── plugins/agentbridge/           # Claude Code plugin bundle
+│   ├── .claude-plugin/plugin.json
+│   ├── commands/init.md
+│   ├── hooks/hooks.json
+│   ├── scripts/health-check.sh
+│   └── server/                    # Bundled bridge-server.js + daemon.js
 ├── src/
-│   ├── bridge.ts             # Claude foreground MCP client that ensures the daemon exists and forwards messages
-│   ├── daemon.ts             # Persistent background process that owns the Codex proxy and bridge state
-│   ├── daemon-client.ts      # Foreground client for the daemon control WS
-│   ├── control-protocol.ts   # Shared foreground/background control protocol
-│   ├── claude-adapter.ts     # MCP server adapter for Claude Code channels
-│   ├── codex-adapter.ts      # Codex app-server WebSocket proxy and message interception
-│   └── types.ts              # Shared types
+│   ├── bridge.ts                  # Claude foreground MCP client (plugin entry point)
+│   ├── daemon.ts                  # Persistent background daemon
+│   ├── daemon-client.ts           # WebSocket client for daemon control port
+│   ├── daemon-lifecycle.ts        # Shared daemon lifecycle (ensureRunning, kill, startup lock)
+│   ├── control-protocol.ts        # Foreground/background control protocol types
+│   ├── claude-adapter.ts          # MCP server adapter for Claude Code channels
+│   ├── codex-adapter.ts           # Codex app-server WebSocket proxy and message interception
+│   ├── config-service.ts          # Project config (.agentbridge/) read/write
+│   ├── state-dir.ts               # Platform-aware state directory resolver
+│   ├── message-filter.ts          # Smart message filtering (markers, summary buffer)
+│   ├── types.ts                   # Shared types
+│   ├── cli.ts                     # CLI entry point and command router
+│   └── cli/
+│       ├── init.ts                # agentbridge init
+│       ├── claude.ts              # agentbridge claude
+│       ├── codex.ts               # agentbridge codex
+│       ├── kill.ts                # agentbridge kill
+│       └── dev.ts                 # agentbridge dev
+├── CLAUDE.md                      # Project rules for AI agents
 ├── CODE_OF_CONDUCT.md
 ├── CONTRIBUTING.md
 ├── LICENSE
@@ -131,36 +182,50 @@ agent_bridge/
 
 ## Configuration
 
-| Environment variable | Default | Description |
-|----------|--------|------|
+### Environment Variables
+
+| Variable | Default | Description |
+|----------|---------|-------------|
 | `CODEX_WS_PORT` | `4500` | Codex app-server WebSocket port |
 | `CODEX_PROXY_PORT` | `4501` | Bridge proxy port for the Codex TUI |
-| `AGENTBRIDGE_CONTROL_PORT` | `4502` | Local control port between `bridge.ts` and `daemon.ts` |
-| `AGENTBRIDGE_PID_FILE` | `/tmp/agentbridge-daemon-4502.pid` | Daemon pid file used to avoid duplicate startup |
+| `AGENTBRIDGE_CONTROL_PORT` | `4502` | Control port between bridge.ts and daemon.ts |
+| `AGENTBRIDGE_STATE_DIR` | Platform default | State directory for pid, status, logs (macOS: `~/Library/Application Support/agentbridge/`, Linux: `$XDG_STATE_HOME/agentbridge/`) |
+| `AGENTBRIDGE_MODE` | `push` | Message delivery mode (`push` for channels, `pull` for API key mode) |
+| `AGENTBRIDGE_DAEMON_ENTRY` | `./daemon.ts` | Override daemon entry point (used by plugin bundles) |
+
+### State Directory
+
+The daemon stores runtime state in a platform-aware directory:
+
+| Platform | Default Path |
+|----------|-------------|
+| macOS | `~/Library/Application Support/agentbridge/` |
+| Linux | `$XDG_STATE_HOME/agentbridge/` (fallback: `~/.local/state/agentbridge/`) |
+
+Contents: `daemon.pid`, `status.json`, `agentbridge.log`, `killed` (sentinel), `startup.lock`
 
 ## Current Limitations
 
 - Only forwards `agentMessage` items, not intermediate `commandExecution`, `fileChange`, or similar events
 - Single Codex thread, no multi-session support yet
 - Single Claude foreground connection; a new Claude session replaces the previous one
+- Fixed ports mean only one AgentBridge instance per machine (multi-project support planned for post-v1)
 
 ### Codex git restrictions
 
 Codex runs in a sandboxed environment that **blocks all writes to the `.git` directory**. This means Codex cannot run `git commit`, `git push`, `git pull`, `git checkout -b`, `git merge`, or any other command that modifies git metadata. Attempting these commands will cause the Codex session to hang indefinitely.
 
-This restriction is especially relevant when Claude Code uses **git worktrees** — the worktree shares `.git` internals with the main repository, which can further tighten sandbox constraints.
-
 **Recommendation:** Let Claude Code handle all git operations (branching, committing, pushing, creating PRs). Codex should focus on code changes and report completed work via `agentMessage`, then Claude Code takes care of the git workflow.
 
 ## Roadmap
 
-- **v1.x (current)**: Improve the single-bridge experience without architectural refactoring — less noise, better turn discipline, and clearer collaboration modes. See [docs/v1-roadmap.md](docs/v1-roadmap.md).
-- **v2 (planned)**: Introduce the multi-agent foundation — room-scoped collaboration, stable identity, a formal control protocol, and stronger recovery semantics. See [docs/v2-architecture.md](docs/v2-architecture.md).
+- **v1.x (current)**: Improve the single-bridge experience without architectural refactoring -- less noise, better turn discipline, and clearer collaboration modes. See [docs/v1-roadmap.md](docs/v1-roadmap.md).
+- **v2 (planned)**: Introduce the multi-agent foundation -- room-scoped collaboration, stable identity, a formal control protocol, and stronger recovery semantics. See [docs/v2-architecture.md](docs/v2-architecture.md).
 - **v3+ (longer term)**: Explore smarter collaboration, richer policies, and more advanced orchestration across runtimes.
 
 ## How This Project Was Built
 
-This project was built collaboratively by **Claude Code** (Anthropic) and **Codex** (OpenAI), communicating through AgentBridge itself — the very tool they were building together. A human developer coordinated the effort, assigning tasks, reviewing progress, and directing the two agents to work in parallel and review each other's output.
+This project was built collaboratively by **Claude Code** (Anthropic) and **Codex** (OpenAI), communicating through AgentBridge itself -- the very tool they were building together. A human developer coordinated the effort, assigning tasks, reviewing progress, and directing the two agents to work in parallel and review each other's output.
 
 In other words, AgentBridge is its own proof of concept: two AI agents from different providers, connected in real time, shipping code side by side.
 

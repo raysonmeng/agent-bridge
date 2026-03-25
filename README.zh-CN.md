@@ -7,12 +7,12 @@ English version: [README.md](README.md)
 
 让 Claude Code 和 Codex 在同一个工作会话中进行双向通信的本地 Bridge。
 
-当前实现采用两层进程结构：
+AgentBridge 采用两层进程结构：
 
-- `bridge.ts` 是由 Claude Code 启动的前台 MCP 客户端
-- `daemon.ts` 是常驻本地的后台进程，持有 Codex app-server 代理和桥接状态
+- **bridge.ts** 是由 Claude Code 通过 AgentBridge 插件启动的前台 MCP 客户端
+- **daemon.ts** 是常驻本地的后台进程，持有 Codex app-server 代理和桥接状态
 
-这意味着当 Claude Code 关闭时，前台 MCP 进程可以退出，而后台 daemon 与 Codex 代理继续存活；当 Claude Code 再次启动时，可以自动复用已有 daemon。
+当 Claude Code 关闭时，前台 MCP 进程退出，后台 daemon 与 Codex 代理继续存活。当 Claude Code 再次启动时，会自动重连（指数退避）。
 
 ## 这个项目是什么 / 不是什么
 
@@ -31,32 +31,32 @@ English version: [README.md](README.md)
 ## 架构
 
 ```
-┌──────────────┐          MCP stdio          ┌────────────────────┐
-│ Claude Code  │ ───────────────────────────▶ │ bridge.ts          │
-│ Session      │ ◀─────────────────────────── │ 前台 MCP 客户端     │
-└──────────────┘                              └─────────┬──────────┘
-                                                        │
-                                                        │ 本地控制 WS
-                                                        ▼
-                                              ┌────────────────────┐
-                                              │ daemon.ts          │
-                                              │ 常驻后台桥接进程    │
-                                              └─────────┬──────────┘
-                                                        │
-                                      ws://127.0.0.1:4501 proxy
-                                                        │
-                                                        ▼
-                                              ┌────────────────────┐
-                                              │ Codex app-server   │
-                                              └────────────────────┘
+┌──────────────┐    MCP stdio / plugin     ┌────────────────────┐
+│ Claude Code  │ ─────────────────────────▶ │ bridge.ts          │
+│ Session      │ ◀─────────────────────────  │ 前台 MCP 客户端     │
+└──────────────┘                            └─────────┬──────────┘
+                                                      │
+                                                      │ 控制 WS (:4502)
+                                                      ▼
+                                            ┌────────────────────┐
+                                            │ daemon.ts          │
+                                            │ 常驻后台桥接进程    │
+                                            └─────────┬──────────┘
+                                                      │
+                                    ws://127.0.0.1:4501 proxy
+                                                      │
+                                                      ▼
+                                            ┌────────────────────┐
+                                            │ Codex app-server   │
+                                            └────────────────────┘
 ```
 
 ### 数据流
 
 | 方向 | 链路 |
 |------|------|
-| **Codex → Claude** | `daemon.ts` 捕获 `agentMessage` → 控制 WS → `bridge.ts` → `notifications/claude/channel` |
-| **Claude → Codex** | Claude 调用 `reply` tool → `bridge.ts` → 控制 WS → `daemon.ts` → `turn/start` 注入 Codex thread |
+| **Codex -> Claude** | `daemon.ts` 捕获 `agentMessage` -> 控制 WS -> `bridge.ts` -> `notifications/claude/channel` |
+| **Claude -> Codex** | Claude 调用 `reply` tool -> `bridge.ts` -> 控制 WS -> `daemon.ts` -> `turn/start` 注入 Codex thread |
 
 ### 防循环
 
@@ -64,7 +64,7 @@ English version: [README.md](README.md)
 
 ## 前置条件
 
-- [Bun](https://bun.sh)
+- [Bun](https://bun.sh) v1.0+
 - [Claude Code](https://docs.anthropic.com/en/docs/claude-code) v2.1.80+
 - [Codex CLI](https://github.com/openai/codex)，且本地可直接使用 `codex` 命令
 
@@ -74,51 +74,102 @@ English version: [README.md](README.md)
 # 1. 安装依赖
 cd agent_bridge
 bun install
+bun link    # 全局注册 agentbridge 命令
 
-# 2. 注册 MCP server
-# 将 .mcp.json.example 的内容合并到 ~/.claude/.mcp.json 中，
-# 并把路径替换为你本地的绝对路径：
-#   "agentbridge": { "command": "bun", "args": ["run", "/absolute/path/to/agent_bridge/src/bridge.ts"] }
+# 2. 初始化项目（安装插件、检查依赖、生成配置）
+agentbridge init
 
-# 3. 启动 Claude Code 并以 channel 形式加载 AgentBridge（开发模式）
-claude --dangerously-load-development-channels server:agentbridge
+# 3. 启动 Claude Code（自动加载 AgentBridge 插件）
+agentbridge claude
+
+# 4. 在另一个终端启动 Codex TUI 连接 Bridge
+agentbridge codex
 ```
 
-> 风险说明：`--dangerously-load-development-channels` 会把本地开发中的 channel 挂载进 Claude Code。这一能力当前属于 Research Preview。你只应启用自己信任的 channel 和 MCP server，因为对应的本地进程可以向 Claude 会话推送消息，并参与同一个工作区流程。AgentBridge 的目标是本地开发与实验，不适合放在不可信环境中使用。
+就这样。Daemon 会在需要时自动启动，重启后自动重连。
 
-`bridge.ts` 启动后会先检查本地 daemon 是否已存在。
+> **注意：** `agentbridge claude` 会自动注入 `--dangerously-load-development-channels server:agentbridge`。这会把本地开发中的 channel 挂载进 Claude Code（当前属于 Research Preview）。请只启用你信任的 channel 和 MCP server。
 
-- 如果不存在，会自动拉起 `daemon.ts`
-- 如果已存在，会直接复用已有 daemon
+### 插件开发者
 
-`daemon.ts` 会自动以 WebSocket 模式启动 `codex app-server`，并在需要时通过 Claude channel 把 attach 命令提示出来。
+如果你在开发 AgentBridge 本身，使用 dev 命令同步本地改动到插件缓存：
 
 ```bash
-# 4. 在另一个终端连接到 Codex 代理，查看 Codex TUI
-codex --enable tui_app_server --remote ws://127.0.0.1:4501
+agentbridge dev     # 注册本地 marketplace + 同步插件文件
+agentbridge claude  # 启动 Claude Code（插件自动加载）
 ```
 
-> 注意：TUI 连接的是 Bridge 代理端口（默认 `4501`），不是 app-server 端口（`4500`）。Bridge 会透明转发流量，并拦截 `agentMessage`。
+## CLI 命令参考
 
-Codex 的 `agentMessage` 会自动推送到 Claude 会话中。Claude 可以通过 `reply` tool 回复 Codex。
+| 命令 | 说明 |
+|------|------|
+| `agentbridge init` | 安装插件、检查依赖（bun/claude/codex）、生成 `.agentbridge/config.json` 和 `collaboration.md` |
+| `agentbridge claude [args...]` | 启动 Claude Code 并启用 push channel。额外参数透传给 `claude` |
+| `agentbridge codex [args...]` | 启动连接到 AgentBridge daemon 的 Codex TUI。额外参数透传给 `codex` |
+| `agentbridge kill` | 优雅停止 daemon，清理状态文件，写入 killed sentinel 阻止自动重连 |
+| `agentbridge dev` | （开发用）注册本地 marketplace + 强制同步插件到缓存 |
+| `agentbridge --help` | 显示帮助 |
+| `agentbridge --version` | 显示版本 |
+
+### Owned flags
+
+部分参数由 CLI 自动注入，不可手动指定：
+
+- `agentbridge claude` 拥有：`--channels`、`--dangerously-load-development-channels`
+- `agentbridge codex` 拥有：`--remote`、`--enable tui_app_server`
+
+手动传入这些参数会报错，并提示使用原生命令。
+
+## 项目配置
+
+运行 `agentbridge init` 会在项目根目录创建 `.agentbridge/` 目录：
+
+| 文件 | 用途 |
+|------|------|
+| `config.json` | 机器可读的项目配置（端口、Agent 角色、消息标记、回合协调） |
+| `collaboration.md` | 人类/Agent 可读的协作规则（角色、思考模式、沟通风格） |
+
+CLI 和 daemon 启动时会加载该配置。重复运行 `init` 是幂等的，不会覆盖已有文件。
 
 ## 文件结构
 
 ```
 agent_bridge/
 ├── .github/
-│   ├── ISSUE_TEMPLATE/       # Bug report 和 feature request 模板
+│   ├── ISSUE_TEMPLATE/           # Bug report 和 feature request 模板
 │   ├── pull_request_template.md
-│   └── workflows/ci.yml      # GitHub Actions CI
-├── assets/                    # 图片资源（微信二维码等）
+│   └── workflows/ci.yml          # GitHub Actions CI
+├── assets/                        # 图片资源
+├── docs/
+│   ├── phase3-spec.md            # Phase 3 设计文档（CLI + Plugin）
+│   ├── v1-roadmap.md             # v1 功能路线图
+│   └── v2-architecture.md        # v2 多 Agent 架构设计
+├── plugins/agentbridge/           # Claude Code 插件包
+│   ├── .claude-plugin/plugin.json
+│   ├── commands/init.md
+│   ├── hooks/hooks.json
+│   ├── scripts/health-check.sh
+│   └── server/                    # 打包的 bridge-server.js + daemon.js
 ├── src/
-│   ├── bridge.ts             # Claude 前台 MCP 客户端，负责确保 daemon 存在并转发消息
-│   ├── daemon.ts             # 常驻后台进程，持有 Codex 代理和桥接状态
-│   ├── daemon-client.ts      # 前台连接 daemon 控制 WS 的客户端
-│   ├── control-protocol.ts   # 前后台共享控制协议
-│   ├── claude-adapter.ts     # 面向 Claude Code channel 的 MCP server 适配层
-│   ├── codex-adapter.ts      # Codex app-server WebSocket 代理与消息拦截
-│   └── types.ts              # 共享类型
+│   ├── bridge.ts                  # Claude 前台 MCP 客户端（插件入口）
+│   ├── daemon.ts                  # 常驻后台 daemon
+│   ├── daemon-client.ts           # daemon 控制端口的 WebSocket 客户端
+│   ├── daemon-lifecycle.ts        # 共享 daemon 生命周期（ensureRunning、kill、启动锁）
+│   ├── control-protocol.ts        # 前后台控制协议类型
+│   ├── claude-adapter.ts          # Claude Code channel 的 MCP server 适配层
+│   ├── codex-adapter.ts           # Codex app-server WebSocket 代理与消息拦截
+│   ├── config-service.ts          # 项目配置（.agentbridge/）读写
+│   ├── state-dir.ts               # 平台感知的状态目录解析
+│   ├── message-filter.ts          # 智能消息过滤（标记、摘要缓冲）
+│   ├── types.ts                   # 共享类型
+│   ├── cli.ts                     # CLI 入口和命令路由
+│   └── cli/
+│       ├── init.ts                # agentbridge init
+│       ├── claude.ts              # agentbridge claude
+│       ├── codex.ts               # agentbridge codex
+│       ├── kill.ts                # agentbridge kill
+│       └── dev.ts                 # agentbridge dev
+├── CLAUDE.md                      # AI Agent 项目规则
 ├── CODE_OF_CONDUCT.md
 ├── CONTRIBUTING.md
 ├── LICENSE
@@ -131,56 +182,46 @@ agent_bridge/
 
 ## 配置
 
-| 环境变量 | 默认值 | 说明 |
-|----------|--------|------|
+### 环境变量
+
+| 变量 | 默认值 | 说明 |
+|------|--------|------|
 | `CODEX_WS_PORT` | `4500` | Codex app-server WebSocket 端口 |
 | `CODEX_PROXY_PORT` | `4501` | Bridge 代理端口，Codex TUI 连接此端口 |
-| `AGENTBRIDGE_CONTROL_PORT` | `4502` | `bridge.ts` 与 `daemon.ts` 之间的本地控制端口 |
-| `AGENTBRIDGE_PID_FILE` | `/tmp/agentbridge-daemon-4502.pid` | daemon pid 文件，用于避免重复启动 |
+| `AGENTBRIDGE_CONTROL_PORT` | `4502` | bridge.ts 与 daemon.ts 之间的控制端口 |
+| `AGENTBRIDGE_STATE_DIR` | 平台默认 | 状态目录（pid、status、日志）。macOS: `~/Library/Application Support/agentbridge/`，Linux: `$XDG_STATE_HOME/agentbridge/` |
+| `AGENTBRIDGE_MODE` | `push` | 消息投递模式（`push` 用于 channel，`pull` 用于 API key 模式） |
+| `AGENTBRIDGE_DAEMON_ENTRY` | `./daemon.ts` | 覆盖 daemon 入口（插件包使用） |
+
+### 状态目录
+
+daemon 在平台感知的目录中存储运行时状态：
+
+| 平台 | 默认路径 |
+|------|---------|
+| macOS | `~/Library/Application Support/agentbridge/` |
+| Linux | `$XDG_STATE_HOME/agentbridge/`（回退：`~/.local/state/agentbridge/`） |
+
+内容：`daemon.pid`、`status.json`、`agentbridge.log`、`killed`（sentinel）、`startup.lock`
 
 ## 当前限制
 
 - 目前只转发 `agentMessage`，不转发 `commandExecution`、`fileChange` 等中间过程事件
 - 当前只支持单个 Codex thread，不支持多会话
 - 当前只支持单个 Claude 前台连接；新的 Claude 会话会替换旧连接
+- 固定端口意味着每台机器只能运行一个 AgentBridge 实例（多项目并行支持计划在 v1 之后）
 
 ### Codex 的 Git 操作限制
 
 Codex 运行在沙箱环境中，**禁止对 `.git` 目录进行任何写操作**。这意味着 Codex 无法执行 `git commit`、`git push`、`git pull`、`git checkout -b`、`git merge` 等任何修改 Git 元数据的命令。尝试执行这些命令会导致 Codex 会话无限期挂起。
 
-当 Claude Code 使用了 **git worktree** 时，这个限制尤其需要注意 — worktree 与主仓库共享 `.git` 内部结构，可能会进一步收紧沙箱的约束。
-
 **建议做法：** 让 Claude Code 负责所有 Git 操作（创建分支、提交、推送、创建 PR）。Codex 专注于代码修改，通过 `agentMessage` 汇报完成的工作，由 Claude Code 负责 Git 工作流。
 
 ## Roadmap
 
-### v1.x（当前） — 单桥体验优化
-
-在不改变架构的前提下优化体验：**降噪、控回合、定角色**。
-
-- **v1.1** 智能消息过滤 — Prompt Contract + Marker Protocol，让 agent 自己决定发什么
-- **v1.2** 双向协调 — Turn Signals + Attention Window，控制消息时序
-- **v1.3** 角色协作 — Role Contract + Thinking Patterns，建立协作分工和思考模式
-
-详见 [v1 路线图](docs/v1-roadmap.zh-CN.md)
-
-### v2（规划中） — 多 Agent 基础设施
-
-Daemon 变为纯消息路由器，支持多 Agent 类型、多实例共存：
-
-- Room 模型与作用域通信
-- Agent 身份注册与断线恢复
-- v2 控制协议（版本协商、认证、心跳、消息回执）
-- 可插拔 Policy 层
-- SQLite 持久化
-
-详见 [v2 架构设计](docs/v2-architecture.zh-CN.md)
-
-### v3+（远期） — 智能协作与高级编排
-
-- 成熟的 Policy 系统与工作流编排
-- 丰富的可观测性
-- 跨 runtime 的多方代理协作智能
+- **v1.x（当前）**：在不改变架构的前提下优化单桥体验 -- 降噪、控回合、定角色。详见 [docs/v1-roadmap.md](docs/v1-roadmap.md)。
+- **v2（规划中）**：引入多 Agent 基础设施 -- Room 作用域协作、稳定身份、正式控制协议、更强的恢复语义。详见 [docs/v2-architecture.md](docs/v2-architecture.md)。
+- **v3+（远期）**：更智能的协作、更丰富的策略、跨 runtime 的高级编排。
 
 ## 这个项目是怎么建成的
 
