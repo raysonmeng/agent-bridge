@@ -15,7 +15,7 @@ const command = args[0];
 const restArgs = args.slice(1);
 
 // Marketplace name constant (shared with plugin)
-export const MARKETPLACE_NAME = "agentbridge-official";
+export const MARKETPLACE_NAME = "agentbridge";
 export const PLUGIN_NAME = "agentbridge";
 
 async function main() {
