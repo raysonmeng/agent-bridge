@@ -43,16 +43,20 @@ daemonClient.on("status", (status) => {
 daemonClient.on("disconnect", () => {
   if (shuttingDown) return;
 
-  log("Daemon control connection closed");
+  log("Daemon control connection closed — will attempt to reconnect");
   void claude.pushNotification(systemMessage(
     "system_daemon_disconnected",
-    "⚠️ AgentBridge daemon control connection lost. The Codex proxy may still be running in the background, but Claude cannot communicate bidirectionally right now.",
+    "⚠️ AgentBridge daemon control connection lost. Attempting to reconnect...",
   ));
+  void reconnectToDaemon();
 });
 
 claude.on("ready", async () => {
   log(`MCP server ready (delivery mode: ${claude.getDeliveryMode()}) — ensuring AgentBridge daemon...`);
+  await connectToDaemon();
+});
 
+async function connectToDaemon() {
   try {
     await daemonLifecycle.ensureRunning();
     await daemonClient.connect();
@@ -65,8 +69,34 @@ claude.on("ready", async () => {
         `❌ AgentBridge daemon failed to start or is unreachable: ${err.message}`,
       ),
     );
+    throw err;
   }
-});
+}
+
+const MAX_RECONNECT_DELAY_MS = 30_000;
+
+async function reconnectToDaemon(attempt = 0) {
+  if (shuttingDown) return;
+
+  const delayMs = Math.min(1000 * 2 ** attempt, MAX_RECONNECT_DELAY_MS);
+  if (attempt > 0) {
+    log(`Reconnect attempt ${attempt + 1}, waiting ${delayMs}ms...`);
+  }
+  await new Promise((resolve) => setTimeout(resolve, delayMs));
+
+  if (shuttingDown) return;
+
+  try {
+    await connectToDaemon();
+    log("Reconnected to AgentBridge daemon successfully");
+    void claude.pushNotification(systemMessage(
+      "system_daemon_reconnected",
+      "✅ AgentBridge daemon reconnected successfully.",
+    ));
+  } catch {
+    void reconnectToDaemon(attempt + 1);
+  }
+}
 
 function systemMessage(idPrefix: string, content: string): BridgeMessage {
   return {
