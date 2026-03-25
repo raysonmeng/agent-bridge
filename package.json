@@ -5,6 +5,9 @@
   "description": "Bridge between Claude Code and Codex — bidirectional agent communication via MCP Channel + JSON-RPC",
   "type": "module",
   "main": "src/bridge.ts",
+  "bin": {
+    "agentbridge": "src/cli.ts"
+  },
   "scripts": {
     "start": "bun run src/bridge.ts",
     "test": "bun test src",
