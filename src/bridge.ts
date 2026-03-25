@@ -9,6 +9,7 @@ import { ConfigService } from "./config-service";
 import type { BridgeMessage } from "./types";
 
 const stateDir = new StateDirResolver();
+stateDir.ensure();
 const configService = new ConfigService();
 const config = configService.loadOrDefault();
 
@@ -16,7 +17,7 @@ const CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10
 const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 const CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 
-const claude = new ClaudeAdapter();
+const claude = new ClaudeAdapter(stateDir.logFile);
 const daemonClient = new DaemonClient(CONTROL_WS_URL);
 
 let shuttingDown = false;

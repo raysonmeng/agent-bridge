@@ -13,6 +13,7 @@ import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { EventEmitter } from "node:events";
 import { appendFileSync } from "node:fs";
+import { StateDirResolver } from "./state-dir";
 import type { BridgeMessage, CodexItem } from "./types";
 import type { ServerWebSocket } from "bun";
 
@@ -20,7 +21,6 @@ interface TuiSocketData {
   connId: number;
 }
 
-const LOG_FILE = "/tmp/agentbridge.log";
 const TRACKED_REQUEST_METHODS = new Set(["thread/start", "thread/resume", "turn/start"]);
 
 type TrackedRequestMethod = "thread/start" | "thread/resume" | "turn/start";
@@ -43,6 +43,7 @@ export class CodexAdapter extends EventEmitter {
   private nextInjectionId = -1;
   private appPort: number;
   private proxyPort: number;
+  private readonly logFile: string;
   private tuiConnId = 0; // tracks which TUI connection is "current"
 
   private agentMessageBuffers = new Map<string, string[]>();
@@ -57,10 +58,15 @@ export class CodexAdapter extends EventEmitter {
   private bridgeRequestIds = new Map<number, ReturnType<typeof setTimeout>>();
   private intentionalDisconnect = false;
 
-  constructor(appPort = 4500, proxyPort = 4501) {
+  constructor(
+    appPort = 4500,
+    proxyPort = 4501,
+    logFile = new StateDirResolver().logFile,
+  ) {
     super();
     this.appPort = appPort;
     this.proxyPort = proxyPort;
+    this.logFile = logFile;
   }
 
   get appServerUrl() { return `ws://127.0.0.1:${this.appPort}`; }
@@ -744,6 +750,6 @@ export class CodexAdapter extends EventEmitter {
   private log(msg: string) {
     const line = `[${new Date().toISOString()}] [CodexAdapter] ${msg}\n`;
     process.stderr.write(line);
-    try { appendFileSync(LOG_FILE, line); } catch {}
+    try { appendFileSync(this.logFile, line); } catch {}
   }
 }
