@@ -6,11 +6,29 @@ import { DaemonLifecycle } from "../daemon-lifecycle";
 import { checkOwnedFlagConflicts } from "./claude";
 
 /** Flags that AgentBridge owns for codex command. */
-const OWNED_FLAGS = ["--remote", "--enable"];
+const OWNED_FLAGS = ["--remote"];
 
 export async function runCodex(args: string[]) {
   // Check for owned flag conflicts
   checkOwnedFlagConflicts(args, "agentbridge codex", OWNED_FLAGS);
+
+  // Specifically check for --enable tui_app_server (not all --enable values)
+  for (let i = 0; i < args.length; i++) {
+    if (args[i] === "--enable" && args[i + 1] === "tui_app_server") {
+      console.error(`Error: "--enable tui_app_server" is automatically set by agentbridge codex.`);
+      console.error("");
+      console.error("If you need full control over these flags, use the native command directly:");
+      console.error("  codex [your flags here]");
+      process.exit(1);
+    }
+    if (args[i] === "--enable=tui_app_server") {
+      console.error(`Error: "--enable=tui_app_server" is automatically set by agentbridge codex.`);
+      console.error("");
+      console.error("If you need full control over these flags, use the native command directly:");
+      console.error("  codex [your flags here]");
+      process.exit(1);
+    }
+  }
 
   const stateDir = new StateDirResolver();
   const configService = new ConfigService();

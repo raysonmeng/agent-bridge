@@ -1,5 +1,5 @@
-import { spawn } from "node:child_process";
-import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { spawn, execSync } from "node:child_process";
+import { readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { StateDirResolver } from "./state-dir";
 
@@ -58,8 +58,21 @@ export class DaemonLifecycle {
       this.removeStalePidFile();
     }
 
-    this.launch();
-    await this.waitForHealthy();
+    // Acquire startup lock to prevent concurrent launches
+    const lockAcquired = this.acquireLock();
+    if (!lockAcquired) {
+      // Another process is launching the daemon — wait for it
+      this.log("Another process is starting the daemon, waiting for health...");
+      await this.waitForHealthy();
+      return;
+    }
+
+    try {
+      this.launch();
+      await this.waitForHealthy();
+    } finally {
+      this.releaseLock();
+    }
   }
 
   /** Check if daemon health endpoint responds. */
@@ -153,6 +166,32 @@ export class DaemonLifecycle {
   }
 
   /**
+   * Try to acquire the startup lock file exclusively.
+   * Returns true if the lock was acquired, false if another process holds it.
+   */
+  private acquireLock(): boolean {
+    this.stateDir.ensure();
+    try {
+      const fd = openSync(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
+      writeFileSync(fd, `${process.pid}\n`);
+      closeSync(fd);
+      return true;
+    } catch (err: any) {
+      if (err.code === "EEXIST") return false;
+      // Non-EEXIST error (permissions, etc.) — log and proceed without lock
+      this.log(`Warning: could not acquire startup lock: ${err.message}`);
+      return true;
+    }
+  }
+
+  /** Release the startup lock file. */
+  private releaseLock(): void {
+    try {
+      unlinkSync(this.stateDir.lockFile);
+    } catch {}
+  }
+
+  /**
    * Kill daemon process precisely.
    * Returns true if a process was found and killed.
    */
@@ -166,6 +205,15 @@ export class DaemonLifecycle {
 
     if (!isProcessAlive(pid)) {
       this.log(`Daemon pid ${pid} is not alive, cleaning up stale files`);
+      this.cleanup();
+      return false;
+    }
+
+    // Verify the PID actually belongs to an AgentBridge daemon.
+    // If the PID file is stale and the OS has reused the PID,
+    // we must NOT kill an unrelated process.
+    if (!this.isDaemonProcess(pid)) {
+      this.log(`Pid ${pid} is alive but is NOT an AgentBridge daemon — refusing to kill. Cleaning up stale pid file.`);
       this.cleanup();
       return false;
     }
@@ -198,6 +246,27 @@ export class DaemonLifecycle {
 
     this.cleanup();
     return true;
+  }
+
+  /**
+   * Verify that a live PID actually belongs to an AgentBridge daemon
+   * by checking the process command line. Prevents killing an unrelated
+   * process when the OS has reused a stale PID.
+   */
+  private isDaemonProcess(pid: number): boolean {
+    // First, try the health endpoint — if it responds, it's definitely our daemon
+    // (synchronous check via status file as a fast path)
+    const status = this.readStatus();
+    if (status?.pid === pid) return true;
+
+    // Fall back to checking the process command line
+    try {
+      const cmd = execSync(`ps -p ${pid} -o command=`, { encoding: "utf-8" }).trim();
+      return cmd.includes("daemon") && (cmd.includes("agentbridge") || cmd.includes("agent_bridge"));
+    } catch {
+      // ps failed — process may have exited between our check and the ps call
+      return false;
+    }
   }
 
   /** Clean up all state files. */

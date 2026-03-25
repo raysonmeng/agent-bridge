@@ -102,4 +102,28 @@ describe("DaemonLifecycle", () => {
     expect(existsSync(stateDir.statusFile)).toBe(false);
     expect(logs.some((l) => l.includes("not alive"))).toBe(true);
   });
+
+  test("kill refuses to signal a live process that is not an AgentBridge daemon", async () => {
+    const lc = createLifecycle();
+    // Use current process pid — it's alive but NOT a daemon
+    lc.writePid(process.pid);
+    // Don't write matching status (so isDaemonProcess falls through to ps check)
+
+    const result = await lc.kill();
+    expect(result).toBe(false);
+    expect(logs.some((l) => l.includes("NOT an AgentBridge daemon"))).toBe(true);
+    // Pid file should be cleaned up
+    expect(existsSync(stateDir.pidFile)).toBe(false);
+  });
+
+  test("kill proceeds when status.json pid matches", async () => {
+    const lc = createLifecycle();
+    // Write a non-existent pid but with matching status — tests the isDaemonProcess fast path
+    lc.writePid(9999999);
+    lc.writeStatus({ pid: 9999999 });
+
+    // Process is dead, so kill returns false before reaching isDaemonProcess
+    const result = await lc.kill();
+    expect(result).toBe(false);
+  });
 });

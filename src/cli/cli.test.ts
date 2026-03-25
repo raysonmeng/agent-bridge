@@ -69,12 +69,38 @@ describe("CLI: owned flag conflict detection", () => {
 
   test("ignores unrelated flags", () => {
     const args = ["--model", "opus", "--resume"];
-    const ownedFlags = ["--remote", "--enable"];
+    const ownedFlags = ["--remote"];
     let exited = false;
     const origExit = process.exit;
     process.exit = (() => { exited = true; }) as any;
     checkOwnedFlagConflicts(args, "agentbridge codex", ownedFlags);
     process.exit = origExit;
     expect(exited).toBe(false);
+  });
+
+  test("allows --enable with non-owned values for codex", () => {
+    const args = ["--enable", "some_other_feature"];
+    const ownedFlags = ["--remote"];
+    let exited = false;
+    const origExit = process.exit;
+    process.exit = (() => { exited = true; }) as any;
+    checkOwnedFlagConflicts(args, "agentbridge codex", ownedFlags);
+    process.exit = origExit;
+    expect(exited).toBe(false);
+  });
+
+  test("fallback message uses correct native command name", () => {
+    const args = ["--remote", "ws://foo"];
+    const ownedFlags = ["--remote"];
+    let output = "";
+    const origExit = process.exit;
+    const origError = console.error;
+    process.exit = (() => {}) as any;
+    console.error = (msg: string) => { output += msg + "\n"; };
+    checkOwnedFlagConflicts(args, "agentbridge codex", ownedFlags);
+    process.exit = origExit;
+    console.error = origError;
+    expect(output).toContain("codex [your flags here]");
+    expect(output).not.toContain("claude [your flags here]");
   });
 });

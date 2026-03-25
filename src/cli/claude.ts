@@ -54,8 +54,9 @@ export function checkOwnedFlagConflicts(
         console.error(`  ${f}`);
       }
       console.error("");
+      const nativeCmd = commandName.includes("codex") ? "codex" : "claude";
       console.error("If you need full control over these flags, use the native command directly:");
-      console.error(`  claude [your flags here]`);
+      console.error(`  ${nativeCmd} [your flags here]`);
       process.exit(1);
     }
   }
