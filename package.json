@@ -11,7 +11,8 @@
     "validate:plugin": "claude plugin validate plugins/agentbridge && claude plugin validate .claude-plugin/marketplace.json",
     "test": "bun test src",
     "typecheck": "tsc --noEmit",
-    "check": "tsc --noEmit && bun test src && bun run build:plugin"
+    "validate:plugin-versions": "node scripts/check-plugin-versions.js",
+    "check": "tsc --noEmit && bun test src && bun run build:plugin && node scripts/check-plugin-versions.js"
   },
   "repository": {
     "type": "git",

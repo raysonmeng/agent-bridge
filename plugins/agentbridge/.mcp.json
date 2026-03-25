@@ -1,0 +1,11 @@
+{
+  "mcpServers": {
+    "agentbridge": {
+      "command": "bun",
+      "args": ["run", "${CLAUDE_PLUGIN_ROOT}/server/bridge-server.js"],
+      "env": {
+        "AGENTBRIDGE_DAEMON_ENTRY": "./daemon.js"
+      }
+    }
+  }
+}
