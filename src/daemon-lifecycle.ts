@@ -46,14 +46,19 @@ export class DaemonLifecycle {
     const existingPid = this.readPid();
     if (existingPid) {
       if (isProcessAlive(existingPid)) {
-        try {
-          await this.waitForHealthy(12, 250);
-          return;
-        } catch {
-          throw new Error(
-            `Found existing daemon process ${existingPid}, but control port ${this.controlPort} never became healthy.`,
-          );
+        // Verify the live process is actually our daemon, not an OS-reused PID
+        if (this.isDaemonProcess(existingPid)) {
+          try {
+            await this.waitForHealthy(12, 250);
+            return;
+          } catch {
+            throw new Error(
+              `Found existing daemon process ${existingPid}, but control port ${this.controlPort} never became healthy.`,
+            );
+          }
         }
+        // Live process but NOT our daemon — stale PID reused by OS
+        this.log(`Pid ${existingPid} is alive but not an AgentBridge daemon, removing stale pid file`);
       }
       this.removeStalePidFile();
     }
@@ -177,7 +182,24 @@ export class DaemonLifecycle {
       closeSync(fd);
       return true;
     } catch (err: any) {
-      if (err.code === "EEXIST") return false;
+      if (err.code === "EEXIST") {
+        // Check if the lock holder is still alive — recover from stale locks
+        // left by crashed launchers
+        try {
+          const holderPid = Number.parseInt(readFileSync(this.stateDir.lockFile, "utf-8").trim(), 10);
+          if (Number.isFinite(holderPid) && !isProcessAlive(holderPid)) {
+            this.log(`Stale lock file from dead process ${holderPid}, removing`);
+            this.releaseLock();
+            return this.acquireLock(); // Retry once
+          }
+        } catch {
+          // Can't read lock file — remove and retry
+          this.log("Cannot read lock file, removing stale lock");
+          this.releaseLock();
+          return this.acquireLock();
+        }
+        return false;
+      }
       // Non-EEXIST error (permissions, etc.) — log and proceed without lock
       this.log(`Warning: could not acquire startup lock: ${err.message}`);
       return true;
@@ -254,12 +276,9 @@ export class DaemonLifecycle {
    * process when the OS has reused a stale PID.
    */
   private isDaemonProcess(pid: number): boolean {
-    // First, try the health endpoint — if it responds, it's definitely our daemon
-    // (synchronous check via status file as a fast path)
-    const status = this.readStatus();
-    if (status?.pid === pid) return true;
-
-    // Fall back to checking the process command line
+    // Always verify via process command line — status.json/pid files can be
+    // stale and matching PIDs only proves two local files agree, not that
+    // the live process is actually AgentBridge.
     try {
       const cmd = execSync(`ps -p ${pid} -o command=`, { encoding: "utf-8" }).trim();
       return cmd.includes("daemon") && (cmd.includes("agentbridge") || cmd.includes("agent_bridge"));
@@ -273,6 +292,7 @@ export class DaemonLifecycle {
   private cleanup(): void {
     this.removePidFile();
     this.removeStatusFile();
+    this.releaseLock();
   }
 }
 
