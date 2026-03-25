@@ -1,4 +1,4 @@
-import { spawn, execSync } from "node:child_process";
+import { spawn, execFileSync } from "node:child_process";
 import { existsSync, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { StateDirResolver } from "./state-dir";
@@ -195,7 +195,11 @@ export class DaemonLifecycle {
    * Try to acquire the startup lock file exclusively.
    * Returns true if the lock was acquired, false if another process holds it.
    */
-  private acquireLock(): boolean {
+  private acquireLock(depth = 0): boolean {
+    if (depth > 1) {
+      this.log("Lock acquisition failed after retry, proceeding without lock");
+      return true;
+    }
     this.stateDir.ensure();
     try {
       const fd = openSync(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
@@ -211,13 +215,13 @@ export class DaemonLifecycle {
           if (Number.isFinite(holderPid) && !isProcessAlive(holderPid)) {
             this.log(`Stale lock file from dead process ${holderPid}, removing`);
             this.releaseLock();
-            return this.acquireLock(); // Retry once
+            return this.acquireLock(depth + 1);
           }
         } catch {
           // Can't read lock file — remove and retry
           this.log("Cannot read lock file, removing stale lock");
           this.releaseLock();
-          return this.acquireLock();
+          return this.acquireLock(depth + 1);
         }
         return false;
       }
@@ -301,7 +305,7 @@ export class DaemonLifecycle {
     // stale and matching PIDs only proves two local files agree, not that
     // the live process is actually AgentBridge.
     try {
-      const cmd = execSync(`ps -p ${pid} -o command=`, { encoding: "utf-8" }).trim();
+      const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
       return cmd.includes("daemon") && (cmd.includes("agentbridge") || cmd.includes("agent_bridge"));
     } catch {
       // ps failed — process may have exited between our check and the ps call

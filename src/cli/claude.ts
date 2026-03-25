@@ -8,10 +8,16 @@ export async function runClaude(args: string[]) {
   // Check for owned flag conflicts
   checkOwnedFlagConflicts(args, "agentbridge claude", OWNED_FLAGS);
 
-  const channelEntry = `plugin:${PLUGIN_NAME}@${MARKETPLACE_NAME}`;
+  // Channel entry format: "server:<mcp-server-name>" for MCP-based channels,
+  // or "plugin:<plugin>@<marketplace>" for plugin-based channels.
+  // AgentBridge uses MCP server delivery, so the entry is server:agentbridge.
+  const channelEntry = `server:${PLUGIN_NAME}`;
 
+  // Only use --dangerously-load-development-channels for now.
+  // --channels checks the approved allowlist (Anthropic-curated) and fails
+  // for custom plugins. The dev flag bypasses this per-entry.
+  // Once published to the official marketplace, switch to --channels.
   const fullArgs = [
-    "--channels", channelEntry,
     "--dangerously-load-development-channels", channelEntry,
     ...args,
   ];

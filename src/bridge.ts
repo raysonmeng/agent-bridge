@@ -21,12 +21,12 @@ const daemonClient = new DaemonClient(CONTROL_WS_URL);
 
 let shuttingDown = false;
 
-claude.setReplySender(async (msg: BridgeMessage) => {
+claude.setReplySender(async (msg: BridgeMessage, requireReply?: boolean) => {
   if (msg.source !== "claude") {
     return { success: false, error: "Invalid message source" };
   }
 
-  return daemonClient.sendReply(msg);
+  return daemonClient.sendReply(msg, requireReply);
 });
 
 daemonClient.on("codexMessage", (message) => {
@@ -56,11 +56,17 @@ claude.on("ready", async () => {
   await connectToDaemon();
 });
 
-async function connectToDaemon() {
+async function connectToDaemon(isReconnect = false) {
   try {
     await daemonLifecycle.ensureRunning();
     await daemonClient.connect();
     daemonClient.attachClaude();
+    if (!isReconnect) {
+      void claude.pushNotification(systemMessage(
+        "system_bridge_ready",
+        "✅ AgentBridge bridge is ready. Daemon connected. Start Codex in another terminal with: agentbridge codex",
+      ));
+    }
   } catch (err: any) {
     log(`Failed to connect to daemon: ${err.message}`);
     await claude.pushNotification(
@@ -96,8 +102,19 @@ async function reconnectToDaemon(attempt = 0) {
 
   if (shuttingDown) return;
 
+  // Re-check after the backoff delay. The killed sentinel may be written
+  // after the disconnect event fires but before the reconnect attempt runs.
+  if (daemonLifecycle.wasKilled()) {
+    log("Daemon was intentionally killed during reconnect backoff — not reconnecting");
+    void claude.pushNotification(systemMessage(
+      "system_daemon_killed",
+      "⛔ AgentBridge daemon was stopped by `agentbridge kill`. Run `agentbridge codex` to restart.",
+    ));
+    return;
+  }
+
   try {
-    await connectToDaemon();
+    await connectToDaemon(true);
     log("Reconnected to AgentBridge daemon successfully");
     void claude.pushNotification(systemMessage(
       "system_daemon_reconnected",

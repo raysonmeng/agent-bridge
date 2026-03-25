@@ -5,6 +5,7 @@
  *
  * Commands:
  *   agentbridge init        — Install plugin, check deps, generate project config
+ *   agentbridge dev         — Register local marketplace + install plugin for local dev
  *   agentbridge claude      — Start Claude Code with push channel flags
  *   agentbridge codex       — Start Codex TUI connected to daemon
  *   agentbridge kill        — Force kill all AgentBridge processes
@@ -23,6 +24,10 @@ async function main() {
     case "init":
       const { runInit } = await import("./cli/init");
       await runInit();
+      break;
+    case "dev":
+      const { runDev } = await import("./cli/dev");
+      await runDev();
       break;
     case "claude":
       const { runClaude } = await import("./cli/claude");
@@ -61,6 +66,7 @@ Usage:
 
 Commands:
   init              Install plugin, check dependencies, generate project config
+  dev               Register local marketplace + install plugin (for local dev)
   claude [args...]  Start Claude Code with push channel enabled
   codex [args...]   Start Codex TUI connected to AgentBridge daemon
   kill              Force kill all AgentBridge processes

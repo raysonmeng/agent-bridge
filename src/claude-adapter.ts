@@ -22,7 +22,7 @@ import { EventEmitter } from "node:events";
 import { appendFileSync } from "node:fs";
 import type { BridgeMessage } from "./types";
 
-export type ReplySender = (msg: BridgeMessage) => Promise<{ success: boolean; error?: string }>;
+export type ReplySender = (msg: BridgeMessage, requireReply?: boolean) => Promise<{ success: boolean; error?: string }>;
 export type DeliveryMode = "push" | "pull" | "auto";
 
 export const CLAUDE_INSTRUCTIONS = [
@@ -241,6 +241,10 @@ export class ClaudeAdapter extends EventEmitter {
                 type: "string",
                 description: "The message to send to Codex.",
               },
+              require_reply: {
+                type: "boolean",
+                description: "When true, Codex is required to send a reply. All Codex messages from this turn will be forwarded immediately (bypassing STATUS buffering). Use this when you need a direct answer from Codex.",
+              },
             },
             required: ["text"],
           },
@@ -285,6 +289,8 @@ export class ClaudeAdapter extends EventEmitter {
       };
     }
 
+    const requireReply = args?.require_reply === true;
+
     const bridgeMsg: BridgeMessage = {
       id: (args?.chat_id as string) ?? `reply_${Date.now()}`,
       source: "claude",
@@ -300,7 +306,7 @@ export class ClaudeAdapter extends EventEmitter {
       };
     }
 
-    const result = await this.replySender(bridgeMsg);
+    const result = await this.replySender(bridgeMsg, requireReply);
     if (!result.success) {
       this.log(`Reply delivery failed: ${result.error}`);
       return {

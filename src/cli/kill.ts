@@ -13,8 +13,11 @@ export async function runKill() {
     log: (msg) => console.log(`  ${msg}`),
   });
 
-  const killed = await lifecycle.kill();
+  // Mark the daemon as intentionally stopped before terminating the process.
+  // This closes the reconnect race where the frontend sees the disconnect
+  // before the sentinel is written and relaunches the daemon.
   lifecycle.markKilled();
+  const killed = await lifecycle.kill();
 
   if (killed) {
     console.log("\nAgentBridge daemon stopped.");

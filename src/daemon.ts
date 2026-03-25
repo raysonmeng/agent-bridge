@@ -5,6 +5,7 @@ import type { ServerWebSocket } from "bun";
 import { CodexAdapter } from "./codex-adapter";
 import {
   BRIDGE_CONTRACT_REMINDER,
+  REPLY_REQUIRED_INSTRUCTION,
   StatusBuffer,
   classifyMessage,
   type FilterMode,
@@ -48,6 +49,8 @@ let nextSystemMessageId = 0;
 let codexBootstrapped = false;
 let attentionWindowTimer: ReturnType<typeof setTimeout> | null = null;
 let inAttentionWindow = false;
+let replyRequired = false;
+let replyReceivedDuringTurn = false;
 let shuttingDown = false;
 let idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
 
@@ -91,6 +94,17 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
   if (msg.source !== "codex") return;
   const result = classifyMessage(msg.content, FILTER_MODE);
 
+  // When replyRequired is active, force-forward ALL messages regardless of marker
+  if (replyRequired) {
+    log(`Codex → Claude [${result.marker}/force-forward-reply-required] (${msg.content.length} chars)`);
+    replyReceivedDuringTurn = true;
+    if (statusBuffer.size > 0) {
+      statusBuffer.flush("reply-required message arrived");
+    }
+    emitToClaude(msg);
+    return;
+  }
+
   // During attention window, suppress STATUS to give Claude space to respond
   if (inAttentionWindow && result.marker === "status") {
     log(`Codex → Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
@@ -121,6 +135,22 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
 codex.on("turnCompleted", () => {
   log("Codex turn completed");
   statusBuffer.flush("turn completed");
+
+  // Check if reply was required but Codex didn't send any agentMessage
+  if (replyRequired && !replyReceivedDuringTurn) {
+    log("⚠️ Reply was required but Codex did not send any agentMessage");
+    emitToClaude(
+      systemMessage(
+        "system_reply_missing",
+        "⚠️ Codex completed the turn without sending a reply (require_reply was set). Codex may not have generated an agentMessage. You may want to retry or rephrase.",
+      ),
+    );
+  }
+
+  // Reset reply-required state
+  replyRequired = false;
+  replyReceivedDuringTurn = false;
+
   emitToClaude(
     systemMessage(
       "system_turn_completed",
@@ -251,8 +281,15 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
         return;
       }
 
-      const contentWithReminder = message.message.content + "\n\n" + BRIDGE_CONTRACT_REMINDER;
-      log(`Forwarding Claude → Codex (${message.message.content.length} chars)`);
+      const requireReply = !!message.requireReply;
+      let contentWithReminder = message.message.content + "\n\n" + BRIDGE_CONTRACT_REMINDER;
+      if (requireReply) {
+        contentWithReminder += REPLY_REQUIRED_INSTRUCTION;
+        replyRequired = true;
+        replyReceivedDuringTurn = false;
+        log(`Reply required flag set for this message`);
+      }
+      log(`Forwarding Claude → Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
       const injected = codex.injectMessage(contentWithReminder);
       if (!injected) {
         const reason = codex.turnInProgress

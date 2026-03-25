@@ -103,7 +103,7 @@ export class ConfigService {
 
   /** Load project config, falling back to defaults. */
   loadOrDefault(): AgentBridgeConfig {
-    return this.load() ?? { ...DEFAULT_CONFIG };
+    return this.load() ?? structuredClone(DEFAULT_CONFIG);
   }
 
   /** Save project config. */

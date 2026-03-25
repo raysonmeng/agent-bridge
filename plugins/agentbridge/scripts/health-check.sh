@@ -25,12 +25,27 @@ if [ -f "$stamp_file" ]; then
   fi
 fi
 
-if curl -fsS --max-time 1 "http://127.0.0.1:${port}/healthz" >/dev/null 2>&1; then
-  exit 0
-fi
-
 printf '%s' "$now" >"$stamp_file" 2>/dev/null || true
 
-cat <<EOF
-{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"AgentBridge daemon is not reachable on http://127.0.0.1:${port}/healthz yet. This hook is hint-only and does not start the daemon. If AgentBridge tools fail later, restart Claude with 'agentbridge claude' or run 'agentbridge init' and then '/reload-plugins'."}}
+health_json="$(curl -fsS --max-time 1 "http://127.0.0.1:${port}/healthz" 2>/dev/null || true)"
+
+if [ -n "$health_json" ]; then
+  tui_connected="false"
+  if printf '%s' "$health_json" | grep -q '"tuiConnected":true'; then
+    tui_connected="true"
+  fi
+
+  if [ "$tui_connected" = "true" ]; then
+    cat <<EOF
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"AgentBridge is running. Daemon healthy, Codex TUI connected. Bridge is ready for communication."}}
 EOF
+  else
+    cat <<EOF
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"AgentBridge daemon is running but Codex TUI is not connected yet. Start Codex in another terminal with: agentbridge codex"}}
+EOF
+  fi
+else
+  cat <<EOF
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"AgentBridge daemon is not reachable on http://127.0.0.1:${port}/healthz yet. Start the bridge with: agentbridge claude (this terminal) + agentbridge codex (another terminal). If you're already using agentbridge claude, the daemon may still be starting up."}}
+EOF
+fi

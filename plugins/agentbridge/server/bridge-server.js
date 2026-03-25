@@ -6518,9 +6518,7 @@ var require_dist = __commonJS((exports, module) => {
 });
 
 // src/bridge.ts
-import { spawn } from "child_process";
-import { appendFileSync as appendFileSync2, readFileSync, unlinkSync } from "fs";
-import { fileURLToPath } from "url";
+import { appendFileSync as appendFileSync2 } from "fs";
 
 // node_modules/zod/v4/core/core.js
 var NEVER = Object.freeze({
@@ -13665,37 +13663,32 @@ class StdioServerTransport {
 import { EventEmitter } from "events";
 import { appendFileSync } from "fs";
 var CLAUDE_INSTRUCTIONS = [
-  "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
+  "AgentBridge connects this Claude Code session to Codex, an AI coding agent running in a separate local session on the same machine.",
   "",
-  "## Message delivery",
-  "Messages from Codex may arrive in two ways depending on the connection mode:",
-  '- As <channel source="agentbridge" chat_id="..." user="Codex" ...> tags (push mode)',
-  "- Via the get_messages tool (pull mode)",
+  "## Delivery paths",
+  "- Primary path: push delivery via notifications/claude/channel.",
+  '- In push mode, Codex messages arrive as <channel source="agentbridge" chat_id="..." user="Codex" user_id="codex" ts="..." message_id="..." source_type="codex">...</channel> tags.',
+  "- Fallback path: pull delivery via the get_messages tool when this session is operating without channel delivery.",
   "",
-  "## Collaboration roles",
-  "Default roles in this setup:",
-  "- Claude: Reviewer, Planner, Hypothesis Challenger",
-  "- Codex: Implementer, Executor, Reproducer/Verifier",
-  "- Expect Codex to provide independent technical judgment and evidence, not passive agreement.",
+  "## Reply protocol",
+  "- Use the reply tool to send a message back to Codex as a new user turn.",
+  "- When an inbound channel tag includes chat_id, pass the same chat_id back to the reply tool.",
+  "- The reply tool is the only supported Claude -> Codex messaging path inside this session.",
   "",
-  "## Thinking patterns (task-driven)",
-  "- Analytical/review tasks: Independent Analysis & Convergence",
-  "- Implementation tasks: Architect -> Builder -> Critic",
-  "- Debugging tasks: Hypothesis -> Experiment -> Interpretation",
+  "## Pull fallback",
+  "- Use get_messages when push-delivered channel tags are unavailable, when you need to poll for queued Codex messages, or after replying in pull-mode workflows.",
+  "- Do not treat get_messages as the primary loop when push-delivered channel tags are arriving normally.",
   "",
-  "## Collaboration language",
-  '- Use explicit phrases such as "My independent view is:", "I agree on:", "I disagree on:", and "Current consensus:".',
-  "",
-  "## How to interact",
-  "- Use the reply tool to send messages back to Codex \u2014 pass chat_id back.",
-  "- Use the get_messages tool to check for pending messages from Codex.",
-  "- After sending a reply, call get_messages to check for responses.",
-  "- When the user asks about Codex status or progress, call get_messages.",
+  "## Agent message markers",
+  "- Codex agent messages may begin with a literal marker at the very start of the text.",
+  "- [IMPORTANT] = decisions, reviews, completions, blockers.",
+  "- [STATUS] = progress updates; these may be buffered or summarized by AgentBridge.",
+  "- [FYI] = background context; these may be filtered in default mode.",
   "",
   "## Turn coordination",
-  "- When you see '\u23F3 Codex is working', do NOT call the reply tool \u2014 wait for '\u2705 Codex finished'.",
-  "- After Codex finishes a turn, you have an attention window to review and respond before new messages arrive.",
-  "- If the reply tool returns a busy error, Codex is still executing \u2014 wait and try again later."
+  "- When you see '\u23F3 Codex is working', do NOT call the reply tool.",
+  "- Wait for '\u2705 Codex finished' before replying, or until Codex explicitly asks for input.",
+  "- If the reply tool returns a busy error, Codex is still executing a turn. Wait and try again later."
 ].join(`
 `);
 var LOG_FILE = "/tmp/agentbridge.log";
@@ -13843,6 +13836,10 @@ ${formatted}`
               text: {
                 type: "string",
                 description: "The message to send to Codex."
+              },
+              require_reply: {
+                type: "boolean",
+                description: "When true, Codex is required to send a reply. All Codex messages from this turn will be forwarded immediately (bypassing STATUS buffering). Use this when you need a direct answer from Codex."
               }
             },
             required: ["text"]
@@ -13881,6 +13878,7 @@ ${formatted}`
         isError: true
       };
     }
+    const requireReply = args?.require_reply === true;
     const bridgeMsg = {
       id: args?.chat_id ?? `reply_${Date.now()}`,
       source: "claude",
@@ -13894,7 +13892,7 @@ ${formatted}`
         isError: true
       };
     }
-    const result = await this.replySender(bridgeMsg);
+    const result = await this.replySender(bridgeMsg, requireReply);
     if (!result.success) {
       this.log(`Reply delivery failed: ${result.error}`);
       return {
@@ -13974,7 +13972,7 @@ class DaemonClient extends EventEmitter2 {
     this.ws = null;
     this.rejectPendingReplies("Daemon connection closed");
   }
-  async sendReply(message) {
+  async sendReply(message, requireReply) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return { success: false, error: "AgentBridge daemon is not connected." };
     }
@@ -13988,7 +13986,8 @@ class DaemonClient extends EventEmitter2 {
       this.send({
         type: "claude_to_codex",
         requestId,
-        message
+        message,
+        ...requireReply ? { requireReply: true } : {}
       });
     });
   }
@@ -14043,22 +14042,423 @@ class DaemonClient extends EventEmitter2 {
   }
 }
 
-// src/bridge.ts
-var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
-var PID_FILE = process.env.AGENTBRIDGE_PID_FILE ?? `/tmp/agentbridge-daemon-${CONTROL_PORT}.pid`;
-var CONTROL_HEALTH_URL = `http://127.0.0.1:${CONTROL_PORT}/healthz`;
-var CONTROL_WS_URL = `ws://127.0.0.1:${CONTROL_PORT}/ws`;
-var LOG_FILE2 = "/tmp/agentbridge.log";
+// src/daemon-lifecycle.ts
+import { spawn, execSync } from "child_process";
+import { existsSync, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "fs";
+import { fileURLToPath } from "url";
 var DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY ?? "./daemon.ts";
 var DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
+
+class DaemonLifecycle {
+  stateDir;
+  controlPort;
+  log;
+  constructor(opts) {
+    this.stateDir = opts.stateDir;
+    this.controlPort = opts.controlPort;
+    this.log = opts.log;
+  }
+  get healthUrl() {
+    return `http://127.0.0.1:${this.controlPort}/healthz`;
+  }
+  get controlWsUrl() {
+    return `ws://127.0.0.1:${this.controlPort}/ws`;
+  }
+  async ensureRunning() {
+    this.clearKilled();
+    if (await this.isHealthy()) {
+      return;
+    }
+    const existingPid = this.readPid();
+    if (existingPid) {
+      if (isProcessAlive(existingPid)) {
+        if (this.isDaemonProcess(existingPid)) {
+          try {
+            await this.waitForHealthy(12, 250);
+            return;
+          } catch {
+            throw new Error(`Found existing daemon process ${existingPid}, but control port ${this.controlPort} never became healthy.`);
+          }
+        }
+        this.log(`Pid ${existingPid} is alive but not an AgentBridge daemon, removing stale pid file`);
+      }
+      this.removeStalePidFile();
+    }
+    const lockAcquired = this.acquireLock();
+    if (!lockAcquired) {
+      this.log("Another process is starting the daemon, waiting for health...");
+      await this.waitForHealthy();
+      return;
+    }
+    try {
+      this.launch();
+      await this.waitForHealthy();
+    } finally {
+      this.releaseLock();
+    }
+  }
+  async isHealthy() {
+    try {
+      const response = await fetch(this.healthUrl);
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+  async waitForHealthy(maxRetries = 40, delayMs = 250) {
+    for (let attempt = 0;attempt < maxRetries; attempt++) {
+      if (await this.isHealthy())
+        return;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    throw new Error(`Timed out waiting for AgentBridge daemon health on ${this.healthUrl}`);
+  }
+  readStatus() {
+    try {
+      const raw = readFileSync(this.stateDir.statusFile, "utf-8");
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  writeStatus(status) {
+    this.stateDir.ensure();
+    writeFileSync(this.stateDir.statusFile, JSON.stringify(status, null, 2) + `
+`, "utf-8");
+  }
+  readPid() {
+    try {
+      const raw = readFileSync(this.stateDir.pidFile, "utf-8").trim();
+      if (!raw)
+        return null;
+      const pid = Number.parseInt(raw, 10);
+      return Number.isFinite(pid) ? pid : null;
+    } catch {
+      return null;
+    }
+  }
+  writePid(pid) {
+    this.stateDir.ensure();
+    writeFileSync(this.stateDir.pidFile, `${pid ?? process.pid}
+`, "utf-8");
+  }
+  removePidFile() {
+    try {
+      unlinkSync(this.stateDir.pidFile);
+    } catch {}
+  }
+  removeStatusFile() {
+    try {
+      unlinkSync(this.stateDir.statusFile);
+    } catch {}
+  }
+  markKilled() {
+    this.stateDir.ensure();
+    writeFileSync(this.stateDir.killedFile, `${Date.now()}
+`, "utf-8");
+  }
+  clearKilled() {
+    try {
+      unlinkSync(this.stateDir.killedFile);
+    } catch {}
+  }
+  wasKilled() {
+    return existsSync(this.stateDir.killedFile);
+  }
+  launch() {
+    this.stateDir.ensure();
+    this.log(`Launching detached daemon on control port ${this.controlPort}`);
+    const daemonProc = spawn(process.execPath, ["run", DAEMON_PATH], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        AGENTBRIDGE_CONTROL_PORT: String(this.controlPort),
+        AGENTBRIDGE_STATE_DIR: this.stateDir.dir
+      },
+      detached: true,
+      stdio: "ignore"
+    });
+    daemonProc.unref();
+  }
+  removeStalePidFile() {
+    this.log("Removing stale pid file");
+    this.removePidFile();
+  }
+  acquireLock() {
+    this.stateDir.ensure();
+    try {
+      const fd = openSync(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
+      writeFileSync(fd, `${process.pid}
+`);
+      closeSync(fd);
+      return true;
+    } catch (err) {
+      if (err.code === "EEXIST") {
+        try {
+          const holderPid = Number.parseInt(readFileSync(this.stateDir.lockFile, "utf-8").trim(), 10);
+          if (Number.isFinite(holderPid) && !isProcessAlive(holderPid)) {
+            this.log(`Stale lock file from dead process ${holderPid}, removing`);
+            this.releaseLock();
+            return this.acquireLock();
+          }
+        } catch {
+          this.log("Cannot read lock file, removing stale lock");
+          this.releaseLock();
+          return this.acquireLock();
+        }
+        return false;
+      }
+      this.log(`Warning: could not acquire startup lock: ${err.message}`);
+      return true;
+    }
+  }
+  releaseLock() {
+    try {
+      unlinkSync(this.stateDir.lockFile);
+    } catch {}
+  }
+  async kill(gracefulTimeoutMs = 3000) {
+    const pid = this.readPid();
+    if (!pid) {
+      this.log("No daemon pid file found");
+      this.cleanup();
+      return false;
+    }
+    if (!isProcessAlive(pid)) {
+      this.log(`Daemon pid ${pid} is not alive, cleaning up stale files`);
+      this.cleanup();
+      return false;
+    }
+    if (!this.isDaemonProcess(pid)) {
+      this.log(`Pid ${pid} is alive but is NOT an AgentBridge daemon \u2014 refusing to kill. Cleaning up stale pid file.`);
+      this.cleanup();
+      return false;
+    }
+    this.log(`Sending SIGTERM to daemon pid ${pid}`);
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      this.cleanup();
+      return false;
+    }
+    const deadline = Date.now() + gracefulTimeoutMs;
+    while (Date.now() < deadline) {
+      if (!isProcessAlive(pid)) {
+        this.log(`Daemon pid ${pid} stopped gracefully`);
+        this.cleanup();
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    this.log(`Daemon pid ${pid} did not stop gracefully, sending SIGKILL`);
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {}
+    this.cleanup();
+    return true;
+  }
+  isDaemonProcess(pid) {
+    try {
+      const cmd = execSync(`ps -p ${pid} -o command=`, { encoding: "utf-8" }).trim();
+      return cmd.includes("daemon") && (cmd.includes("agentbridge") || cmd.includes("agent_bridge"));
+    } catch {
+      return false;
+    }
+  }
+  cleanup() {
+    this.removePidFile();
+    this.removeStatusFile();
+    this.releaseLock();
+  }
+}
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// src/state-dir.ts
+import { mkdirSync, existsSync as existsSync2 } from "fs";
+import { join } from "path";
+import { homedir, platform } from "os";
+
+class StateDirResolver {
+  stateDir;
+  constructor(envOverride) {
+    const override = envOverride ?? process.env.AGENTBRIDGE_STATE_DIR;
+    if (override) {
+      this.stateDir = override;
+    } else if (platform() === "darwin") {
+      this.stateDir = join(homedir(), "Library", "Application Support", "AgentBridge");
+    } else {
+      const xdgState = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
+      this.stateDir = join(xdgState, "agentbridge");
+    }
+  }
+  ensure() {
+    if (!existsSync2(this.stateDir)) {
+      mkdirSync(this.stateDir, { recursive: true });
+    }
+  }
+  get dir() {
+    return this.stateDir;
+  }
+  get pidFile() {
+    return join(this.stateDir, "daemon.pid");
+  }
+  get lockFile() {
+    return join(this.stateDir, "daemon.lock");
+  }
+  get statusFile() {
+    return join(this.stateDir, "status.json");
+  }
+  get portsFile() {
+    return join(this.stateDir, "ports.json");
+  }
+  get logFile() {
+    return join(this.stateDir, "agentbridge.log");
+  }
+  get killedFile() {
+    return join(this.stateDir, "killed");
+  }
+}
+
+// src/config-service.ts
+import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync3 } from "fs";
+import { join as join2 } from "path";
+var DEFAULT_CONFIG = {
+  version: "1.0",
+  daemon: {
+    port: 4500,
+    proxyPort: 4501
+  },
+  agents: {
+    claude: {
+      role: "Reviewer, Planner",
+      mode: "push"
+    },
+    codex: {
+      role: "Implementer, Executor"
+    }
+  },
+  markers: ["IMPORTANT", "STATUS", "FYI"],
+  turnCoordination: {
+    attentionWindowSeconds: 15,
+    busyGuard: true
+  },
+  idleShutdownSeconds: 30
+};
+var DEFAULT_COLLABORATION_MD = `# Collaboration Rules
+
+## Roles
+- Claude: Reviewer, Planner, Hypothesis Challenger
+- Codex: Implementer, Executor, Reproducer/Verifier
+
+## Thinking Patterns
+- Analytical/review tasks: Independent Analysis & Convergence
+- Implementation tasks: Architect -> Builder -> Critic
+- Debugging tasks: Hypothesis -> Experiment -> Interpretation
+
+## Communication
+- Use explicit phrases: "My independent view is:", "I agree on:", "I disagree on:", "Current consensus:"
+- Tag messages with [IMPORTANT], [STATUS], or [FYI]
+
+## Review Process
+- Cross-review: author never reviews their own code
+- All changes go through feature/fix branches + PR
+- Merge via squash merge
+
+## Custom Rules
+<!-- Add your project-specific collaboration rules here -->
+`;
+var CONFIG_DIR = ".agentbridge";
+var CONFIG_FILE = "config.json";
+var COLLABORATION_FILE = "collaboration.md";
+
+class ConfigService {
+  configDir;
+  configPath;
+  collaborationPath;
+  constructor(projectRoot) {
+    const root = projectRoot ?? process.cwd();
+    this.configDir = join2(root, CONFIG_DIR);
+    this.configPath = join2(this.configDir, CONFIG_FILE);
+    this.collaborationPath = join2(this.configDir, COLLABORATION_FILE);
+  }
+  hasConfig() {
+    return existsSync3(this.configPath);
+  }
+  load() {
+    try {
+      const raw = readFileSync2(this.configPath, "utf-8");
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  loadOrDefault() {
+    return this.load() ?? { ...DEFAULT_CONFIG };
+  }
+  save(config2) {
+    this.ensureConfigDir();
+    writeFileSync2(this.configPath, JSON.stringify(config2, null, 2) + `
+`, "utf-8");
+  }
+  loadCollaboration() {
+    try {
+      return readFileSync2(this.collaborationPath, "utf-8");
+    } catch {
+      return null;
+    }
+  }
+  saveCollaboration(content) {
+    this.ensureConfigDir();
+    writeFileSync2(this.collaborationPath, content, "utf-8");
+  }
+  initDefaults() {
+    this.ensureConfigDir();
+    const created = [];
+    if (!existsSync3(this.configPath)) {
+      this.save(DEFAULT_CONFIG);
+      created.push(this.configPath);
+    }
+    if (!existsSync3(this.collaborationPath)) {
+      this.saveCollaboration(DEFAULT_COLLABORATION_MD);
+      created.push(this.collaborationPath);
+    }
+    return created;
+  }
+  get configFilePath() {
+    return this.configPath;
+  }
+  get collaborationFilePath() {
+    return this.collaborationPath;
+  }
+  ensureConfigDir() {
+    if (!existsSync3(this.configDir)) {
+      mkdirSync2(this.configDir, { recursive: true });
+    }
+  }
+}
+
+// src/bridge.ts
+var stateDir = new StateDirResolver;
+var configService = new ConfigService;
+var config2 = configService.loadOrDefault();
+var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
+var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
+var CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 var claude = new ClaudeAdapter;
 var daemonClient = new DaemonClient(CONTROL_WS_URL);
 var shuttingDown = false;
-claude.setReplySender(async (msg) => {
+claude.setReplySender(async (msg, requireReply) => {
   if (msg.source !== "claude") {
     return { success: false, error: "Invalid message source" };
   }
-  return daemonClient.sendReply(msg);
+  return daemonClient.sendReply(msg, requireReply);
 });
 daemonClient.on("codexMessage", (message) => {
   log(`Forwarding daemon \u2192 Claude (${message.content.length} chars)`);
@@ -14070,20 +14470,52 @@ daemonClient.on("status", (status) => {
 daemonClient.on("disconnect", () => {
   if (shuttingDown)
     return;
-  log("Daemon control connection closed");
-  claude.pushNotification(systemMessage("system_daemon_disconnected", "\u26A0\uFE0F AgentBridge daemon control connection lost. The Codex proxy may still be running in the background, but Claude cannot communicate bidirectionally right now."));
+  log("Daemon control connection closed \u2014 will attempt to reconnect");
+  claude.pushNotification(systemMessage("system_daemon_disconnected", "\u26A0\uFE0F AgentBridge daemon control connection lost. Attempting to reconnect..."));
+  reconnectToDaemon();
 });
 claude.on("ready", async () => {
   log(`MCP server ready (delivery mode: ${claude.getDeliveryMode()}) \u2014 ensuring AgentBridge daemon...`);
+  await connectToDaemon();
+});
+async function connectToDaemon(isReconnect = false) {
   try {
-    await ensureDaemonRunning();
+    await daemonLifecycle.ensureRunning();
     await daemonClient.connect();
     daemonClient.attachClaude();
+    if (!isReconnect) {
+      claude.pushNotification(systemMessage("system_bridge_ready", "\u2705 AgentBridge bridge is ready. Daemon connected. Start Codex in another terminal with: agentbridge codex"));
+    }
   } catch (err) {
     log(`Failed to connect to daemon: ${err.message}`);
     await claude.pushNotification(systemMessage("system_daemon_connect_failed", `\u274C AgentBridge daemon failed to start or is unreachable: ${err.message}`));
+    throw err;
   }
-});
+}
+var MAX_RECONNECT_DELAY_MS = 30000;
+async function reconnectToDaemon(attempt = 0) {
+  if (shuttingDown)
+    return;
+  if (daemonLifecycle.wasKilled()) {
+    log("Daemon was intentionally killed by user (killed sentinel found) \u2014 not reconnecting");
+    claude.pushNotification(systemMessage("system_daemon_killed", "\u26D4 AgentBridge daemon was stopped by `agentbridge kill`. Run `agentbridge codex` to restart."));
+    return;
+  }
+  const delayMs = Math.min(1000 * 2 ** attempt, MAX_RECONNECT_DELAY_MS);
+  if (attempt > 0) {
+    log(`Reconnect attempt ${attempt + 1}, waiting ${delayMs}ms...`);
+  }
+  await new Promise((resolve) => setTimeout(resolve, delayMs));
+  if (shuttingDown)
+    return;
+  try {
+    await connectToDaemon(true);
+    log("Reconnected to AgentBridge daemon successfully");
+    claude.pushNotification(systemMessage("system_daemon_reconnected", "\u2705 AgentBridge daemon reconnected successfully."));
+  } catch {
+    reconnectToDaemon(attempt + 1);
+  }
+}
 function systemMessage(idPrefix, content) {
   return {
     id: `${idPrefix}_${Date.now()}`,
@@ -14091,75 +14523,6 @@ function systemMessage(idPrefix, content) {
     content,
     timestamp: Date.now()
   };
-}
-async function ensureDaemonRunning() {
-  if (await isDaemonHealthy()) {
-    return;
-  }
-  const existingPid = readDaemonPid();
-  if (existingPid) {
-    if (isProcessAlive(existingPid)) {
-      try {
-        await waitForDaemonHealthy(12, 250);
-        return;
-      } catch {
-        throw new Error(`Found existing daemon process ${existingPid}, but control port ${CONTROL_PORT} never became healthy.`);
-      }
-    }
-    removeStalePidFile();
-  }
-  launchDaemon();
-  await waitForDaemonHealthy();
-}
-function launchDaemon() {
-  log(`Launching detached daemon on control port ${CONTROL_PORT}`);
-  const daemonProc = spawn(process.execPath, ["run", DAEMON_PATH], {
-    cwd: process.cwd(),
-    env: { ...process.env },
-    detached: true,
-    stdio: "ignore"
-  });
-  daemonProc.unref();
-}
-async function isDaemonHealthy() {
-  try {
-    const response = await fetch(CONTROL_HEALTH_URL);
-    return response.ok;
-  } catch {
-    return false;
-  }
-}
-async function waitForDaemonHealthy(maxRetries = 40, delayMs = 250) {
-  for (let attempt = 0;attempt < maxRetries; attempt++) {
-    if (await isDaemonHealthy())
-      return;
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
-  }
-  throw new Error(`Timed out waiting for AgentBridge daemon health on ${CONTROL_HEALTH_URL}`);
-}
-function readDaemonPid() {
-  try {
-    const raw = readFileSync(PID_FILE, "utf-8").trim();
-    if (!raw)
-      return null;
-    const pid = Number.parseInt(raw, 10);
-    return Number.isFinite(pid) ? pid : null;
-  } catch {
-    return null;
-  }
-}
-function isProcessAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-function removeStalePidFile() {
-  try {
-    unlinkSync(PID_FILE);
-  } catch {}
 }
 function shutdown(reason) {
   if (shuttingDown)
@@ -14195,7 +14558,7 @@ function log(msg) {
 `;
   process.stderr.write(line);
   try {
-    appendFileSync2(LOG_FILE2, line);
+    appendFileSync2(stateDir.logFile, line);
   } catch {}
 }
 log(`Starting AgentBridge frontend (daemon ws ${CONTROL_WS_URL})`);
