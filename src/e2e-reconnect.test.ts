@@ -1,6 +1,7 @@
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
-import { readFileSync, unlinkSync } from "node:fs";
+import { readFileSync, unlinkSync, mkdirSync, rmSync } from "node:fs";
+import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DaemonClient } from "./daemon-client";
 
@@ -15,7 +16,8 @@ import { DaemonClient } from "./daemon-client";
 const TEST_CONTROL_PORT = 14502;
 const TEST_APP_PORT = 14500;
 const TEST_PROXY_PORT = 14501;
-const TEST_PID_FILE = `/tmp/agentbridge-e2e-test-${TEST_CONTROL_PORT}.pid`;
+const TEST_STATE_DIR = `/tmp/agentbridge-e2e-test-${TEST_CONTROL_PORT}`;
+const TEST_PID_FILE = join(TEST_STATE_DIR, "daemon.pid");
 const HEALTH_URL = `http://127.0.0.1:${TEST_CONTROL_PORT}/healthz`;
 const WS_URL = `ws://127.0.0.1:${TEST_CONTROL_PORT}/ws`;
 const DAEMON_PATH = fileURLToPath(new URL("./daemon.ts", import.meta.url));
@@ -23,11 +25,12 @@ const DAEMON_PATH = fileURLToPath(new URL("./daemon.ts", import.meta.url));
 let daemonProc: ChildProcess | null = null;
 
 function launchDaemon(): ChildProcess {
+  mkdirSync(TEST_STATE_DIR, { recursive: true });
   const proc = spawn(process.execPath, ["run", DAEMON_PATH], {
     env: {
       ...process.env,
       AGENTBRIDGE_CONTROL_PORT: String(TEST_CONTROL_PORT),
-      AGENTBRIDGE_PID_FILE: TEST_PID_FILE,
+      AGENTBRIDGE_STATE_DIR: TEST_STATE_DIR,
       CODEX_WS_PORT: String(TEST_APP_PORT),
       CODEX_PROXY_PORT: String(TEST_PROXY_PORT),
       AGENTBRIDGE_IDLE_SHUTDOWN_MS: "60000", // don't auto-shutdown during tests
@@ -66,7 +69,7 @@ function killDaemon(): Promise<void> {
 }
 
 function cleanup() {
-  try { unlinkSync(TEST_PID_FILE); } catch {}
+  try { rmSync(TEST_STATE_DIR, { recursive: true, force: true }); } catch {}
 }
 
 describe("E2E: daemon lifecycle + reconnect", () => {
