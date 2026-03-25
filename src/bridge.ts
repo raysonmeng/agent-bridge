@@ -1,21 +1,20 @@
 #!/usr/bin/env bun
 
-import { spawn } from "node:child_process";
-import { appendFileSync, readFileSync, unlinkSync } from "node:fs";
-import { fileURLToPath } from "node:url";
+import { appendFileSync } from "node:fs";
 import { ClaudeAdapter } from "./claude-adapter";
 import { DaemonClient } from "./daemon-client";
+import { DaemonLifecycle } from "./daemon-lifecycle";
+import { StateDirResolver } from "./state-dir";
+import { ConfigService } from "./config-service";
 import type { BridgeMessage } from "./types";
 
+const stateDir = new StateDirResolver();
+const configService = new ConfigService();
+const config = configService.loadOrDefault();
+
 const CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
-const PID_FILE = process.env.AGENTBRIDGE_PID_FILE ?? `/tmp/agentbridge-daemon-${CONTROL_PORT}.pid`;
-const CONTROL_HEALTH_URL = `http://127.0.0.1:${CONTROL_PORT}/healthz`;
-const CONTROL_WS_URL = `ws://127.0.0.1:${CONTROL_PORT}/ws`;
-const LOG_FILE = "/tmp/agentbridge.log";
-// When bundled into a Claude Code plugin, the frontend runs from the plugin
-// cache directory and must launch the sibling daemon bundle from there.
-const DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY ?? "./daemon.ts";
-const DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
+const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
+const CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 
 const claude = new ClaudeAdapter();
 const daemonClient = new DaemonClient(CONTROL_WS_URL);
@@ -55,7 +54,7 @@ claude.on("ready", async () => {
   log(`MCP server ready (delivery mode: ${claude.getDeliveryMode()}) — ensuring AgentBridge daemon...`);
 
   try {
-    await ensureDaemonRunning();
+    await daemonLifecycle.ensureRunning();
     await daemonClient.connect();
     daemonClient.attachClaude();
   } catch (err: any) {
@@ -76,88 +75,6 @@ function systemMessage(idPrefix: string, content: string): BridgeMessage {
     content,
     timestamp: Date.now(),
   };
-}
-
-async function ensureDaemonRunning() {
-  if (await isDaemonHealthy()) {
-    return;
-  }
-
-  const existingPid = readDaemonPid();
-  if (existingPid) {
-    if (isProcessAlive(existingPid)) {
-      try {
-        await waitForDaemonHealthy(12, 250);
-        return;
-      } catch {
-        throw new Error(
-          `Found existing daemon process ${existingPid}, but control port ${CONTROL_PORT} never became healthy.`,
-        );
-      }
-    }
-
-    removeStalePidFile();
-  }
-
-  launchDaemon();
-  await waitForDaemonHealthy();
-}
-
-function launchDaemon() {
-  log(`Launching detached daemon on control port ${CONTROL_PORT}`);
-
-  const daemonProc = spawn(process.execPath, ["run", DAEMON_PATH], {
-    cwd: process.cwd(),
-    env: { ...process.env },
-    detached: true,
-    stdio: "ignore",
-  });
-  daemonProc.unref();
-}
-
-async function isDaemonHealthy() {
-  try {
-    const response = await fetch(CONTROL_HEALTH_URL);
-    return response.ok;
-  } catch {
-    return false;
-  }
-}
-
-async function waitForDaemonHealthy(maxRetries = 40, delayMs = 250) {
-  for (let attempt = 0; attempt < maxRetries; attempt++) {
-    if (await isDaemonHealthy()) return;
-    await new Promise((resolve) => setTimeout(resolve, delayMs));
-  }
-
-  throw new Error(`Timed out waiting for AgentBridge daemon health on ${CONTROL_HEALTH_URL}`);
-}
-
-function readDaemonPid() {
-  try {
-    const raw = readFileSync(PID_FILE, "utf-8").trim();
-    if (!raw) return null;
-
-    const pid = Number.parseInt(raw, 10);
-    return Number.isFinite(pid) ? pid : null;
-  } catch {
-    return null;
-  }
-}
-
-function isProcessAlive(pid: number) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function removeStalePidFile() {
-  try {
-    unlinkSync(PID_FILE);
-  } catch {}
 }
 
 function shutdown(reason: string) {
@@ -194,7 +111,7 @@ function log(msg: string) {
   const line = `[${new Date().toISOString()}] [AgentBridgeFrontend] ${msg}\n`;
   process.stderr.write(line);
   try {
-    appendFileSync(LOG_FILE, line);
+    appendFileSync(stateDir.logFile, line);
   } catch {}
 }
 
