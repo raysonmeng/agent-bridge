@@ -10,7 +10,7 @@
   },
   "scripts": {
     "start": "bun run src/bridge.ts",
-    "build:plugin": "mkdir -p plugins/agentbridge/server && bun build src/bridge.ts --outfile plugins/agentbridge/server/bridge-server.js --target bun && bun build src/daemon.ts --outfile plugins/agentbridge/server/daemon.js --target bun",
+    "build:plugin": "mkdir -p plugins/agentbridge/server plugins/agentbridge/scripts && bun build src/bridge.ts --outfile plugins/agentbridge/server/bridge-server.js --target bun && bun build src/daemon.ts --outfile plugins/agentbridge/server/daemon.js --target bun && bun build src/plugin/init-project.ts --outfile plugins/agentbridge/scripts/init-project.js --target bun",
     "validate:plugin": "claude plugin validate plugins/agentbridge && claude plugin validate .claude-plugin/marketplace.json",
     "test": "bun test src",
     "typecheck": "tsc --noEmit",

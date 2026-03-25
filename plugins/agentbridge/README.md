@@ -11,6 +11,7 @@ plugins/agentbridge/
 ├── commands/init.md
 ├── hooks/hooks.json
 ├── scripts/health-check.sh
+├── scripts/init-project.js
 └── server/
     ├── bridge-server.js
     └── daemon.js
@@ -28,6 +29,7 @@ This creates self-contained bundles at:
 
 - `plugins/agentbridge/server/bridge-server.js`
 - `plugins/agentbridge/server/daemon.js`
+- `plugins/agentbridge/scripts/init-project.js`
 
 ## Local Testing
 
@@ -39,4 +41,4 @@ This creates self-contained bundles at:
 
 - The plugin frontend launches the sibling daemon bundle via `AGENTBRIDGE_DAEMON_ENTRY=./daemon.js`.
 - The SessionStart hook is informational only. It never starts or stops the daemon.
-- The command at `/agentbridge:init` edits project-local `.agentbridge/` files only; plugin installation remains the job of terminal `agentbridge init`.
+- The command at `/agentbridge:init` runs the bundled `init-project.js` helper, which uses ConfigService to initialize project-local `.agentbridge/` files. Plugin installation remains the job of terminal `agentbridge init`.
