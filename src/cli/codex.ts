@@ -69,7 +69,7 @@ export async function runCodex(args: string[]) {
   let savedStty: string | null = null;
   if (process.stdin.isTTY) {
     try {
-      savedStty = execSync("stty -g", { encoding: "utf-8" }).trim();
+      savedStty = execSync("stty -g", { encoding: "utf-8", stdio: ["inherit", "pipe", "pipe"] }).trim();
     } catch {}
   }
 
@@ -77,10 +77,10 @@ export async function runCodex(args: string[]) {
     // Restore saved terminal settings
     if (savedStty && process.stdin.isTTY) {
       try {
-        execSync(`stty ${savedStty}`, { stdio: "ignore" });
+        execSync(`stty ${savedStty}`, { stdio: ["inherit", "ignore", "ignore"] });
       } catch {
         try {
-          execSync("stty sane", { stdio: "ignore" });
+          execSync("stty sane", { stdio: ["inherit", "ignore", "ignore"] });
         } catch {}
       }
     }
