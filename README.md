@@ -144,6 +144,14 @@ agent_bridge/
 - Single Codex thread, no multi-session support yet
 - Single Claude foreground connection; a new Claude session replaces the previous one
 
+### Codex git restrictions
+
+Codex runs in a sandboxed environment that **blocks all writes to the `.git` directory**. This means Codex cannot run `git commit`, `git push`, `git pull`, `git checkout -b`, `git merge`, or any other command that modifies git metadata. Attempting these commands will cause the Codex session to hang indefinitely.
+
+This restriction is especially relevant when Claude Code uses **git worktrees** — the worktree shares `.git` internals with the main repository, which can further tighten sandbox constraints.
+
+**Recommendation:** Let Claude Code handle all git operations (branching, committing, pushing, creating PRs). Codex should focus on code changes and report completed work via `agentMessage`, then Claude Code takes care of the git workflow.
+
 ## Roadmap
 
 - **v1.x (current)**: Improve the single-bridge experience without architectural refactoring — less noise, better turn discipline, and clearer collaboration modes. See [docs/v1-roadmap.md](docs/v1-roadmap.md).

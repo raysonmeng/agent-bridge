@@ -41,6 +41,13 @@ const BRIDGE_CONTRACT_REMINDER = `[Bridge Contract] When sending agentMessage, p
 The marker MUST be the first text in the message (e.g. "[IMPORTANT] Task done", not "Task done [IMPORTANT]").
 Keep agentMessage for high-value communication only.
 
+[Git Operations — FORBIDDEN]
+You MUST NOT execute any git write commands. This includes but is not limited to:
+git commit, git push, git pull, git fetch, git checkout -b, git branch, git merge, git rebase, git cherry-pick, git tag, git stash.
+These commands write to the .git directory, which is blocked by your sandbox. Attempting them will cause your session to hang indefinitely.
+Read-only git commands (git status, git log, git diff, git show, git rev-parse) are allowed.
+All git write operations must be delegated to Claude Code via agentMessage. Report what you changed and let Claude handle branching, committing, and pushing.
+
 [Role Guidance for Codex]
 - Your default role: Implementer, Executor, Verifier
 - Analytical/review tasks: Independent Analysis & Convergence

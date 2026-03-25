@@ -144,6 +144,14 @@ agent_bridge/
 - 当前只支持单个 Codex thread，不支持多会话
 - 当前只支持单个 Claude 前台连接；新的 Claude 会话会替换旧连接
 
+### Codex 的 Git 操作限制
+
+Codex 运行在沙箱环境中，**禁止对 `.git` 目录进行任何写操作**。这意味着 Codex 无法执行 `git commit`、`git push`、`git pull`、`git checkout -b`、`git merge` 等任何修改 Git 元数据的命令。尝试执行这些命令会导致 Codex 会话无限期挂起。
+
+当 Claude Code 使用了 **git worktree** 时，这个限制尤其需要注意 — worktree 与主仓库共享 `.git` 内部结构，可能会进一步收紧沙箱的约束。
+
+**建议做法：** 让 Claude Code 负责所有 Git 操作（创建分支、提交、推送、创建 PR）。Codex 专注于代码修改，通过 `agentMessage` 汇报完成的工作，由 Claude Code 负责 Git 工作流。
+
 ## Roadmap
 
 ### v1.x（当前） — 单桥体验优化
