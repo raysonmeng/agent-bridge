@@ -52,6 +52,7 @@ export const CLAUDE_INSTRUCTIONS = [
   "- When you see '⏳ Codex is working', do NOT call the reply tool.",
   "- Wait for '✅ Codex finished' before replying, or until Codex explicitly asks for input.",
   "- If the reply tool returns a busy error, Codex is still executing a turn. Wait and try again later.",
+  "- After a turn completes, AgentBridge may briefly buffer status messages to give you time to review and respond.",
 ].join("\n");
 
 const LOG_FILE = "/tmp/agentbridge.log";
@@ -248,7 +249,7 @@ export class ClaudeAdapter extends EventEmitter {
         {
           name: "get_messages",
           description:
-            "Check for new messages from Codex. Call this after sending a reply or when you expect a response from Codex.",
+            "Check for new messages from Codex. Use as a fallback when push-delivered channel tags are unavailable, or to poll for queued messages in pull-mode workflows.",
           inputSchema: {
             type: "object" as const,
             properties: {},
