@@ -1,0 +1,12 @@
+{
+  "name": "agentbridge",
+  "version": "0.1.0",
+  "description": "Bridge Claude Code and Codex with a shared daemon, push channel delivery, and bidirectional reply tooling.",
+  "author": {
+    "name": "AgentBridge Contributors",
+    "email": "raysonmeng@qq.com"
+  },
+  "homepage": "https://github.com/raysonmeng/agent-bridge#readme",
+  "repository": "https://github.com/raysonmeng/agent-bridge",
+  "license": "MIT"
+}
