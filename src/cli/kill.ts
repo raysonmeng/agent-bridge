@@ -14,6 +14,7 @@ export async function runKill() {
   });
 
   const killed = await lifecycle.kill();
+  lifecycle.markKilled();
 
   if (killed) {
     console.log("\nAgentBridge daemon stopped.");

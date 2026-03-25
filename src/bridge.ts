@@ -78,6 +78,16 @@ const MAX_RECONNECT_DELAY_MS = 30_000;
 async function reconnectToDaemon(attempt = 0) {
   if (shuttingDown) return;
 
+  // Don't reconnect if user explicitly killed the daemon
+  if (daemonLifecycle.wasKilled()) {
+    log("Daemon was intentionally killed by user (killed sentinel found) — not reconnecting");
+    void claude.pushNotification(systemMessage(
+      "system_daemon_killed",
+      "⛔ AgentBridge daemon was stopped by `agentbridge kill`. Run `agentbridge codex` to restart.",
+    ));
+    return;
+  }
+
   const delayMs = Math.min(1000 * 2 ** attempt, MAX_RECONNECT_DELAY_MS);
   if (attempt > 0) {
     log(`Reconnect attempt ${attempt + 1}, waiting ${delayMs}ms...`);

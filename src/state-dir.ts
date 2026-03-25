@@ -57,4 +57,8 @@ export class StateDirResolver {
   get logFile(): string {
     return join(this.stateDir, "agentbridge.log");
   }
+
+  get killedFile(): string {
+    return join(this.stateDir, "killed");
+  }
 }

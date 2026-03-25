@@ -542,6 +542,14 @@ function log(msg: string) {
   } catch {}
 }
 
+// Refuse to start if user intentionally killed the daemon.
+// This prevents stale auto-reconnect loops from relaunching us.
+// Only `agentbridge codex` / `ensureRunning` clears the sentinel before launching.
+if (daemonLifecycle.wasKilled()) {
+  log("Killed sentinel found — daemon was intentionally stopped. Exiting immediately.");
+  process.exit(0);
+}
+
 writePidFile();
 startControlServer();
 void bootCodex();

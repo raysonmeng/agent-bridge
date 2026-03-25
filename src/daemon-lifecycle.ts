@@ -1,5 +1,5 @@
 import { spawn, execSync } from "node:child_process";
-import { readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "node:fs";
+import { existsSync, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { StateDirResolver } from "./state-dir";
 
@@ -39,6 +39,9 @@ export class DaemonLifecycle {
 
   /** Ensure daemon is running: check health, check pid, start if needed. */
   async ensureRunning(): Promise<void> {
+    // Clear killed sentinel — user is explicitly starting the daemon
+    this.clearKilled();
+
     if (await this.isHealthy()) {
       return;
     }
@@ -145,6 +148,24 @@ export class DaemonLifecycle {
     try {
       unlinkSync(this.stateDir.statusFile);
     } catch {}
+  }
+
+  /** Write killed sentinel — prevents auto-reconnect from relaunching daemon. */
+  markKilled(): void {
+    this.stateDir.ensure();
+    writeFileSync(this.stateDir.killedFile, `${Date.now()}\n`, "utf-8");
+  }
+
+  /** Remove killed sentinel — allows daemon to be launched again. */
+  clearKilled(): void {
+    try {
+      unlinkSync(this.stateDir.killedFile);
+    } catch {}
+  }
+
+  /** Check if daemon was intentionally killed by the user. */
+  wasKilled(): boolean {
+    return existsSync(this.stateDir.killedFile);
   }
 
   /** Launch daemon as detached background process. */
