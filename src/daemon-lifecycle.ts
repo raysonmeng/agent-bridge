@@ -3,7 +3,10 @@ import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { StateDirResolver } from "./state-dir";
 
-const DAEMON_PATH = fileURLToPath(new URL("./daemon.ts", import.meta.url));
+// When bundled into a Claude Code plugin, the frontend runs from the plugin
+// cache directory and must launch the sibling daemon bundle from there.
+const DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY ?? "./daemon.ts";
+const DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
 
 export interface DaemonLifecycleOptions {
   stateDir: StateDirResolver;

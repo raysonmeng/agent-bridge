@@ -1,0 +1,16 @@
+{
+  "description": "Hint-only health checks for AgentBridge startup. These hooks never orchestrate the daemon.",
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/health-check.sh\""
+          }
+        ]
+      }
+    ]
+  }
+}
