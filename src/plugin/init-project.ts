@@ -1,9 +1,9 @@
 #!/usr/bin/env bun
 
-import { execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import { ConfigService } from "../config-service";
 
-type RunCommand = (command: string) => string;
+type RunCommand = (command: string, args: string[]) => string;
 
 export interface InitProjectResult {
   checked: {
@@ -17,18 +17,19 @@ export interface InitProjectResult {
   };
 }
 
-function defaultRunCommand(command: string): string {
-  return execSync(command, { encoding: "utf-8" }).trim();
+function defaultRunCommand(command: string, args: string[]): string {
+  return execFileSync(command, args, { encoding: "utf-8" }).trim();
 }
 
 function requireVersion(
   name: string,
   command: string,
+  args: string[],
   installHint: string,
   runCommand: RunCommand,
 ): string {
   try {
-    return runCommand(command);
+    return runCommand(command, args);
   } catch {
     throw new Error(`${name} not found in PATH. ${installHint}`);
   }
@@ -38,8 +39,14 @@ export function initProjectDefaults(
   projectRoot = process.cwd(),
   runCommand: RunCommand = defaultRunCommand,
 ): InitProjectResult {
-  const bunVersion = requireVersion("bun", "bun --version", "Install Bun: https://bun.sh", runCommand);
-  const codexVersion = requireVersion("codex", "codex --version", "Install Codex: https://github.com/openai/codex", runCommand);
+  const bunVersion = requireVersion("bun", "bun", ["--version"], "Install Bun: https://bun.sh", runCommand);
+  const codexVersion = requireVersion(
+    "codex",
+    "codex",
+    ["--version"],
+    "Install Codex: https://github.com/openai/codex",
+    runCommand,
+  );
 
   const configService = new ConfigService(projectRoot);
   const created = configService.initDefaults();
