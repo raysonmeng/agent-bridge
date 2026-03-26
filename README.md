@@ -70,14 +70,17 @@ Each message carries a `source` field (`"claude"` or `"codex"`). The bridge neve
 
 ## Quick Start
 
+> **Note:** AgentBridge is not yet published to a plugin marketplace. The current setup uses a local plugin from the repository.
+
 ```bash
 # 1. Install dependencies
 cd agent_bridge
 bun install
 bun link    # Makes the 'agentbridge' command available globally
 
-# 2. Initialize project (installs plugin, checks dependencies, generates config)
-agentbridge init
+# 2. Set up local plugin + project config
+agentbridge dev     # Register local marketplace + install plugin
+agentbridge init    # Check dependencies, generate .agentbridge/config.json
 
 # 3. Start Claude Code with AgentBridge plugin loaded
 agentbridge claude
@@ -90,14 +93,9 @@ That's it. The daemon starts automatically when needed and reconnects if restart
 
 > **Note:** `agentbridge claude` injects `--dangerously-load-development-channels server:agentbridge` automatically. This loads a local development channel into Claude Code (currently a Research Preview workflow). Only enable channels and MCP servers you trust.
 
-### For plugin developers
+### Updating after code changes
 
-If you're working on AgentBridge itself, use the dev command to sync local changes to the plugin cache:
-
-```bash
-agentbridge dev     # Register local marketplace + sync plugin files
-agentbridge claude  # Start Claude Code (plugin auto-loaded)
-```
+After modifying AgentBridge source code, re-run `agentbridge dev` to sync changes to the plugin cache, then restart Claude Code or run `/reload-plugins` in an active session.
 
 ## CLI Reference
 

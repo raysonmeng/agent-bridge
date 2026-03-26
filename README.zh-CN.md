@@ -70,14 +70,17 @@ AgentBridge 采用两层进程结构：
 
 ## Quick Start
 
+> **注意：** AgentBridge 尚未发布到插件市场，当前使用仓库内的本地插件。
+
 ```bash
 # 1. 安装依赖
 cd agent_bridge
 bun install
 bun link    # 全局注册 agentbridge 命令
 
-# 2. 初始化项目（安装插件、检查依赖、生成配置）
-agentbridge init
+# 2. 安装本地插件 + 生成项目配置
+agentbridge dev     # 注册本地 marketplace + 安装插件
+agentbridge init    # 检查依赖、生成 .agentbridge/config.json
 
 # 3. 启动 Claude Code（自动加载 AgentBridge 插件）
 agentbridge claude
@@ -90,14 +93,9 @@ agentbridge codex
 
 > **注意：** `agentbridge claude` 会自动注入 `--dangerously-load-development-channels server:agentbridge`。这会把本地开发中的 channel 挂载进 Claude Code（当前属于 Research Preview）。请只启用你信任的 channel 和 MCP server。
 
-### 插件开发者
+### 修改代码后更新
 
-如果你在开发 AgentBridge 本身，使用 dev 命令同步本地改动到插件缓存：
-
-```bash
-agentbridge dev     # 注册本地 marketplace + 同步插件文件
-agentbridge claude  # 启动 Claude Code（插件自动加载）
-```
+修改 AgentBridge 源码后，重新执行 `agentbridge dev` 同步插件到缓存，然后重启 Claude Code 或在活跃会话中执行 `/reload-plugins`。
 
 ## CLI 命令参考
 
