@@ -13,7 +13,7 @@ export interface DaemonStatus {
 export type ControlClientMessage =
   | { type: "claude_connect" }
   | { type: "claude_disconnect" }
-  | { type: "claude_to_codex"; requestId: string; message: BridgeMessage }
+  | { type: "claude_to_codex"; requestId: string; message: BridgeMessage; requireReply?: boolean }
   | { type: "status" };
 
 export type ControlServerMessage =

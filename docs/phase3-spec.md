@@ -1,313 +1,250 @@
-# Phase 3 Spec v2 — CLI + Plugin Integration
+# AgentBridge Phase 3 Final State
 
-> Finalized 2026-03-25. This is the execution spec for Phase 3.
+## Status
 
-## 1. Goal
+Phase 3 is complete in the current codebase.
 
-Deliver AgentBridge as a productized "one daemon, two entry points" solution:
-- **CLI**: 4 commands for users (`init`, `claude`, `codex`, `kill`)
-- **Plugin**: Claude Code integration (MCP server, push channel, commands, hooks)
-- **Daemon**: single long-running runtime, shared state
+This document records what actually shipped, not the earlier proposal shape. If an older planning note or conversation describes Phase 3 as future work, this file should be treated as the source of truth for the delivered Phase 3 surface.
 
-## 2. Design Assumptions
+## What Phase 3 Delivered
 
-- Users always have Claude Code
-- Push mode is the primary path; `--dangerously-load-development-channels` required during research preview
-- Pull mode (`get_messages`) retained as fallback for users who forget channel flags
-- Plugin must be self-contained (copied to cache on install, no external path references)
-- v1 depends on Bun runtime
-- v1 does not support: permission relay, Windows, agents/skills default injection
+Phase 3 turned AgentBridge from a repo-first prototype into a CLI-first local product flow built around a foreground Claude integration, a persistent daemon, and an attachable Codex TUI.
 
-## 3. Minimum Environment Requirements
+Delivered scope:
 
-- `claude` >= 2.1.80 (channels support)
-- `bun` in PATH
-- `codex` in PATH
-- `agentbridge init` checks all of the above and gives actionable error messages
+- A repository-local `agentbridge` CLI entrypoint via `src/cli.ts` and the package `bin` field.
+- First-run setup via `agentbridge init`.
+- Claude startup via `agentbridge claude`.
+- Codex startup and daemon bootstrap via `agentbridge codex`.
+- Controlled daemon shutdown via `agentbridge kill`.
+- A developer-only local plugin workflow via `agentbridge dev`.
+- Project-level config generation through `.agentbridge/config.json` and `.agentbridge/collaboration.md`.
+- Shared runtime state management through `StateDirResolver`.
+- Shared daemon lifecycle logic through `DaemonLifecycle`.
+- Plugin-oriented runtime artifacts under `plugins/agentbridge/server/`.
 
-## 4. CLI Commands
+## User-Facing CLI
+
+The current command set is:
+
+- `agentbridge init`
+- `agentbridge dev`
+- `agentbridge claude [args...]`
+- `agentbridge codex [args...]`
+- `agentbridge kill`
 
 ### `agentbridge init`
 
-- Check dependencies: `claude` version, `bun`, `codex`
-- Install plugin to user scope via Claude CLI
-- Merge `extraKnownMarketplaces` into `.claude/settings.json`
-- Generate `.agentbridge/config.json` (machine-readable config)
-- Generate `.agentbridge/collaboration.md` (human-editable collaboration rules)
-- Prompt user to run `/reload-plugins` in current Claude session
+Current behavior:
 
-### `agentbridge claude [args...]`
+- Verifies `bun`, `claude`, and `codex` are available.
+- Enforces a minimum Claude Code version of `2.1.80`.
+- Creates `.agentbridge/config.json` if missing.
+- Creates `.agentbridge/collaboration.md` if missing.
+- Attempts `claude plugin install agentbridge@agentbridge` as a best-effort step.
 
-- Inject flags:
-  - `--channels plugin:agentbridge@<marketplace>`
-  - `--dangerously-load-development-channels plugin:agentbridge@<marketplace>`
-- Pass through all other arguments
-- **Hard error** if user passes `--channels` or `--dangerously-load-development-channels`
-- Error message explains: what flags AgentBridge sets, why conflicts aren't allowed, how to use native `claude` command directly
+Important nuance:
 
-### `agentbridge codex [args...]`
+- `init` does not patch a global Claude MCP JSON file.
+- Plugin installation is best-effort and may be skipped if the marketplace is not configured yet.
 
-- Call `ensureDaemonRunning()` (auto-start daemon if not running)
-- Read `proxyUrl` from daemon status or shared config (not hardcoded)
-- Inject flags:
-  - `--enable tui_app_server`
-  - `--remote <proxyUrl>`
-- Integrate terminal state protection (save/restore stty, escape sequences to /dev/tty)
-- Pass through all other arguments
-- **Hard error** if user passes `--remote` or `--enable tui_app_server`
+### `agentbridge claude`
+
+Current behavior:
+
+- Rejects AgentBridge-owned flags from the user.
+- Starts Claude Code with:
+
+```bash
+claude --dangerously-load-development-channels server:agentbridge
+```
+
+- Passes through additional user arguments after the injected channel flags.
+
+Important nuance:
+
+- The shipped implementation still uses the development-channel flag.
+- It does not yet switch to `--channels`, because the current flow still depends on a development plugin/runtime path.
+
+### `agentbridge codex`
+
+Current behavior:
+
+- Rejects AgentBridge-owned transport flags such as `--remote` and `--enable tui_app_server`.
+- Uses `DaemonLifecycle` to reuse or launch the background daemon.
+- Reads the live proxy URL from daemon status when available.
+- Falls back to the project config when daemon status is unavailable.
+- Launches Codex with:
+
+```bash
+codex --enable tui_app_server --remote ws://127.0.0.1:<proxy-port>
+```
+
+- Passes through additional user arguments after the injected transport flags.
 
 ### `agentbridge kill`
 
-- Read pid/lock/status from shared state directory
-- Verify target processes belong to AgentBridge runtime
-- Attempt graceful shutdown first
-- Force kill after timeout
-- Clean up stale pid/lock/status files
-- **Never** use `pkill -f` (risk of killing unrelated processes)
+Current behavior:
 
-## 5. Argument Conflict Strategy
+- Marks a `killed` sentinel before shutting down the daemon.
+- Prevents the foreground Claude-side bridge from racing to relaunch the daemon during disconnect handling.
+- Removes stale state when no live daemon exists.
 
-- AgentBridge-owned flags: **hard error**, not warning
-- `agentbridge claude` owned: `--channels`, `--dangerously-load-development-channels`
-- `agentbridge codex` owned: `--enable tui_app_server`, `--remote`
-- All non-owned flags: passthrough
-- Error message must explain:
-  1. Which flags AgentBridge has already set
-  2. Why they cannot be mixed
-  3. How to use native commands directly for full customization
+### `agentbridge dev`
 
-## 6. Path Conventions
+Current behavior:
 
-### Shared Runtime State Directory
+- Developer workflow only.
+- Registers a local Claude marketplace.
+- Installs the local AgentBridge plugin into Claude.
+- Syncs local plugin files into Claude's plugin cache.
+
+Important nuance:
+
+- This command is for local development of the plugin/runtime packaging flow.
+- It is not part of the normal end-user quick start.
+
+## Actual Runtime Architecture
+
+Phase 3 kept the two-process design, but productized it through shared lifecycle helpers and CLI commands.
+
+### Foreground process
+
+`src/bridge.ts` is the Claude-facing foreground process:
+
+- starts as the MCP server runtime seen by Claude Code
+- owns the `ClaudeAdapter`
+- ensures the daemon exists through `DaemonLifecycle`
+- connects to the daemon control socket through `DaemonClient`
+- forwards Codex messages to Claude and replies back to Codex
+
+### Background process
+
+`src/daemon.ts` is the persistent background process:
+
+- owns the Codex adapter and proxy
+- exposes `/healthz`, `/readyz`, and `/ws` on the local control port
+- survives Claude foreground restarts
+- manages buffered messages, turn coordination, and Codex thread state
+
+### Shared runtime helpers added or formalized in Phase 3
+
+- `src/daemon-lifecycle.ts`
+  - shared launch, health-check, pid, lock, and kill behavior
+- `src/config-service.ts`
+  - project config loading, defaults, and collaboration file generation
+- `src/state-dir.ts`
+  - OS-specific shared runtime state directory resolution
+- `src/daemon-client.ts`
+  - foreground client for daemon control WebSocket traffic
+
+### Plugin-oriented delivery shape
+
+The runtime is designed around Claude-side plugin or channel delivery:
+
+- source entrypoints live under `src/`
+- bundled runtime artifacts live under `plugins/agentbridge/server/`
+- the CLI is the main operator-facing surface
+
+This means Phase 3 shipped the plugin-oriented architecture, even though packaging and marketplace polish are still evolving.
+
+## Configuration and State
+
+Phase 3 split persistent data into two layers.
+
+### Project-level config
+
+Stored in the repo under `.agentbridge/`:
+
+- `config.json`
+- `collaboration.md`
+
+This data is project-specific and travels with the working tree.
+
+### Machine-local runtime state
+
+Resolved by `StateDirResolver`:
 
 - macOS: `~/Library/Application Support/AgentBridge`
 - Linux: `${XDG_STATE_HOME:-~/.local/state}/agentbridge`
-- Override: `AGENTBRIDGE_STATE_DIR` env var
-- Contents:
-  - `daemon.pid`
-  - `daemon.lock`
-  - `status.json` (daemon status, proxyUrl, ports)
-  - `ports.json`
-  - `agentbridge.log`
+- override: `AGENTBRIDGE_STATE_DIR`
 
-### Project Config Directory
+Files maintained there include:
 
-- `.agentbridge/config.json` — machine-readable project config
-- `.agentbridge/collaboration.md` — human/AI-readable collaboration rules
-- Lives in repo root, can be committed and reviewed
+- `daemon.pid`
+- `daemon.lock`
+- `status.json`
+- `agentbridge.log`
+- `killed`
 
-### Claude Code Config
+This split is intentional:
 
-- `.claude/settings.json` — only for Claude Code's own config (`extraKnownMarketplaces`)
+- `.agentbridge/` is for shared project defaults and collaboration rules
+- the state dir is for local process lifecycle and diagnostics
 
-## 7. Project Config Files
+## Phase 3 Runtime Controls
 
-### `.agentbridge/config.json`
+The current implementation uses these environment variables as the main runtime controls:
 
-```json
-{
-  "version": "1.0",
-  "daemon": {
-    "port": 4500,
-    "proxyPort": 4501
-  },
-  "agents": {
-    "claude": {
-      "role": "Reviewer, Planner",
-      "mode": "push"
-    },
-    "codex": {
-      "role": "Implementer, Executor"
-    }
-  },
-  "markers": ["IMPORTANT", "STATUS", "FYI"],
-  "turnCoordination": {
-    "attentionWindowSeconds": 15,
-    "busyGuard": true
-  },
-  "idleShutdownSeconds": 30
-}
-```
+| Variable | Purpose |
+| --- | --- |
+| `AGENTBRIDGE_STATE_DIR` | Override the machine-local runtime state directory |
+| `AGENTBRIDGE_DAEMON_ENTRY` | Override the daemon entrypoint used by `DaemonLifecycle` |
+| `AGENTBRIDGE_CONTROL_PORT` | Control HTTP/WebSocket port between foreground and daemon |
+| `CODEX_WS_PORT` | Codex app-server listen port |
+| `CODEX_PROXY_PORT` | AgentBridge proxy port used by the Codex TUI |
+| `AGENTBRIDGE_MODE` | Claude delivery mode override: `push`, `pull`, or `auto` |
+| `AGENTBRIDGE_MAX_BUFFERED_MESSAGES` | Pull-mode queue bound and buffering limit |
+| `AGENTBRIDGE_FILTER_MODE` | Codex message filtering mode |
+| `AGENTBRIDGE_IDLE_SHUTDOWN_MS` | Daemon idle shutdown override |
+| `AGENTBRIDGE_ATTENTION_WINDOW_MS` | Claude attention-window override |
 
-### `.agentbridge/collaboration.md`
+## Where Phase 3 Landed Differently Than The Earlier Proposal
 
-```markdown
-# Collaboration Rules
+Phase 3 shipped the intended product direction, but not every original proposal detail survived unchanged.
 
-## Roles
-- Claude: Reviewer, Planner, Hypothesis Challenger
-- Codex: Implementer, Executor, Reproducer/Verifier
+### Shipped differently
 
-## Thinking Patterns
-- Analytical/review tasks: Independent Analysis & Convergence
-- Implementation tasks: Architect -> Builder -> Critic
-- Debugging tasks: Hypothesis -> Experiment -> Interpretation
+- The CLI exists, but the package is still repository-local today.
+  - `package.json` exposes the `agentbridge` bin, but the package is still marked `private`.
+- The command surface is more opinionated than the original generic lifecycle proposal.
+  - Shipped commands are `init`, `dev`, `claude`, `codex`, and `kill`.
+  - Proposed commands such as `doctor`, `status`, `start`, `stop`, and `attach` did not ship in Phase 3.
+- `init` generates project config and attempts plugin installation, but it does not rewrite global Claude configuration files.
+- Claude startup still uses the development-channel path instead of a stable marketplace `--channels` flow.
+- Delivery mode auto-detection is intentionally conservative.
+  - `auto` resolves to push mode today.
+  - API-key users can force pull mode with `AGENTBRIDGE_MODE=pull`.
 
-## Communication
-- Use explicit phrases: "My independent view is:", "I agree on:", "I disagree on:"
-- Tag messages with [IMPORTANT], [STATUS], or [FYI]
+### Why those differences are acceptable for v1
 
-## Review Process
-- Cross-review: author never reviews their own code
-- All changes go through feature/fix branches + PR
+- The current command set matches the real user workflow more directly.
+- The daemon lifecycle is now precise enough that a generic `start` or `attach` command is not required for normal use.
+- Keeping `claude` and `codex` as explicit commands makes the startup contract easier to understand and test.
+- Explicit pull-mode override solves the practical API-key case without over-engineering capability negotiation.
 
-## Custom Rules
-<!-- Add your project-specific collaboration rules here -->
-```
+## Validation Shipped With Phase 3
 
-## 8. Plugin Structure
+Phase 3 is backed by targeted automated coverage in the repository:
 
-```
-plugins/agentbridge/
-  .claude-plugin/
-    plugin.json              # manifest
-  .mcp.json                  # MCP server config
-  commands/
-    init.md                  # /agentbridge:init command
-  hooks/
-    hooks.json               # SessionStart health check
-  scripts/
-    health-check.sh          # daemon reachability check
-  server/
-    bridge-server.js         # self-contained MCP + channel server bundle
-    daemon.js                # daemon bundle
-```
+- CLI helper and flag handling tests
+- config and lifecycle tests
+- daemon client tests
+- CLI end-to-end harness coverage for:
+  - `init`
+  - `claude`
+  - `codex`
+  - daemon reuse
+  - concurrent startup lock behavior
+  - `kill`
+  - killed-sentinel reconnect behavior
 
-### Plugin Capabilities (v1)
+## Remaining Follow-Ups After Phase 3
 
-- **MCP server**: reply/get_messages tools + push channel
-- **Command**: `/agentbridge:init` for in-session project config updates
-- **Hook**: `SessionStart` health check (hint-only, does not start daemon, does not block session)
+Phase 3 is complete, but these items remain follow-up work rather than part of the shipped baseline:
 
-### Not in v1
-
-- agents / skills (deferred to v2)
-- settings.json (only supports `agent` key currently)
-- permission relay
-
-## 9. Hook Strategy
-
-- `SessionStart` only checks, does not orchestrate
-- Daemon unreachable → show hint, do not start daemon (avoid competing with `ensureDaemonRunning`)
-- Dedup/cooldown: limit per workspace/session to avoid repeated hints
-- Hook failure must not block Claude session startup
-
-## 10. Push / Pull Strategy
-
-- Push is default and recommended path
-- `agentbridge claude` always injects channel flags
-- `get_messages` retained as:
-  - Fallback when user runs native `claude` without channel flags
-  - Debug / recovery tool
-  - Not the primary interaction path
-- Documentation must clarify this distinction
-
-## 11. Runtime Integration
-
-### Refactoring approach
-
-Extract shared services from existing code, create thin entrypoints:
-
-- `DaemonService` — from daemon.ts
-- `ClaudeFrontendService` — from bridge.ts
-- `ConfigService` — shared config loading/writing
-- `StateDirResolver` — platform-aware state directory resolution
-
-### Shared modules (keep as-is or light migration)
-
-- `codex-adapter.ts`
-- `claude-adapter.ts`
-- `daemon-client.ts`
-- `control-protocol.ts`
-- `message-filter.ts`
-- `tui-connection-state.ts`
-
-### Bundling
-
-- Bun build generates self-contained bundles
-- Plugin bundle: no external `node_modules` dependency
-- CLI npm package: also ships built artifacts
-- Plugin and CLI publish from same version tag
-
-## 12. Task Breakdown
-
-### Task 5A: Core Runtime
-
-**Deliverables:**
-- DaemonService, ClaudeFrontendService, ConfigService, StateDirResolver
-- ensureDaemonRunning()
-- Single-instance pid/lock management
-- healthz / readyz / status endpoints
-- Runtime state file read/write
-- Stable abstraction over control protocol
-- Unit tests + integration tests
-
-**Dependencies:** None (foundation block)
-
-**Done when:** CLI and plugin can both reuse the same runtime core; daemon is single-instance; health/status works in all scenarios.
-
-### Task 5B: CLI Surface
-
-**Deliverables:**
-- `agentbridge init` / `claude` / `codex` / `kill`
-- Dependency checks + version checks
-- Owned flags conflict detection (hard error)
-- Terminal state protection integration
-- npm package publish config
-
-**Dependencies:** 5A
-
-**Done when:** All 4 commands work on a clean machine from installed package; claude/codex auto-connect to same daemon; conflict flags produce clear errors.
-
-### Task 5C: Plugin Packaging
-
-**Deliverables:**
-- plugin.json manifest
-- .mcp.json
-- bridge-server.js bundle (self-contained)
-- daemon.js bundle (self-contained)
-- commands/init.md
-- hooks/hooks.json + health-check.sh
-- Marketplace manifest
-- Local dev + publish workflow
-
-**Dependencies:** 5A
-
-**Done when:** Plugin installs via `/plugin install`, activates via `/reload-plugins`, runs from cache directory without external dependencies.
-
-### Task 6A: Protocol-Level Instructions
-
-**Deliverables:**
-- MCP instructions text (channel event format, reply tool usage, get_messages fallback, turn coordination, bridge contract)
-- No team culture or project-specific role preferences
-
-**Dependencies:** 5C
-
-**Done when:** Claude correctly understands interaction protocol in both push and fallback modes.
-
-### Task 6B: Bootstrap Command
-
-**Deliverables:**
-- `/agentbridge:init` implementation
-- Shared config schema + config writer
-- `.agentbridge/config.json` update logic
-- `.agentbridge/collaboration.md` template update logic
-
-**Dependencies:** 5A, 5C (shared config writer also used by CLI init in 5B)
-
-**Done when:** CLI init and slash command produce consistent config format; users can update roles/rules in-session.
-
-### Task 6C: Optional Collaboration Skill (v2)
-
-Deferred. Not in v1 scope.
-
-## 13. Acceptance Scenarios
-
-1. Fresh install: `agentbridge init` → `/reload-plugins` → plugin active in current session
-2. `agentbridge claude` → Claude starts with push channel working
-3. `agentbridge codex` (daemon not running) → daemon auto-starts, Codex TUI connects
-4. Plugin runs from cache directory with all paths valid
-5. User passes owned flags → hard error with clear explanation
-6. `agentbridge kill` → precise cleanup, no collateral damage
-7. Codex TUI crash → terminal state restored
-8. User runs native `claude` (no flags) → `get_messages` fallback works
+- publishing a non-private npm package
+- stabilizing marketplace packaging and plugin manifests
+- deciding whether `doctor` or `status` are still worth adding
+- replacing development-channel startup with a stable marketplace path when available
+- broader multi-session and multi-agent work, which remains v2+ scope

@@ -2,7 +2,7 @@
 // @bun
 
 // src/daemon.ts
-import { appendFileSync as appendFileSync2, unlinkSync, writeFileSync } from "fs";
+import { appendFileSync as appendFileSync2 } from "fs";
 
 // src/codex-adapter.ts
 import { spawn, execSync } from "child_process";
@@ -654,6 +654,9 @@ Keep agentMessage for high-value communication only.
 - Debugging tasks: Hypothesis -> Experiment -> Interpretation
 - Do not blindly follow Claude - challenge with evidence when you disagree
 - Use explicit collaboration phrases: "My independent view is:", "I agree on:", "I disagree on:", "Current consensus:"`;
+var REPLY_REQUIRED_INSTRUCTION = `
+
+[\u26A0\uFE0F REPLY REQUIRED] Claude has explicitly requested a reply. You MUST send an agentMessage with [IMPORTANT] marker containing your response. This is a mandatory requirement \u2014 do not skip or use [STATUS]/[FYI] markers for this reply.`;
 class StatusBuffer {
   onFlush;
   buffer = [];
@@ -805,17 +808,422 @@ class TuiConnectionState {
   }
 }
 
+// src/daemon-lifecycle.ts
+import { spawn as spawn2, execSync as execSync2 } from "child_process";
+import { existsSync, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "fs";
+import { fileURLToPath } from "url";
+var DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY ?? "./daemon.ts";
+var DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
+
+class DaemonLifecycle {
+  stateDir;
+  controlPort;
+  log;
+  constructor(opts) {
+    this.stateDir = opts.stateDir;
+    this.controlPort = opts.controlPort;
+    this.log = opts.log;
+  }
+  get healthUrl() {
+    return `http://127.0.0.1:${this.controlPort}/healthz`;
+  }
+  get controlWsUrl() {
+    return `ws://127.0.0.1:${this.controlPort}/ws`;
+  }
+  async ensureRunning() {
+    this.clearKilled();
+    if (await this.isHealthy()) {
+      return;
+    }
+    const existingPid = this.readPid();
+    if (existingPid) {
+      if (isProcessAlive(existingPid)) {
+        if (this.isDaemonProcess(existingPid)) {
+          try {
+            await this.waitForHealthy(12, 250);
+            return;
+          } catch {
+            throw new Error(`Found existing daemon process ${existingPid}, but control port ${this.controlPort} never became healthy.`);
+          }
+        }
+        this.log(`Pid ${existingPid} is alive but not an AgentBridge daemon, removing stale pid file`);
+      }
+      this.removeStalePidFile();
+    }
+    const lockAcquired = this.acquireLock();
+    if (!lockAcquired) {
+      this.log("Another process is starting the daemon, waiting for health...");
+      await this.waitForHealthy();
+      return;
+    }
+    try {
+      this.launch();
+      await this.waitForHealthy();
+    } finally {
+      this.releaseLock();
+    }
+  }
+  async isHealthy() {
+    try {
+      const response = await fetch(this.healthUrl);
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+  async waitForHealthy(maxRetries = 40, delayMs = 250) {
+    for (let attempt = 0;attempt < maxRetries; attempt++) {
+      if (await this.isHealthy())
+        return;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    throw new Error(`Timed out waiting for AgentBridge daemon health on ${this.healthUrl}`);
+  }
+  readStatus() {
+    try {
+      const raw = readFileSync(this.stateDir.statusFile, "utf-8");
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  writeStatus(status) {
+    this.stateDir.ensure();
+    writeFileSync(this.stateDir.statusFile, JSON.stringify(status, null, 2) + `
+`, "utf-8");
+  }
+  readPid() {
+    try {
+      const raw = readFileSync(this.stateDir.pidFile, "utf-8").trim();
+      if (!raw)
+        return null;
+      const pid = Number.parseInt(raw, 10);
+      return Number.isFinite(pid) ? pid : null;
+    } catch {
+      return null;
+    }
+  }
+  writePid(pid) {
+    this.stateDir.ensure();
+    writeFileSync(this.stateDir.pidFile, `${pid ?? process.pid}
+`, "utf-8");
+  }
+  removePidFile() {
+    try {
+      unlinkSync(this.stateDir.pidFile);
+    } catch {}
+  }
+  removeStatusFile() {
+    try {
+      unlinkSync(this.stateDir.statusFile);
+    } catch {}
+  }
+  markKilled() {
+    this.stateDir.ensure();
+    writeFileSync(this.stateDir.killedFile, `${Date.now()}
+`, "utf-8");
+  }
+  clearKilled() {
+    try {
+      unlinkSync(this.stateDir.killedFile);
+    } catch {}
+  }
+  wasKilled() {
+    return existsSync(this.stateDir.killedFile);
+  }
+  launch() {
+    this.stateDir.ensure();
+    this.log(`Launching detached daemon on control port ${this.controlPort}`);
+    const daemonProc = spawn2(process.execPath, ["run", DAEMON_PATH], {
+      cwd: process.cwd(),
+      env: {
+        ...process.env,
+        AGENTBRIDGE_CONTROL_PORT: String(this.controlPort),
+        AGENTBRIDGE_STATE_DIR: this.stateDir.dir
+      },
+      detached: true,
+      stdio: "ignore"
+    });
+    daemonProc.unref();
+  }
+  removeStalePidFile() {
+    this.log("Removing stale pid file");
+    this.removePidFile();
+  }
+  acquireLock() {
+    this.stateDir.ensure();
+    try {
+      const fd = openSync(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
+      writeFileSync(fd, `${process.pid}
+`);
+      closeSync(fd);
+      return true;
+    } catch (err) {
+      if (err.code === "EEXIST") {
+        try {
+          const holderPid = Number.parseInt(readFileSync(this.stateDir.lockFile, "utf-8").trim(), 10);
+          if (Number.isFinite(holderPid) && !isProcessAlive(holderPid)) {
+            this.log(`Stale lock file from dead process ${holderPid}, removing`);
+            this.releaseLock();
+            return this.acquireLock();
+          }
+        } catch {
+          this.log("Cannot read lock file, removing stale lock");
+          this.releaseLock();
+          return this.acquireLock();
+        }
+        return false;
+      }
+      this.log(`Warning: could not acquire startup lock: ${err.message}`);
+      return true;
+    }
+  }
+  releaseLock() {
+    try {
+      unlinkSync(this.stateDir.lockFile);
+    } catch {}
+  }
+  async kill(gracefulTimeoutMs = 3000) {
+    const pid = this.readPid();
+    if (!pid) {
+      this.log("No daemon pid file found");
+      this.cleanup();
+      return false;
+    }
+    if (!isProcessAlive(pid)) {
+      this.log(`Daemon pid ${pid} is not alive, cleaning up stale files`);
+      this.cleanup();
+      return false;
+    }
+    if (!this.isDaemonProcess(pid)) {
+      this.log(`Pid ${pid} is alive but is NOT an AgentBridge daemon \u2014 refusing to kill. Cleaning up stale pid file.`);
+      this.cleanup();
+      return false;
+    }
+    this.log(`Sending SIGTERM to daemon pid ${pid}`);
+    try {
+      process.kill(pid, "SIGTERM");
+    } catch {
+      this.cleanup();
+      return false;
+    }
+    const deadline = Date.now() + gracefulTimeoutMs;
+    while (Date.now() < deadline) {
+      if (!isProcessAlive(pid)) {
+        this.log(`Daemon pid ${pid} stopped gracefully`);
+        this.cleanup();
+        return true;
+      }
+      await new Promise((resolve) => setTimeout(resolve, 200));
+    }
+    this.log(`Daemon pid ${pid} did not stop gracefully, sending SIGKILL`);
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {}
+    this.cleanup();
+    return true;
+  }
+  isDaemonProcess(pid) {
+    try {
+      const cmd = execSync2(`ps -p ${pid} -o command=`, { encoding: "utf-8" }).trim();
+      return cmd.includes("daemon") && (cmd.includes("agentbridge") || cmd.includes("agent_bridge"));
+    } catch {
+      return false;
+    }
+  }
+  cleanup() {
+    this.removePidFile();
+    this.removeStatusFile();
+    this.releaseLock();
+  }
+}
+function isProcessAlive(pid) {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+// src/state-dir.ts
+import { mkdirSync, existsSync as existsSync2 } from "fs";
+import { join } from "path";
+import { homedir, platform } from "os";
+
+class StateDirResolver {
+  stateDir;
+  constructor(envOverride) {
+    const override = envOverride ?? process.env.AGENTBRIDGE_STATE_DIR;
+    if (override) {
+      this.stateDir = override;
+    } else if (platform() === "darwin") {
+      this.stateDir = join(homedir(), "Library", "Application Support", "AgentBridge");
+    } else {
+      const xdgState = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
+      this.stateDir = join(xdgState, "agentbridge");
+    }
+  }
+  ensure() {
+    if (!existsSync2(this.stateDir)) {
+      mkdirSync(this.stateDir, { recursive: true });
+    }
+  }
+  get dir() {
+    return this.stateDir;
+  }
+  get pidFile() {
+    return join(this.stateDir, "daemon.pid");
+  }
+  get lockFile() {
+    return join(this.stateDir, "daemon.lock");
+  }
+  get statusFile() {
+    return join(this.stateDir, "status.json");
+  }
+  get portsFile() {
+    return join(this.stateDir, "ports.json");
+  }
+  get logFile() {
+    return join(this.stateDir, "agentbridge.log");
+  }
+  get killedFile() {
+    return join(this.stateDir, "killed");
+  }
+}
+
+// src/config-service.ts
+import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync3 } from "fs";
+import { join as join2 } from "path";
+var DEFAULT_CONFIG = {
+  version: "1.0",
+  daemon: {
+    port: 4500,
+    proxyPort: 4501
+  },
+  agents: {
+    claude: {
+      role: "Reviewer, Planner",
+      mode: "push"
+    },
+    codex: {
+      role: "Implementer, Executor"
+    }
+  },
+  markers: ["IMPORTANT", "STATUS", "FYI"],
+  turnCoordination: {
+    attentionWindowSeconds: 15,
+    busyGuard: true
+  },
+  idleShutdownSeconds: 30
+};
+var DEFAULT_COLLABORATION_MD = `# Collaboration Rules
+
+## Roles
+- Claude: Reviewer, Planner, Hypothesis Challenger
+- Codex: Implementer, Executor, Reproducer/Verifier
+
+## Thinking Patterns
+- Analytical/review tasks: Independent Analysis & Convergence
+- Implementation tasks: Architect -> Builder -> Critic
+- Debugging tasks: Hypothesis -> Experiment -> Interpretation
+
+## Communication
+- Use explicit phrases: "My independent view is:", "I agree on:", "I disagree on:", "Current consensus:"
+- Tag messages with [IMPORTANT], [STATUS], or [FYI]
+
+## Review Process
+- Cross-review: author never reviews their own code
+- All changes go through feature/fix branches + PR
+- Merge via squash merge
+
+## Custom Rules
+<!-- Add your project-specific collaboration rules here -->
+`;
+var CONFIG_DIR = ".agentbridge";
+var CONFIG_FILE = "config.json";
+var COLLABORATION_FILE = "collaboration.md";
+
+class ConfigService {
+  configDir;
+  configPath;
+  collaborationPath;
+  constructor(projectRoot) {
+    const root = projectRoot ?? process.cwd();
+    this.configDir = join2(root, CONFIG_DIR);
+    this.configPath = join2(this.configDir, CONFIG_FILE);
+    this.collaborationPath = join2(this.configDir, COLLABORATION_FILE);
+  }
+  hasConfig() {
+    return existsSync3(this.configPath);
+  }
+  load() {
+    try {
+      const raw = readFileSync2(this.configPath, "utf-8");
+      return JSON.parse(raw);
+    } catch {
+      return null;
+    }
+  }
+  loadOrDefault() {
+    return this.load() ?? { ...DEFAULT_CONFIG };
+  }
+  save(config) {
+    this.ensureConfigDir();
+    writeFileSync2(this.configPath, JSON.stringify(config, null, 2) + `
+`, "utf-8");
+  }
+  loadCollaboration() {
+    try {
+      return readFileSync2(this.collaborationPath, "utf-8");
+    } catch {
+      return null;
+    }
+  }
+  saveCollaboration(content) {
+    this.ensureConfigDir();
+    writeFileSync2(this.collaborationPath, content, "utf-8");
+  }
+  initDefaults() {
+    this.ensureConfigDir();
+    const created = [];
+    if (!existsSync3(this.configPath)) {
+      this.save(DEFAULT_CONFIG);
+      created.push(this.configPath);
+    }
+    if (!existsSync3(this.collaborationPath)) {
+      this.saveCollaboration(DEFAULT_COLLABORATION_MD);
+      created.push(this.collaborationPath);
+    }
+    return created;
+  }
+  get configFilePath() {
+    return this.configPath;
+  }
+  get collaborationFilePath() {
+    return this.collaborationPath;
+  }
+  ensureConfigDir() {
+    if (!existsSync3(this.configDir)) {
+      mkdirSync2(this.configDir, { recursive: true });
+    }
+  }
+}
+
 // src/daemon.ts
-var CODEX_APP_PORT = parseInt(process.env.CODEX_WS_PORT ?? "4500", 10);
-var CODEX_PROXY_PORT = parseInt(process.env.CODEX_PROXY_PORT ?? "4501", 10);
+var stateDir = new StateDirResolver;
+stateDir.ensure();
+var configService = new ConfigService;
+var config = configService.loadOrDefault();
+var CODEX_APP_PORT = parseInt(process.env.CODEX_WS_PORT ?? String(config.daemon.port), 10);
+var CODEX_PROXY_PORT = parseInt(process.env.CODEX_PROXY_PORT ?? String(config.daemon.proxyPort), 10);
 var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
-var PID_FILE = process.env.AGENTBRIDGE_PID_FILE ?? `/tmp/agentbridge-daemon-${CONTROL_PORT}.pid`;
-var LOG_FILE2 = "/tmp/agentbridge.log";
 var TUI_DISCONNECT_GRACE_MS = parseInt(process.env.TUI_DISCONNECT_GRACE_MS ?? "2500", 10);
 var MAX_BUFFERED_MESSAGES = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
 var FILTER_MODE = process.env.AGENTBRIDGE_FILTER_MODE === "full" ? "full" : "filtered";
-var IDLE_SHUTDOWN_MS = parseInt(process.env.AGENTBRIDGE_IDLE_SHUTDOWN_MS ?? "30000", 10);
-var ATTENTION_WINDOW_MS = parseInt(process.env.AGENTBRIDGE_ATTENTION_WINDOW_MS ?? "15000", 10);
+var IDLE_SHUTDOWN_MS = parseInt(process.env.AGENTBRIDGE_IDLE_SHUTDOWN_MS ?? String(config.idleShutdownSeconds * 1000), 10);
+var ATTENTION_WINDOW_MS = parseInt(process.env.AGENTBRIDGE_ATTENTION_WINDOW_MS ?? String(config.turnCoordination.attentionWindowSeconds * 1000), 10);
+var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 var codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT);
 var attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
 var controlServer = null;
@@ -825,6 +1233,8 @@ var nextSystemMessageId = 0;
 var codexBootstrapped = false;
 var attentionWindowTimer = null;
 var inAttentionWindow = false;
+var replyRequired = false;
+var replyReceivedDuringTurn = false;
 var shuttingDown = false;
 var idleShutdownTimer = null;
 var bufferedMessages = [];
@@ -848,6 +1258,15 @@ codex.on("agentMessage", (msg) => {
   if (msg.source !== "codex")
     return;
   const result = classifyMessage(msg.content, FILTER_MODE);
+  if (replyRequired) {
+    log(`Codex \u2192 Claude [${result.marker}/force-forward-reply-required] (${msg.content.length} chars)`);
+    replyReceivedDuringTurn = true;
+    if (statusBuffer.size > 0) {
+      statusBuffer.flush("reply-required message arrived");
+    }
+    emitToClaude(msg);
+    return;
+  }
   if (inAttentionWindow && result.marker === "status") {
     log(`Codex \u2192 Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
     statusBuffer.add(msg);
@@ -874,6 +1293,12 @@ codex.on("agentMessage", (msg) => {
 codex.on("turnCompleted", () => {
   log("Codex turn completed");
   statusBuffer.flush("turn completed");
+  if (replyRequired && !replyReceivedDuringTurn) {
+    log("\u26A0\uFE0F Reply was required but Codex did not send any agentMessage");
+    emitToClaude(systemMessage("system_reply_missing", "\u26A0\uFE0F Codex completed the turn without sending a reply (require_reply was set). Codex may not have generated an agentMessage. You may want to retry or rephrase."));
+  }
+  replyRequired = false;
+  replyReceivedDuringTurn = false;
   emitToClaude(systemMessage("system_turn_completed", "\u2705 Codex finished the current turn. You can reply now if needed."));
   startAttentionWindow();
 });
@@ -977,10 +1402,17 @@ function handleControlMessage(ws, raw) {
         });
         return;
       }
-      const contentWithReminder = message.message.content + `
+      const requireReply = !!message.requireReply;
+      let contentWithReminder = message.message.content + `
 
 ` + BRIDGE_CONTRACT_REMINDER;
-      log(`Forwarding Claude \u2192 Codex (${message.message.content.length} chars)`);
+      if (requireReply) {
+        contentWithReminder += REPLY_REQUIRED_INSTRUCTION;
+        replyRequired = true;
+        replyReceivedDuringTurn = false;
+        log(`Reply required flag set for this message`);
+      }
+      log(`Forwarding Claude \u2192 Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
       const injected = codex.injectMessage(contentWithReminder);
       if (!injected) {
         const reason = codex.turnInProgress ? "Codex is busy executing a turn. Wait for it to finish before sending another message." : "Injection failed: no active thread or WebSocket not connected.";
@@ -1166,13 +1598,21 @@ function systemMessage(idPrefix, content) {
   };
 }
 function writePidFile() {
-  writeFileSync(PID_FILE, `${process.pid}
-`, "utf-8");
+  daemonLifecycle.writePid();
 }
 function removePidFile() {
-  try {
-    unlinkSync(PID_FILE);
-  } catch {}
+  daemonLifecycle.removePidFile();
+}
+function writeStatusFile() {
+  daemonLifecycle.writeStatus({
+    proxyUrl: codex.proxyUrl,
+    appServerUrl: codex.appServerUrl,
+    controlPort: CONTROL_PORT,
+    pid: process.pid
+  });
+}
+function removeStatusFile() {
+  daemonLifecycle.removeStatusFile();
 }
 async function bootCodex() {
   log("Starting AgentBridge daemon...");
@@ -1182,6 +1622,7 @@ async function bootCodex() {
   try {
     await codex.start();
     codexBootstrapped = true;
+    writeStatusFile();
     emitToClaude(systemMessage("system_waiting", currentWaitingMessage()));
     broadcastStatus();
   } catch (err) {
@@ -1200,11 +1641,15 @@ function shutdown(reason) {
   controlServer = null;
   codex.stop();
   removePidFile();
+  removeStatusFile();
   process.exit(0);
 }
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("exit", () => removePidFile());
+process.on("exit", () => {
+  removePidFile();
+  removeStatusFile();
+});
 process.on("uncaughtException", (err) => {
   log(`UNCAUGHT EXCEPTION: ${err.stack ?? err.message}`);
 });
@@ -1216,8 +1661,12 @@ function log(msg) {
 `;
   process.stderr.write(line);
   try {
-    appendFileSync2(LOG_FILE2, line);
+    appendFileSync2(stateDir.logFile, line);
   } catch {}
+}
+if (daemonLifecycle.wasKilled()) {
+  log("Killed sentinel found \u2014 daemon was intentionally stopped. Exiting immediately.");
+  process.exit(0);
 }
 writePidFile();
 startControlServer();

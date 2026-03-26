@@ -35,6 +35,13 @@ describe("role-aware collaboration guidance", () => {
     expect(BRIDGE_CONTRACT_REMINDER).toContain("MUST be the first text");
   });
 
+  test("bridge contract reminder forbids git write operations", () => {
+    expect(BRIDGE_CONTRACT_REMINDER).toContain("Git Operations — FORBIDDEN");
+    expect(BRIDGE_CONTRACT_REMINDER).toContain("MUST NOT execute any git write commands");
+    expect(BRIDGE_CONTRACT_REMINDER).toContain("hang indefinitely");
+    expect(BRIDGE_CONTRACT_REMINDER).toContain("delegated to Claude Code");
+  });
+
   test("CLAUDE_INSTRUCTIONS is wired into MCP Server", () => {
     const adapter = new ClaudeAdapter() as any;
     // Verify the exported constant is actually passed to the Server constructor
