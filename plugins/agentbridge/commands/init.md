@@ -8,7 +8,7 @@ Bootstrap or update AgentBridge's project-local configuration in this workspace.
 Follow these rules:
 
 1. Work only inside `.agentbridge/`.
-2. Do not install plugins or modify `.claude/settings.json` here. Terminal `agentbridge init` handles plugin installation and marketplace setup.
+2. Do not install plugins or modify `.claude/settings.json` here. Plugin setup belongs to terminal workflows: `agentbridge init` attempts best-effort plugin installation, and `agentbridge dev` handles local marketplace registration/sync.
 3. Preserve user edits when the files already exist. Update only the fields the user asked to change.
 4. Keep `.agentbridge/config.json` valid JSON.
 5. Keep `.agentbridge/collaboration.md` human-editable and concise.
@@ -61,6 +61,7 @@ If `.agentbridge/collaboration.md` is missing, create it with this default templ
 ## Review Process
 - Cross-review: author never reviews their own code
 - All changes go through feature/fix branches + PR
+- Merge via squash merge
 
 ## Custom Rules
 <!-- Add project-specific collaboration rules here -->
