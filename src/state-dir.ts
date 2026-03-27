@@ -9,7 +9,7 @@ import { homedir, platform } from "node:os";
  * Linux:  ${XDG_STATE_HOME:-~/.local/state}/agentbridge
  * Override: AGENTBRIDGE_STATE_DIR env var
  *
- * This directory stores daemon pid, lock, status, ports, and logs.
+ * This directory stores daemon pid, managed TUI pid, lock, status, ports, and logs.
  * It is NOT for project-level config (that lives in .agentbridge/).
  */
 export class StateDirResolver {
@@ -40,6 +40,10 @@ export class StateDirResolver {
 
   get pidFile(): string {
     return join(this.stateDir, "daemon.pid");
+  }
+
+  get tuiPidFile(): string {
+    return join(this.stateDir, "codex-tui.pid");
   }
 
   get lockFile(): string {

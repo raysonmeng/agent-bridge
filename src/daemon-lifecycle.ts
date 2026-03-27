@@ -33,16 +33,18 @@ export class DaemonLifecycle {
     return `http://127.0.0.1:${this.controlPort}/healthz`;
   }
 
+  get readyUrl(): string {
+    return `http://127.0.0.1:${this.controlPort}/readyz`;
+  }
+
   get controlWsUrl(): string {
     return `ws://127.0.0.1:${this.controlPort}/ws`;
   }
 
   /** Ensure daemon is running: check health, check pid, start if needed. */
   async ensureRunning(): Promise<void> {
-    // Clear killed sentinel — user is explicitly starting the daemon
-    this.clearKilled();
-
     if (await this.isHealthy()) {
+      await this.waitForReady();
       return;
     }
 
@@ -52,11 +54,11 @@ export class DaemonLifecycle {
         // Verify the live process is actually our daemon, not an OS-reused PID
         if (this.isDaemonProcess(existingPid)) {
           try {
-            await this.waitForHealthy(12, 250);
+            await this.waitForReady(12, 250);
             return;
           } catch {
             throw new Error(
-              `Found existing daemon process ${existingPid}, but control port ${this.controlPort} never became healthy.`,
+              `Found existing daemon process ${existingPid}, but control port ${this.controlPort} never became ready.`,
             );
           }
         }
@@ -70,14 +72,14 @@ export class DaemonLifecycle {
     const lockAcquired = this.acquireLock();
     if (!lockAcquired) {
       // Another process is launching the daemon — wait for it
-      this.log("Another process is starting the daemon, waiting for health...");
-      await this.waitForHealthy();
+      this.log("Another process is starting the daemon, waiting for readiness...");
+      await this.waitForReady();
       return;
     }
 
     try {
       this.launch();
-      await this.waitForHealthy();
+      await this.waitForReady();
     } finally {
       this.releaseLock();
     }
@@ -100,6 +102,25 @@ export class DaemonLifecycle {
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
     throw new Error(`Timed out waiting for AgentBridge daemon health on ${this.healthUrl}`);
+  }
+
+  /** Check if daemon is ready to accept Codex TUI connections. */
+  async isReady(): Promise<boolean> {
+    try {
+      const response = await fetch(this.readyUrl);
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+
+  /** Wait for daemon to become ready. */
+  async waitForReady(maxRetries = 40, delayMs = 250): Promise<void> {
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      if (await this.isReady()) return;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    throw new Error(`Timed out waiting for AgentBridge daemon readiness on ${this.readyUrl}`);
   }
 
   /** Read daemon status from status.json. */
