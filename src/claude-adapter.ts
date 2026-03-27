@@ -19,6 +19,7 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { EventEmitter } from "node:events";
+import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
 import type { BridgeMessage } from "./types";
 
@@ -65,6 +66,7 @@ export class ClaudeAdapter extends EventEmitter {
   private server: Server;
   private notificationSeq = 0;
   private sessionId: string;
+  private readonly notificationIdPrefix: string;
   private replySender: ReplySender | null = null;
 
   // Dual-mode transport
@@ -77,6 +79,7 @@ export class ClaudeAdapter extends EventEmitter {
   constructor() {
     super();
     this.sessionId = `codex_${Date.now()}`;
+    this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 12);
 
     const envMode = process.env.AGENTBRIDGE_MODE as DeliveryMode | undefined;
     this.configuredMode = envMode && ["push", "pull", "auto"].includes(envMode) ? envMode : "auto";
@@ -151,7 +154,7 @@ export class ClaudeAdapter extends EventEmitter {
   }
 
   private async pushViaChannel(message: BridgeMessage) {
-    const msgId = `codex_msg_${++this.notificationSeq}`;
+    const msgId = `codex_msg_${this.notificationIdPrefix}_${++this.notificationSeq}`;
     const ts = new Date(message.timestamp).toISOString();
 
     try {
