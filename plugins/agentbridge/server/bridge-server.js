@@ -13663,32 +13663,37 @@ class StdioServerTransport {
 import { EventEmitter } from "events";
 import { appendFileSync } from "fs";
 var CLAUDE_INSTRUCTIONS = [
-  "AgentBridge connects this Claude Code session to Codex, an AI coding agent running in a separate local session on the same machine.",
+  "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
   "",
-  "## Delivery paths",
-  "- Primary path: push delivery via notifications/claude/channel.",
-  '- In push mode, Codex messages arrive as <channel source="agentbridge" chat_id="..." user="Codex" user_id="codex" ts="..." message_id="..." source_type="codex">...</channel> tags.',
-  "- Fallback path: pull delivery via the get_messages tool when this session is operating without channel delivery.",
+  "## Message delivery",
+  "Messages from Codex may arrive in two ways depending on the connection mode:",
+  '- As <channel source="agentbridge" chat_id="..." user="Codex" ...> tags (push mode)',
+  "- Via the get_messages tool (pull mode)",
   "",
-  "## Reply protocol",
-  "- Use the reply tool to send a message back to Codex as a new user turn.",
-  "- When an inbound channel tag includes chat_id, pass the same chat_id back to the reply tool.",
-  "- The reply tool is the only supported Claude -> Codex messaging path inside this session.",
+  "## Collaboration roles",
+  "Default roles in this setup:",
+  "- Claude: Reviewer, Planner, Hypothesis Challenger",
+  "- Codex: Implementer, Executor, Reproducer/Verifier",
+  "- Expect Codex to provide independent technical judgment and evidence, not passive agreement.",
   "",
-  "## Pull fallback",
-  "- Use get_messages when push-delivered channel tags are unavailable, when you need to poll for queued Codex messages, or after replying in pull-mode workflows.",
-  "- Do not treat get_messages as the primary loop when push-delivered channel tags are arriving normally.",
+  "## Thinking patterns (task-driven)",
+  "- Analytical/review tasks: Independent Analysis & Convergence",
+  "- Implementation tasks: Architect -> Builder -> Critic",
+  "- Debugging tasks: Hypothesis -> Experiment -> Interpretation",
   "",
-  "## Agent message markers",
-  "- Codex agent messages may begin with a literal marker at the very start of the text.",
-  "- [IMPORTANT] = decisions, reviews, completions, blockers.",
-  "- [STATUS] = progress updates; these may be buffered or summarized by AgentBridge.",
-  "- [FYI] = background context; these may be filtered in default mode.",
+  "## Collaboration language",
+  '- Use explicit phrases such as "My independent view is:", "I agree on:", "I disagree on:", and "Current consensus:".',
+  "",
+  "## How to interact",
+  "- Use the reply tool to send messages back to Codex \u2014 pass chat_id back.",
+  "- Use the get_messages tool to check for pending messages from Codex.",
+  "- After sending a reply, call get_messages to check for responses.",
+  "- When the user asks about Codex status or progress, call get_messages.",
   "",
   "## Turn coordination",
-  "- When you see '\u23F3 Codex is working', do NOT call the reply tool.",
-  "- Wait for '\u2705 Codex finished' before replying, or until Codex explicitly asks for input.",
-  "- If the reply tool returns a busy error, Codex is still executing a turn. Wait and try again later."
+  "- When you see '\u23F3 Codex is working', do NOT call the reply tool \u2014 wait for '\u2705 Codex finished'.",
+  "- After Codex finishes a turn, you have an attention window to review and respond before new messages arrive.",
+  "- If the reply tool returns a busy error, Codex is still executing \u2014 wait and try again later."
 ].join(`
 `);
 var LOG_FILE = "/tmp/agentbridge.log";
@@ -13921,10 +13926,12 @@ ${formatted}`
 
 // src/daemon-client.ts
 import { EventEmitter as EventEmitter2 } from "events";
+var nextSocketId = 0;
 
 class DaemonClient extends EventEmitter2 {
   url;
   ws = null;
+  wsId = 0;
   nextRequestId = 1;
   pendingReplies = new Map;
   constructor(url) {
@@ -13932,15 +13939,28 @@ class DaemonClient extends EventEmitter2 {
     this.url = url;
   }
   async connect() {
-    if (this.ws?.readyState === WebSocket.OPEN)
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.log(`connect() skipped \u2014 ws#${this.wsId} already OPEN`);
       return;
+    }
+    if (this.ws) {
+      const state = this.ws.readyState;
+      this.log(`connect() closing lingering ws#${this.wsId} (readyState=${state})`);
+      try {
+        this.ws.close();
+      } catch {}
+      this.ws = null;
+    }
+    const socketId = ++nextSocketId;
     await new Promise((resolve, reject) => {
       const ws = new WebSocket(this.url);
       let settled = false;
       ws.onopen = () => {
         settled = true;
         this.ws = ws;
-        this.attachSocketHandlers(ws);
+        this.wsId = socketId;
+        this.attachSocketHandlers(ws, socketId);
+        this.log(`ws#${socketId} opened and attached`);
         resolve();
       };
       ws.onerror = () => {
@@ -13991,7 +14011,7 @@ class DaemonClient extends EventEmitter2 {
       });
     });
   }
-  attachSocketHandlers(ws) {
+  attachSocketHandlers(ws, socketId) {
     ws.onmessage = (event) => {
       const raw = typeof event.data === "string" ? event.data : event.data.toString();
       let message;
@@ -14018,12 +14038,14 @@ class DaemonClient extends EventEmitter2 {
           return;
       }
     };
-    ws.onclose = () => {
-      if (this.ws === ws) {
+    ws.onclose = (event) => {
+      const isCurrent = this.ws === ws;
+      this.log(`ws#${socketId} onclose (code=${event.code}, reason=${event.reason || "none"}, isCurrent=${isCurrent}, currentWsId=${this.wsId})`);
+      if (isCurrent) {
         this.ws = null;
+        this.rejectPendingReplies("AgentBridge daemon disconnected.");
+        this.emit("disconnect");
       }
-      this.rejectPendingReplies("AgentBridge daemon disconnected.");
-      this.emit("disconnect");
     };
     ws.onerror = () => {};
   }
@@ -14040,10 +14062,14 @@ class DaemonClient extends EventEmitter2 {
     }
     this.ws.send(JSON.stringify(message));
   }
+  log(msg) {
+    process.stderr.write(`[${new Date().toISOString()}] [DaemonClient] ${msg}
+`);
+  }
 }
 
 // src/daemon-lifecycle.ts
-import { spawn, execSync } from "child_process";
+import { spawn, execFileSync } from "child_process";
 import { existsSync, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
 var DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY ?? "./daemon.ts";
@@ -14061,12 +14087,15 @@ class DaemonLifecycle {
   get healthUrl() {
     return `http://127.0.0.1:${this.controlPort}/healthz`;
   }
+  get readyUrl() {
+    return `http://127.0.0.1:${this.controlPort}/readyz`;
+  }
   get controlWsUrl() {
     return `ws://127.0.0.1:${this.controlPort}/ws`;
   }
   async ensureRunning() {
-    this.clearKilled();
     if (await this.isHealthy()) {
+      await this.waitForReady();
       return;
     }
     const existingPid = this.readPid();
@@ -14074,10 +14103,10 @@ class DaemonLifecycle {
       if (isProcessAlive(existingPid)) {
         if (this.isDaemonProcess(existingPid)) {
           try {
-            await this.waitForHealthy(12, 250);
+            await this.waitForReady(12, 250);
             return;
           } catch {
-            throw new Error(`Found existing daemon process ${existingPid}, but control port ${this.controlPort} never became healthy.`);
+            throw new Error(`Found existing daemon process ${existingPid}, but control port ${this.controlPort} never became ready.`);
           }
         }
         this.log(`Pid ${existingPid} is alive but not an AgentBridge daemon, removing stale pid file`);
@@ -14086,13 +14115,13 @@ class DaemonLifecycle {
     }
     const lockAcquired = this.acquireLock();
     if (!lockAcquired) {
-      this.log("Another process is starting the daemon, waiting for health...");
-      await this.waitForHealthy();
+      this.log("Another process is starting the daemon, waiting for readiness...");
+      await this.waitForReady();
       return;
     }
     try {
       this.launch();
-      await this.waitForHealthy();
+      await this.waitForReady();
     } finally {
       this.releaseLock();
     }
@@ -14112,6 +14141,22 @@ class DaemonLifecycle {
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
     throw new Error(`Timed out waiting for AgentBridge daemon health on ${this.healthUrl}`);
+  }
+  async isReady() {
+    try {
+      const response = await fetch(this.readyUrl);
+      return response.ok;
+    } catch {
+      return false;
+    }
+  }
+  async waitForReady(maxRetries = 40, delayMs = 250) {
+    for (let attempt = 0;attempt < maxRetries; attempt++) {
+      if (await this.isReady())
+        return;
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+    throw new Error(`Timed out waiting for AgentBridge daemon readiness on ${this.readyUrl}`);
   }
   readStatus() {
     try {
@@ -14184,7 +14229,11 @@ class DaemonLifecycle {
     this.log("Removing stale pid file");
     this.removePidFile();
   }
-  acquireLock() {
+  acquireLock(depth = 0) {
+    if (depth > 1) {
+      this.log("Lock acquisition failed after retry, proceeding without lock");
+      return true;
+    }
     this.stateDir.ensure();
     try {
       const fd = openSync(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
@@ -14199,12 +14248,12 @@ class DaemonLifecycle {
           if (Number.isFinite(holderPid) && !isProcessAlive(holderPid)) {
             this.log(`Stale lock file from dead process ${holderPid}, removing`);
             this.releaseLock();
-            return this.acquireLock();
+            return this.acquireLock(depth + 1);
           }
         } catch {
           this.log("Cannot read lock file, removing stale lock");
           this.releaseLock();
-          return this.acquireLock();
+          return this.acquireLock(depth + 1);
         }
         return false;
       }
@@ -14259,7 +14308,7 @@ class DaemonLifecycle {
   }
   isDaemonProcess(pid) {
     try {
-      const cmd = execSync(`ps -p ${pid} -o command=`, { encoding: "utf-8" }).trim();
+      const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
       return cmd.includes("daemon") && (cmd.includes("agentbridge") || cmd.includes("agent_bridge"));
     } catch {
       return false;
@@ -14308,6 +14357,9 @@ class StateDirResolver {
   }
   get pidFile() {
     return join(this.stateDir, "daemon.pid");
+  }
+  get tuiPidFile() {
+    return join(this.stateDir, "codex-tui.pid");
   }
   get lockFile() {
     return join(this.stateDir, "daemon.lock");
@@ -14400,7 +14452,7 @@ class ConfigService {
     }
   }
   loadOrDefault() {
-    return this.load() ?? { ...DEFAULT_CONFIG };
+    return this.load() ?? structuredClone(DEFAULT_CONFIG);
   }
   save(config2) {
     this.ensureConfigDir();
@@ -14454,9 +14506,19 @@ var CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 var claude = new ClaudeAdapter;
 var daemonClient = new DaemonClient(CONTROL_WS_URL);
 var shuttingDown = false;
+var daemonDisabled = false;
+var RECONNECT_NOTIFY_COOLDOWN_MS = 30000;
+var lastDisconnectNotifyTs = 0;
+var lastReconnectNotifyTs = 0;
 claude.setReplySender(async (msg, requireReply) => {
   if (msg.source !== "claude") {
     return { success: false, error: "Invalid message source" };
+  }
+  if (daemonDisabled) {
+    return {
+      success: false,
+      error: "AgentBridge is disabled by `agentbridge kill`. Restart Claude Code (`agentbridge claude`) to reconnect."
+    };
   }
   return daemonClient.sendReply(msg, requireReply);
 });
@@ -14468,17 +14530,31 @@ daemonClient.on("status", (status) => {
   log(`Daemon status: ready=${status.bridgeReady} tui=${status.tuiConnected} thread=${status.threadId ?? "none"} queued=${status.queuedMessageCount}`);
 });
 daemonClient.on("disconnect", () => {
-  if (shuttingDown)
+  if (shuttingDown || daemonDisabled)
     return;
   log("Daemon control connection closed \u2014 will attempt to reconnect");
-  claude.pushNotification(systemMessage("system_daemon_disconnected", "\u26A0\uFE0F AgentBridge daemon control connection lost. Attempting to reconnect..."));
+  const now = Date.now();
+  if (now - lastDisconnectNotifyTs >= RECONNECT_NOTIFY_COOLDOWN_MS) {
+    lastDisconnectNotifyTs = now;
+    claude.pushNotification(systemMessage("system_daemon_disconnected", "\u26A0\uFE0F AgentBridge daemon control connection lost. Attempting to reconnect..."));
+  } else {
+    log("Suppressing duplicate disconnect notification (within cooldown)");
+  }
   reconnectToDaemon();
 });
 claude.on("ready", async () => {
   log(`MCP server ready (delivery mode: ${claude.getDeliveryMode()}) \u2014 ensuring AgentBridge daemon...`);
+  if (daemonLifecycle.wasKilled()) {
+    await enterDisabledState("Killed sentinel found \u2014 bridge staying idle", "\u26D4 AgentBridge was stopped by `agentbridge kill`. Bridge is staying idle. Restart Claude Code (`agentbridge claude`) to reconnect.");
+    return;
+  }
   await connectToDaemon();
 });
 async function connectToDaemon(isReconnect = false) {
+  if (daemonDisabled) {
+    log("connectToDaemon() skipped \u2014 bridge is disabled");
+    return;
+  }
   try {
     await daemonLifecycle.ensureRunning();
     await daemonClient.connect();
@@ -14492,29 +14568,63 @@ async function connectToDaemon(isReconnect = false) {
     throw err;
   }
 }
+async function enterDisabledState(logMessage, notificationContent) {
+  if (daemonDisabled)
+    return;
+  daemonDisabled = true;
+  log(logMessage);
+  await claude.pushNotification(systemMessage("system_bridge_disabled", notificationContent));
+  await daemonClient.disconnect();
+}
 var MAX_RECONNECT_DELAY_MS = 30000;
-async function reconnectToDaemon(attempt = 0) {
-  if (shuttingDown)
-    return;
-  if (daemonLifecycle.wasKilled()) {
-    log("Daemon was intentionally killed by user (killed sentinel found) \u2014 not reconnecting");
-    claude.pushNotification(systemMessage("system_daemon_killed", "\u26D4 AgentBridge daemon was stopped by `agentbridge kill`. Run `agentbridge codex` to restart."));
-    return;
+var reconnectTask = null;
+async function notifyIfDaemonKilled(logMessage) {
+  if (!daemonLifecycle.wasKilled())
+    return false;
+  await enterDisabledState(logMessage, "\u26D4 AgentBridge was stopped by `agentbridge kill`. Bridge is staying idle. Restart Claude Code (`agentbridge claude`) to reconnect.");
+  return true;
+}
+function reconnectToDaemon() {
+  if (shuttingDown || daemonDisabled)
+    return Promise.resolve();
+  if (reconnectTask) {
+    log("Skipping reconnect \u2014 another reconnect is already in progress");
+    return reconnectTask;
   }
-  const delayMs = Math.min(1000 * 2 ** attempt, MAX_RECONNECT_DELAY_MS);
-  if (attempt > 0) {
-    log(`Reconnect attempt ${attempt + 1}, waiting ${delayMs}ms...`);
-  }
-  await new Promise((resolve) => setTimeout(resolve, delayMs));
-  if (shuttingDown)
-    return;
-  try {
-    await connectToDaemon(true);
-    log("Reconnected to AgentBridge daemon successfully");
-    claude.pushNotification(systemMessage("system_daemon_reconnected", "\u2705 AgentBridge daemon reconnected successfully."));
-  } catch {
-    reconnectToDaemon(attempt + 1);
-  }
+  reconnectTask = (async () => {
+    try {
+      for (let attempt = 0;!shuttingDown; attempt += 1) {
+        if (await notifyIfDaemonKilled("Daemon was intentionally killed by user (killed sentinel found) \u2014 not reconnecting")) {
+          return;
+        }
+        const delayMs = Math.min(1000 * 2 ** attempt, MAX_RECONNECT_DELAY_MS);
+        if (attempt > 0) {
+          log(`Reconnect attempt ${attempt + 1}, waiting ${delayMs}ms...`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        if (shuttingDown)
+          return;
+        if (await notifyIfDaemonKilled("Daemon was intentionally killed during reconnect backoff \u2014 not reconnecting")) {
+          return;
+        }
+        try {
+          await connectToDaemon(true);
+          log("Reconnected to AgentBridge daemon successfully");
+          const now = Date.now();
+          if (now - lastReconnectNotifyTs >= RECONNECT_NOTIFY_COOLDOWN_MS) {
+            lastReconnectNotifyTs = now;
+            claude.pushNotification(systemMessage("system_daemon_reconnected", "\u2705 AgentBridge daemon reconnected successfully."));
+          } else {
+            log("Suppressing duplicate reconnect notification (within cooldown)");
+          }
+          return;
+        } catch {}
+      }
+    } finally {
+      reconnectTask = null;
+    }
+  })();
+  return reconnectTask;
 }
 function systemMessage(idPrefix, content) {
   return {
