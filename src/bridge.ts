@@ -24,8 +24,11 @@ let daemonDisabled = false;
 
 // --- Notification throttling for reconnect loops ---
 const RECONNECT_NOTIFY_COOLDOWN_MS = 30_000; // Only notify once per 30s window
+const DISABLED_RECOVERY_INTERVAL_MS = 5_000;
 let lastDisconnectNotifyTs = 0;
 let lastReconnectNotifyTs = 0;
+let disabledRecoveryTimer: ReturnType<typeof setInterval> | null = null;
+let disabledRecoveryInFlight = false;
 
 claude.setReplySender(async (msg: BridgeMessage, requireReply?: boolean) => {
   if (msg.source !== "claude") {
@@ -118,6 +121,7 @@ async function enterDisabledState(logMessage: string, notificationContent: strin
   log(logMessage);
   await claude.pushNotification(systemMessage("system_bridge_disabled", notificationContent));
   await daemonClient.disconnect();
+  startDisabledRecoveryPoller();
 }
 
 const MAX_RECONNECT_DELAY_MS = 30_000;
@@ -189,6 +193,59 @@ function reconnectToDaemon(): Promise<void> {
   return reconnectTask;
 }
 
+function startDisabledRecoveryPoller() {
+  if (disabledRecoveryTimer || shuttingDown) return;
+
+  log(`Starting disabled-state recovery poller (${DISABLED_RECOVERY_INTERVAL_MS}ms)`);
+  disabledRecoveryTimer = setInterval(() => {
+    void pollDisabledRecovery();
+  }, DISABLED_RECOVERY_INTERVAL_MS);
+}
+
+function stopDisabledRecoveryPoller() {
+  if (!disabledRecoveryTimer) return;
+
+  clearInterval(disabledRecoveryTimer);
+  disabledRecoveryTimer = null;
+  disabledRecoveryInFlight = false;
+  log("Stopped disabled-state recovery poller");
+}
+
+async function pollDisabledRecovery() {
+  if (!daemonDisabled || shuttingDown || disabledRecoveryInFlight) return;
+
+  disabledRecoveryInFlight = true;
+  try {
+    if (daemonLifecycle.wasKilled()) {
+      return;
+    }
+
+    const healthy = await daemonLifecycle.isHealthy();
+    if (!healthy) {
+      return;
+    }
+
+    log("Disabled-state recovery conditions met — attempting direct daemon reconnect");
+    try {
+      await daemonClient.connect();
+      daemonClient.attachClaude();
+      daemonDisabled = false;
+      stopDisabledRecoveryPoller();
+      void claude.pushNotification(systemMessage(
+        "system_bridge_recovered",
+        "✅ AgentBridge recovered after the killed sentinel was cleared. Daemon reconnected.",
+      ));
+    } catch (err: any) {
+      log(`Disabled-state direct reconnect failed: ${err.message}`);
+      daemonDisabled = false;
+      stopDisabledRecoveryPoller();
+      void reconnectToDaemon();
+    }
+  } finally {
+    disabledRecoveryInFlight = false;
+  }
+}
+
 function systemMessage(idPrefix: string, content: string): BridgeMessage {
   return {
     id: `${idPrefix}_${Date.now()}`,
@@ -202,6 +259,7 @@ function shutdown(reason: string) {
   if (shuttingDown) return;
   shuttingDown = true;
   log(`Shutting down Claude frontend (${reason})...`);
+  stopDisabledRecoveryPoller();
   const hardExit = setTimeout(() => {
     log("Shutdown timed out waiting for daemon disconnect; forcing exit");
     process.exit(0);

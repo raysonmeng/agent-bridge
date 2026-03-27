@@ -14508,8 +14508,11 @@ var daemonClient = new DaemonClient(CONTROL_WS_URL);
 var shuttingDown = false;
 var daemonDisabled = false;
 var RECONNECT_NOTIFY_COOLDOWN_MS = 30000;
+var DISABLED_RECOVERY_INTERVAL_MS = 5000;
 var lastDisconnectNotifyTs = 0;
 var lastReconnectNotifyTs = 0;
+var disabledRecoveryTimer = null;
+var disabledRecoveryInFlight = false;
 claude.setReplySender(async (msg, requireReply) => {
   if (msg.source !== "claude") {
     return { success: false, error: "Invalid message source" };
@@ -14517,7 +14520,7 @@ claude.setReplySender(async (msg, requireReply) => {
   if (daemonDisabled) {
     return {
       success: false,
-      error: "AgentBridge is disabled by `agentbridge kill`. Restart Claude Code (`agentbridge claude`) to reconnect."
+      error: "AgentBridge is disabled by `agentbridge kill`. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect."
     };
   }
   return daemonClient.sendReply(msg, requireReply);
@@ -14545,7 +14548,7 @@ daemonClient.on("disconnect", () => {
 claude.on("ready", async () => {
   log(`MCP server ready (delivery mode: ${claude.getDeliveryMode()}) \u2014 ensuring AgentBridge daemon...`);
   if (daemonLifecycle.wasKilled()) {
-    await enterDisabledState("Killed sentinel found \u2014 bridge staying idle", "\u26D4 AgentBridge was stopped by `agentbridge kill`. Bridge is staying idle. Restart Claude Code (`agentbridge claude`) to reconnect.");
+    await enterDisabledState("Killed sentinel found \u2014 bridge staying idle", "\u26D4 AgentBridge was stopped by `agentbridge kill`. Bridge is staying idle. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.");
     return;
   }
   await connectToDaemon();
@@ -14575,13 +14578,14 @@ async function enterDisabledState(logMessage, notificationContent) {
   log(logMessage);
   await claude.pushNotification(systemMessage("system_bridge_disabled", notificationContent));
   await daemonClient.disconnect();
+  startDisabledRecoveryPoller();
 }
 var MAX_RECONNECT_DELAY_MS = 30000;
 var reconnectTask = null;
 async function notifyIfDaemonKilled(logMessage) {
   if (!daemonLifecycle.wasKilled())
     return false;
-  await enterDisabledState(logMessage, "\u26D4 AgentBridge was stopped by `agentbridge kill`. Bridge is staying idle. Restart Claude Code (`agentbridge claude`) to reconnect.");
+  await enterDisabledState(logMessage, "\u26D4 AgentBridge was stopped by `agentbridge kill`. Bridge is staying idle. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.");
   return true;
 }
 function reconnectToDaemon() {
@@ -14626,6 +14630,51 @@ function reconnectToDaemon() {
   })();
   return reconnectTask;
 }
+function startDisabledRecoveryPoller() {
+  if (disabledRecoveryTimer || shuttingDown)
+    return;
+  log(`Starting disabled-state recovery poller (${DISABLED_RECOVERY_INTERVAL_MS}ms)`);
+  disabledRecoveryTimer = setInterval(() => {
+    pollDisabledRecovery();
+  }, DISABLED_RECOVERY_INTERVAL_MS);
+}
+function stopDisabledRecoveryPoller() {
+  if (!disabledRecoveryTimer)
+    return;
+  clearInterval(disabledRecoveryTimer);
+  disabledRecoveryTimer = null;
+  disabledRecoveryInFlight = false;
+  log("Stopped disabled-state recovery poller");
+}
+async function pollDisabledRecovery() {
+  if (!daemonDisabled || shuttingDown || disabledRecoveryInFlight)
+    return;
+  disabledRecoveryInFlight = true;
+  try {
+    if (daemonLifecycle.wasKilled()) {
+      return;
+    }
+    const healthy = await daemonLifecycle.isHealthy();
+    if (!healthy) {
+      return;
+    }
+    log("Disabled-state recovery conditions met \u2014 attempting direct daemon reconnect");
+    try {
+      await daemonClient.connect();
+      daemonClient.attachClaude();
+      daemonDisabled = false;
+      stopDisabledRecoveryPoller();
+      claude.pushNotification(systemMessage("system_bridge_recovered", "\u2705 AgentBridge recovered after the killed sentinel was cleared. Daemon reconnected."));
+    } catch (err) {
+      log(`Disabled-state direct reconnect failed: ${err.message}`);
+      daemonDisabled = false;
+      stopDisabledRecoveryPoller();
+      reconnectToDaemon();
+    }
+  } finally {
+    disabledRecoveryInFlight = false;
+  }
+}
 function systemMessage(idPrefix, content) {
   return {
     id: `${idPrefix}_${Date.now()}`,
@@ -14639,6 +14688,7 @@ function shutdown(reason) {
     return;
   shuttingDown = true;
   log(`Shutting down Claude frontend (${reason})...`);
+  stopDisabledRecoveryPoller();
   const hardExit = setTimeout(() => {
     log("Shutdown timed out waiting for daemon disconnect; forcing exit");
     process.exit(0);
