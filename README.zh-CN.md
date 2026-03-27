@@ -102,9 +102,9 @@ agentbridge codex
 | 命令 | 说明 |
 |------|------|
 | `agentbridge init` | 安装插件、检查依赖（bun/claude/codex）、生成 `.agentbridge/config.json` 和 `collaboration.md` |
-| `agentbridge claude [args...]` | 启动 Claude Code 并启用 push channel。额外参数透传给 `claude` |
-| `agentbridge codex [args...]` | 启动连接到 AgentBridge daemon 的 Codex TUI。额外参数透传给 `codex` |
-| `agentbridge kill` | 优雅停止 daemon，清理状态文件，写入 killed sentinel 阻止自动重连 |
+| `agentbridge claude [args...]` | 启动 Claude Code 并启用 push channel。自动清除之前 `kill` 留下的 sentinel。额外参数透传给 `claude` |
+| `agentbridge codex [args...]` | 启动连接到 AgentBridge daemon 的 Codex TUI。管理 TUI 进程生命周期（pid 跟踪、清理）。额外参数透传给 `codex` |
+| `agentbridge kill` | 优雅停止 daemon 和托管的 Codex TUI，清理状态文件，写入 killed sentinel |
 | `agentbridge dev` | （开发用）注册本地 marketplace + 强制同步插件到缓存 |
 | `agentbridge --help` | 显示帮助 |
 | `agentbridge --version` | 显示版本 |

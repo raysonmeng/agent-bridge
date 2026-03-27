@@ -102,9 +102,9 @@ After modifying AgentBridge source code, re-run `agentbridge dev` to sync change
 | Command | Description |
 |---------|-------------|
 | `agentbridge init` | Install plugin, check dependencies (bun/claude/codex), generate `.agentbridge/config.json` and `collaboration.md` |
-| `agentbridge claude [args...]` | Start Claude Code with push channel enabled. Pass-through args are forwarded to `claude` |
-| `agentbridge codex [args...]` | Start Codex TUI connected to AgentBridge daemon. Pass-through args forwarded to `codex` |
-| `agentbridge kill` | Gracefully stop daemon, clean up state files, write killed sentinel to prevent auto-reconnect |
+| `agentbridge claude [args...]` | Start Claude Code with push channel enabled. Clears any killed sentinel from a previous `kill`. Pass-through args are forwarded to `claude` |
+| `agentbridge codex [args...]` | Start Codex TUI connected to AgentBridge daemon. Manages TUI process lifecycle (pid tracking, cleanup). Pass-through args forwarded to `codex` |
+| `agentbridge kill` | Gracefully stop both daemon and managed Codex TUI, clean up state files, write killed sentinel |
 | `agentbridge dev` | (Dev only) Register local marketplace + force-sync plugin to cache |
 | `agentbridge --help` | Show help |
 | `agentbridge --version` | Show version |
