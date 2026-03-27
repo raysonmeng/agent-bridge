@@ -20,6 +20,7 @@
     "start": "bun run src/bridge.ts",
     "build:cli": "mkdir -p dist && bun build src/cli.ts --outfile dist/cli.js --target bun && chmod +x dist/cli.js",
     "build:plugin": "mkdir -p plugins/agentbridge/server && bun build src/bridge.ts --outfile plugins/agentbridge/server/bridge-server.js --target bun && bun build src/daemon.ts --outfile plugins/agentbridge/server/daemon.js --target bun",
+    "postinstall": "node scripts/postinstall.cjs 2>/dev/null || true",
     "prepublishOnly": "bun run build:cli && bun run build:plugin",
     "validate:plugin": "claude plugin validate plugins/agentbridge && claude plugin validate .claude-plugin/marketplace.json",
     "test": "bun test src",
