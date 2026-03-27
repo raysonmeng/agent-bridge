@@ -10,8 +10,8 @@ export async function runClaude(args: string[]) {
 
   // Channel entry format: "server:<mcp-server-name>" for MCP-based channels,
   // or "plugin:<plugin>@<marketplace>" for plugin-based channels.
-  // AgentBridge uses MCP server delivery, so the entry is server:agentbridge.
-  const channelEntry = `server:${PLUGIN_NAME}`;
+  // AgentBridge is installed as a plugin, so use the plugin channel format.
+  const channelEntry = `plugin:${PLUGIN_NAME}@${MARKETPLACE_NAME}`;
 
   // Only use --dangerously-load-development-channels for now.
   // --channels checks the approved allowlist (Anthropic-curated) and fails
