@@ -8,8 +8,11 @@ interface DaemonClientEvents {
   status: [DaemonStatus];
 }
 
+let nextSocketId = 0;
+
 export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   private ws: WebSocket | null = null;
+  private wsId: number = 0; // Track socket identity for debugging
   private nextRequestId = 1;
   private pendingReplies = new Map<
     string,
@@ -24,7 +27,20 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   }
 
   async connect() {
-    if (this.ws?.readyState === WebSocket.OPEN) return;
+    if (this.ws?.readyState === WebSocket.OPEN) {
+      this.log(`connect() skipped — ws#${this.wsId} already OPEN`);
+      return;
+    }
+
+    // Close any lingering socket in non-OPEN state to avoid orphans
+    if (this.ws) {
+      const state = this.ws.readyState;
+      this.log(`connect() closing lingering ws#${this.wsId} (readyState=${state})`);
+      try { this.ws.close(); } catch {}
+      this.ws = null;
+    }
+
+    const socketId = ++nextSocketId;
 
     await new Promise<void>((resolve, reject) => {
       const ws = new WebSocket(this.url);
@@ -33,7 +49,9 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       ws.onopen = () => {
         settled = true;
         this.ws = ws;
-        this.attachSocketHandlers(ws);
+        this.wsId = socketId;
+        this.attachSocketHandlers(ws, socketId);
+        this.log(`ws#${socketId} opened and attached`);
         resolve();
       };
 
@@ -92,7 +110,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     });
   }
 
-  private attachSocketHandlers(ws: WebSocket) {
+  private attachSocketHandlers(ws: WebSocket, socketId: number) {
     ws.onmessage = (event) => {
       const raw = typeof event.data === "string" ? event.data : event.data.toString();
 
@@ -121,12 +139,16 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       }
     };
 
-    ws.onclose = () => {
-      if (this.ws === ws) {
+    ws.onclose = (event) => {
+      const isCurrent = this.ws === ws;
+      this.log(`ws#${socketId} onclose (code=${event.code}, reason=${event.reason || "none"}, isCurrent=${isCurrent}, currentWsId=${this.wsId})`);
+      if (isCurrent) {
         this.ws = null;
+        this.rejectPendingReplies("AgentBridge daemon disconnected.");
+        this.emit("disconnect");
       }
-      this.rejectPendingReplies("AgentBridge daemon disconnected.");
-      this.emit("disconnect");
+      // If this.ws !== ws, this socket was replaced by a newer connection —
+      // don't emit "disconnect" or it will trigger a reconnect loop.
     };
 
     ws.onerror = () => {
@@ -148,5 +170,9 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     }
 
     this.ws.send(JSON.stringify(message));
+  }
+
+  private log(msg: string) {
+    process.stderr.write(`[${new Date().toISOString()}] [DaemonClient] ${msg}\n`);
   }
 }

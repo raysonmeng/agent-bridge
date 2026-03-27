@@ -53,6 +53,8 @@ let replyRequired = false;
 let replyReceivedDuringTurn = false;
 let shuttingDown = false;
 let idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
+let lastAttachStatusSentTs = 0;
+const ATTACH_STATUS_COOLDOWN_MS = 30_000; // Don't re-send status on rapid reattach
 
 const bufferedMessages: BridgeMessage[] = [];
 
@@ -194,6 +196,7 @@ codex.on("error", (err: Error) => {
 
 codex.on("exit", (code: number | null) => {
   log(`Codex process exited (code ${code})`);
+  codexBootstrapped = false;
   statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
   emitToClaude(
@@ -212,8 +215,12 @@ function startControlServer() {
     fetch(req, server) {
       const url = new URL(req.url);
 
-      if (url.pathname === "/healthz" || url.pathname === "/readyz") {
+      if (url.pathname === "/healthz") {
         return Response.json(currentStatus());
+      }
+
+      if (url.pathname === "/readyz") {
+        return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
       }
 
       if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false } })) {
@@ -223,12 +230,14 @@ function startControlServer() {
       return new Response("AgentBridge daemon");
     },
     websocket: {
+      idleTimeout: 960, // 16 minutes — prevent premature idle disconnects
+      sendPings: true,
       open: (ws: ServerWebSocket<ControlSocketData>) => {
         ws.data.clientId = ++nextControlClientId;
         log(`Frontend socket opened (#${ws.data.clientId})`);
       },
-      close: (ws: ServerWebSocket<ControlSocketData>) => {
-        log(`Frontend socket closed (#${ws.data.clientId})`);
+      close: (ws: ServerWebSocket<ControlSocketData>, code: number, reason: string) => {
+        log(`Frontend socket closed (#${ws.data.clientId}, code=${code}, reason=${reason || "none"}, wasAttached=${attachedClaude === ws})`);
         if (attachedClaude === ws) {
           detachClaude(ws, "frontend socket closed");
         }
@@ -328,13 +337,21 @@ function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
   statusBuffer.flush("claude reconnected");
   sendStatus(ws);
 
+  const now = Date.now();
+  const isRapidReattach = now - lastAttachStatusSentTs < ATTACH_STATUS_COOLDOWN_MS;
+
   if (bufferedMessages.length > 0) {
     flushBufferedMessages(ws);
-  } else if (tuiConnectionState.canReply()) {
-    sendBridgeMessage(ws, systemMessage("system_ready", currentReadyMessage()));
-  } else if (codexBootstrapped) {
-    sendBridgeMessage(ws, systemMessage("system_waiting", currentWaitingMessage()));
+  } else if (!isRapidReattach) {
+    // Only send status messages if this is not a rapid reattach (avoid flooding Claude)
+    if (tuiConnectionState.canReply()) {
+      sendBridgeMessage(ws, systemMessage("system_ready", currentReadyMessage()));
+    } else if (codexBootstrapped) {
+      sendBridgeMessage(ws, systemMessage("system_waiting", currentWaitingMessage()));
+    }
   }
+
+  lastAttachStatusSentTs = now;
 
   if (tuiConnectionState.canReply()) {
     notifyCodexClaudeOnline();
