@@ -70,13 +70,63 @@ Each message carries a `source` field (`"claude"` or `"codex"`). The bridge neve
 
 ## Quick Start
 
-> **Note:** AgentBridge is not yet published to a plugin marketplace. The current setup uses a local plugin from the repository.
+### Install via Plugin Marketplace (recommended)
+
+Install AgentBridge directly from Claude Code using the plugin marketplace:
 
 ```bash
-# 1. Install dependencies
-cd agent_bridge
+# 1. In Claude Code, add the AgentBridge marketplace
+/plugin marketplace add raysonmeng/agent-bridge
+
+# 2. Install the plugin
+/plugin install agentbridge@agentbridge
+
+# 3. Reload plugins to activate
+/reload-plugins
+```
+
+Then install the CLI tool:
+
+```bash
+# 4. Clone the repo and set up the CLI
+git clone https://github.com/raysonmeng/agent-bridge.git
+cd agent-bridge
 bun install
 bun link    # Makes the 'agentbridge' command available globally
+
+# 5. Generate project config (optional)
+agentbridge init
+
+# 6. Start Claude Code with AgentBridge channel enabled
+agentbridge claude
+
+# 7. Start Codex TUI connected to the bridge (in another terminal)
+agentbridge codex
+```
+
+That's it. The daemon starts automatically when needed and reconnects if restarted.
+
+#### Updating the plugin
+
+When a new version is released, update from Claude Code:
+
+```bash
+/plugin marketplace update agentbridge
+/reload-plugins
+```
+
+Or enable auto-update: run `/plugin` → **Marketplaces** tab → select **agentbridge** → **Enable auto-update**.
+
+### Install for local development
+
+If you want to modify AgentBridge source code, use the local development setup instead:
+
+```bash
+# 1. Clone and install dependencies
+git clone https://github.com/raysonmeng/agent-bridge.git
+cd agent-bridge
+bun install
+bun link
 
 # 2. Set up local plugin + project config
 agentbridge dev     # Register local marketplace + install plugin
@@ -89,11 +139,9 @@ agentbridge claude
 agentbridge codex
 ```
 
-That's it. The daemon starts automatically when needed and reconnects if restarted.
-
 > **Note:** `agentbridge claude` injects `--dangerously-load-development-channels plugin:agentbridge@agentbridge` automatically. This loads a local development channel into Claude Code (currently a Research Preview workflow). Only enable channels and MCP servers you trust.
 
-### Updating after code changes
+#### Updating after code changes
 
 After modifying AgentBridge source code, re-run `agentbridge dev` to sync changes to the plugin cache, then restart Claude Code or run `/reload-plugins` in an active session.
 
