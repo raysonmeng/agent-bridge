@@ -20,10 +20,23 @@ const claude = new ClaudeAdapter();
 const daemonClient = new DaemonClient(CONTROL_WS_URL);
 
 let shuttingDown = false;
+let daemonDisabled = false;
+
+// --- Notification throttling for reconnect loops ---
+const RECONNECT_NOTIFY_COOLDOWN_MS = 30_000; // Only notify once per 30s window
+let lastDisconnectNotifyTs = 0;
+let lastReconnectNotifyTs = 0;
 
 claude.setReplySender(async (msg: BridgeMessage, requireReply?: boolean) => {
   if (msg.source !== "claude") {
     return { success: false, error: "Invalid message source" };
+  }
+
+  if (daemonDisabled) {
+    return {
+      success: false,
+      error: "AgentBridge is disabled by `agentbridge kill`. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.",
+    };
   }
 
   return daemonClient.sendReply(msg, requireReply);
@@ -41,22 +54,41 @@ daemonClient.on("status", (status) => {
 });
 
 daemonClient.on("disconnect", () => {
-  if (shuttingDown) return;
+  if (shuttingDown || daemonDisabled) return;
 
   log("Daemon control connection closed — will attempt to reconnect");
-  void claude.pushNotification(systemMessage(
-    "system_daemon_disconnected",
-    "⚠️ AgentBridge daemon control connection lost. Attempting to reconnect...",
-  ));
+
+  const now = Date.now();
+  if (now - lastDisconnectNotifyTs >= RECONNECT_NOTIFY_COOLDOWN_MS) {
+    lastDisconnectNotifyTs = now;
+    void claude.pushNotification(systemMessage(
+      "system_daemon_disconnected",
+      "⚠️ AgentBridge daemon control connection lost. Attempting to reconnect...",
+    ));
+  } else {
+    log("Suppressing duplicate disconnect notification (within cooldown)");
+  }
   void reconnectToDaemon();
 });
 
 claude.on("ready", async () => {
   log(`MCP server ready (delivery mode: ${claude.getDeliveryMode()}) — ensuring AgentBridge daemon...`);
+  if (daemonLifecycle.wasKilled()) {
+    await enterDisabledState(
+      "Killed sentinel found — bridge staying idle",
+      "⛔ AgentBridge was stopped by `agentbridge kill`. Bridge is staying idle. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.",
+    );
+    return;
+  }
   await connectToDaemon();
 });
 
 async function connectToDaemon(isReconnect = false) {
+  if (daemonDisabled) {
+    log("connectToDaemon() skipped — bridge is disabled");
+    return;
+  }
+
   try {
     await daemonLifecycle.ensureRunning();
     await daemonClient.connect();
@@ -79,50 +111,82 @@ async function connectToDaemon(isReconnect = false) {
   }
 }
 
+async function enterDisabledState(logMessage: string, notificationContent: string) {
+  if (daemonDisabled) return;
+
+  daemonDisabled = true;
+  log(logMessage);
+  await claude.pushNotification(systemMessage("system_bridge_disabled", notificationContent));
+  await daemonClient.disconnect();
+}
+
 const MAX_RECONNECT_DELAY_MS = 30_000;
+let reconnectTask: Promise<void> | null = null;
 
-async function reconnectToDaemon(attempt = 0) {
-  if (shuttingDown) return;
+async function notifyIfDaemonKilled(logMessage: string) {
+  if (!daemonLifecycle.wasKilled()) return false;
 
-  // Don't reconnect if user explicitly killed the daemon
-  if (daemonLifecycle.wasKilled()) {
-    log("Daemon was intentionally killed by user (killed sentinel found) — not reconnecting");
-    void claude.pushNotification(systemMessage(
-      "system_daemon_killed",
-      "⛔ AgentBridge daemon was stopped by `agentbridge kill`. Run `agentbridge codex` to restart.",
-    ));
-    return;
+  await enterDisabledState(
+    logMessage,
+    "⛔ AgentBridge was stopped by `agentbridge kill`. Bridge is staying idle. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.",
+  );
+  return true;
+}
+
+function reconnectToDaemon(): Promise<void> {
+  if (shuttingDown || daemonDisabled) return Promise.resolve();
+
+  if (reconnectTask) {
+    log("Skipping reconnect — another reconnect is already in progress");
+    return reconnectTask;
   }
 
-  const delayMs = Math.min(1000 * 2 ** attempt, MAX_RECONNECT_DELAY_MS);
-  if (attempt > 0) {
-    log(`Reconnect attempt ${attempt + 1}, waiting ${delayMs}ms...`);
-  }
-  await new Promise((resolve) => setTimeout(resolve, delayMs));
+  reconnectTask = (async () => {
+    try {
+      for (let attempt = 0; !shuttingDown; attempt += 1) {
+        if (await notifyIfDaemonKilled("Daemon was intentionally killed by user (killed sentinel found) — not reconnecting")) {
+          return;
+        }
 
-  if (shuttingDown) return;
+        const delayMs = Math.min(1000 * 2 ** attempt, MAX_RECONNECT_DELAY_MS);
+        if (attempt > 0) {
+          log(`Reconnect attempt ${attempt + 1}, waiting ${delayMs}ms...`);
+        }
+        await new Promise((resolve) => setTimeout(resolve, delayMs));
 
-  // Re-check after the backoff delay. The killed sentinel may be written
-  // after the disconnect event fires but before the reconnect attempt runs.
-  if (daemonLifecycle.wasKilled()) {
-    log("Daemon was intentionally killed during reconnect backoff — not reconnecting");
-    void claude.pushNotification(systemMessage(
-      "system_daemon_killed",
-      "⛔ AgentBridge daemon was stopped by `agentbridge kill`. Run `agentbridge codex` to restart.",
-    ));
-    return;
-  }
+        if (shuttingDown) return;
 
-  try {
-    await connectToDaemon(true);
-    log("Reconnected to AgentBridge daemon successfully");
-    void claude.pushNotification(systemMessage(
-      "system_daemon_reconnected",
-      "✅ AgentBridge daemon reconnected successfully.",
-    ));
-  } catch {
-    void reconnectToDaemon(attempt + 1);
-  }
+        // Re-check after the backoff delay. The killed sentinel may be written
+        // after the disconnect event fires but before the reconnect attempt runs.
+        if (await notifyIfDaemonKilled("Daemon was intentionally killed during reconnect backoff — not reconnecting")) {
+          return;
+        }
+
+        try {
+          await connectToDaemon(true);
+          log("Reconnected to AgentBridge daemon successfully");
+
+          const now = Date.now();
+          if (now - lastReconnectNotifyTs >= RECONNECT_NOTIFY_COOLDOWN_MS) {
+            lastReconnectNotifyTs = now;
+            void claude.pushNotification(systemMessage(
+              "system_daemon_reconnected",
+              "✅ AgentBridge daemon reconnected successfully.",
+            ));
+          } else {
+            log("Suppressing duplicate reconnect notification (within cooldown)");
+          }
+          return;
+        } catch {
+          // Continue retrying with exponential backoff until shutdown or killed sentinel.
+        }
+      }
+    } finally {
+      reconnectTask = null;
+    }
+  })();
+
+  return reconnectTask;
 }
 
 function systemMessage(idPrefix: string, content: string): BridgeMessage {
