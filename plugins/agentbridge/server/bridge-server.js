@@ -13661,6 +13661,7 @@ class StdioServerTransport {
 
 // src/claude-adapter.ts
 import { EventEmitter } from "events";
+import { randomUUID } from "crypto";
 import { appendFileSync } from "fs";
 var CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
@@ -13702,6 +13703,7 @@ class ClaudeAdapter extends EventEmitter {
   server;
   notificationSeq = 0;
   sessionId;
+  notificationIdPrefix;
   replySender = null;
   configuredMode;
   resolvedMode = null;
@@ -13711,6 +13713,7 @@ class ClaudeAdapter extends EventEmitter {
   constructor() {
     super();
     this.sessionId = `codex_${Date.now()}`;
+    this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 12);
     const envMode = process.env.AGENTBRIDGE_MODE;
     this.configuredMode = envMode && ["push", "pull", "auto"].includes(envMode) ? envMode : "auto";
     this.maxBufferedMessages = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
@@ -13758,7 +13761,7 @@ class ClaudeAdapter extends EventEmitter {
     }
   }
   async pushViaChannel(message) {
-    const msgId = `codex_msg_${++this.notificationSeq}`;
+    const msgId = `codex_msg_${this.notificationIdPrefix}_${++this.notificationSeq}`;
     const ts = new Date(message.timestamp).toISOString();
     try {
       await this.server.notification({
