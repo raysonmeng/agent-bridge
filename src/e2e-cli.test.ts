@@ -46,8 +46,8 @@ class CliE2EHarness {
 
   private readonly trackedProcesses: TrackedProcess[] = [];
   private readonly portReservations: PortReservation[];
-  private controlPortReservation: PortReservation | null;
-  private controlPortReleasePromise: Promise<void> | null = null;
+  private daemonPortReservations: PortReservation[];
+  private daemonPortReleasePromise: Promise<void> | null = null;
 
   private constructor(
     rootDir: string,
@@ -74,7 +74,11 @@ class CliE2EHarness {
     this.appPort = appPort;
     this.proxyPort = proxyPort;
     this.portReservations = portReservations;
-    this.controlPortReservation = portReservations[0] ?? null;
+    this.daemonPortReservations = [
+      portReservations[0],
+      portReservations[1],
+      portReservations[2],
+    ].filter((reservation): reservation is PortReservation => !!reservation);
     this.env = env;
   }
 
@@ -170,19 +174,44 @@ class CliE2EHarness {
   }
 
   async runCli(args: string[], timeoutMs = 20000): Promise<RunResult> {
+    return this.runCliWithEnv(args, {}, timeoutMs);
+  }
+
+  async runCliWithEnv(
+    args: string[],
+    extraEnv: NodeJS.ProcessEnv,
+    timeoutMs = 20000,
+  ): Promise<RunResult> {
     if (args[0] === "codex") {
-      await this.releaseControlPortReservation();
+      await this.releaseDaemonPortReservations();
     }
 
     const proc = this.spawnProcess(process.execPath, ["run", CLI_PATH, ...args], {
       cwd: this.projectDir,
-      env: this.env,
+      env: {
+        ...this.env,
+        ...extraEnv,
+      },
     });
     return waitForExit(proc, timeoutMs);
   }
 
+  async spawnCli(args: string[], extraEnv: NodeJS.ProcessEnv = {}): Promise<TrackedProcess> {
+    if (args[0] === "codex") {
+      await this.releaseDaemonPortReservations();
+    }
+
+    return this.spawnProcess(process.execPath, ["run", CLI_PATH, ...args], {
+      cwd: this.projectDir,
+      env: {
+        ...this.env,
+        ...extraEnv,
+      },
+    });
+  }
+
   async spawnBridge(): Promise<TrackedProcess> {
-    await this.releaseControlPortReservation();
+    await this.releaseDaemonPortReservations();
     return this.spawnProcess(process.execPath, ["run", BRIDGE_PATH], {
       cwd: this.projectDir,
       env: this.env,
@@ -190,7 +219,7 @@ class CliE2EHarness {
   }
 
   async startManagedFakeDaemon(): Promise<TrackedProcess> {
-    await this.releaseControlPortReservation();
+    await this.releaseDaemonPortReservations();
     const proc = this.spawnProcess(process.execPath, ["run", this.fakeDaemonPath], {
       cwd: this.projectDir,
       env: this.env,
@@ -245,9 +274,27 @@ class CliE2EHarness {
     return JSON.parse(readFileSync(statusPath, "utf-8"));
   }
 
+  readTuiPid(): number | null {
+    const pidPath = join(this.stateDir, "codex-tui.pid");
+    if (!existsSync(pidPath)) {
+      return null;
+    }
+    const raw = readFileSync(pidPath, "utf-8").trim();
+    const pid = Number.parseInt(raw, 10);
+    return Number.isFinite(pid) ? pid : null;
+  }
+
   async cleanup(): Promise<void> {
     for (const proc of this.trackedProcesses) {
       await stopProcess(proc);
+    }
+
+    const tuiPid = this.readTuiPid();
+    if (tuiPid && isProcessAlive(tuiPid)) {
+      try {
+        process.kill(tuiPid, "SIGKILL");
+      } catch {}
+      await sleep(100);
     }
 
     const pid = this.readPid();
@@ -267,21 +314,23 @@ class CliE2EHarness {
     rmSync(this.rootDir, { recursive: true, force: true });
   }
 
-  private async releaseControlPortReservation(): Promise<void> {
-    if (!this.controlPortReservation) {
-      if (this.controlPortReleasePromise) {
-        await this.controlPortReleasePromise;
+  private async releaseDaemonPortReservations(): Promise<void> {
+    if (this.daemonPortReservations.length === 0) {
+      if (this.daemonPortReleasePromise) {
+        await this.daemonPortReleasePromise;
       }
       return;
     }
 
-    if (!this.controlPortReleasePromise) {
-      const reservation = this.controlPortReservation;
-      this.controlPortReservation = null;
-      this.controlPortReleasePromise = reservation.release();
+    if (!this.daemonPortReleasePromise) {
+      const reservations = this.daemonPortReservations;
+      this.daemonPortReservations = [];
+      this.daemonPortReleasePromise = Promise.all(
+        reservations.map((reservation) => reservation.release()),
+      ).then(() => {});
     }
 
-    await this.controlPortReleasePromise;
+    await this.daemonPortReleasePromise;
   }
 
   private spawnProcess(
@@ -356,7 +405,7 @@ describe("E2E: CLI surface", () => {
       expect(invocations.length).toBe(1);
       expect(invocations[0]?.args).toEqual([
         "--dangerously-load-development-channels",
-        "server:agentbridge",
+        "plugin:agentbridge@agentbridge",
         "--resume",
       ]);
     });
@@ -382,6 +431,7 @@ describe("E2E: CLI surface", () => {
       expect(harness.readLaunches()).toHaveLength(1);
       expect(harness.readPid()).not.toBeNull();
       expect(harness.readStatus()?.proxyUrl).toBe(`ws://127.0.0.1:${harness.proxyPort}`);
+      expect(harness.readTuiPid()).toBeNull();
 
       const invocations = harness
         .readShimCalls("codex")
@@ -468,24 +518,36 @@ describe("E2E: CLI surface", () => {
 
   test("agentbridge kill stops daemon, cleans state, and writes killed sentinel", async () => {
     await withHarness(async (harness) => {
-      await harness.runCli(["codex"]);
+      const codexProc = await harness.spawnCli(
+        ["codex"],
+        { AGENTBRIDGE_CODEX_SHIM_HOLD_MS: "30000" },
+      );
       await harness.waitForHealth();
+      await waitFor(() => harness.readTuiPid() !== null, 80, 50);
 
       const pid = harness.readPid();
+      const tuiPid = harness.readTuiPid();
       expect(pid).not.toBeNull();
+      expect(tuiPid).not.toBeNull();
       expect(pid && isProcessAlive(pid)).toBe(true);
+      expect(tuiPid && isProcessAlive(tuiPid)).toBe(true);
 
       const result = await harness.runCli(["kill"]);
 
       expect(result.code).toBe(0);
+      expect(result.stdout).toContain("AgentBridge stopped.");
+      expect(result.stdout).toContain("Please restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to fully disconnect.");
       await waitFor(() => (pid ? !isProcessAlive(pid) : true), 60, 50);
+      await waitFor(() => (tuiPid ? !isProcessAlive(tuiPid) : true), 60, 50);
+      await waitFor(() => codexProc.child.exitCode !== null, 60, 50);
       expect(existsSync(join(harness.stateDir, "daemon.pid"))).toBe(false);
+      expect(existsSync(join(harness.stateDir, "codex-tui.pid"))).toBe(false);
       expect(existsSync(join(harness.stateDir, "status.json"))).toBe(false);
       expect(existsSync(join(harness.stateDir, "killed"))).toBe(true);
     });
   }, 20000);
 
-  test("bridge does not relaunch daemon after kill writes the killed sentinel", async () => {
+  test("bridge stays idle and does not relaunch daemon after kill writes the killed sentinel", async () => {
     await withHarness(async (harness) => {
       const bridge = await harness.spawnBridge();
 
@@ -498,6 +560,7 @@ describe("E2E: CLI surface", () => {
 
       await harness.waitForOutput(bridge, "not reconnecting");
       await sleep(1200);
+      expect(bridge.child.exitCode).toBeNull();
       expect(harness.readLaunches()).toHaveLength(1);
       expect(existsSync(join(harness.stateDir, "killed"))).toBe(true);
     });
@@ -533,7 +596,7 @@ describe("E2E: CLI surface", () => {
       const claudeRun = harness
         .readShimCalls("claude")
         .find((entry) => entry.args[0] === "--dangerously-load-development-channels");
-      expect(claudeRun?.args[1]).toBe("server:agentbridge");
+      expect(claudeRun?.args[1]).toBe("plugin:agentbridge@agentbridge");
 
       const codexRun = harness
         .readShimCalls("codex")
@@ -745,6 +808,13 @@ if ("${commandName}" === "claude" && args[0] === "plugin" && args[1] === "instal
   process.exit(0);
 }
 
+if ("${commandName}" === "codex" && args[0] === "--enable" && args[1] === "tui_app_server") {
+  const holdMs = Number.parseInt(process.env.AGENTBRIDGE_CODEX_SHIM_HOLD_MS ?? "0", 10);
+  if (Number.isFinite(holdMs) && holdMs > 0) {
+    await Bun.sleep(holdMs);
+  }
+}
+
 process.exit(0);
 `;
 }
@@ -846,9 +916,22 @@ const server = Bun.serve({
   },
 });
 
+const proxyServer = Bun.serve({
+  port: proxyPort,
+  hostname: "127.0.0.1",
+  fetch(req) {
+    const url = new URL(req.url);
+    if (url.pathname === "/healthz" || url.pathname === "/readyz") {
+      return Response.json({ ok: true, proxyUrl });
+    }
+    return new Response("fake codex proxy");
+  },
+});
+
 function shutdown() {
   cleanupFiles();
   server.stop();
+  proxyServer.stop();
   process.exit(0);
 }
 

@@ -23,6 +23,7 @@ describe("StateDirResolver", () => {
   test("returns correct file paths under state dir", () => {
     const resolver = new StateDirResolver(tempDir);
     expect(resolver.pidFile).toBe(join(tempDir, "daemon.pid"));
+    expect(resolver.tuiPidFile).toBe(join(tempDir, "codex-tui.pid"));
     expect(resolver.lockFile).toBe(join(tempDir, "daemon.lock"));
     expect(resolver.statusFile).toBe(join(tempDir, "status.json"));
     expect(resolver.portsFile).toBe(join(tempDir, "ports.json"));

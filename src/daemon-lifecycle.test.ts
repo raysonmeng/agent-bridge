@@ -32,6 +32,7 @@ describe("DaemonLifecycle", () => {
   test("healthUrl and controlWsUrl use correct port", () => {
     const lc = createLifecycle(5555);
     expect(lc.healthUrl).toBe("http://127.0.0.1:5555/healthz");
+    expect(lc.readyUrl).toBe("http://127.0.0.1:5555/readyz");
     expect(lc.controlWsUrl).toBe("ws://127.0.0.1:5555/ws");
   });
 
