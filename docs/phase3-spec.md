@@ -56,7 +56,7 @@ Current behavior:
 - Starts Claude Code with:
 
 ```bash
-claude --dangerously-load-development-channels server:agentbridge
+claude --dangerously-load-development-channels plugin:agentbridge@agentbridge
 ```
 
 - Passes through additional user arguments after the injected channel flags.

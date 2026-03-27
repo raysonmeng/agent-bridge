@@ -91,7 +91,7 @@ agentbridge codex
 
 就这样。Daemon 会在需要时自动启动，重启后自动重连。
 
-> **注意：** `agentbridge claude` 会自动注入 `--dangerously-load-development-channels server:agentbridge`。这会把本地开发中的 channel 挂载进 Claude Code（当前属于 Research Preview）。请只启用你信任的 channel 和 MCP server。
+> **注意：** `agentbridge claude` 会自动注入 `--dangerously-load-development-channels plugin:agentbridge@agentbridge`。这会把本地开发中的 channel 挂载进 Claude Code（当前属于 Research Preview）。请只启用你信任的 channel 和 MCP server。
 
 ### 修改代码后更新
 

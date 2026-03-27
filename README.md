@@ -91,7 +91,7 @@ agentbridge codex
 
 That's it. The daemon starts automatically when needed and reconnects if restarted.
 
-> **Note:** `agentbridge claude` injects `--dangerously-load-development-channels server:agentbridge` automatically. This loads a local development channel into Claude Code (currently a Research Preview workflow). Only enable channels and MCP servers you trust.
+> **Note:** `agentbridge claude` injects `--dangerously-load-development-channels plugin:agentbridge@agentbridge` automatically. This loads a local development channel into Claude Code (currently a Research Preview workflow). Only enable channels and MCP servers you trust.
 
 ### Updating after code changes
 

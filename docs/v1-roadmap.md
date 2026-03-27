@@ -328,7 +328,7 @@ What those commands do in practice:
 - `dev`
   - developer-only local marketplace and plugin-cache workflow
 - `claude`
-  - launches Claude with `--dangerously-load-development-channels server:agentbridge`
+  - launches Claude with `--dangerously-load-development-channels plugin:agentbridge@agentbridge`
 - `codex`
   - ensures the daemon is running
   - launches Codex with the injected proxy arguments

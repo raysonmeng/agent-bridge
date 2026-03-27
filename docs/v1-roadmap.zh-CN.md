@@ -370,7 +370,7 @@ v1.3 覆盖两个正交维度：
 npx agentbridge init
 
 # OAuth 用户（实时 push 模式）
-claude --dangerously-load-development-channels server:agentbridge
+claude --dangerously-load-development-channels plugin:agentbridge@agentbridge
 
 # API key 用户（tool pull 模式，无需特殊标志）
 claude
