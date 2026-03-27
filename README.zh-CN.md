@@ -64,9 +64,13 @@ AgentBridge 采用两层进程结构：
 
 ## 前置条件
 
-- [Bun](https://bun.sh) v1.0+
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) v2.1.80+
-- [Codex CLI](https://github.com/openai/codex)，且本地可直接使用 `codex` 命令
+| 依赖 | 版本 | 安装方式 |
+|------|------|----------|
+| [Bun](https://bun.sh) | v1.0+ | `curl -fsSL https://bun.sh/install \| bash` |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | v2.1.80+ | `npm install -g @anthropic-ai/claude-code` |
+| [Codex CLI](https://github.com/openai/codex) | latest | `npm install -g @openai/codex` |
+
+> **注意：** Bun 是 AgentBridge daemon 和插件服务器的必要运行时，仅有 Node.js 不够。
 
 ## Quick Start
 
@@ -88,21 +92,20 @@ AgentBridge 采用两层进程结构：
 然后安装 CLI 工具：
 
 ```bash
-# 4. 克隆仓库并安装 CLI
-git clone https://github.com/raysonmeng/agent-bridge.git
-cd agent-bridge
-bun install
-bun link    # 全局注册 agentbridge 命令
+# 4. 全局安装 CLI
+npm install -g agentbridge
 
 # 5. 生成项目配置（可选）
-agentbridge init
+abg init
 
 # 6. 启动 Claude Code（自动加载 AgentBridge channel）
-agentbridge claude
+abg claude
 
 # 7. 在另一个终端启动 Codex TUI 连接 Bridge
-agentbridge codex
+abg codex
 ```
+
+> **提示：** `abg` 是 `agentbridge` 的简写别名，两个命令完全等价，用哪个都行。
 
 就这样。Daemon 会在需要时自动启动，重启后自动重连。
 
@@ -147,15 +150,17 @@ agentbridge codex
 
 ## CLI 命令参考
 
+> 所有命令同时支持 `agentbridge` 和简写别名 `abg`。
+
 | 命令 | 说明 |
 |------|------|
-| `agentbridge init` | 安装插件、检查依赖（bun/claude/codex）、生成 `.agentbridge/config.json` 和 `collaboration.md` |
-| `agentbridge claude [args...]` | 启动 Claude Code 并启用 push channel。自动清除之前 `kill` 留下的 sentinel。额外参数透传给 `claude` |
-| `agentbridge codex [args...]` | 启动连接到 AgentBridge daemon 的 Codex TUI。管理 TUI 进程生命周期（pid 跟踪、清理）。额外参数透传给 `codex` |
-| `agentbridge kill` | 优雅停止 daemon 和托管的 Codex TUI，清理状态文件，写入 killed sentinel |
-| `agentbridge dev` | （开发用）注册本地 marketplace + 强制同步插件到缓存 |
-| `agentbridge --help` | 显示帮助 |
-| `agentbridge --version` | 显示版本 |
+| `abg init` | 安装插件、检查依赖（bun/claude/codex）、生成 `.agentbridge/config.json` 和 `collaboration.md` |
+| `abg claude [args...]` | 启动 Claude Code 并启用 push channel。自动清除之前 `kill` 留下的 sentinel。额外参数透传给 `claude` |
+| `abg codex [args...]` | 启动连接到 AgentBridge daemon 的 Codex TUI。管理 TUI 进程生命周期（pid 跟踪、清理）。额外参数透传给 `codex` |
+| `abg kill` | 优雅停止 daemon 和托管的 Codex TUI，清理状态文件，写入 killed sentinel |
+| `abg dev` | （开发用）注册本地 marketplace + 强制同步插件到缓存 |
+| `abg --help` | 显示帮助 |
+| `abg --version` | 显示版本 |
 
 ### Owned flags
 
