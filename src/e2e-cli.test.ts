@@ -411,6 +411,17 @@ describe("E2E: CLI surface", () => {
     });
   });
 
+  test("agentbridge claude clears killed sentinel before launching Claude Code", async () => {
+    await withHarness(async (harness) => {
+      writeFileSync(join(harness.stateDir, "killed"), `${Date.now()}\n`, "utf-8");
+
+      const result = await harness.runCli(["claude", "--resume"]);
+
+      expect(result.code).toBe(0);
+      expect(existsSync(join(harness.stateDir, "killed"))).toBe(false);
+    });
+  });
+
   test("agentbridge claude rejects owned flags", async () => {
     await withHarness(async (harness) => {
       const result = await harness.runCli(["claude", "--channels", "manual"]);

@@ -120,6 +120,31 @@ describe("Dual-mode transport: pull mode message queue", () => {
     expect(adapter.pendingMessages).toHaveLength(1);
     expect(adapter.pendingMessages[0].content).toBe("pull msg");
   });
+
+  test("push mode message ids include a session-unique prefix", async () => {
+    const adapter = createAdapter("push");
+    adapter.resolveMode();
+
+    const notifications: any[] = [];
+    adapter.server = {
+      notification: async (payload: any) => {
+        notifications.push(payload);
+      },
+    };
+
+    await adapter.pushNotification(makeBridgeMessage("first push", 1705312200000));
+    await adapter.pushNotification(makeBridgeMessage("second push", 1705312205000));
+
+    expect(notifications).toHaveLength(2);
+
+    const firstId = notifications[0].params.meta.message_id as string;
+    const secondId = notifications[1].params.meta.message_id as string;
+
+    expect(firstId).toMatch(/^codex_msg_[a-f0-9]{12}_1$/);
+    expect(secondId).toMatch(/^codex_msg_[a-f0-9]{12}_2$/);
+    expect(firstId.replace(/_1$/, "")).toBe(secondId.replace(/_2$/, ""));
+    expect(firstId).not.toBe("codex_msg_1");
+  });
 });
 
 describe("Dual-mode transport: drainMessages (get_messages)", () => {
