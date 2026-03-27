@@ -1,5 +1,5 @@
 import { spawn, execSync } from "node:child_process";
-import { openSync, writeSync, closeSync } from "node:fs";
+import { openSync, writeSync, closeSync, writeFileSync, unlinkSync } from "node:fs";
 import { StateDirResolver } from "../state-dir";
 import { ConfigService } from "../config-service";
 import { DaemonLifecycle } from "../daemon-lifecycle";
@@ -44,6 +44,7 @@ export async function runCodex(args: string[]) {
   // Ensure daemon is running
   console.error("[agentbridge] Ensuring daemon is running...");
   try {
+    lifecycle.clearKilled();
     await lifecycle.ensureRunning();
     console.error("[agentbridge] Daemon is ready.");
   } catch (err: any) {
@@ -60,6 +61,13 @@ export async function runCodex(args: string[]) {
   } else {
     proxyUrl = `ws://127.0.0.1:${config.daemon.proxyPort}`;
     console.error(`[agentbridge] No daemon status found, using config default: ${proxyUrl}`);
+  }
+
+  try {
+    await waitForProxyReady(proxyUrl);
+  } catch (err: any) {
+    console.error(`[agentbridge] ${err.message}`);
+    process.exit(1);
   }
 
   // Save terminal state and launch Codex with protection
@@ -115,10 +123,6 @@ export async function runCodex(args: string[]) {
     }
   }
 
-  process.on("exit", restoreTerminal);
-  process.on("SIGINT", () => { restoreTerminal(); process.exit(130); });
-  process.on("SIGTERM", () => { restoreTerminal(); process.exit(143); });
-
   const fullArgs = [
     "--enable", "tui_app_server",
     "--remote", proxyUrl,
@@ -130,11 +134,30 @@ export async function runCodex(args: string[]) {
     env: process.env,
   });
 
+  if (typeof child.pid === "number") {
+    writeFileSync(stateDir.tuiPidFile, `${child.pid}\n`, "utf-8");
+  }
+
+  let cleanedTuiPid = false;
+  function cleanupTuiPidFile() {
+    if (cleanedTuiPid) return;
+    cleanedTuiPid = true;
+    try {
+      unlinkSync(stateDir.tuiPidFile);
+    } catch {}
+  }
+
+  process.on("exit", () => { restoreTerminal(); cleanupTuiPidFile(); });
+  process.on("SIGINT", () => { restoreTerminal(); cleanupTuiPidFile(); process.exit(130); });
+  process.on("SIGTERM", () => { restoreTerminal(); cleanupTuiPidFile(); process.exit(143); });
+
   child.on("exit", (code) => {
+    cleanupTuiPidFile();
     process.exit(code ?? 0);
   });
 
   child.on("error", (err) => {
+    cleanupTuiPidFile();
     if ((err as NodeJS.ErrnoException).code === "ENOENT") {
       console.error("Error: codex not found in PATH.");
       console.error("Install Codex: https://github.com/openai/codex");
@@ -143,4 +166,30 @@ export async function runCodex(args: string[]) {
     console.error(`Error starting Codex: ${err.message}`);
     process.exit(1);
   });
+}
+
+function proxyHealthUrl(proxyUrl: string): string {
+  const url = new URL(proxyUrl);
+  url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+  url.pathname = "/healthz";
+  url.search = "";
+  url.hash = "";
+  return url.toString();
+}
+
+async function waitForProxyReady(proxyUrl: string, maxRetries = 20, delayMs = 100): Promise<void> {
+  const healthUrl = proxyHealthUrl(proxyUrl);
+
+  for (let attempt = 0; attempt < maxRetries; attempt++) {
+    try {
+      const response = await fetch(healthUrl);
+      if (response.ok) {
+        return;
+      }
+    } catch {}
+
+    await new Promise((resolve) => setTimeout(resolve, delayMs));
+  }
+
+  throw new Error(`Timed out waiting for Codex proxy readiness on ${healthUrl}`);
 }
