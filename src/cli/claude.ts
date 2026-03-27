@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
+import { DaemonLifecycle } from "../daemon-lifecycle";
+import { StateDirResolver } from "../state-dir";
 
 /** Flags that AgentBridge owns and will inject automatically. */
 const OWNED_FLAGS = ["--channels", "--dangerously-load-development-channels"];
@@ -7,6 +9,16 @@ const OWNED_FLAGS = ["--channels", "--dangerously-load-development-channels"];
 export async function runClaude(args: string[]) {
   // Check for owned flag conflicts
   checkOwnedFlagConflicts(args, "agentbridge claude", OWNED_FLAGS);
+
+  const stateDir = new StateDirResolver();
+  const controlPort = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
+  const lifecycle = new DaemonLifecycle({
+    stateDir,
+    controlPort,
+    log: (msg) => console.error(`[agentbridge] ${msg}`),
+  });
+
+  lifecycle.clearKilled();
 
   // Channel entry format: "server:<mcp-server-name>" for MCP-based channels,
   // or "plugin:<plugin>@<marketplace>" for plugin-based channels.
