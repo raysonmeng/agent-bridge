@@ -1,5 +1,5 @@
 {
-  "name": "agentbridge",
+  "name": "@raysonmeng/agentbridge",
   "version": "0.1.0",
   "description": "Bridge between Claude Code and Codex — bidirectional agent communication via MCP Channel + JSON-RPC",
   "type": "module",
