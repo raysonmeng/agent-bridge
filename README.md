@@ -64,9 +64,13 @@ Each message carries a `source` field (`"claude"` or `"codex"`). The bridge neve
 
 ## Prerequisites
 
-- [Bun](https://bun.sh) v1.0+
-- [Claude Code](https://docs.anthropic.com/en/docs/claude-code) v2.1.80+
-- [Codex CLI](https://github.com/openai/codex) with the `codex` command available
+| Dependency | Version | Install |
+|-----------|---------|---------|
+| [Bun](https://bun.sh) | v1.0+ | `curl -fsSL https://bun.sh/install \| bash` |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | v2.1.80+ | `npm install -g @anthropic-ai/claude-code` |
+| [Codex CLI](https://github.com/openai/codex) | latest | `npm install -g @openai/codex` |
+
+> **Note:** Bun is required as the runtime for the AgentBridge daemon and plugin server. Node.js alone is not sufficient.
 
 ## Quick Start
 
@@ -88,21 +92,20 @@ Install AgentBridge directly from Claude Code using the plugin marketplace:
 Then install the CLI tool:
 
 ```bash
-# 4. Clone the repo and set up the CLI
-git clone https://github.com/raysonmeng/agent-bridge.git
-cd agent-bridge
-bun install
-bun link    # Makes the 'agentbridge' command available globally
+# 4. Install the CLI globally
+npm install -g agentbridge
 
 # 5. Generate project config (optional)
-agentbridge init
+abg init
 
 # 6. Start Claude Code with AgentBridge channel enabled
-agentbridge claude
+abg claude
 
 # 7. Start Codex TUI connected to the bridge (in another terminal)
-agentbridge codex
+abg codex
 ```
+
+> **Tip:** `abg` is a short alias for `agentbridge`. Both commands are identical — use whichever you prefer.
 
 That's it. The daemon starts automatically when needed and reconnects if restarted.
 
@@ -147,15 +150,17 @@ After modifying AgentBridge source code, re-run `agentbridge dev` to sync change
 
 ## CLI Reference
 
+> All commands work with both `agentbridge` and the short alias `abg`.
+
 | Command | Description |
 |---------|-------------|
-| `agentbridge init` | Install plugin, check dependencies (bun/claude/codex), generate `.agentbridge/config.json` and `collaboration.md` |
-| `agentbridge claude [args...]` | Start Claude Code with push channel enabled. Clears any killed sentinel from a previous `kill`. Pass-through args are forwarded to `claude` |
-| `agentbridge codex [args...]` | Start Codex TUI connected to AgentBridge daemon. Manages TUI process lifecycle (pid tracking, cleanup). Pass-through args forwarded to `codex` |
-| `agentbridge kill` | Gracefully stop both daemon and managed Codex TUI, clean up state files, write killed sentinel |
-| `agentbridge dev` | (Dev only) Register local marketplace + force-sync plugin to cache |
-| `agentbridge --help` | Show help |
-| `agentbridge --version` | Show version |
+| `abg init` | Install plugin, check dependencies (bun/claude/codex), generate `.agentbridge/config.json` and `collaboration.md` |
+| `abg claude [args...]` | Start Claude Code with push channel enabled. Clears any killed sentinel from a previous `kill`. Pass-through args are forwarded to `claude` |
+| `abg codex [args...]` | Start Codex TUI connected to AgentBridge daemon. Manages TUI process lifecycle (pid tracking, cleanup). Pass-through args forwarded to `codex` |
+| `abg kill` | Gracefully stop both daemon and managed Codex TUI, clean up state files, write killed sentinel |
+| `abg dev` | (Dev only) Register local marketplace + force-sync plugin to cache |
+| `abg --help` | Show help |
+| `abg --version` | Show version |
 
 ### Owned flags
 
