@@ -1,5 +1,6 @@
 import { dirname, join } from "node:path";
 import { existsSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 
 /**
  * Walk up from the current module's directory until we find package.json.
@@ -17,4 +18,14 @@ export function findPackageRoot(): string {
     }
     dir = parent;
   }
+}
+
+/**
+ * Register a marketplace with Claude Code. Idempotent — safe to call
+ * even if already registered. Throws on failure.
+ */
+export function registerMarketplace(marketplaceRoot: string): void {
+  execFileSync("claude", ["plugin", "marketplace", "add", marketplaceRoot], {
+    stdio: "inherit",
+  });
 }
