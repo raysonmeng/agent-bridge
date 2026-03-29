@@ -52,7 +52,7 @@ async function main() {
       break;
     default:
       console.error(`Unknown command: ${command}`);
-      console.error(`Run "agentbridge --help" (or "abg --help") for usage.`);
+      console.error(`Run "agentbridge --help" for usage.`);
       process.exit(1);
   }
 }
@@ -63,7 +63,6 @@ AgentBridge — Multi-agent collaboration bridge
 
 Usage:
   agentbridge <command> [args...]
-  abg <command> [args...]
 
 Commands:
   init              Install plugin, check dependencies, generate project config
@@ -77,12 +76,12 @@ Options:
   --version, -v     Show version
 
 Examples:
-  abg init                     # First-time setup
-  abg claude                   # Start Claude Code
-  abg claude --resume          # Start Claude Code and resume session
-  abg codex                    # Start Codex TUI
-  abg codex --model o3         # Start Codex with specific model
-  abg kill                     # Emergency: kill all processes
+  agentbridge init                     # First-time setup
+  agentbridge claude                   # Start Claude Code
+  agentbridge claude --resume          # Start Claude Code and resume session
+  agentbridge codex                    # Start Codex TUI
+  agentbridge codex --model o3         # Start Codex with specific model
+  agentbridge kill                     # Emergency: kill all processes
 `.trim());
 }
 
