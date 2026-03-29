@@ -1,5 +1,5 @@
 import { execSync, execFileSync } from "node:child_process";
-import { resolve, dirname } from "node:path";
+import { resolve } from "node:path";
 import { existsSync } from "node:fs";
 import { ConfigService } from "../config-service";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
@@ -52,7 +52,7 @@ export async function runInit() {
       }
     }
 
-    execSync(`claude plugin install ${PLUGIN_NAME}@${MARKETPLACE_NAME}`, {
+    execFileSync("claude", ["plugin", "install", `${PLUGIN_NAME}@${MARKETPLACE_NAME}`], {
       stdio: "inherit",
     });
     console.log("  Plugin installed successfully.");
