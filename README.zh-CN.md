@@ -93,7 +93,7 @@ AgentBridge 采用两层进程结构：
 
 ```bash
 # 4. 全局安装 CLI
-npm install -g agentbridge
+npm install -g @raysonmeng/agentbridge
 
 # 5. 生成项目配置（可选）
 abg init

@@ -93,7 +93,7 @@ Then install the CLI tool:
 
 ```bash
 # 4. Install the CLI globally
-npm install -g agentbridge
+npm install -g @raysonmeng/agentbridge
 
 # 5. Generate project config (optional)
 abg init
