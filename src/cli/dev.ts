@@ -1,19 +1,14 @@
 import { execFileSync } from "node:child_process";
-import { resolve, dirname } from "node:path";
+import { resolve } from "node:path";
 import { existsSync, cpSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
-
-/** Resolve the project root from the CLI module location (not cwd). */
-function getProjectRoot(): string {
-  // src/cli/dev.ts -> project root is ../../
-  return resolve(dirname(import.meta.dir), "..");
-}
+import { findPackageRoot } from "./pkg-root";
 
 export async function runDev() {
   console.log("AgentBridge Dev Setup\n");
 
-  const projectRoot = getProjectRoot();
+  const projectRoot = findPackageRoot();
   const marketplacePath = resolve(projectRoot, ".claude-plugin", "marketplace.json");
   const pluginDir = resolve(projectRoot, "plugins", "agentbridge");
   const pluginManifest = resolve(pluginDir, ".claude-plugin", "plugin.json");

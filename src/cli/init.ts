@@ -3,11 +3,7 @@ import { resolve, dirname } from "node:path";
 import { existsSync } from "node:fs";
 import { ConfigService } from "../config-service";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
-
-/** Resolve the project/package root from the CLI module location (not cwd). */
-function getPackageRoot(): string {
-  return resolve(dirname(import.meta.dir), "..");
-}
+import { findPackageRoot } from "./pkg-root";
 
 const MIN_CLAUDE_VERSION = "2.1.80";
 
@@ -38,7 +34,7 @@ export async function runInit() {
   // Step 3: Register marketplace + install plugin (best-effort)
   console.log("Installing AgentBridge plugin...");
   try {
-    const packageRoot = getPackageRoot();
+    const packageRoot = findPackageRoot();
     const marketplacePath = resolve(packageRoot, ".claude-plugin", "marketplace.json");
 
     if (existsSync(marketplacePath)) {
