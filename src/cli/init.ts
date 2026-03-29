@@ -1,6 +1,13 @@
-import { execSync } from "node:child_process";
+import { execSync, execFileSync } from "node:child_process";
+import { resolve, dirname } from "node:path";
+import { existsSync } from "node:fs";
 import { ConfigService } from "../config-service";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
+
+/** Resolve the project/package root from the CLI module location (not cwd). */
+function getPackageRoot(): string {
+  return resolve(dirname(import.meta.dir), "..");
+}
 
 const MIN_CLAUDE_VERSION = "2.1.80";
 
@@ -28,17 +35,35 @@ export async function runInit() {
   }
   console.log("");
 
-  // Step 3: Install plugin (best-effort)
+  // Step 3: Register marketplace + install plugin (best-effort)
   console.log("Installing AgentBridge plugin...");
   try {
+    const packageRoot = getPackageRoot();
+    const marketplacePath = resolve(packageRoot, ".claude-plugin", "marketplace.json");
+
+    if (existsSync(marketplacePath)) {
+      // Register marketplace if not already registered
+      try {
+        const listOutput = execFileSync("claude", ["plugin", "marketplace", "list"], { encoding: "utf-8" });
+        if (!listOutput.includes(MARKETPLACE_NAME)) {
+          execFileSync("claude", ["plugin", "marketplace", "add", packageRoot], { stdio: "inherit" });
+        }
+      } catch {
+        // marketplace list failed — try adding anyway
+        try {
+          execFileSync("claude", ["plugin", "marketplace", "add", packageRoot], { stdio: "inherit" });
+        } catch {}
+      }
+    }
+
     execSync(`claude plugin install ${PLUGIN_NAME}@${MARKETPLACE_NAME}`, {
       stdio: "inherit",
     });
     console.log("  Plugin installed successfully.");
   } catch {
-    console.log("  Plugin install skipped (marketplace may not be configured yet).");
+    console.log("  Plugin install skipped (marketplace registration or install failed).");
     console.log("  You can install it later with:");
-    console.log(`    claude plugin install ${PLUGIN_NAME}@${MARKETPLACE_NAME}`);
+    console.log(`    abg dev   # registers marketplace and installs plugin`);
   }
   console.log("");
 
