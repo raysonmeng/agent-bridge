@@ -3,7 +3,6 @@
   "version": "0.1.0",
   "description": "Bridge between Claude Code and Codex — bidirectional agent communication via MCP Channel + JSON-RPC",
   "type": "module",
-  "main": "dist/cli.js",
   "bin": {
     "agentbridge": "dist/cli.js",
     "abg": "dist/cli.js"
@@ -12,7 +11,7 @@
     "dist/",
     "plugins/",
     ".claude-plugin/",
-    "scripts/",
+    "scripts/postinstall.cjs",
     "README.md",
     "LICENSE"
   ],
@@ -48,10 +47,8 @@
   "author": "AgentBridge Contributors",
   "license": "MIT",
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "^1.27.1",
     "@types/bun": "^1.3.11",
     "typescript": "^5.8.0"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/sdk": "^1.27.1"
   }
 }
