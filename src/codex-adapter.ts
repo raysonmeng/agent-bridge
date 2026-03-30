@@ -20,6 +20,13 @@ interface TuiSocketData {
   connId: number;
 }
 
+interface PendingServerRequest {
+  serverId: number | string;
+  connId: number;
+  method: string;
+  timestamp: number;
+}
+
 const LOG_FILE = "/tmp/agentbridge.log";
 const TRACKED_REQUEST_METHODS = new Set(["thread/start", "thread/resume", "turn/start"]);
 
@@ -53,6 +60,8 @@ export class CodexAdapter extends EventEmitter {
   // Proxy-layer id rewriting: upstream uses globally unique ids
   private nextProxyId = 100000;
   private upstreamToClient = new Map<number, { connId: number; clientId: number | string }>();
+  private serverRequestToProxy = new Map<number, PendingServerRequest>();
+  private pendingServerRequests: Array<{ raw: string; serverId: number | string; method: string }> = [];
   private staleProxyIds = new Map<number, ReturnType<typeof setTimeout>>();
   private bridgeRequestIds = new Map<number, ReturnType<typeof setTimeout>>();
   private intentionalDisconnect = false;
@@ -310,6 +319,34 @@ export class CodexAdapter extends EventEmitter {
       return;
     }
 
+    // Check if this is a response to a server-originated request
+    try {
+      const parsed = JSON.parse(data);
+      if (parsed.id !== undefined && !parsed.method) {
+        const rawId = parsed.id;
+        const normalizedId = typeof rawId === "number"
+          ? rawId
+          : (typeof rawId === "string" && /^-?\d+$/.test(rawId) ? Number(rawId) : NaN);
+        const pending = !isNaN(normalizedId) ? this.serverRequestToProxy.get(normalizedId) : undefined;
+        if (pending !== undefined) {
+          if (pending.connId !== connId) {
+            this.log(`Dropping stale server request response (proxy id=${normalizedId}, expected conn #${pending.connId}, got #${connId})`);
+            return;
+          }
+          parsed.id = pending.serverId;
+          try {
+            this.appServerWs!.send(JSON.stringify(parsed));
+            this.serverRequestToProxy.delete(normalizedId);
+            this.log(`TUI → app-server: ${pending.method} response (proxy id=${normalizedId} → server id=${pending.serverId})`);
+          } catch (e: any) {
+            parsed.id = normalizedId;
+            this.log(`Failed to forward approval response (proxy id=${normalizedId}): ${e.message}`);
+          }
+          return;
+        }
+      }
+    } catch {}
+
     let forwarded = data;
     try {
       const parsed = JSON.parse(data);
@@ -350,10 +387,41 @@ export class CodexAdapter extends EventEmitter {
         return forwarded;
       }
 
+      if (parsed.method !== undefined) {
+        this.handleServerRequest(parsed);
+        return null;
+      }
+
       return this.handleAppServerResponse(parsed, raw);
     } catch {
       return raw;
     }
+  }
+
+  private handleServerRequest(parsed: any): void {
+    const raw = JSON.stringify(parsed);
+    const serverId = parsed.id;
+    const method = parsed.method;
+
+    if (!this.tuiWs) {
+      this.pendingServerRequests.push({ raw, serverId, method });
+      this.log(`Server request buffered (no TUI): ${method} (server id=${serverId})`);
+      return;
+    }
+
+    const proxyId = this.nextProxyId++;
+    parsed.id = proxyId;
+
+    try {
+      this.tuiWs.send(JSON.stringify(parsed));
+    } catch (e: any) {
+      this.log(`Server request send failed, buffering: ${method} (server id=${serverId}): ${e.message}`);
+      this.pendingServerRequests.push({ raw, serverId, method });
+      return;
+    }
+
+    this.serverRequestToProxy.set(proxyId, { serverId, connId: this.tuiConnId, method, timestamp: Date.now() });
+    this.log(`Server request: ${method} (server id=${serverId} → proxy id=${proxyId}, conn #${this.tuiConnId})`);
   }
 
   private handleAppServerResponse(parsed: any, raw: string): string | null {
