@@ -209,34 +209,29 @@ FEATS=$(echo "$CHANGELOG" | grep -iE "^[a-f0-9]+ feat" || true)
 FIXES=$(echo "$CHANGELOG" | grep -iE "^[a-f0-9]+ fix" || true)
 OTHERS=$(echo "$CHANGELOG" | grep -ivE "^[a-f0-9]+ (feat|fix|chore)" || true)
 
-NOTES="## What's Changed"$'\n'
-if [[ -n "$FIXES" ]]; then
-  NOTES+=$'\n'"### Bug Fixes"$'\n'
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    NOTES+="- ${line#* }"$'\n'
-  done <<< "$FIXES"
-fi
-if [[ -n "$FEATS" ]]; then
-  NOTES+=$'\n'"### Features"$'\n'
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    NOTES+="- ${line#* }"$'\n'
-  done <<< "$FEATS"
-fi
-if [[ -n "$OTHERS" ]]; then
-  NOTES+=$'\n'"### Other"$'\n'
-  while IFS= read -r line; do
-    [[ -z "$line" ]] && continue
-    NOTES+="- ${line#* }"$'\n'
-  done <<< "$OTHERS"
-fi
+append_section() {
+  local heading_en="$1"
+  local heading_zh="$2"
+  local content="$3"
+  if [[ -n "$content" ]]; then
+    NOTES+=$'\n'"### $heading_en / $heading_zh"$'\n'
+    while IFS= read -r line; do
+      [[ -z "$line" ]] && continue
+      NOTES+="- ${line#* }"$'\n'
+    done <<< "$content"
+  fi
+}
 
-NOTES+=$'\n'"### Installation"$'\n'
+NOTES="## What's Changed / 变更内容"$'\n'
+append_section "Bug Fixes" "问题修复" "$FIXES"
+append_section "Features" "新功能" "$FEATS"
+append_section "Other" "其他" "$OTHERS"
+
+NOTES+=$'\n'"### Installation / 安装"$'\n'
 NOTES+='```bash'$'\n'
 NOTES+="npm install -g @raysonmeng/agentbridge"$'\n'
 NOTES+='```'$'\n'
-NOTES+=$'\n'"**Full Changelog:** https://github.com/$REPO/compare/$COMPARE_BASE...v$NEW_VERSION"
+NOTES+=$'\n'"**Full Changelog / 完整变更记录:** https://github.com/$REPO/compare/$COMPARE_BASE...v$NEW_VERSION"
 
 RELEASE_URL=$(gh release create "v$NEW_VERSION" \
   --repo "$REPO" \
