@@ -12,7 +12,7 @@
     {
       "name": "agentbridge",
       "description": "Bridge Claude Code and Codex through a shared daemon, push channel delivery, and reply/get_messages tools.",
-      "version": "0.1.2",
+      "version": "0.1.3",
       "author": {
         "name": "AgentBridge Contributors",
         "email": "raysonmeng@qq.com"
