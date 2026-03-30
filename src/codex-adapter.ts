@@ -355,9 +355,13 @@ export class CodexAdapter extends EventEmitter {
             this.log(`Dropping stale server request response (proxy id=${normalizedId}, expected conn #${pending.connId}, got #${connId})`);
             return;
           }
+          if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+            this.log(`Cannot forward approval response: app-server disconnected (proxy id=${normalizedId})`);
+            return;
+          }
           parsed.id = pending.serverId;
           try {
-            this.appServerWs!.send(JSON.stringify(parsed));
+            this.appServerWs.send(JSON.stringify(parsed));
             this.serverRequestToProxy.delete(normalizedId);
             this.log(`TUI → app-server: ${pending.method} response (proxy id=${normalizedId} → server id=${pending.serverId})`);
           } catch (e: any) {
@@ -410,7 +414,7 @@ export class CodexAdapter extends EventEmitter {
       }
 
       if (parsed.method !== undefined) {
-        this.handleServerRequest(parsed);
+        this.handleServerRequest(parsed, raw);
         return null;
       }
 
@@ -420,8 +424,7 @@ export class CodexAdapter extends EventEmitter {
     }
   }
 
-  private handleServerRequest(parsed: any): void {
-    const raw = JSON.stringify(parsed);
+  private handleServerRequest(parsed: any, raw: string): void {
     const serverId = parsed.id;
     const method = parsed.method;
 
