@@ -33,22 +33,6 @@ export interface JsonRpcNotification {
 
 export type JsonRpcMessage = JsonRpcRequest | JsonRpcResponse | JsonRpcNotification;
 
-// ===== Codex App Server Types =====
-
-export interface CodexThread {
-  id: string;
-}
-
-export interface CodexItem {
-  id: string;
-  type: string;
-  content?: Array<{ type: string; text?: string }>;
-}
-
-export interface CodexTurn {
-  id: string;
-}
-
 // ===== MCP Tool Schema =====
 
 export interface McpTool {

@@ -13,8 +13,21 @@ import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { EventEmitter } from "node:events";
 import { appendFileSync } from "node:fs";
-import type { BridgeMessage, CodexItem } from "./types";
+import type { BridgeMessage } from "./types";
 import type { ServerWebSocket } from "bun";
+import {
+  isAppServerNotification,
+  isAppServerRequestMessage,
+  isAppServerResponseMessage,
+  isTrackedAppServerRequestMethod,
+  type AppServerItem,
+  type AppServerNotification,
+  type AppServerRequest,
+  type AppServerResponse,
+  type AppServerServerRequestMethod,
+  type AppServerTrackedRequestMethod,
+  type TurnStartParams,
+} from "./app-server-protocol";
 
 interface TuiSocketData {
   connId: number;
@@ -23,17 +36,14 @@ interface TuiSocketData {
 interface PendingServerRequest {
   serverId: number | string;
   connId: number;
-  method: string;
+  method: AppServerServerRequestMethod | string;
   timestamp: number;
 }
 
 const LOG_FILE = "/tmp/agentbridge.log";
-const TRACKED_REQUEST_METHODS = new Set(["thread/start", "thread/resume", "turn/start"]);
-
-type TrackedRequestMethod = "thread/start" | "thread/resume" | "turn/start";
 
 interface PendingRequest {
-  method: TrackedRequestMethod;
+  method: AppServerTrackedRequestMethod;
   threadId?: string;
 }
 
@@ -160,7 +170,7 @@ export class CodexAdapter extends EventEmitter {
         method: "turn/start",
         id: requestId,
         params: { threadId: this.threadId, input: [{ type: "text", text }] },
-      }));
+      } satisfies AppServerRequest<"turn/start", TurnStartParams>));
       return true;
     } catch (err: any) {
       this.untrackBridgeRequestId(requestId);
@@ -403,26 +413,37 @@ export class CodexAdapter extends EventEmitter {
 
   private handleAppServerPayload(raw: string): string | null {
     try {
-      const parsed = JSON.parse(raw);
+      const parsed: unknown = JSON.parse(raw);
 
-      if (parsed.id === undefined) {
-        const forwarded = this.patchResponse(parsed, raw);
-        this.interceptServerMessage(parsed);
+      if (isAppServerNotification(parsed) || (typeof parsed === "object" && parsed !== null && !("id" in parsed))) {
+        const notificationLike = parsed as Record<string, unknown>;
+        const forwarded = this.patchResponse(notificationLike, raw);
+        this.interceptServerMessage(notificationLike);
         return forwarded;
       }
 
-      if (parsed.method !== undefined) {
+      if (isAppServerRequestMessage(parsed)) {
+        // Intentionally uses the broad isAppServerRequestMessage (any id+method) instead of
+        // the narrow isAppServerServerRequest (only known approval methods). This ensures
+        // unknown future server-to-client requests are forwarded rather than silently dropped
+        // (lesson from issue #37).
         this.handleServerRequest(parsed, raw);
         return null;
       }
 
-      return this.handleAppServerResponse(parsed, raw);
+      if (isAppServerResponseMessage(parsed)) {
+        return this.handleAppServerResponse(parsed, raw);
+      }
+
+      // Drop unclassifiable messages (not notification, not request, not response).
+      this.log(`Dropping unclassifiable app-server message: ${raw.slice(0, 100)}`);
+      return null;
     } catch {
       return raw;
     }
   }
 
-  private handleServerRequest(parsed: any, raw: string): void {
+  private handleServerRequest(parsed: AppServerRequest, raw: string): void {
     const serverId = parsed.id;
     const method = parsed.method;
 
@@ -454,7 +475,7 @@ export class CodexAdapter extends EventEmitter {
     return NaN;
   }
 
-  private handleAppServerResponse(parsed: any, raw: string): string | null {
+  private handleAppServerResponse(parsed: AppServerResponse, raw: string): string | null {
     const responseId = parsed.id;
     const numericId = this.normalizeNumericId(responseId);
     const mapping = !isNaN(numericId) ? this.upstreamToClient.get(numericId) : undefined;
@@ -491,8 +512,8 @@ export class CodexAdapter extends EventEmitter {
     return null;
   }
 
-  private patchResponse(parsed: any, raw: string): string {
-    if (parsed.error && parsed.id !== undefined) {
+  private patchResponse(parsed: AppServerNotification | AppServerResponse | Record<string, unknown>, raw: string): string {
+    if (isAppServerResponseMessage(parsed) && parsed.error && parsed.id !== undefined) {
       const errMsg: string = parsed.error.message ?? "";
       if (errMsg.includes("rate limits") || errMsg.includes("rateLimits")) {
         this.log(`Patching rateLimits error → mock success (id: ${parsed.id})`);
@@ -529,29 +550,33 @@ export class CodexAdapter extends EventEmitter {
 
   // ── Server Message Interception (for Bridge) ───────────────
 
-  private interceptServerMessage(msg: any, connId?: number) {
+  private interceptServerMessage(msg: AppServerNotification | AppServerResponse | Record<string, unknown>, connId?: number) {
     this.handleTrackedResponse(msg, connId);
-    if (msg.method) this.handleServerNotification(msg);
+    if ("method" in msg && typeof msg.method === "string" && isAppServerNotification(msg)) {
+      this.handleServerNotification(msg);
+    }
   }
 
-  private handleServerNotification(msg: any) {
+  private handleServerNotification(msg: AppServerNotification) {
     const { method, params } = msg;
     switch (method) {
       case "turn/started":
         this.markTurnStarted(params?.turn?.id);
         break;
       case "item/started": {
-        const item: CodexItem = params?.item;
+        const item: AppServerItem | undefined = params?.item;
         if (item?.type === "agentMessage") this.agentMessageBuffers.set(item.id, []);
         break;
       }
       case "item/agentMessage/delta": {
-        const buf = this.agentMessageBuffers.get(params?.itemId);
+        const itemId = params?.itemId;
+        if (typeof itemId !== "string") break;
+        const buf = this.agentMessageBuffers.get(itemId);
         if (buf && params?.delta) buf.push(params.delta);
         break;
       }
       case "item/completed": {
-        const item: CodexItem = params?.item;
+        const item: AppServerItem | undefined = params?.item;
         if (item?.type === "agentMessage") {
           const content = this.extractContent(item);
           this.agentMessageBuffers.delete(item.id);
@@ -576,7 +601,7 @@ export class CodexAdapter extends EventEmitter {
     }
   }
 
-  private extractContent(item: CodexItem): string {
+  private extractContent(item: AppServerItem): string {
     if (item.content?.length) {
       return item.content.filter((c) => c.type === "text" && c.text).map((c) => c.text!).join("");
     }
@@ -590,17 +615,21 @@ export class CodexAdapter extends EventEmitter {
     return `${connId ?? this.tuiConnId}:${base}`;
   }
 
-  private trackPendingRequest(message: any, connId: number, _proxyId?: number) {
-    const method = message?.method;
-    const key = this.pendingKey(message?.id, connId);
+  private trackPendingRequest(message: AppServerRequest | Record<string, unknown>, connId: number, _proxyId?: number) {
+    const rpcId = "id" in message ? message.id : undefined;
+    const method = "method" in message && typeof message.method === "string" ? message.method : undefined;
+    const key = this.pendingKey(rpcId, connId);
 
-    this.log(`[track] method=${method} id=${message?.id} (type=${typeof message?.id}) key=${key}`);
+    this.log(`[track] method=${method} id=${rpcId} (type=${typeof rpcId}) key=${key}`);
 
-    if (!key || !TRACKED_REQUEST_METHODS.has(method)) return;
+    if (!key || !isTrackedAppServerRequestMethod(method)) return;
 
     const pending: PendingRequest = { method };
     if (method === "turn/start") {
-      const threadId = message?.params?.threadId;
+      const params = "params" in message && typeof message.params === "object" && message.params !== null
+        ? message.params as Record<string, unknown>
+        : undefined;
+      const threadId = params?.threadId;
       if (typeof threadId === "string" && threadId.length > 0) {
         pending.threadId = threadId;
       }
@@ -613,6 +642,7 @@ export class CodexAdapter extends EventEmitter {
     this.pendingRequests.set(key, pending);
   }
 
+  // TODO: narrow this type further once response shapes are fully typed (#47 follow-up)
   private handleTrackedResponse(message: any, connId?: number) {
     const key = this.pendingKey(message?.id, connId);
     if (!key) return;

@@ -175,6 +175,19 @@ describe("CodexAdapter app-server response handling", () => {
 
     adapter.clearResponseTrackingState();
   });
+
+  test("drops malformed id-bearing payloads that are neither request nor response", () => {
+    const adapter = createAdapter();
+    const intercepted: Array<{ message: any; connId?: number }> = [];
+    adapter.interceptServerMessage = (message: any, connId?: number) => intercepted.push({ message, connId });
+
+    const forwarded = adapter.handleAppServerPayload(JSON.stringify({ id: 1 }));
+
+    expect(forwarded).toBeNull();
+    expect(intercepted).toEqual([]);
+
+    adapter.clearResponseTrackingState();
+  });
 });
 
 describe("CodexAdapter turn state machine", () => {
@@ -250,9 +263,91 @@ describe("CodexAdapter turn state machine", () => {
     adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
     expect(adapter.injectMessage("hello after reset")).toBe(true);
   });
+
+  test("thread/start tracked request lifecycle emits ready from response thread id", () => {
+    const adapter = createAdapter();
+    const appSent: string[] = [];
+    const readyEvents: string[] = [];
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: (data: string) => appSent.push(data) } as any;
+    adapter.tuiConnId = 1;
+    adapter.on("ready", (threadId: string) => readyEvents.push(threadId));
+
+    const ws = { data: { connId: 1 } } as any;
+    adapter.onTuiMessage(ws, JSON.stringify({
+      id: "client-thread-start",
+      method: "thread/start",
+      params: {},
+    }));
+
+    const proxyId = JSON.parse(appSent[0]).id;
+    const forwarded = adapter.handleAppServerPayload(JSON.stringify({
+      id: proxyId,
+      result: { thread: { id: "thread-from-response" } },
+    }));
+
+    expect(forwarded).not.toBeNull();
+    expect(adapter.activeThreadId).toBe("thread-from-response");
+    expect(readyEvents).toEqual(["thread-from-response"]);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("turn/start tracked request lifecycle restores thread id from request params", () => {
+    const adapter = createAdapter();
+    const appSent: string[] = [];
+    const readyEvents: string[] = [];
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: (data: string) => appSent.push(data) } as any;
+    adapter.tuiConnId = 1;
+    adapter.on("ready", (threadId: string) => readyEvents.push(threadId));
+
+    const ws = { data: { connId: 1 } } as any;
+    adapter.onTuiMessage(ws, JSON.stringify({
+      id: "client-turn-start",
+      method: "turn/start",
+      params: {
+        threadId: "thread-from-request",
+        input: [{ type: "text", text: "hello" }],
+      },
+    }));
+
+    const proxyId = JSON.parse(appSent[0]).id;
+    const forwarded = adapter.handleAppServerPayload(JSON.stringify({
+      id: proxyId,
+      result: { accepted: true },
+    }));
+
+    expect(forwarded).not.toBeNull();
+    expect(adapter.activeThreadId).toBe("thread-from-request");
+    expect(readyEvents).toEqual(["thread-from-request"]);
+
+    adapter.clearResponseTrackingState();
+  });
 });
 
 describe("CodexAdapter server-to-client request passthrough", () => {
+  test("forwards unknown future server request method to TUI (broad classification)", () => {
+    const adapter = createAdapter();
+    const sent: string[] = [];
+    adapter.tuiWs = { send: (data: string) => sent.push(data) } as any;
+    adapter.tuiConnId = 1;
+
+    // A hypothetical future server-to-client request method not in the known allowlist
+    const result = adapter.handleAppServerPayload(JSON.stringify({
+      id: 99,
+      method: "item/futureFeature/requestSomething",
+      params: { detail: "test" },
+    }));
+
+    expect(result).toBeNull();
+    expect(sent.length).toBe(1);
+    const parsed = JSON.parse(sent[0]);
+    expect(parsed.method).toBe("item/futureFeature/requestSomething");
+    expect(parsed.id).not.toBe(99); // remapped to proxy id
+    expect(adapter.serverRequestToProxy.size).toBe(1);
+
+    adapter.clearResponseTrackingState();
+  });
+
   test("forwards server request (id + method) to TUI instead of dropping", () => {
     const adapter = createAdapter();
     const sent: string[] = [];
