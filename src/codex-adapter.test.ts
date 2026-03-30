@@ -419,4 +419,128 @@ describe("CodexAdapter server-to-client request passthrough", () => {
 
     adapter.clearResponseTrackingState();
   });
+
+  test("approval response send failure retains mapping", () => {
+    const adapter = createAdapter();
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => { throw new Error("broken"); } } as any;
+    adapter.tuiConnId = 1;
+
+    adapter.serverRequestToProxy.set(100500, {
+      serverId: 99,
+      connId: 1,
+      method: "item/permissions/requestApproval",
+      timestamp: Date.now(),
+    });
+
+    const ws = { data: { connId: 1 } } as any;
+    adapter.onTuiMessage(ws, JSON.stringify({ id: 100500, result: { approved: true } }));
+
+    // mapping should still exist after send failure
+    expect(adapter.serverRequestToProxy.has(100500)).toBe(true);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("replays buffered server requests on TUI reconnect", () => {
+    const adapter = createAdapter();
+    const sent: string[] = [];
+
+    adapter.pendingServerRequests = [
+      { raw: JSON.stringify({ id: 50, method: "item/fileChange/requestApproval", params: { file: "test.ts" } }), serverId: 50, method: "item/fileChange/requestApproval" },
+    ];
+
+    const ws = { data: { connId: 0 }, send: (data: string) => sent.push(data) } as any;
+    adapter.onTuiConnect(ws);
+
+    expect(adapter.pendingServerRequests.length).toBe(0);
+    expect(sent.length).toBe(1);
+    const parsed = JSON.parse(sent[0]);
+    expect(parsed.method).toBe("item/fileChange/requestApproval");
+    expect(parsed.id).not.toBe(50);
+    expect(adapter.serverRequestToProxy.size).toBe(1);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("replay send failure: no phantom mapping, request stays buffered", () => {
+    const adapter = createAdapter();
+
+    adapter.pendingServerRequests = [
+      { raw: JSON.stringify({ id: 60, method: "item/permissions/requestApproval", params: {} }), serverId: 60, method: "item/permissions/requestApproval" },
+    ];
+
+    const ws = { data: { connId: 0 }, send: () => { throw new Error("connection reset"); } } as any;
+    adapter.onTuiConnect(ws);
+
+    expect(adapter.serverRequestToProxy.size).toBe(0);
+    expect(adapter.pendingServerRequests.length).toBe(1);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("server request mappings survive TUI disconnect (TTL cleanup)", () => {
+    const adapter = createAdapter();
+    adapter.tuiConnId = 1;
+
+    adapter.serverRequestToProxy.set(100400, {
+      serverId: 70,
+      connId: 1,
+      method: "item/permissions/requestApproval",
+      timestamp: Date.now(),
+    });
+
+    adapter.retireConnectionState(1);
+    expect(adapter.serverRequestToProxy.has(100400)).toBe(true);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("app-server close clears all server request state", () => {
+    const adapter = createAdapter();
+
+    adapter.serverRequestToProxy.set(100401, {
+      serverId: 71,
+      connId: 1,
+      method: "item/permissions/requestApproval",
+      timestamp: Date.now(),
+    });
+    adapter.pendingServerRequests = [
+      { raw: "{}", serverId: 72, method: "item/fileChange/requestApproval" },
+    ];
+
+    adapter.clearResponseTrackingState();
+    adapter.activeTurnIds.clear();
+    adapter.turnInProgress = false;
+
+    expect(adapter.serverRequestToProxy.size).toBe(0);
+    expect(adapter.pendingServerRequests.length).toBe(0);
+  });
+
+  test("server request and client request share nextProxyId without collision", () => {
+    const adapter = createAdapter();
+    const sent: string[] = [];
+    adapter.tuiWs = { send: (data: string) => sent.push(data) } as any;
+    adapter.tuiConnId = 1;
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+
+    adapter.handleAppServerPayload(JSON.stringify({
+      id: 80,
+      method: "item/permissions/requestApproval",
+      params: {},
+    }));
+
+    const ws = { data: { connId: 1 } } as any;
+    adapter.onTuiMessage(ws, JSON.stringify({
+      id: "client-1",
+      method: "thread/start",
+      params: {},
+    }));
+
+    const serverProxyId = JSON.parse(sent[0]).id;
+    const clientMapping = [...adapter.upstreamToClient.entries()];
+    expect(clientMapping.length).toBe(1);
+    expect(clientMapping[0][0]).not.toBe(serverProxyId);
+
+    adapter.clearResponseTrackingState();
+  });
 });

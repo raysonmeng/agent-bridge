@@ -293,6 +293,28 @@ export class CodexAdapter extends EventEmitter {
     this.tuiWs = ws;
     this.log(`TUI connected (conn #${this.tuiConnId})`);
     this.emit("tuiConnected", this.tuiConnId);
+
+    // Replay buffered server requests.
+    const remaining: typeof this.pendingServerRequests = [];
+    for (const buffered of this.pendingServerRequests) {
+      const proxyId = this.nextProxyId++;
+      try {
+        const parsed = JSON.parse(buffered.raw);
+        parsed.id = proxyId;
+        ws.send(JSON.stringify(parsed));
+        this.serverRequestToProxy.set(proxyId, {
+          serverId: buffered.serverId,
+          connId: this.tuiConnId,
+          method: buffered.method,
+          timestamp: Date.now(),
+        });
+        this.log(`Replayed buffered server request: ${buffered.method} (server id=${buffered.serverId} → proxy id=${proxyId})`);
+      } catch (e: any) {
+        this.log(`Failed to replay buffered server request: ${buffered.method} (server id=${buffered.serverId}): ${e.message}`);
+        remaining.push(buffered);
+      }
+    }
+    this.pendingServerRequests = remaining;
   }
 
   private onTuiDisconnect(ws: ServerWebSocket<TuiSocketData>) {
@@ -686,6 +708,19 @@ export class CodexAdapter extends EventEmitter {
       this.upstreamToClient.delete(upId);
       this.trackStaleProxyId(upId);
     }
+
+    // TTL cleanup for server request mappings belonging to this connection.
+    for (const [proxyId, pending] of this.serverRequestToProxy.entries()) {
+      if (pending.connId === connId) {
+        const timer = setTimeout(() => {
+          if (this.serverRequestToProxy.get(proxyId)?.connId === connId) {
+            this.serverRequestToProxy.delete(proxyId);
+            this.log(`Expired stale server request mapping (proxy id=${proxyId}, method=${pending.method})`);
+          }
+        }, CodexAdapter.RESPONSE_TRACKING_TTL_MS);
+        timer.unref?.();
+      }
+    }
   }
 
   private trackStaleProxyId(proxyId: number) {
@@ -741,6 +776,9 @@ export class CodexAdapter extends EventEmitter {
       clearTimeout(timer);
     }
     this.bridgeRequestIds.clear();
+
+    this.serverRequestToProxy.clear();
+    this.pendingServerRequests = [];
   }
 
   /**
