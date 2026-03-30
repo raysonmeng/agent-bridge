@@ -61,6 +61,7 @@ export class CodexAdapter extends EventEmitter {
   private nextProxyId = 100000;
   private upstreamToClient = new Map<number, { connId: number; clientId: number | string }>();
   private serverRequestToProxy = new Map<number, PendingServerRequest>();
+  private serverRequestTtlTimers = new Map<number, ReturnType<typeof setTimeout>>();
   private pendingServerRequests: Array<{ raw: string; serverId: number | string; method: string }> = [];
   private staleProxyIds = new Map<number, ReturnType<typeof setTimeout>>();
   private bridgeRequestIds = new Map<number, ReturnType<typeof setTimeout>>();
@@ -345,10 +346,7 @@ export class CodexAdapter extends EventEmitter {
     try {
       const parsed = JSON.parse(data);
       if (parsed.id !== undefined && !parsed.method) {
-        const rawId = parsed.id;
-        const normalizedId = typeof rawId === "number"
-          ? rawId
-          : (typeof rawId === "string" && /^-?\d+$/.test(rawId) ? Number(rawId) : NaN);
+        const normalizedId = this.normalizeNumericId(parsed.id);
         const pending = !isNaN(normalizedId) ? this.serverRequestToProxy.get(normalizedId) : undefined;
         if (pending !== undefined) {
           if (pending.connId !== connId) {
@@ -449,12 +447,16 @@ export class CodexAdapter extends EventEmitter {
     this.log(`Server request: ${method} (server id=${serverId} → proxy id=${proxyId}, conn #${this.tuiConnId})`);
   }
 
+  /** Normalize a JSON-RPC id to a number. Returns NaN for non-numeric strings. */
+  private normalizeNumericId(id: unknown): number {
+    if (typeof id === "number") return id;
+    if (typeof id === "string" && /^-?\d+$/.test(id)) return Number(id);
+    return NaN;
+  }
+
   private handleAppServerResponse(parsed: any, raw: string): string | null {
     const responseId = parsed.id;
-    // Handle response IDs that may arrive as numeric strings (e.g. "100005"
-    // instead of 100005). Non-numeric string IDs like "initialize" stay NaN
-    // and fall through to the unmatched response log at the end of this method.
-    const numericId = typeof responseId === "number" ? responseId : (typeof responseId === "string" && /^-?\d+$/.test(responseId) ? Number(responseId) : NaN);
+    const numericId = this.normalizeNumericId(responseId);
     const mapping = !isNaN(numericId) ? this.upstreamToClient.get(numericId) : undefined;
 
     if (mapping) {
@@ -715,13 +717,16 @@ export class CodexAdapter extends EventEmitter {
     // TTL cleanup for server request mappings belonging to this connection.
     for (const [proxyId, pending] of this.serverRequestToProxy.entries()) {
       if (pending.connId === connId) {
+        this.clearTrackedId(this.serverRequestTtlTimers, proxyId);
         const timer = setTimeout(() => {
+          this.serverRequestTtlTimers.delete(proxyId);
           if (this.serverRequestToProxy.get(proxyId)?.connId === connId) {
             this.serverRequestToProxy.delete(proxyId);
             this.log(`Expired stale server request mapping (proxy id=${proxyId}, method=${pending.method})`);
           }
         }, CodexAdapter.RESPONSE_TRACKING_TTL_MS);
         timer.unref?.();
+        this.serverRequestTtlTimers.set(proxyId, timer);
       }
     }
   }
@@ -780,6 +785,10 @@ export class CodexAdapter extends EventEmitter {
     }
     this.bridgeRequestIds.clear();
 
+    for (const timer of this.serverRequestTtlTimers.values()) {
+      clearTimeout(timer);
+    }
+    this.serverRequestTtlTimers.clear();
     this.serverRequestToProxy.clear();
     this.pendingServerRequests = [];
   }

@@ -420,6 +420,27 @@ describe("CodexAdapter server-to-client request passthrough", () => {
     adapter.clearResponseTrackingState();
   });
 
+  test("approval response when app-server disconnected is dropped gracefully", () => {
+    const adapter = createAdapter();
+    adapter.appServerWs = null;
+    adapter.tuiConnId = 1;
+
+    adapter.serverRequestToProxy.set(100600, {
+      serverId: 88,
+      connId: 1,
+      method: "item/permissions/requestApproval",
+      timestamp: Date.now(),
+    });
+
+    const ws = { data: { connId: 1 } } as any;
+    adapter.onTuiMessage(ws, JSON.stringify({ id: 100600, result: { approved: true } }));
+
+    // mapping preserved (not deleted, not forwarded)
+    expect(adapter.serverRequestToProxy.has(100600)).toBe(true);
+
+    adapter.clearResponseTrackingState();
+  });
+
   test("approval response send failure retains mapping", () => {
     const adapter = createAdapter();
     adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => { throw new Error("broken"); } } as any;
