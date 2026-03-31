@@ -1,10 +1,12 @@
 import { EventEmitter } from "node:events";
 import type { BridgeMessage } from "./types";
+import { CLOSE_CODE_REPLACED } from "./control-protocol";
 import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
 
 interface DaemonClientEvents {
   codexMessage: [BridgeMessage];
   disconnect: [];
+  replaced: [];
   status: [DaemonStatus];
 }
 
@@ -145,7 +147,11 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       if (isCurrent) {
         this.ws = null;
         this.rejectPendingReplies("AgentBridge daemon disconnected.");
-        this.emit("disconnect");
+        if (event.code === CLOSE_CODE_REPLACED) {
+          this.emit("replaced");
+        } else {
+          this.emit("disconnect");
+        }
       }
       // If this.ws !== ws, this socket was replaced by a newer connection —
       // don't emit "disconnect" or it will trigger a reconnect loop.

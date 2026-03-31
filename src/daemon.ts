@@ -14,6 +14,7 @@ import { TuiConnectionState } from "./tui-connection-state";
 import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
 import { ConfigService } from "./config-service";
+import { CLOSE_CODE_REPLACED } from "./control-protocol";
 import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
 import type { BridgeMessage } from "./types";
 
@@ -333,7 +334,7 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
 
 function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
   if (attachedClaude && attachedClaude !== ws) {
-    attachedClaude.close(4001, "replaced by a newer Claude session");
+    attachedClaude.close(CLOSE_CODE_REPLACED, "replaced by a newer Claude session");
   }
 
   clearPendingClaudeDisconnect("Claude frontend attached");

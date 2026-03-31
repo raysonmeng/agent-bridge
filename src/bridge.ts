@@ -74,6 +74,17 @@ daemonClient.on("disconnect", () => {
   void reconnectToDaemon();
 });
 
+daemonClient.on("replaced", () => {
+  if (shuttingDown || daemonDisabled) return;
+
+  log("Daemon closed our connection with code 4001 — replaced by a newer Claude session");
+
+  void enterDisabledState(
+    "Replaced by a newer Claude session (close code 4001)",
+    "⚠️ Another Claude Code session connected to AgentBridge and replaced this one. This session is now idle. 另一个 Claude Code 会话已接管 AgentBridge 连接，当前会话已进入空闲状态。",
+  );
+});
+
 claude.on("ready", async () => {
   log(`MCP server ready (delivery mode: ${claude.getDeliveryMode()}) — ensuring AgentBridge daemon...`);
   if (daemonLifecycle.wasKilled()) {
