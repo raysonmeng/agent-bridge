@@ -237,14 +237,7 @@ export class CodexAdapter extends EventEmitter {
       };
 
       appWs.onclose = () => {
-        this.log("App-server connection closed");
-        this.appServerWs = null;
-        this.clearTransientResponseTrackingState();
-        this.activeTurnIds.clear();
-        this.turnInProgress = false;
-        if (!this.intentionalDisconnect) {
-          this.scheduleReconnect();
-        }
+        this.handleAppServerClose();
       };
     });
   }
@@ -282,6 +275,19 @@ export class CodexAdapter extends EventEmitter {
         this.scheduleReconnect();
       }
     }, delay);
+  }
+
+  private handleAppServerClose() {
+    this.log("App-server connection closed");
+    this.appServerWs = null;
+    // Approval request/response ids are scoped to the current app-server session.
+    // If the socket reconnects, replaying old approval state would forward stale ids.
+    this.clearResponseTrackingState();
+    this.activeTurnIds.clear();
+    this.turnInProgress = false;
+    if (!this.intentionalDisconnect) {
+      this.scheduleReconnect();
+    }
   }
 
   // ── Proxy Server ───────────────────────────────────────────

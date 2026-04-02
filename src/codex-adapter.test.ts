@@ -698,6 +698,40 @@ describe("CodexAdapter server-to-client request passthrough", () => {
     adapter.clearResponseTrackingState();
   });
 
+  test("app-server close discards approval state across reconnects", () => {
+    const adapter = createAdapter();
+    const sent: string[] = [];
+
+    adapter.tuiWs = { send: (data: string) => sent.push(data) } as any;
+    adapter.tuiConnId = 1;
+
+    adapter.handleAppServerPayload(JSON.stringify({
+      id: 71,
+      method: "item/permissions/requestApproval",
+      params: { permission: "network" },
+    }));
+
+    adapter.pendingServerRequests = [
+      { raw: JSON.stringify({ id: 72, method: "item/fileChange/requestApproval", params: { file: "draft.txt" } }), serverId: 72, method: "item/fileChange/requestApproval" },
+    ];
+    adapter.pendingServerResponses.set(100402, {
+      raw: JSON.stringify({ id: 73, result: { approved: true } }),
+      serverId: 73,
+      method: "item/commandExecution/requestApproval",
+      timestamp: Date.now(),
+    });
+
+    expect(adapter.serverRequestToProxy.size).toBe(1);
+    expect(adapter.pendingServerRequests.length).toBe(1);
+    expect(adapter.pendingServerResponses.size).toBe(1);
+
+    adapter.handleAppServerClose();
+
+    expect(adapter.serverRequestToProxy.size).toBe(0);
+    expect(adapter.pendingServerRequests.length).toBe(0);
+    expect(adapter.pendingServerResponses.size).toBe(0);
+  });
+
   test("app-server close clears all server request state", () => {
     const adapter = createAdapter();
 
