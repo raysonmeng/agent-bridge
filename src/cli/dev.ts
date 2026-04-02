@@ -1,4 +1,4 @@
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import { resolve } from "node:path";
 import { existsSync, cpSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
@@ -12,6 +12,30 @@ export async function runDev() {
   const marketplacePath = resolve(projectRoot, ".claude-plugin", "marketplace.json");
   const pluginDir = resolve(projectRoot, "plugins", "agentbridge");
   const pluginManifest = resolve(pluginDir, ".claude-plugin", "plugin.json");
+
+  // Step 0a: Build CLI from source
+  console.log("Building CLI from source...");
+  const cliBuild = spawnSync("bun", ["run", "build:cli"], {
+    cwd: projectRoot,
+    stdio: "inherit",
+  });
+  if (cliBuild.status !== 0) {
+    console.error("  ERROR: CLI build failed. Fix build errors and try again.");
+    process.exit(1);
+  }
+  console.log("  ✓ CLI built successfully\n");
+
+  // Step 0b: Build plugin bundles from source
+  console.log("Building plugin from source...");
+  const buildResult = spawnSync("bun", ["run", "build:plugin"], {
+    cwd: projectRoot,
+    stdio: "inherit",
+  });
+  if (buildResult.status !== 0) {
+    console.error("  ERROR: Plugin build failed. Fix build errors and try again.");
+    process.exit(1);
+  }
+  console.log("  ✓ Plugin built successfully\n");
 
   // Step 1: Validate local plugin exists
   if (!existsSync(pluginManifest)) {
