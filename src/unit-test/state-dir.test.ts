@@ -2,7 +2,7 @@ import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { StateDirResolver } from "./state-dir";
+import { StateDirResolver } from "../state-dir";
 
 describe("StateDirResolver", () => {
   let tempDir: string;

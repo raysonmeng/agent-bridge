@@ -2,7 +2,7 @@ import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { ConfigService, DEFAULT_CONFIG, DEFAULT_COLLABORATION_MD } from "./config-service";
+import { ConfigService, DEFAULT_CONFIG, DEFAULT_COLLABORATION_MD } from "../config-service";
 
 describe("ConfigService", () => {
   let tempDir: string;

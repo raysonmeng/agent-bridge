@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { disabledReplyError } from "./bridge-disabled-state";
+import { disabledReplyError } from "../bridge-disabled-state";
 
 describe("bridge disabled-state messaging", () => {
   test("kill-disabled sessions explain how to reconnect", () => {

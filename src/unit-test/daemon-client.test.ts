@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { DaemonClient } from "./daemon-client";
+import { DaemonClient } from "../daemon-client";
 
 /**
  * Tests for DaemonClient — connection, disconnection, and message routing.

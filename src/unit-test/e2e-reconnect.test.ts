@@ -3,7 +3,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { readFileSync, unlinkSync, mkdirSync, rmSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
-import { DaemonClient } from "./daemon-client";
+import { DaemonClient } from "../daemon-client";
 
 /**
  * E2E tests: daemon lifecycle + client reconnect
@@ -20,7 +20,7 @@ const TEST_STATE_DIR = `/tmp/agentbridge-e2e-test-${TEST_CONTROL_PORT}`;
 const TEST_PID_FILE = join(TEST_STATE_DIR, "daemon.pid");
 const HEALTH_URL = `http://127.0.0.1:${TEST_CONTROL_PORT}/healthz`;
 const WS_URL = `ws://127.0.0.1:${TEST_CONTROL_PORT}/ws`;
-const DAEMON_PATH = fileURLToPath(new URL("./daemon.ts", import.meta.url));
+const DAEMON_PATH = fileURLToPath(new URL("../daemon.ts", import.meta.url));
 
 let daemonProc: ChildProcess | null = null;
 

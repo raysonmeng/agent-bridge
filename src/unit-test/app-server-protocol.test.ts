@@ -7,7 +7,7 @@ import {
   isAppServerResponseMessage,
   isAppServerServerRequest,
   isTrackedAppServerRequestMethod,
-} from "./app-server-protocol";
+} from "../app-server-protocol";
 
 describe("app-server protocol subset", () => {
   test("exports the tracked app-server request methods used by CodexAdapter", () => {

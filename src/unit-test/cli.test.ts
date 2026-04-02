@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { compareVersions } from "./init";
-import { checkOwnedFlagConflicts } from "./claude";
+import { compareVersions } from "../cli/init";
+import { checkOwnedFlagConflicts } from "../cli/claude";
 
 describe("CLI: version comparison", () => {
   test("equal versions return 0", () => {

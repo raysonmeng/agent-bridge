@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { TuiConnectionState } from "./tui-connection-state";
+import { TuiConnectionState } from "../tui-connection-state";
 
 const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
 

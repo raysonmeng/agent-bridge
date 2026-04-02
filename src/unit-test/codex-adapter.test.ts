@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { CodexAdapter } from "./codex-adapter";
+import { CodexAdapter } from "../codex-adapter";
 
 function createAdapter() {
   return new CodexAdapter(4510, 4511) as any;
