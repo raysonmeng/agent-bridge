@@ -76,19 +76,19 @@ daemonClient.on("disconnect", () => {
   void reconnectToDaemon();
 });
 
-daemonClient.on("replaced", async () => {
+daemonClient.on("rejected", async () => {
   if (shuttingDown || daemonDisabled) return;
 
-  log("Replaced by a newer Claude session (close code 4001) — entering permanent dormant state");
+  log("Daemon rejected this session (close code 4001) — another Claude session is already connected");
 
-  // Do NOT use enterDisabledState() here — it starts the recovery poller,
-  // which would reconnect and kick the newer session, causing a slow ping-pong.
-  // A replaced session should stay dormant permanently.
+  // The daemon now rejects NEW connections when an existing session is active.
+  // This session was the latecomer, so it should enter dormant state permanently
+  // and not try to reconnect (which would just get rejected again).
   daemonDisabled = true;
-  daemonDisabledReason = "replaced";
+  daemonDisabledReason = "rejected";
   await claude.pushNotification(systemMessage(
     "system_bridge_replaced",
-    "⚠️ Another Claude Code session connected to AgentBridge and replaced this one. This session is now permanently idle. 另一个 Claude Code 会话已接管 AgentBridge 连接，当前会话已永久进入空闲状态。",
+    "⚠️ AgentBridge daemon rejected this session — another Claude Code session is already connected. Close the other session first, or run `agentbridge kill` to reset. AgentBridge 守护进程拒绝了此会话——另一个 Claude Code 会话已在连接中。请先关闭另一个会话，或运行 `agentbridge kill` 重置。",
   ));
   await daemonClient.disconnect();
 });

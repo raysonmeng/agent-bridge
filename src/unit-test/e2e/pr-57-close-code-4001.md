@@ -1,25 +1,37 @@
 # PR #57 — E2E Test Plan
 
-## fix: stop infinite reconnect storm + approval lifecycle reliability
+## fix: single-session admission + approval lifecycle reliability
 
-### Test 1: Close Code 4001 — 多会话 dormant
+### Test 1: 单会话保护 — 新连接被拒绝
 
-**目的：** 验证第二个 Claude Code 会话连接后，第一个会话优雅进入永久 dormant，不会无限重连。
+**目的：** 验证第二个 Claude Code 会话连接时被拒绝，第一个会话不受影响。
 
 1. 终端 A：`agentbridge claude` 启动第一个 Claude Code 会话
 2. 终端 B：`agentbridge codex` 启动 Codex TUI
 3. 确认终端 A 收到 `✅ AgentBridge bridge is ready` 和 Codex 连接通知
 4. **终端 C：`agentbridge claude` 启动第二个 Claude Code 会话**
 5. 验证：
-   - 终端 A 应收到 `⚠️ Another Claude Code session connected to AgentBridge and replaced this one. This session is now permanently idle.`
-   - 终端 A **不应**出现持续的重连日志（无 reconnect 循环）
-   - 终端 C 正常工作，能和 Codex 通信
-6. 关闭终端 C 的 Claude Code
-7. 验证终端 A **仍然保持 dormant**（不自动恢复），这是预期行为
+   - 终端 C（新会话）应收到 `⚠️ AgentBridge daemon rejected this session — another Claude Code session is already connected.`
+   - 终端 A（旧会话）**不受任何影响**，继续正常工作
+   - 终端 A 能正常和 Codex 通信
+6. 关闭终端 C
+7. 终端 A 仍然正常工作
 
-**通过标准：** 旧会话收到 replaced 通知后完全静默，无重连尝试，新会话正常工作。
+**通过标准：** 旧会话完全不受影响，新会话被拒绝并收到明确错误消息。
 
-### Test 2: TUI 断连后审批请求重放
+### Test 2: 旧会话断开后新会话可连入
+
+**目的：** 验证第一个 Claude 正常关闭后，新的 Claude 可以成功连入。
+
+1. 终端 A：`agentbridge claude` 启动第一个 Claude Code 会话
+2. 确认连接正常
+3. 关闭终端 A 的 Claude Code（Ctrl+C 或 /exit）
+4. 终端 B：`agentbridge claude` 启动新的 Claude Code 会话
+5. 验证：终端 B 成功连入，收到 `✅ AgentBridge bridge is ready`
+
+**通过标准：** 旧会话释放 slot 后，新会话正常连入。
+
+### Test 3: TUI 断连后审批请求重放
 
 **目的：** 验证 TUI 断连重连后，pending 的审批请求被正确重放。
 
@@ -32,7 +44,7 @@
 
 **通过标准：** 审批请求在 TUI 重连后正确重放，用户审批后 Codex 正常继续。
 
-### Test 3: app-server 断连后审批状态清理
+### Test 4: app-server 断连后审批状态清理
 
 **目的：** 验证 app-server 断连后，旧的审批状态被正确清理，不会 flush 到新连接。
 
@@ -42,7 +54,7 @@
 
 **通过标准：** 单元测试 `"app-server close discards approval state across reconnects"` 通过。
 
-### Test 4: `agentbridge kill` → 恢复
+### Test 5: `agentbridge kill` → 恢复
 
 **目的：** 验证 killed 状态下的错误消息和恢复机制。
 

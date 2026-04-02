@@ -7,11 +7,11 @@ describe("bridge disabled-state messaging", () => {
     expect(disabledReplyError("killed")).toContain("/resume");
   });
 
-  test("replaced sessions stay permanently dormant and do not suggest reconnect", () => {
-    const message = disabledReplyError("replaced");
-    expect(message).toContain("replaced by a newer Claude Code session");
-    expect(message).toContain("permanently idle");
-    expect(message).not.toContain("agentbridge kill");
+  test("rejected sessions explain another session is active", () => {
+    const message = disabledReplyError("rejected");
+    expect(message).toContain("rejected this session");
+    expect(message).toContain("another Claude Code session is already connected");
+    expect(message).toContain("agentbridge kill");
     expect(message).not.toContain("/resume");
   });
 });

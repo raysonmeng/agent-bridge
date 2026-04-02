@@ -90,31 +90,31 @@ describe("DaemonClient", () => {
     await disconnected;
   });
 
-  test("emits replaced (not disconnect) when server closes with code 4001", async () => {
+  test("emits rejected (not disconnect) when server closes with code 4001", async () => {
     await client.connect();
 
     let disconnectEmitted = false;
     client.on("disconnect", () => { disconnectEmitted = true; });
 
-    const replaced = new Promise<void>((resolve) => {
-      client.on("replaced", () => resolve());
+    const rejected = new Promise<void>((resolve) => {
+      client.on("rejected", () => resolve());
     });
 
     for (const ws of serverSockets) {
-      ws.close(4001, "replaced by a newer Claude session");
+      ws.close(4001, "another Claude session is already connected");
     }
 
-    await replaced;
+    await rejected;
     // Give a tick for any stray disconnect to fire
     await new Promise((r) => setTimeout(r, 50));
     expect(disconnectEmitted).toBe(false);
   });
 
-  test("emits disconnect (not replaced) for non-4001 close codes", async () => {
+  test("emits disconnect (not rejected) for non-4001 close codes", async () => {
     await client.connect();
 
-    let replacedEmitted = false;
-    client.on("replaced", () => { replacedEmitted = true; });
+    let rejectedEmitted = false;
+    client.on("rejected", () => { rejectedEmitted = true; });
 
     const disconnected = new Promise<void>((resolve) => {
       client.on("disconnect", () => resolve());
@@ -126,10 +126,10 @@ describe("DaemonClient", () => {
 
     await disconnected;
     await new Promise((r) => setTimeout(r, 50));
-    expect(replacedEmitted).toBe(false);
+    expect(rejectedEmitted).toBe(false);
   });
 
-  test("pending replies rejected on replaced close (code 4001)", async () => {
+  test("pending replies rejected on rejected close (code 4001)", async () => {
     await client.connect();
 
     // Send a message that expects a reply — it will never be answered
@@ -140,7 +140,7 @@ describe("DaemonClient", () => {
 
     // Close with 4001 before any response
     for (const ws of serverSockets) {
-      ws.close(4001, "replaced by a newer Claude session");
+      ws.close(4001, "another Claude session is already connected");
     }
 
     const result = await replyPromise;

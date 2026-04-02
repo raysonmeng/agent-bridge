@@ -6,7 +6,7 @@ import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from ".
 interface DaemonClientEvents {
   codexMessage: [BridgeMessage];
   disconnect: [];
-  replaced: [];
+  rejected: [];
   status: [DaemonStatus];
 }
 
@@ -148,7 +148,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
         this.ws = null;
         this.rejectPendingReplies("AgentBridge daemon disconnected.");
         if (event.code === CLOSE_CODE_REPLACED) {
-          this.emit("replaced");
+          this.emit("rejected");
         } else {
           this.emit("disconnect");
         }
