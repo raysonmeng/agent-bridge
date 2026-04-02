@@ -34,8 +34,16 @@ interface TuiSocketData {
 }
 
 interface PendingServerRequest {
+  raw: string;
   serverId: number | string;
   connId: number;
+  method: AppServerServerRequestMethod | string;
+  timestamp: number;
+}
+
+interface PendingServerResponse {
+  raw: string;
+  serverId: number | string;
   method: AppServerServerRequestMethod | string;
   timestamp: number;
 }
@@ -71,8 +79,8 @@ export class CodexAdapter extends EventEmitter {
   private nextProxyId = 100000;
   private upstreamToClient = new Map<number, { connId: number; clientId: number | string }>();
   private serverRequestToProxy = new Map<number, PendingServerRequest>();
-  private serverRequestTtlTimers = new Map<number, ReturnType<typeof setTimeout>>();
   private pendingServerRequests: Array<{ raw: string; serverId: number | string; method: string }> = [];
+  private pendingServerResponses = new Map<number, PendingServerResponse>();
   private staleProxyIds = new Map<number, ReturnType<typeof setTimeout>>();
   private bridgeRequestIds = new Map<number, ReturnType<typeof setTimeout>>();
   private intentionalDisconnect = false;
@@ -203,6 +211,7 @@ export class CodexAdapter extends EventEmitter {
         this.intentionalDisconnect = false;
         this.reconnectAttempts = 0;
         this.log(isReconnect ? "Reconnected to app-server" : "Connected to app-server (persistent)");
+        this.flushPendingServerResponses();
         resolve();
       };
 
@@ -230,7 +239,7 @@ export class CodexAdapter extends EventEmitter {
       appWs.onclose = () => {
         this.log("App-server connection closed");
         this.appServerWs = null;
-        this.clearResponseTrackingState();
+        this.clearTransientResponseTrackingState();
         this.activeTurnIds.clear();
         this.turnInProgress = false;
         if (!this.intentionalDisconnect) {
@@ -299,13 +308,19 @@ export class CodexAdapter extends EventEmitter {
   }
 
   private onTuiConnect(ws: ServerWebSocket<TuiSocketData>) {
+    const previousConnId = this.tuiWs ? this.tuiConnId : null;
     this.tuiConnId++;
     ws.data.connId = this.tuiConnId;
     this.tuiWs = ws;
     this.log(`TUI connected (conn #${this.tuiConnId})`);
     this.emit("tuiConnected", this.tuiConnId);
+    if (previousConnId !== null) {
+      this.retireConnectionState(previousConnId);
+    }
+    this.replayPendingServerRequests(ws);
+  }
 
-    // Replay buffered server requests.
+  private replayPendingServerRequests(ws: ServerWebSocket<TuiSocketData>) {
     const remaining: typeof this.pendingServerRequests = [];
     for (const buffered of this.pendingServerRequests) {
       const proxyId = this.nextProxyId++;
@@ -314,6 +329,7 @@ export class CodexAdapter extends EventEmitter {
         parsed.id = proxyId;
         ws.send(JSON.stringify(parsed));
         this.serverRequestToProxy.set(proxyId, {
+          raw: buffered.raw,
           serverId: buffered.serverId,
           connId: this.tuiConnId,
           method: buffered.method,
@@ -357,24 +373,28 @@ export class CodexAdapter extends EventEmitter {
       const parsed = JSON.parse(data);
       if (parsed.id !== undefined && !parsed.method) {
         const normalizedId = this.normalizeNumericId(parsed.id);
+        if (!isNaN(normalizedId) && this.pendingServerResponses.has(normalizedId)) {
+          this.log(`Ignoring duplicate approval response while app-server reconnect is pending (proxy id=${normalizedId})`);
+          return;
+        }
         const pending = !isNaN(normalizedId) ? this.serverRequestToProxy.get(normalizedId) : undefined;
         if (pending !== undefined) {
           if (pending.connId !== connId) {
             this.log(`Dropping stale server request response (proxy id=${normalizedId}, expected conn #${pending.connId}, got #${connId})`);
             return;
           }
+          parsed.id = pending.serverId;
+          const forwardedResponse = JSON.stringify(parsed);
           if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
-            this.log(`Cannot forward approval response: app-server disconnected (proxy id=${normalizedId})`);
+            this.bufferPendingServerResponse(normalizedId, pending, forwardedResponse, "app-server disconnected");
             return;
           }
-          parsed.id = pending.serverId;
           try {
-            this.appServerWs.send(JSON.stringify(parsed));
+            this.appServerWs.send(forwardedResponse);
             this.serverRequestToProxy.delete(normalizedId);
             this.log(`TUI → app-server: ${pending.method} response (proxy id=${normalizedId} → server id=${pending.serverId})`);
           } catch (e: any) {
-            parsed.id = normalizedId;
-            this.log(`Failed to forward approval response (proxy id=${normalizedId}): ${e.message}`);
+            this.bufferPendingServerResponse(normalizedId, pending, forwardedResponse, `send failed: ${e.message}`);
           }
           return;
         }
@@ -464,7 +484,13 @@ export class CodexAdapter extends EventEmitter {
       return;
     }
 
-    this.serverRequestToProxy.set(proxyId, { serverId, connId: this.tuiConnId, method, timestamp: Date.now() });
+    this.serverRequestToProxy.set(proxyId, {
+      raw,
+      serverId,
+      connId: this.tuiConnId,
+      method,
+      timestamp: Date.now(),
+    });
     this.log(`Server request: ${method} (server id=${serverId} → proxy id=${proxyId}, conn #${this.tuiConnId})`);
   }
 
@@ -473,6 +499,37 @@ export class CodexAdapter extends EventEmitter {
     if (typeof id === "number") return id;
     if (typeof id === "string" && /^-?\d+$/.test(id)) return Number(id);
     return NaN;
+  }
+
+  private bufferPendingServerResponse(
+    proxyId: number,
+    pending: PendingServerRequest,
+    forwardedResponse: string,
+    reason: string,
+  ) {
+    this.pendingServerResponses.set(proxyId, {
+      raw: forwardedResponse,
+      serverId: pending.serverId,
+      method: pending.method,
+      timestamp: Date.now(),
+    });
+    this.serverRequestToProxy.delete(proxyId);
+    this.log(`Buffered approval response until app-server reconnect (${reason}) (proxy id=${proxyId} → server id=${pending.serverId})`);
+  }
+
+  private flushPendingServerResponses() {
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) return;
+
+    for (const [proxyId, pending] of this.pendingServerResponses.entries()) {
+      try {
+        this.appServerWs.send(pending.raw);
+        this.pendingServerResponses.delete(proxyId);
+        this.log(`Flushed buffered approval response after app-server reconnect (proxy id=${proxyId} → server id=${pending.serverId})`);
+      } catch (e: any) {
+        this.log(`Failed to flush buffered approval response (proxy id=${proxyId}): ${e.message}`);
+        break;
+      }
+    }
   }
 
   private handleAppServerResponse(parsed: AppServerResponse, raw: string): string | null {
@@ -744,20 +801,25 @@ export class CodexAdapter extends EventEmitter {
       this.trackStaleProxyId(upId);
     }
 
-    // TTL cleanup for server request mappings belonging to this connection.
+    const requeuedServerRequests: typeof this.pendingServerRequests = [];
     for (const [proxyId, pending] of this.serverRequestToProxy.entries()) {
       if (pending.connId === connId) {
-        this.clearTrackedId(this.serverRequestTtlTimers, proxyId);
-        const timer = setTimeout(() => {
-          this.serverRequestTtlTimers.delete(proxyId);
-          if (this.serverRequestToProxy.get(proxyId)?.connId === connId) {
-            this.serverRequestToProxy.delete(proxyId);
-            this.log(`Expired stale server request mapping (proxy id=${proxyId}, method=${pending.method})`);
-          }
-        }, CodexAdapter.RESPONSE_TRACKING_TTL_MS);
-        timer.unref?.();
-        this.serverRequestTtlTimers.set(proxyId, timer);
+        this.serverRequestToProxy.delete(proxyId);
+        requeuedServerRequests.push({
+          raw: pending.raw,
+          serverId: pending.serverId,
+          method: pending.method,
+        });
+        this.log(`Requeued in-flight server request after TUI disconnect (proxy id=${proxyId}, server id=${pending.serverId}, method=${pending.method})`);
       }
+    }
+
+    if (requeuedServerRequests.length === 0) return;
+
+    this.pendingServerRequests.push(...requeuedServerRequests);
+
+    if (this.tuiWs && this.tuiConnId !== connId) {
+      this.replayPendingServerRequests(this.tuiWs);
     }
   }
 
@@ -801,7 +863,7 @@ export class CodexAdapter extends EventEmitter {
     return true;
   }
 
-  private clearResponseTrackingState() {
+  private clearTransientResponseTrackingState() {
     this.pendingRequests.clear();
     this.upstreamToClient.clear();
 
@@ -814,13 +876,13 @@ export class CodexAdapter extends EventEmitter {
       clearTimeout(timer);
     }
     this.bridgeRequestIds.clear();
+  }
 
-    for (const timer of this.serverRequestTtlTimers.values()) {
-      clearTimeout(timer);
-    }
-    this.serverRequestTtlTimers.clear();
+  private clearResponseTrackingState() {
+    this.clearTransientResponseTrackingState();
     this.serverRequestToProxy.clear();
     this.pendingServerRequests = [];
+    this.pendingServerResponses.clear();
   }
 
   /**

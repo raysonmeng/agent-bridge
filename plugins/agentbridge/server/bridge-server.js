@@ -13929,6 +13929,11 @@ ${formatted}`
 
 // src/daemon-client.ts
 import { EventEmitter as EventEmitter2 } from "events";
+
+// src/control-protocol.ts
+var CLOSE_CODE_REPLACED = 4001;
+
+// src/daemon-client.ts
 var nextSocketId = 0;
 
 class DaemonClient extends EventEmitter2 {
@@ -14047,7 +14052,11 @@ class DaemonClient extends EventEmitter2 {
       if (isCurrent) {
         this.ws = null;
         this.rejectPendingReplies("AgentBridge daemon disconnected.");
-        this.emit("disconnect");
+        if (event.code === CLOSE_CODE_REPLACED) {
+          this.emit("replaced");
+        } else {
+          this.emit("disconnect");
+        }
       }
     };
     ws.onerror = () => {};
@@ -14499,6 +14508,16 @@ class ConfigService {
   }
 }
 
+// src/bridge-disabled-state.ts
+function disabledReplyError(reason) {
+  switch (reason) {
+    case "replaced":
+      return "AgentBridge was replaced by a newer Claude Code session. This session is now permanently idle. Switch to the active session or start a new Claude Code session with `agentbridge claude`.";
+    case "killed":
+      return "AgentBridge is disabled by `agentbridge kill`. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.";
+  }
+}
+
 // src/bridge.ts
 var stateDir = new StateDirResolver;
 var configService = new ConfigService;
@@ -14510,6 +14529,7 @@ var claude = new ClaudeAdapter;
 var daemonClient = new DaemonClient(CONTROL_WS_URL);
 var shuttingDown = false;
 var daemonDisabled = false;
+var daemonDisabledReason = null;
 var RECONNECT_NOTIFY_COOLDOWN_MS = 30000;
 var DISABLED_RECOVERY_INTERVAL_MS = 5000;
 var lastDisconnectNotifyTs = 0;
@@ -14523,7 +14543,7 @@ claude.setReplySender(async (msg, requireReply) => {
   if (daemonDisabled) {
     return {
       success: false,
-      error: "AgentBridge is disabled by `agentbridge kill`. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect."
+      error: disabledReplyError(daemonDisabledReason ?? "killed")
     };
   }
   return daemonClient.sendReply(msg, requireReply);
@@ -14548,6 +14568,15 @@ daemonClient.on("disconnect", () => {
   }
   reconnectToDaemon();
 });
+daemonClient.on("replaced", async () => {
+  if (shuttingDown || daemonDisabled)
+    return;
+  log("Replaced by a newer Claude session (close code 4001) \u2014 entering permanent dormant state");
+  daemonDisabled = true;
+  daemonDisabledReason = "replaced";
+  await claude.pushNotification(systemMessage("system_bridge_replaced", "\u26A0\uFE0F Another Claude Code session connected to AgentBridge and replaced this one. This session is now permanently idle. \u53E6\u4E00\u4E2A Claude Code \u4F1A\u8BDD\u5DF2\u63A5\u7BA1 AgentBridge \u8FDE\u63A5\uFF0C\u5F53\u524D\u4F1A\u8BDD\u5DF2\u6C38\u4E45\u8FDB\u5165\u7A7A\u95F2\u72B6\u6001\u3002"));
+  await daemonClient.disconnect();
+});
 claude.on("ready", async () => {
   log(`MCP server ready (delivery mode: ${claude.getDeliveryMode()}) \u2014 ensuring AgentBridge daemon...`);
   if (daemonLifecycle.wasKilled()) {
@@ -14565,6 +14594,7 @@ async function connectToDaemon(isReconnect = false) {
     await daemonLifecycle.ensureRunning();
     await daemonClient.connect();
     daemonClient.attachClaude();
+    daemonDisabledReason = null;
     if (!isReconnect) {
       claude.pushNotification(systemMessage("system_bridge_ready", "\u2705 AgentBridge bridge is ready. Daemon connected. Start Codex in another terminal with: agentbridge codex"));
     }
@@ -14578,6 +14608,7 @@ async function enterDisabledState(logMessage, notificationContent) {
   if (daemonDisabled)
     return;
   daemonDisabled = true;
+  daemonDisabledReason = "killed";
   log(logMessage);
   await claude.pushNotification(systemMessage("system_bridge_disabled", notificationContent));
   await daemonClient.disconnect();
@@ -14666,11 +14697,13 @@ async function pollDisabledRecovery() {
       await daemonClient.connect();
       daemonClient.attachClaude();
       daemonDisabled = false;
+      daemonDisabledReason = null;
       stopDisabledRecoveryPoller();
       claude.pushNotification(systemMessage("system_bridge_recovered", "\u2705 AgentBridge recovered after the killed sentinel was cleared. Daemon reconnected."));
     } catch (err) {
       log(`Disabled-state direct reconnect failed: ${err.message}`);
       daemonDisabled = false;
+      daemonDisabledReason = null;
       stopDisabledRecoveryPoller();
       reconnectToDaemon();
     }

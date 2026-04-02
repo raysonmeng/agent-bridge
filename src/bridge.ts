@@ -6,6 +6,7 @@ import { DaemonClient } from "./daemon-client";
 import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
 import { ConfigService } from "./config-service";
+import { disabledReplyError, type BridgeDisabledReason } from "./bridge-disabled-state";
 import type { BridgeMessage } from "./types";
 
 const stateDir = new StateDirResolver();
@@ -21,6 +22,7 @@ const daemonClient = new DaemonClient(CONTROL_WS_URL);
 
 let shuttingDown = false;
 let daemonDisabled = false;
+let daemonDisabledReason: BridgeDisabledReason | null = null;
 
 // --- Notification throttling for reconnect loops ---
 const RECONNECT_NOTIFY_COOLDOWN_MS = 30_000; // Only notify once per 30s window
@@ -38,7 +40,7 @@ claude.setReplySender(async (msg: BridgeMessage, requireReply?: boolean) => {
   if (daemonDisabled) {
     return {
       success: false,
-      error: "AgentBridge is disabled by `agentbridge kill`. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.",
+      error: disabledReplyError(daemonDisabledReason ?? "killed"),
     };
   }
 
@@ -74,15 +76,21 @@ daemonClient.on("disconnect", () => {
   void reconnectToDaemon();
 });
 
-daemonClient.on("replaced", () => {
+daemonClient.on("replaced", async () => {
   if (shuttingDown || daemonDisabled) return;
 
-  log("Daemon closed our connection with code 4001 — replaced by a newer Claude session");
+  log("Replaced by a newer Claude session (close code 4001) — entering permanent dormant state");
 
-  void enterDisabledState(
-    "Replaced by a newer Claude session (close code 4001)",
-    "⚠️ Another Claude Code session connected to AgentBridge and replaced this one. This session is now idle. 另一个 Claude Code 会话已接管 AgentBridge 连接，当前会话已进入空闲状态。",
-  );
+  // Do NOT use enterDisabledState() here — it starts the recovery poller,
+  // which would reconnect and kick the newer session, causing a slow ping-pong.
+  // A replaced session should stay dormant permanently.
+  daemonDisabled = true;
+  daemonDisabledReason = "replaced";
+  await claude.pushNotification(systemMessage(
+    "system_bridge_replaced",
+    "⚠️ Another Claude Code session connected to AgentBridge and replaced this one. This session is now permanently idle. 另一个 Claude Code 会话已接管 AgentBridge 连接，当前会话已永久进入空闲状态。",
+  ));
+  await daemonClient.disconnect();
 });
 
 claude.on("ready", async () => {
@@ -107,6 +115,7 @@ async function connectToDaemon(isReconnect = false) {
     await daemonLifecycle.ensureRunning();
     await daemonClient.connect();
     daemonClient.attachClaude();
+    daemonDisabledReason = null;
     if (!isReconnect) {
       void claude.pushNotification(systemMessage(
         "system_bridge_ready",
@@ -129,6 +138,7 @@ async function enterDisabledState(logMessage: string, notificationContent: strin
   if (daemonDisabled) return;
 
   daemonDisabled = true;
+  daemonDisabledReason = "killed";
   log(logMessage);
   await claude.pushNotification(systemMessage("system_bridge_disabled", notificationContent));
   await daemonClient.disconnect();
@@ -241,6 +251,7 @@ async function pollDisabledRecovery() {
       await daemonClient.connect();
       daemonClient.attachClaude();
       daemonDisabled = false;
+      daemonDisabledReason = null;
       stopDisabledRecoveryPoller();
       void claude.pushNotification(systemMessage(
         "system_bridge_recovered",
@@ -249,6 +260,7 @@ async function pollDisabledRecovery() {
     } catch (err: any) {
       log(`Disabled-state direct reconnect failed: ${err.message}`);
       daemonDisabled = false;
+      daemonDisabledReason = null;
       stopDisabledRecoveryPoller();
       void reconnectToDaemon();
     }

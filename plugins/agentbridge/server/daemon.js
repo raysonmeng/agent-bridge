@@ -9,8 +9,52 @@ import { spawn, execSync } from "child_process";
 import { createInterface } from "readline";
 import { EventEmitter } from "events";
 import { appendFileSync } from "fs";
+
+// src/app-server-protocol.ts
+var APP_SERVER_TRACKED_REQUEST_METHODS = [
+  "thread/start",
+  "thread/resume",
+  "turn/start"
+];
+var APP_SERVER_SERVER_REQUEST_METHODS = [
+  "item/permissions/requestApproval",
+  "item/fileChange/requestApproval",
+  "item/commandExecution/requestApproval"
+];
+var APP_SERVER_NOTIFICATION_METHODS = [
+  "turn/started",
+  "turn/completed",
+  "item/started",
+  "item/agentMessage/delta",
+  "item/completed"
+];
+var TRACKED_REQUEST_METHOD_SET = new Set(APP_SERVER_TRACKED_REQUEST_METHODS);
+var SERVER_REQUEST_METHOD_SET = new Set(APP_SERVER_SERVER_REQUEST_METHODS);
+var NOTIFICATION_METHOD_SET = new Set(APP_SERVER_NOTIFICATION_METHODS);
+function isObjectRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function isTrackedAppServerRequestMethod(method) {
+  return typeof method === "string" && TRACKED_REQUEST_METHOD_SET.has(method);
+}
+function isAppServerRequestMessage(value) {
+  if (!isObjectRecord(value))
+    return false;
+  return (typeof value.id === "number" || typeof value.id === "string") && typeof value.method === "string";
+}
+function isAppServerNotification(value) {
+  if (!isObjectRecord(value))
+    return false;
+  return value.id === undefined && typeof value.method === "string" && NOTIFICATION_METHOD_SET.has(value.method);
+}
+function isAppServerResponseMessage(value) {
+  if (!isObjectRecord(value))
+    return false;
+  return (typeof value.id === "number" || typeof value.id === "string") && value.method === undefined && (("result" in value) || ("error" in value));
+}
+
+// src/codex-adapter.ts
 var LOG_FILE = "/tmp/agentbridge.log";
-var TRACKED_REQUEST_METHODS = new Set(["thread/start", "thread/resume", "turn/start"]);
 
 class CodexAdapter extends EventEmitter {
   static RESPONSE_TRACKING_TTL_MS = 30000;
@@ -29,6 +73,9 @@ class CodexAdapter extends EventEmitter {
   turnInProgress = false;
   nextProxyId = 1e5;
   upstreamToClient = new Map;
+  serverRequestToProxy = new Map;
+  pendingServerRequests = [];
+  pendingServerResponses = new Map;
   staleProxyIds = new Map;
   bridgeRequestIds = new Map;
   intentionalDisconnect = false;
@@ -139,6 +186,7 @@ class CodexAdapter extends EventEmitter {
         this.intentionalDisconnect = false;
         this.reconnectAttempts = 0;
         this.log(isReconnect ? "Reconnected to app-server" : "Connected to app-server (persistent)");
+        this.flushPendingServerResponses();
         resolve();
       };
       appWs.onmessage = (event) => {
@@ -164,7 +212,7 @@ class CodexAdapter extends EventEmitter {
       appWs.onclose = () => {
         this.log("App-server connection closed");
         this.appServerWs = null;
-        this.clearResponseTrackingState();
+        this.clearTransientResponseTrackingState();
         this.activeTurnIds.clear();
         this.turnInProgress = false;
         if (!this.intentionalDisconnect) {
@@ -220,11 +268,39 @@ class CodexAdapter extends EventEmitter {
     });
   }
   onTuiConnect(ws) {
+    const previousConnId = this.tuiWs ? this.tuiConnId : null;
     this.tuiConnId++;
     ws.data.connId = this.tuiConnId;
     this.tuiWs = ws;
     this.log(`TUI connected (conn #${this.tuiConnId})`);
     this.emit("tuiConnected", this.tuiConnId);
+    if (previousConnId !== null) {
+      this.retireConnectionState(previousConnId);
+    }
+    this.replayPendingServerRequests(ws);
+  }
+  replayPendingServerRequests(ws) {
+    const remaining = [];
+    for (const buffered of this.pendingServerRequests) {
+      const proxyId = this.nextProxyId++;
+      try {
+        const parsed = JSON.parse(buffered.raw);
+        parsed.id = proxyId;
+        ws.send(JSON.stringify(parsed));
+        this.serverRequestToProxy.set(proxyId, {
+          raw: buffered.raw,
+          serverId: buffered.serverId,
+          connId: this.tuiConnId,
+          method: buffered.method,
+          timestamp: Date.now()
+        });
+        this.log(`Replayed buffered server request: ${buffered.method} (server id=${buffered.serverId} \u2192 proxy id=${proxyId})`);
+      } catch (e) {
+        this.log(`Failed to replay buffered server request: ${buffered.method} (server id=${buffered.serverId}): ${e.message}`);
+        remaining.push(buffered);
+      }
+    }
+    this.pendingServerRequests = remaining;
   }
   onTuiDisconnect(ws) {
     const connId = ws.data.connId;
@@ -244,6 +320,37 @@ class CodexAdapter extends EventEmitter {
       this.log(`Dropping message from stale TUI conn #${connId} (current is #${this.tuiConnId})`);
       return;
     }
+    try {
+      const parsed = JSON.parse(data);
+      if (parsed.id !== undefined && !parsed.method) {
+        const normalizedId = this.normalizeNumericId(parsed.id);
+        if (!isNaN(normalizedId) && this.pendingServerResponses.has(normalizedId)) {
+          this.log(`Ignoring duplicate approval response while app-server reconnect is pending (proxy id=${normalizedId})`);
+          return;
+        }
+        const pending = !isNaN(normalizedId) ? this.serverRequestToProxy.get(normalizedId) : undefined;
+        if (pending !== undefined) {
+          if (pending.connId !== connId) {
+            this.log(`Dropping stale server request response (proxy id=${normalizedId}, expected conn #${pending.connId}, got #${connId})`);
+            return;
+          }
+          parsed.id = pending.serverId;
+          const forwardedResponse = JSON.stringify(parsed);
+          if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+            this.bufferPendingServerResponse(normalizedId, pending, forwardedResponse, "app-server disconnected");
+            return;
+          }
+          try {
+            this.appServerWs.send(forwardedResponse);
+            this.serverRequestToProxy.delete(normalizedId);
+            this.log(`TUI \u2192 app-server: ${pending.method} response (proxy id=${normalizedId} \u2192 server id=${pending.serverId})`);
+          } catch (e) {
+            this.bufferPendingServerResponse(normalizedId, pending, forwardedResponse, `send failed: ${e.message}`);
+          }
+          return;
+        }
+      }
+    } catch {}
     let forwarded = data;
     try {
       const parsed = JSON.parse(data);
@@ -270,19 +377,85 @@ class CodexAdapter extends EventEmitter {
   handleAppServerPayload(raw) {
     try {
       const parsed = JSON.parse(raw);
-      if (parsed.id === undefined) {
-        const forwarded = this.patchResponse(parsed, raw);
-        this.interceptServerMessage(parsed);
+      if (isAppServerNotification(parsed) || typeof parsed === "object" && parsed !== null && !("id" in parsed)) {
+        const notificationLike = parsed;
+        const forwarded = this.patchResponse(notificationLike, raw);
+        this.interceptServerMessage(notificationLike);
         return forwarded;
       }
-      return this.handleAppServerResponse(parsed, raw);
+      if (isAppServerRequestMessage(parsed)) {
+        this.handleServerRequest(parsed, raw);
+        return null;
+      }
+      if (isAppServerResponseMessage(parsed)) {
+        return this.handleAppServerResponse(parsed, raw);
+      }
+      this.log(`Dropping unclassifiable app-server message: ${raw.slice(0, 100)}`);
+      return null;
     } catch {
       return raw;
     }
   }
+  handleServerRequest(parsed, raw) {
+    const serverId = parsed.id;
+    const method = parsed.method;
+    if (!this.tuiWs) {
+      this.pendingServerRequests.push({ raw, serverId, method });
+      this.log(`Server request buffered (no TUI): ${method} (server id=${serverId})`);
+      return;
+    }
+    const proxyId = this.nextProxyId++;
+    parsed.id = proxyId;
+    try {
+      this.tuiWs.send(JSON.stringify(parsed));
+    } catch (e) {
+      this.log(`Server request send failed, buffering: ${method} (server id=${serverId}): ${e.message}`);
+      this.pendingServerRequests.push({ raw, serverId, method });
+      return;
+    }
+    this.serverRequestToProxy.set(proxyId, {
+      raw,
+      serverId,
+      connId: this.tuiConnId,
+      method,
+      timestamp: Date.now()
+    });
+    this.log(`Server request: ${method} (server id=${serverId} \u2192 proxy id=${proxyId}, conn #${this.tuiConnId})`);
+  }
+  normalizeNumericId(id) {
+    if (typeof id === "number")
+      return id;
+    if (typeof id === "string" && /^-?\d+$/.test(id))
+      return Number(id);
+    return NaN;
+  }
+  bufferPendingServerResponse(proxyId, pending, forwardedResponse, reason) {
+    this.pendingServerResponses.set(proxyId, {
+      raw: forwardedResponse,
+      serverId: pending.serverId,
+      method: pending.method,
+      timestamp: Date.now()
+    });
+    this.serverRequestToProxy.delete(proxyId);
+    this.log(`Buffered approval response until app-server reconnect (${reason}) (proxy id=${proxyId} \u2192 server id=${pending.serverId})`);
+  }
+  flushPendingServerResponses() {
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN)
+      return;
+    for (const [proxyId, pending] of this.pendingServerResponses.entries()) {
+      try {
+        this.appServerWs.send(pending.raw);
+        this.pendingServerResponses.delete(proxyId);
+        this.log(`Flushed buffered approval response after app-server reconnect (proxy id=${proxyId} \u2192 server id=${pending.serverId})`);
+      } catch (e) {
+        this.log(`Failed to flush buffered approval response (proxy id=${proxyId}): ${e.message}`);
+        break;
+      }
+    }
+  }
   handleAppServerResponse(parsed, raw) {
     const responseId = parsed.id;
-    const numericId = typeof responseId === "number" ? responseId : typeof responseId === "string" && /^-?\d+$/.test(responseId) ? Number(responseId) : NaN;
+    const numericId = this.normalizeNumericId(responseId);
     const mapping = !isNaN(numericId) ? this.upstreamToClient.get(numericId) : undefined;
     if (mapping) {
       this.upstreamToClient.delete(numericId);
@@ -311,7 +484,7 @@ class CodexAdapter extends EventEmitter {
     return null;
   }
   patchResponse(parsed, raw) {
-    if (parsed.error && parsed.id !== undefined) {
+    if (isAppServerResponseMessage(parsed) && parsed.error && parsed.id !== undefined) {
       const errMsg = parsed.error.message ?? "";
       if (errMsg.includes("rate limits") || errMsg.includes("rateLimits")) {
         this.log(`Patching rateLimits error \u2192 mock success (id: ${parsed.id})`);
@@ -346,8 +519,9 @@ class CodexAdapter extends EventEmitter {
   }
   interceptServerMessage(msg, connId) {
     this.handleTrackedResponse(msg, connId);
-    if (msg.method)
+    if ("method" in msg && typeof msg.method === "string" && isAppServerNotification(msg)) {
       this.handleServerNotification(msg);
+    }
   }
   handleServerNotification(msg) {
     const { method, params } = msg;
@@ -362,7 +536,10 @@ class CodexAdapter extends EventEmitter {
         break;
       }
       case "item/agentMessage/delta": {
-        const buf = this.agentMessageBuffers.get(params?.itemId);
+        const itemId = params?.itemId;
+        if (typeof itemId !== "string")
+          break;
+        const buf = this.agentMessageBuffers.get(itemId);
         if (buf && params?.delta)
           buf.push(params.delta);
         break;
@@ -407,14 +584,16 @@ class CodexAdapter extends EventEmitter {
     return `${connId ?? this.tuiConnId}:${base}`;
   }
   trackPendingRequest(message, connId, _proxyId) {
-    const method = message?.method;
-    const key = this.pendingKey(message?.id, connId);
-    this.log(`[track] method=${method} id=${message?.id} (type=${typeof message?.id}) key=${key}`);
-    if (!key || !TRACKED_REQUEST_METHODS.has(method))
+    const rpcId = "id" in message ? message.id : undefined;
+    const method = "method" in message && typeof message.method === "string" ? message.method : undefined;
+    const key = this.pendingKey(rpcId, connId);
+    this.log(`[track] method=${method} id=${rpcId} (type=${typeof rpcId}) key=${key}`);
+    if (!key || !isTrackedAppServerRequestMethod(method))
       return;
     const pending = { method };
     if (method === "turn/start") {
-      const threadId = message?.params?.threadId;
+      const params = "params" in message && typeof message.params === "object" && message.params !== null ? message.params : undefined;
+      const threadId = params?.threadId;
       if (typeof threadId === "string" && threadId.length > 0) {
         pending.threadId = threadId;
       }
@@ -511,6 +690,24 @@ class CodexAdapter extends EventEmitter {
       this.upstreamToClient.delete(upId);
       this.trackStaleProxyId(upId);
     }
+    const requeuedServerRequests = [];
+    for (const [proxyId, pending] of this.serverRequestToProxy.entries()) {
+      if (pending.connId === connId) {
+        this.serverRequestToProxy.delete(proxyId);
+        requeuedServerRequests.push({
+          raw: pending.raw,
+          serverId: pending.serverId,
+          method: pending.method
+        });
+        this.log(`Requeued in-flight server request after TUI disconnect (proxy id=${proxyId}, server id=${pending.serverId}, method=${pending.method})`);
+      }
+    }
+    if (requeuedServerRequests.length === 0)
+      return;
+    this.pendingServerRequests.push(...requeuedServerRequests);
+    if (this.tuiWs && this.tuiConnId !== connId) {
+      this.replayPendingServerRequests(this.tuiWs);
+    }
   }
   trackStaleProxyId(proxyId) {
     this.clearTrackedId(this.staleProxyIds, proxyId);
@@ -545,7 +742,7 @@ class CodexAdapter extends EventEmitter {
     store.delete(id);
     return true;
   }
-  clearResponseTrackingState() {
+  clearTransientResponseTrackingState() {
     this.pendingRequests.clear();
     this.upstreamToClient.clear();
     for (const timer of this.staleProxyIds.values()) {
@@ -556,6 +753,12 @@ class CodexAdapter extends EventEmitter {
       clearTimeout(timer);
     }
     this.bridgeRequestIds.clear();
+  }
+  clearResponseTrackingState() {
+    this.clearTransientResponseTrackingState();
+    this.serverRequestToProxy.clear();
+    this.pendingServerRequests = [];
+    this.pendingServerResponses.clear();
   }
   async checkPorts() {
     for (const port of [this.appPort, this.proxyPort]) {
@@ -1243,6 +1446,9 @@ class ConfigService {
   }
 }
 
+// src/control-protocol.ts
+var CLOSE_CODE_REPLACED = 4001;
+
 // src/daemon.ts
 var stateDir = new StateDirResolver;
 stateDir.ensure();
@@ -1485,7 +1691,7 @@ function handleControlMessage(ws, raw) {
 }
 function attachClaude(ws) {
   if (attachedClaude && attachedClaude !== ws) {
-    attachedClaude.close(4001, "replaced by a newer Claude session");
+    attachedClaude.close(CLOSE_CODE_REPLACED, "replaced by a newer Claude session");
   }
   clearPendingClaudeDisconnect("Claude frontend attached");
   attachedClaude = ws;
