@@ -14053,7 +14053,7 @@ class DaemonClient extends EventEmitter2 {
         this.ws = null;
         this.rejectPendingReplies("AgentBridge daemon disconnected.");
         if (event.code === CLOSE_CODE_REPLACED) {
-          this.emit("replaced");
+          this.emit("rejected");
         } else {
           this.emit("disconnect");
         }
@@ -14511,8 +14511,8 @@ class ConfigService {
 // src/bridge-disabled-state.ts
 function disabledReplyError(reason) {
   switch (reason) {
-    case "replaced":
-      return "AgentBridge was replaced by a newer Claude Code session. This session is now permanently idle. Switch to the active session or start a new Claude Code session with `agentbridge claude`.";
+    case "rejected":
+      return "AgentBridge rejected this session \u2014 another Claude Code session is already connected. Close the other session first, or run `agentbridge kill` to reset.";
     case "killed":
       return "AgentBridge is disabled by `agentbridge kill`. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.";
   }
@@ -14568,13 +14568,13 @@ daemonClient.on("disconnect", () => {
   }
   reconnectToDaemon();
 });
-daemonClient.on("replaced", async () => {
+daemonClient.on("rejected", async () => {
   if (shuttingDown || daemonDisabled)
     return;
-  log("Replaced by a newer Claude session (close code 4001) \u2014 entering permanent dormant state");
+  log("Daemon rejected this session (close code 4001) \u2014 another Claude session is already connected");
   daemonDisabled = true;
-  daemonDisabledReason = "replaced";
-  await claude.pushNotification(systemMessage("system_bridge_replaced", "\u26A0\uFE0F Another Claude Code session connected to AgentBridge and replaced this one. This session is now permanently idle. \u53E6\u4E00\u4E2A Claude Code \u4F1A\u8BDD\u5DF2\u63A5\u7BA1 AgentBridge \u8FDE\u63A5\uFF0C\u5F53\u524D\u4F1A\u8BDD\u5DF2\u6C38\u4E45\u8FDB\u5165\u7A7A\u95F2\u72B6\u6001\u3002"));
+  daemonDisabledReason = "rejected";
+  await claude.pushNotification(systemMessage("system_bridge_replaced", "\u26A0\uFE0F AgentBridge daemon rejected this session \u2014 another Claude Code session is already connected. Close the other session first, or run `agentbridge kill` to reset. AgentBridge \u5B88\u62A4\u8FDB\u7A0B\u62D2\u7EDD\u4E86\u6B64\u4F1A\u8BDD\u2014\u2014\u53E6\u4E00\u4E2A Claude Code \u4F1A\u8BDD\u5DF2\u5728\u8FDE\u63A5\u4E2D\u3002\u8BF7\u5148\u5173\u95ED\u53E6\u4E00\u4E2A\u4F1A\u8BDD\uFF0C\u6216\u8FD0\u884C `agentbridge kill` \u91CD\u7F6E\u3002"));
   await daemonClient.disconnect();
 });
 claude.on("ready", async () => {

@@ -68,7 +68,15 @@ export class CodexAdapter extends EventEmitter {
   private nextInjectionId = -1;
   private appPort: number;
   private proxyPort: number;
-  private tuiConnId = 0; // tracks which TUI connection is "current"
+  private tuiConnId = 0; // tracks which TUI connection is "current" (primary)
+  private connIdCounter = 0; // monotonically increasing counter for unique conn IDs
+  // Secondary (picker) connections: each gets its own dedicated app-server WS
+  // for raw passthrough. The primary connection stays untouched.
+  private secondaryConnections = new Map<number, {
+    tuiWs: ServerWebSocket<TuiSocketData>;
+    appServerWs: WebSocket | null;
+    buffer: string[];
+  }>();
 
   private agentMessageBuffers = new Map<string, string[]>();
   private pendingRequests = new Map<string, PendingRequest>();
@@ -84,6 +92,12 @@ export class CodexAdapter extends EventEmitter {
   private staleProxyIds = new Map<number, ReturnType<typeof setTimeout>>();
   private bridgeRequestIds = new Map<number, ReturnType<typeof setTimeout>>();
   private intentionalDisconnect = false;
+  // Fresh-session reconnection: buffer TUI messages while reconnecting app-server
+  private pendingTuiMessages: string[] = [];
+  private reconnectingForNewSession = false;
+  private replayingBufferedMessages = false;
+  // Generation counter to prevent stale app-server close handlers from interfering
+  private appServerGeneration = 0;
 
   constructor(appPort = 4500, proxyPort = 4501) {
     super();
@@ -134,6 +148,11 @@ export class CodexAdapter extends EventEmitter {
 
     this.appServerWs?.close();
     this.appServerWs = null;
+    // Close all secondary (picker) connections
+    for (const [id, sec] of this.secondaryConnections) {
+      try { sec.appServerWs?.close(); } catch {}
+      this.secondaryConnections.delete(id);
+    }
     this.proxyServer?.stop();
     this.proxyServer = null;
     this.clearResponseTrackingState();
@@ -203,19 +222,25 @@ export class CodexAdapter extends EventEmitter {
   // ── Persistent App-Server Connection ───────────────────────
 
   private connectToAppServer(isReconnect = false): Promise<void> {
+    const generation = ++this.appServerGeneration;
     return new Promise((resolve, reject) => {
       const appWs = new WebSocket(this.appServerUrl);
 
       appWs.onopen = () => {
+        if (this.appServerGeneration !== generation) {
+          appWs.close();
+          return;
+        }
         this.appServerWs = appWs;
         this.intentionalDisconnect = false;
         this.reconnectAttempts = 0;
-        this.log(isReconnect ? "Reconnected to app-server" : "Connected to app-server (persistent)");
+        this.log(isReconnect ? "Reconnected to app-server" : "Connected to app-server");
         this.flushPendingServerResponses();
         resolve();
       };
 
       appWs.onmessage = (event) => {
+        if (this.appServerGeneration !== generation) return;
         const data = typeof event.data === "string" ? event.data : event.data.toString();
 
         const forwarded = this.handleAppServerPayload(data);
@@ -232,14 +257,67 @@ export class CodexAdapter extends EventEmitter {
       };
 
       appWs.onerror = () => {
+        if (this.appServerGeneration !== generation) return;
         this.log("App-server connection error");
         if (!isReconnect) reject(new Error("Failed to connect to app-server"));
       };
 
       appWs.onclose = () => {
+        if (this.appServerGeneration !== generation) return;
         this.handleAppServerClose();
       };
     });
+  }
+
+  /** Reconnect app-server WS to give TUI a fresh connection-scoped session. */
+  private async reconnectAppServerForNewSession(tuiWs: ServerWebSocket<TuiSocketData>) {
+    // Bump generation so stale handlers from the old connection become no-ops
+    this.appServerGeneration++;
+    this.intentionalDisconnect = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+
+    // Close old connection
+    const oldWs = this.appServerWs;
+    this.appServerWs = null;
+    if (oldWs) {
+      try { oldWs.close(); } catch {}
+    }
+
+    // Clear ALL connection-scoped state (including upstreamToClient).
+    // Buffered messages are raw (un-rewritten), so replay through onTuiMessage
+    // will create fresh id mappings after the new connection is established.
+    this.clearResponseTrackingState();
+    this.activeTurnIds.clear();
+    this.turnInProgress = false;
+
+    try {
+      await this.connectToAppServer(false);
+      this.log("App-server reconnected for new TUI session — replaying buffered messages");
+
+      // Replay raw buffered messages through onTuiMessage so they get
+      // proper id-rewriting and response tracking on the fresh connection.
+      const messages = this.pendingTuiMessages;
+      this.pendingTuiMessages = [];
+      this.reconnectingForNewSession = false;
+
+      this.replayingBufferedMessages = true;
+      try {
+        for (const msg of messages) {
+          this.onTuiMessage(tuiWs, msg);
+        }
+      } finally {
+        this.replayingBufferedMessages = false;
+      }
+    } catch (err: any) {
+      this.log(`Failed to reconnect app-server for new session: ${err.message}`);
+      this.pendingTuiMessages = [];
+      this.reconnectingForNewSession = false;
+      this.intentionalDisconnect = false;
+      this.scheduleReconnect();
+    }
   }
 
   // ── Auto-Reconnect ──────────────────────────────────────────
@@ -299,31 +377,94 @@ export class CodexAdapter extends EventEmitter {
       hostname: "127.0.0.1",
       fetch(req, server) {
         const url = new URL(req.url);
+        const isUpgrade = req.headers.get("upgrade")?.toLowerCase() === "websocket";
+        self.log(`HTTP ${req.method} ${url.pathname} (upgrade=${isUpgrade})`);
         if (url.pathname === "/healthz" || url.pathname === "/readyz") {
           return fetch(`http://127.0.0.1:${self.appPort}${url.pathname}`);
         }
         if (server.upgrade(req, { data: { connId: 0 } })) return undefined;
+        self.log(`WARNING: non-upgrade HTTP request not handled: ${req.method} ${url.pathname}`);
         return new Response("AgentBridge Codex Proxy");
       },
       websocket: {
         open: (ws: ServerWebSocket<TuiSocketData>) => self.onTuiConnect(ws),
-        close: (ws: ServerWebSocket<TuiSocketData>) => self.onTuiDisconnect(ws),
+        close: (ws: ServerWebSocket<TuiSocketData>, code: number, reason: string) => {
+          self.log(`WebSocket close event: conn #${ws.data.connId}, code=${code}, reason=${reason || "none"}`);
+          self.onTuiDisconnect(ws);
+        },
         message: (ws: ServerWebSocket<TuiSocketData>, msg) => self.onTuiMessage(ws, msg),
       },
     });
   }
 
   private onTuiConnect(ws: ServerWebSocket<TuiSocketData>) {
-    const previousConnId = this.tuiWs ? this.tuiConnId : null;
-    this.tuiConnId++;
-    ws.data.connId = this.tuiConnId;
+    const connId = ++this.connIdCounter;
+    ws.data.connId = connId;
+
+    // If a primary TUI connection is still alive, this is a secondary (picker)
+    // connection. The Codex TUI opens a parallel WS for the resume picker while
+    // the main session connection stays open. Give the secondary its own
+    // app-server WS so the primary is not disturbed.
+    if (this.tuiWs) {
+      this.log(`Secondary TUI connected (conn #${connId}, primary is #${this.tuiConnId})`);
+      this.setupSecondaryConnection(ws, connId);
+      return;
+    }
+
+    // No active primary — this becomes the new primary connection
+    const previousConnId = this.tuiConnId > 0 ? this.tuiConnId : null;
+    this.tuiConnId = connId;
     this.tuiWs = ws;
+    // Reset threadId to prevent premature message injection before TUI completes
+    // its handshake (initialize → thread/start or thread/resume).
+    this.threadId = null;
     this.log(`TUI connected (conn #${this.tuiConnId})`);
     this.emit("tuiConnected", this.tuiConnId);
     if (previousConnId !== null) {
       this.retireConnectionState(previousConnId);
     }
     this.replayPendingServerRequests(ws);
+  }
+
+  /** Set up a secondary (picker) connection with its own dedicated app-server WS. */
+  private setupSecondaryConnection(ws: ServerWebSocket<TuiSocketData>, connId: number) {
+    const appWs = new WebSocket(this.appServerUrl);
+    // Store the appWs handle immediately (not just in onopen) so that
+    // onTuiDisconnect can close it even if the picker disconnects before
+    // the app-server WS finishes connecting.
+    const entry = { tuiWs: ws, appServerWs: appWs, buffer: [] as string[] };
+    this.secondaryConnections.set(connId, entry);
+
+    appWs.onopen = () => {
+      // Picker may have already disconnected — if so, close immediately
+      if (!this.secondaryConnections.has(connId)) {
+        appWs.close();
+        return;
+      }
+      this.log(`Secondary conn #${connId}: app-server WS connected, flushing ${entry.buffer.length} buffered messages`);
+      for (const msg of entry.buffer) {
+        try { appWs.send(msg); } catch {}
+      }
+      entry.buffer = [];
+    };
+    appWs.onmessage = (event) => {
+      if (!this.secondaryConnections.has(connId)) return;
+      const data = typeof event.data === "string" ? event.data : event.data.toString();
+      try { ws.send(data); } catch {}
+    };
+    appWs.onerror = () => {
+      this.log(`Secondary conn #${connId}: app-server WS error`);
+    };
+    appWs.onclose = () => {
+      this.log(`Secondary conn #${connId}: app-server WS closed`);
+      const sec = this.secondaryConnections.get(connId);
+      if (sec) {
+        // App-server died — tear down the picker TUI socket too so it
+        // doesn't become a zombie that silently drops messages.
+        this.secondaryConnections.delete(connId);
+        try { sec.tuiWs.close(); } catch {}
+      }
+    };
   }
 
   private replayPendingServerRequests(ws: ServerWebSocket<TuiSocketData>) {
@@ -352,21 +493,49 @@ export class CodexAdapter extends EventEmitter {
 
   private onTuiDisconnect(ws: ServerWebSocket<TuiSocketData>) {
     const connId = ws.data.connId;
+
+    // Check if this is a secondary (picker) connection
+    const secondary = this.secondaryConnections.get(connId);
+    if (secondary) {
+      this.log(`Secondary TUI disconnected (conn #${connId})`);
+      this.secondaryConnections.delete(connId);
+      if (secondary.appServerWs) {
+        try { secondary.appServerWs.close(); } catch {}
+      }
+      return;
+    }
+
     // Only clear tuiWs if this is still the current connection
     if (this.tuiWs === ws) {
       this.log(`TUI disconnected (conn #${connId})`);
       this.tuiWs = null;
+      // Clear any pending reconnection state
+      if (this.reconnectingForNewSession) {
+        this.log("Clearing pending TUI message buffer (TUI disconnected during app-server reconnect)");
+        this.pendingTuiMessages = [];
+        this.reconnectingForNewSession = false;
+      }
       this.emit("tuiDisconnected", connId);
     } else {
       this.log(`Stale TUI disconnected (conn #${connId}, current is #${this.tuiConnId})`);
     }
     this.retireConnectionState(connId);
-    // Do NOT close app-server connection — TUI will reconnect shortly
   }
 
   private onTuiMessage(ws: ServerWebSocket<TuiSocketData>, msg: string | Buffer) {
     const data = typeof msg === "string" ? msg : msg.toString();
     const connId = ws.data.connId;
+
+    // Route secondary (picker) connection messages to their own app-server WS
+    const secondary = this.secondaryConnections.get(connId);
+    if (secondary) {
+      if (secondary.appServerWs && secondary.appServerWs.readyState === WebSocket.OPEN) {
+        try { secondary.appServerWs.send(data); } catch {}
+      } else {
+        secondary.buffer.push(data);
+      }
+      return;
+    }
 
     // Ignore messages from stale connections
     if (connId !== this.tuiConnId) {
@@ -407,6 +576,34 @@ export class CodexAdapter extends EventEmitter {
       }
     } catch {}
 
+    // Detect method before id-rewriting so we can intercept `initialize`
+    // and buffer the RAW (un-rewritten) message for replay after reconnect.
+    let detectedMethod: string | undefined;
+    try {
+      const parsed = JSON.parse(data);
+      detectedMethod = typeof parsed.method === "string" ? parsed.method : undefined;
+    } catch {}
+
+    // When TUI sends `initialize`, reconnect app-server to give it a fresh
+    // connection-scoped session (the upstream protocol requires per-connection init).
+    // Buffer the raw message — id-rewriting happens after reconnect during replay.
+    // Skip this check during replay to avoid infinite recursion.
+    if (!this.replayingBufferedMessages) {
+      if (detectedMethod === "initialize") {
+        this.log("Detected initialize — reconnecting app-server for fresh session");
+        this.reconnectingForNewSession = true;
+        this.pendingTuiMessages = [data];
+        this.reconnectAppServerForNewSession(ws);
+        return;
+      }
+
+      // Buffer raw messages while reconnecting app-server for a fresh session
+      if (this.reconnectingForNewSession) {
+        this.pendingTuiMessages.push(data);
+        return;
+      }
+    }
+
     let forwarded = data;
     try {
       const parsed = JSON.parse(data);
@@ -440,7 +637,6 @@ export class CodexAdapter extends EventEmitter {
   private handleAppServerPayload(raw: string): string | null {
     try {
       const parsed: unknown = JSON.parse(raw);
-
       if (isAppServerNotification(parsed) || (typeof parsed === "object" && parsed !== null && !("id" in parsed))) {
         const notificationLike = parsed as Record<string, unknown>;
         const forwarded = this.patchResponse(notificationLike, raw);
@@ -552,6 +748,7 @@ export class CodexAdapter extends EventEmitter {
       }
 
       parsed.id = mapping.clientId;
+      this.log(`app-server → TUI: response (proxy id=${numericId} → client id=${String(mapping.clientId)}, conn #${mapping.connId})`);
       const forwarded = this.patchResponse(parsed, JSON.stringify(parsed));
       this.interceptServerMessage(parsed, mapping.connId);
       return forwarded;
@@ -595,18 +792,8 @@ export class CodexAdapter extends EventEmitter {
           },
         });
       }
-      // Patch "Already initialized" — just return success
-      if (errMsg.includes("Already initialized")) {
-        this.log(`Patching "Already initialized" error (id: ${parsed.id})`);
-        return JSON.stringify({
-          id: parsed.id,
-          result: {
-            userAgent: "agent_bridge/0.1.0",
-            platformFamily: "unix",
-            platformOs: "macos",
-          },
-        });
-      }
+      // "Already initialized" is no longer patched — we reconnect the app-server
+      // WS on each TUI `initialize` request, giving it a fresh connection scope.
     }
     return raw;
   }
@@ -682,8 +869,6 @@ export class CodexAdapter extends EventEmitter {
     const rpcId = "id" in message ? message.id : undefined;
     const method = "method" in message && typeof message.method === "string" ? message.method : undefined;
     const key = this.pendingKey(rpcId, connId);
-
-    this.log(`[track] method=${method} id=${rpcId} (type=${typeof rpcId}) key=${key}`);
 
     if (!key || !isTrackedAppServerRequestMethod(method)) return;
 

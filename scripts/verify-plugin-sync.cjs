@@ -70,6 +70,22 @@ try {
   }
 
   console.log("Plugin bundles are already in sync with source.");
+
+  // Guard: ensure src/cli.ts has not been overwritten by a bundle artifact.
+  const cliSource = resolve(repoRoot, "src/cli.ts");
+  if (existsSync(cliSource)) {
+    const cliContent = readFileSync(cliSource, "utf-8");
+    const bundleMarkers = ["// @bun", "var __commonJS", "var __defProp = Object.defineProperty"];
+    const found = bundleMarkers.find((m) => cliContent.includes(m));
+    if (found) {
+      console.error(
+        `\nsrc/cli.ts contains bundle marker "${found}" — it looks like a compiled artifact was written back over the source file.`
+      );
+      console.error('Run: git restore src/cli.ts');
+      process.exit(1);
+    }
+  }
+  console.log("src/cli.ts is not a bundle artifact.");
 } finally {
   rmSync(tempDir, { recursive: true, force: true });
 }

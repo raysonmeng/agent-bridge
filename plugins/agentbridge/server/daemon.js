@@ -67,6 +67,8 @@ class CodexAdapter extends EventEmitter {
   appPort;
   proxyPort;
   tuiConnId = 0;
+  connIdCounter = 0;
+  secondaryConnections = new Map;
   agentMessageBuffers = new Map;
   pendingRequests = new Map;
   activeTurnIds = new Set;
@@ -79,6 +81,10 @@ class CodexAdapter extends EventEmitter {
   staleProxyIds = new Map;
   bridgeRequestIds = new Map;
   intentionalDisconnect = false;
+  pendingTuiMessages = [];
+  reconnectingForNewSession = false;
+  replayingBufferedMessages = false;
+  appServerGeneration = 0;
   constructor(appPort = 4500, proxyPort = 4501) {
     super();
     this.appPort = appPort;
@@ -119,6 +125,12 @@ class CodexAdapter extends EventEmitter {
     }
     this.appServerWs?.close();
     this.appServerWs = null;
+    for (const [id, sec] of this.secondaryConnections) {
+      try {
+        sec.appServerWs?.close();
+      } catch {}
+      this.secondaryConnections.delete(id);
+    }
     this.proxyServer?.stop();
     this.proxyServer = null;
     this.clearResponseTrackingState();
@@ -179,17 +191,24 @@ class CodexAdapter extends EventEmitter {
     throw new Error("Codex app-server failed to become healthy");
   }
   connectToAppServer(isReconnect = false) {
+    const generation = ++this.appServerGeneration;
     return new Promise((resolve, reject) => {
       const appWs = new WebSocket(this.appServerUrl);
       appWs.onopen = () => {
+        if (this.appServerGeneration !== generation) {
+          appWs.close();
+          return;
+        }
         this.appServerWs = appWs;
         this.intentionalDisconnect = false;
         this.reconnectAttempts = 0;
-        this.log(isReconnect ? "Reconnected to app-server" : "Connected to app-server (persistent)");
+        this.log(isReconnect ? "Reconnected to app-server" : "Connected to app-server");
         this.flushPendingServerResponses();
         resolve();
       };
       appWs.onmessage = (event) => {
+        if (this.appServerGeneration !== generation)
+          return;
         const data = typeof event.data === "string" ? event.data : event.data.toString();
         const forwarded = this.handleAppServerPayload(data);
         if (forwarded === null)
@@ -205,21 +224,57 @@ class CodexAdapter extends EventEmitter {
         }
       };
       appWs.onerror = () => {
+        if (this.appServerGeneration !== generation)
+          return;
         this.log("App-server connection error");
         if (!isReconnect)
           reject(new Error("Failed to connect to app-server"));
       };
       appWs.onclose = () => {
-        this.log("App-server connection closed");
-        this.appServerWs = null;
-        this.clearTransientResponseTrackingState();
-        this.activeTurnIds.clear();
-        this.turnInProgress = false;
-        if (!this.intentionalDisconnect) {
-          this.scheduleReconnect();
-        }
+        if (this.appServerGeneration !== generation)
+          return;
+        this.handleAppServerClose();
       };
     });
+  }
+  async reconnectAppServerForNewSession(tuiWs) {
+    this.appServerGeneration++;
+    this.intentionalDisconnect = true;
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+    const oldWs = this.appServerWs;
+    this.appServerWs = null;
+    if (oldWs) {
+      try {
+        oldWs.close();
+      } catch {}
+    }
+    this.clearResponseTrackingState();
+    this.activeTurnIds.clear();
+    this.turnInProgress = false;
+    try {
+      await this.connectToAppServer(false);
+      this.log("App-server reconnected for new TUI session \u2014 replaying buffered messages");
+      const messages = this.pendingTuiMessages;
+      this.pendingTuiMessages = [];
+      this.reconnectingForNewSession = false;
+      this.replayingBufferedMessages = true;
+      try {
+        for (const msg of messages) {
+          this.onTuiMessage(tuiWs, msg);
+        }
+      } finally {
+        this.replayingBufferedMessages = false;
+      }
+    } catch (err) {
+      this.log(`Failed to reconnect app-server for new session: ${err.message}`);
+      this.pendingTuiMessages = [];
+      this.reconnectingForNewSession = false;
+      this.intentionalDisconnect = false;
+      this.scheduleReconnect();
+    }
   }
   reconnectAttempts = 0;
   reconnectTimer = null;
@@ -246,6 +301,16 @@ class CodexAdapter extends EventEmitter {
       }
     }, delay);
   }
+  handleAppServerClose() {
+    this.log("App-server connection closed");
+    this.appServerWs = null;
+    this.clearResponseTrackingState();
+    this.activeTurnIds.clear();
+    this.turnInProgress = false;
+    if (!this.intentionalDisconnect) {
+      this.scheduleReconnect();
+    }
+  }
   startProxy() {
     const self = this;
     this.proxyServer = Bun.serve({
@@ -253,31 +318,83 @@ class CodexAdapter extends EventEmitter {
       hostname: "127.0.0.1",
       fetch(req, server) {
         const url = new URL(req.url);
+        const isUpgrade = req.headers.get("upgrade")?.toLowerCase() === "websocket";
+        self.log(`HTTP ${req.method} ${url.pathname} (upgrade=${isUpgrade})`);
         if (url.pathname === "/healthz" || url.pathname === "/readyz") {
           return fetch(`http://127.0.0.1:${self.appPort}${url.pathname}`);
         }
         if (server.upgrade(req, { data: { connId: 0 } }))
           return;
+        self.log(`WARNING: non-upgrade HTTP request not handled: ${req.method} ${url.pathname}`);
         return new Response("AgentBridge Codex Proxy");
       },
       websocket: {
         open: (ws) => self.onTuiConnect(ws),
-        close: (ws) => self.onTuiDisconnect(ws),
+        close: (ws, code, reason) => {
+          self.log(`WebSocket close event: conn #${ws.data.connId}, code=${code}, reason=${reason || "none"}`);
+          self.onTuiDisconnect(ws);
+        },
         message: (ws, msg) => self.onTuiMessage(ws, msg)
       }
     });
   }
   onTuiConnect(ws) {
-    const previousConnId = this.tuiWs ? this.tuiConnId : null;
-    this.tuiConnId++;
-    ws.data.connId = this.tuiConnId;
+    const connId = ++this.connIdCounter;
+    ws.data.connId = connId;
+    if (this.tuiWs) {
+      this.log(`Secondary TUI connected (conn #${connId}, primary is #${this.tuiConnId})`);
+      this.setupSecondaryConnection(ws, connId);
+      return;
+    }
+    const previousConnId = this.tuiConnId > 0 ? this.tuiConnId : null;
+    this.tuiConnId = connId;
     this.tuiWs = ws;
+    this.threadId = null;
     this.log(`TUI connected (conn #${this.tuiConnId})`);
     this.emit("tuiConnected", this.tuiConnId);
     if (previousConnId !== null) {
       this.retireConnectionState(previousConnId);
     }
     this.replayPendingServerRequests(ws);
+  }
+  setupSecondaryConnection(ws, connId) {
+    const appWs = new WebSocket(this.appServerUrl);
+    const entry = { tuiWs: ws, appServerWs: appWs, buffer: [] };
+    this.secondaryConnections.set(connId, entry);
+    appWs.onopen = () => {
+      if (!this.secondaryConnections.has(connId)) {
+        appWs.close();
+        return;
+      }
+      this.log(`Secondary conn #${connId}: app-server WS connected, flushing ${entry.buffer.length} buffered messages`);
+      for (const msg of entry.buffer) {
+        try {
+          appWs.send(msg);
+        } catch {}
+      }
+      entry.buffer = [];
+    };
+    appWs.onmessage = (event) => {
+      if (!this.secondaryConnections.has(connId))
+        return;
+      const data = typeof event.data === "string" ? event.data : event.data.toString();
+      try {
+        ws.send(data);
+      } catch {}
+    };
+    appWs.onerror = () => {
+      this.log(`Secondary conn #${connId}: app-server WS error`);
+    };
+    appWs.onclose = () => {
+      this.log(`Secondary conn #${connId}: app-server WS closed`);
+      const sec = this.secondaryConnections.get(connId);
+      if (sec) {
+        this.secondaryConnections.delete(connId);
+        try {
+          sec.tuiWs.close();
+        } catch {}
+      }
+    };
   }
   replayPendingServerRequests(ws) {
     const remaining = [];
@@ -304,9 +421,25 @@ class CodexAdapter extends EventEmitter {
   }
   onTuiDisconnect(ws) {
     const connId = ws.data.connId;
+    const secondary = this.secondaryConnections.get(connId);
+    if (secondary) {
+      this.log(`Secondary TUI disconnected (conn #${connId})`);
+      this.secondaryConnections.delete(connId);
+      if (secondary.appServerWs) {
+        try {
+          secondary.appServerWs.close();
+        } catch {}
+      }
+      return;
+    }
     if (this.tuiWs === ws) {
       this.log(`TUI disconnected (conn #${connId})`);
       this.tuiWs = null;
+      if (this.reconnectingForNewSession) {
+        this.log("Clearing pending TUI message buffer (TUI disconnected during app-server reconnect)");
+        this.pendingTuiMessages = [];
+        this.reconnectingForNewSession = false;
+      }
       this.emit("tuiDisconnected", connId);
     } else {
       this.log(`Stale TUI disconnected (conn #${connId}, current is #${this.tuiConnId})`);
@@ -316,8 +449,20 @@ class CodexAdapter extends EventEmitter {
   onTuiMessage(ws, msg) {
     const data = typeof msg === "string" ? msg : msg.toString();
     const connId = ws.data.connId;
+    const secondary = this.secondaryConnections.get(connId);
+    if (secondary) {
+      if (secondary.appServerWs && secondary.appServerWs.readyState === WebSocket.OPEN) {
+        try {
+          secondary.appServerWs.send(data);
+        } catch {}
+      } else {
+        secondary.buffer.push(data);
+      }
+      return;
+    }
     if (connId !== this.tuiConnId) {
-      this.log(`Dropping message from stale TUI conn #${connId} (current is #${this.tuiConnId})`);
+      const preview = data.length > 300 ? data.slice(0, 300) + "\u2026" : data;
+      this.log(`Dropping message from stale TUI conn #${connId} (current is #${this.tuiConnId}): ${preview}`);
       return;
     }
     try {
@@ -351,6 +496,24 @@ class CodexAdapter extends EventEmitter {
         }
       }
     } catch {}
+    let detectedMethod;
+    try {
+      const parsed = JSON.parse(data);
+      detectedMethod = typeof parsed.method === "string" ? parsed.method : undefined;
+    } catch {}
+    if (!this.replayingBufferedMessages) {
+      if (detectedMethod === "initialize") {
+        this.log("Detected initialize \u2014 reconnecting app-server for fresh session");
+        this.reconnectingForNewSession = true;
+        this.pendingTuiMessages = [data];
+        this.reconnectAppServerForNewSession(ws);
+        return;
+      }
+      if (this.reconnectingForNewSession) {
+        this.pendingTuiMessages.push(data);
+        return;
+      }
+    }
     let forwarded = data;
     try {
       const parsed = JSON.parse(data);
@@ -377,6 +540,8 @@ class CodexAdapter extends EventEmitter {
   handleAppServerPayload(raw) {
     try {
       const parsed = JSON.parse(raw);
+      const preview = raw.length > 200 ? raw.slice(0, 200) + "\u2026" : raw;
+      this.log(`app-server \u2192 proxy: ${preview}`);
       if (isAppServerNotification(parsed) || typeof parsed === "object" && parsed !== null && !("id" in parsed)) {
         const notificationLike = parsed;
         const forwarded = this.patchResponse(notificationLike, raw);
@@ -464,6 +629,7 @@ class CodexAdapter extends EventEmitter {
         return null;
       }
       parsed.id = mapping.clientId;
+      this.log(`app-server \u2192 TUI: response (proxy id=${numericId} \u2192 client id=${String(mapping.clientId)}, conn #${mapping.connId})`);
       const forwarded = this.patchResponse(parsed, JSON.stringify(parsed));
       this.interceptServerMessage(parsed, mapping.connId);
       return forwarded;
@@ -500,17 +666,6 @@ class CodexAdapter extends EventEmitter {
               planType: null
             },
             rateLimitsByLimitId: null
-          }
-        });
-      }
-      if (errMsg.includes("Already initialized")) {
-        this.log(`Patching "Already initialized" error (id: ${parsed.id})`);
-        return JSON.stringify({
-          id: parsed.id,
-          result: {
-            userAgent: "agent_bridge/0.1.0",
-            platformFamily: "unix",
-            platformOs: "macos"
           }
         });
       }
@@ -1690,8 +1845,10 @@ function handleControlMessage(ws, raw) {
   }
 }
 function attachClaude(ws) {
-  if (attachedClaude && attachedClaude !== ws) {
-    attachedClaude.close(CLOSE_CODE_REPLACED, "replaced by a newer Claude session");
+  if (attachedClaude && attachedClaude !== ws && attachedClaude.readyState !== WebSocket.CLOSED) {
+    log(`Rejecting Claude frontend #${ws.data.clientId} \u2014 another session (#${attachedClaude.data.clientId}) is already attached (readyState=${attachedClaude.readyState})`);
+    ws.close(CLOSE_CODE_REPLACED, "another Claude session is already connected");
+    return;
   }
   clearPendingClaudeDisconnect("Claude frontend attached");
   attachedClaude = ws;
