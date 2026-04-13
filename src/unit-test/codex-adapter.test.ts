@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { CodexAdapter } from "./codex-adapter";
+import { CodexAdapter } from "../codex-adapter";
 
 function createAdapter() {
   return new CodexAdapter(4510, 4511) as any;
@@ -521,6 +521,11 @@ describe("CodexAdapter server-to-client request passthrough", () => {
     adapter.tuiConnId = 1;
 
     adapter.serverRequestToProxy.set(100600, {
+      raw: JSON.stringify({
+        id: 88,
+        method: "item/permissions/requestApproval",
+        params: { permission: "network" },
+      }),
       serverId: 88,
       connId: 1,
       method: "item/permissions/requestApproval",
@@ -530,18 +535,32 @@ describe("CodexAdapter server-to-client request passthrough", () => {
     const ws = { data: { connId: 1 } } as any;
     adapter.onTuiMessage(ws, JSON.stringify({ id: 100600, result: { approved: true } }));
 
-    // mapping preserved (not deleted, not forwarded)
-    expect(adapter.serverRequestToProxy.has(100600)).toBe(true);
+    expect(adapter.serverRequestToProxy.has(100600)).toBe(false);
+    expect(adapter.pendingServerResponses.has(100600)).toBe(true);
+
+    const appSent: string[] = [];
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: (data: string) => appSent.push(data) } as any;
+    adapter.flushPendingServerResponses();
+
+    expect(appSent).toEqual([
+      JSON.stringify({ id: 88, result: { approved: true } }),
+    ]);
+    expect(adapter.pendingServerResponses.size).toBe(0);
 
     adapter.clearResponseTrackingState();
   });
 
-  test("approval response send failure retains mapping", () => {
+  test("approval response send failure is buffered for retry", () => {
     const adapter = createAdapter();
     adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => { throw new Error("broken"); } } as any;
     adapter.tuiConnId = 1;
 
     adapter.serverRequestToProxy.set(100500, {
+      raw: JSON.stringify({
+        id: 99,
+        method: "item/permissions/requestApproval",
+        params: { permission: "network" },
+      }),
       serverId: 99,
       connId: 1,
       method: "item/permissions/requestApproval",
@@ -551,8 +570,8 @@ describe("CodexAdapter server-to-client request passthrough", () => {
     const ws = { data: { connId: 1 } } as any;
     adapter.onTuiMessage(ws, JSON.stringify({ id: 100500, result: { approved: true } }));
 
-    // mapping should still exist after send failure
-    expect(adapter.serverRequestToProxy.has(100500)).toBe(true);
+    expect(adapter.serverRequestToProxy.has(100500)).toBe(false);
+    expect(adapter.pendingServerResponses.has(100500)).toBe(true);
 
     adapter.clearResponseTrackingState();
   });
@@ -572,6 +591,7 @@ describe("CodexAdapter server-to-client request passthrough", () => {
     expect(sent.length).toBe(1);
     const parsed = JSON.parse(sent[0]);
     expect(parsed.method).toBe("item/fileChange/requestApproval");
+    expect(parsed.params).toEqual({ file: "test.ts" });
     expect(parsed.id).not.toBe(50);
     expect(adapter.serverRequestToProxy.size).toBe(1);
 
@@ -594,21 +614,157 @@ describe("CodexAdapter server-to-client request passthrough", () => {
     adapter.clearResponseTrackingState();
   });
 
-  test("server request mappings survive TUI disconnect (TTL cleanup)", () => {
+  test("requeues in-flight server requests on TUI disconnect and replays them on reconnect", () => {
     const adapter = createAdapter();
     adapter.tuiConnId = 1;
+    const raw = JSON.stringify({
+      id: 70,
+      method: "item/permissions/requestApproval",
+      params: { permission: "network" },
+    });
 
     adapter.serverRequestToProxy.set(100400, {
       serverId: 70,
       connId: 1,
       method: "item/permissions/requestApproval",
+      raw,
       timestamp: Date.now(),
     });
 
     adapter.retireConnectionState(1);
-    expect(adapter.serverRequestToProxy.has(100400)).toBe(true);
+    expect(adapter.serverRequestToProxy.has(100400)).toBe(false);
+    expect(adapter.pendingServerRequests).toEqual([
+      {
+        raw,
+        serverId: 70,
+        method: "item/permissions/requestApproval",
+      },
+    ]);
+
+    const sent: string[] = [];
+    const ws = { data: { connId: 0 }, send: (data: string) => sent.push(data) } as any;
+    adapter.onTuiConnect(ws);
+
+    expect(adapter.pendingServerRequests.length).toBe(0);
+    expect(sent.length).toBe(1);
+    const replayed = JSON.parse(sent[0]);
+    expect(replayed.id).not.toBe(70);
+    expect(replayed.method).toBe("item/permissions/requestApproval");
+    expect(adapter.serverRequestToProxy.size).toBe(1);
+
+    const appSent: string[] = [];
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: (data: string) => appSent.push(data) } as any;
+    adapter.onTuiMessage(ws, JSON.stringify({ id: replayed.id, result: { approved: true } }));
+
+    expect(appSent.length).toBe(1);
+    expect(JSON.parse(appSent[0]).id).toBe(70);
+    expect(adapter.serverRequestToProxy.size).toBe(0);
 
     adapter.clearResponseTrackingState();
+  });
+
+  test("new TUI connection replays in-flight server requests after old primary disconnects", () => {
+    const adapter = createAdapter();
+    const sent: string[] = [];
+
+    // Set up primary conn #1 with a pending server request
+    adapter.connIdCounter = 1;
+    adapter.tuiConnId = 1;
+    adapter.tuiWs = { data: { connId: 1 }, send: () => {} } as any;
+    adapter.serverRequestToProxy.set(100700, {
+      raw: JSON.stringify({
+        id: 91,
+        method: "item/fileChange/requestApproval",
+        params: { file: "draft.txt" },
+      }),
+      serverId: 91,
+      connId: 1,
+      method: "item/fileChange/requestApproval",
+      timestamp: Date.now(),
+    });
+
+    // Primary disconnects — retires state, moves server requests to pending
+    adapter.onTuiDisconnect(adapter.tuiWs);
+    expect(adapter.tuiWs).toBeNull();
+    expect(adapter.pendingServerRequests.length).toBe(1);
+
+    // New TUI opens — becomes primary (no active tuiWs), replays pending requests
+    const ws = { data: { connId: 0 }, send: (data: string) => sent.push(data) } as any;
+    adapter.onTuiConnect(ws);
+
+    expect(sent.length).toBe(1);
+    const replayed = JSON.parse(sent[0]);
+    expect(replayed.method).toBe("item/fileChange/requestApproval");
+    expect(replayed.params).toEqual({ file: "draft.txt" });
+    expect(replayed.id).not.toBe(91);
+    expect(adapter.serverRequestToProxy.has(100700)).toBe(false);
+    expect(adapter.serverRequestToProxy.size).toBe(1);
+    const migrated = [...adapter.serverRequestToProxy.values()][0];
+    expect(migrated.connId).toBe(adapter.tuiConnId);
+    expect(migrated.serverId).toBe(91);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("new connection while primary alive becomes secondary (not primary)", () => {
+    const adapter = createAdapter();
+
+    // Set up primary conn #1
+    adapter.connIdCounter = 1;
+    adapter.tuiConnId = 1;
+    const primaryWs = { data: { connId: 1 }, send: () => {} } as any;
+    adapter.tuiWs = primaryWs;
+
+    // New conn opens while primary is alive — becomes secondary
+    const secondaryWs = { data: { connId: 0 }, send: () => {}, close: () => {} } as any;
+    adapter.onTuiConnect(secondaryWs);
+
+    // Primary is unchanged
+    expect(adapter.tuiWs).toBe(primaryWs);
+    expect(adapter.tuiConnId).toBe(1);
+    // Secondary is tracked
+    expect(adapter.secondaryConnections.size).toBe(1);
+
+    // Clean up — close the secondary's app-server WS mock
+    for (const sec of adapter.secondaryConnections.values()) {
+      if (sec.appServerWs) sec.appServerWs.close();
+    }
+    adapter.secondaryConnections.clear();
+    adapter.clearResponseTrackingState();
+  });
+
+  test("app-server close discards approval state across reconnects", () => {
+    const adapter = createAdapter();
+    const sent: string[] = [];
+
+    adapter.tuiWs = { send: (data: string) => sent.push(data) } as any;
+    adapter.tuiConnId = 1;
+
+    adapter.handleAppServerPayload(JSON.stringify({
+      id: 71,
+      method: "item/permissions/requestApproval",
+      params: { permission: "network" },
+    }));
+
+    adapter.pendingServerRequests = [
+      { raw: JSON.stringify({ id: 72, method: "item/fileChange/requestApproval", params: { file: "draft.txt" } }), serverId: 72, method: "item/fileChange/requestApproval" },
+    ];
+    adapter.pendingServerResponses.set(100402, {
+      raw: JSON.stringify({ id: 73, result: { approved: true } }),
+      serverId: 73,
+      method: "item/commandExecution/requestApproval",
+      timestamp: Date.now(),
+    });
+
+    expect(adapter.serverRequestToProxy.size).toBe(1);
+    expect(adapter.pendingServerRequests.length).toBe(1);
+    expect(adapter.pendingServerResponses.size).toBe(1);
+
+    adapter.handleAppServerClose();
+
+    expect(adapter.serverRequestToProxy.size).toBe(0);
+    expect(adapter.pendingServerRequests.length).toBe(0);
+    expect(adapter.pendingServerResponses.size).toBe(0);
   });
 
   test("app-server close clears all server request state", () => {
@@ -658,5 +814,104 @@ describe("CodexAdapter server-to-client request passthrough", () => {
     expect(clientMapping[0][0]).not.toBe(serverProxyId);
 
     adapter.clearResponseTrackingState();
+  });
+});
+
+describe("CodexAdapter initialize reconnect", () => {
+  test("initialize triggers buffering and reconnect — replayed messages get fresh id mappings", async () => {
+    const adapter = createAdapter();
+    const appSent: string[] = [];
+    adapter.tuiConnId = 1;
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: (data: string) => appSent.push(data) } as any;
+
+    // Mock connectToAppServer to simulate a successful reconnect
+    const newAppSent: string[] = [];
+    adapter.connectToAppServer = async () => {
+      adapter.appServerWs = {
+        readyState: WebSocket.OPEN,
+        send: (data: string) => newAppSent.push(data),
+      } as any;
+    };
+
+    const ws = { data: { connId: 1 } } as any;
+
+    // Send initialize — should be buffered, NOT forwarded to old app-server
+    adapter.onTuiMessage(ws, JSON.stringify({
+      id: 1,
+      method: "initialize",
+      params: {},
+    }));
+
+    expect(adapter.reconnectingForNewSession).toBe(true);
+    expect(appSent).toEqual([]); // NOT sent to old connection
+
+    // Send a follow-up message while reconnecting — should also be buffered
+    adapter.onTuiMessage(ws, JSON.stringify({
+      id: 2,
+      method: "initialized",
+    }));
+
+    expect(adapter.pendingTuiMessages.length).toBe(2);
+
+    // Wait for reconnect to complete (async)
+    await new Promise((resolve) => setTimeout(resolve, 10));
+
+    // After reconnect, messages should be replayed on the new connection
+    expect(adapter.reconnectingForNewSession).toBe(false);
+    expect(newAppSent.length).toBe(2);
+
+    // Verify the initialize message was rewritten with a proxy id
+    const initMsg = JSON.parse(newAppSent[0]);
+    expect(initMsg.method).toBe("initialize");
+    expect(initMsg.id).not.toBe(1); // rewritten to proxy id
+
+    // Verify the mapping exists for the new proxy id
+    const mapping = adapter.upstreamToClient.get(initMsg.id);
+    expect(mapping).toBeDefined();
+    expect(mapping.clientId).toBe(1);
+    expect(mapping.connId).toBe(1);
+
+    // Simulate app-server responding to initialize
+    const tuiForwarded: string[] = [];
+    adapter.tuiWs = { send: (data: string) => tuiForwarded.push(data) } as any;
+
+    const forwarded = adapter.handleAppServerPayload(JSON.stringify({
+      id: initMsg.id,
+      result: { userAgent: "codex/1.0", platformFamily: "unix", platformOs: "macos" },
+    }));
+
+    expect(forwarded).not.toBeNull();
+    const response = JSON.parse(forwarded);
+    expect(response.id).toBe(1); // mapped back to client's original id
+    expect(response.result.userAgent).toBe("codex/1.0");
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("TUI disconnect during reconnect clears pending buffer", () => {
+    const adapter = createAdapter();
+    adapter.reconnectingForNewSession = true;
+    adapter.pendingTuiMessages = ["msg1", "msg2"];
+
+    const ws = { data: { connId: 1 } } as any;
+    adapter.tuiWs = ws;
+    adapter.tuiConnId = 1;
+
+    adapter.onTuiDisconnect(ws);
+
+    expect(adapter.reconnectingForNewSession).toBe(false);
+    expect(adapter.pendingTuiMessages).toEqual([]);
+  });
+
+  test("threadId is reset on TUI connect to prevent premature injection", () => {
+    const adapter = createAdapter();
+    adapter.threadId = "old-thread";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+
+    const ws = { data: { connId: 0 } } as any;
+    adapter.onTuiConnect(ws);
+
+    expect(adapter.threadId).toBeNull();
+    expect(adapter.injectMessage("hello")).toBe(false);
   });
 });

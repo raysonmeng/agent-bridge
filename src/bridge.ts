@@ -6,6 +6,7 @@ import { DaemonClient } from "./daemon-client";
 import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
 import { ConfigService } from "./config-service";
+import { disabledReplyError, type BridgeDisabledReason } from "./bridge-disabled-state";
 import type { BridgeMessage } from "./types";
 
 const stateDir = new StateDirResolver();
@@ -21,6 +22,7 @@ const daemonClient = new DaemonClient(CONTROL_WS_URL);
 
 let shuttingDown = false;
 let daemonDisabled = false;
+let daemonDisabledReason: BridgeDisabledReason | null = null;
 
 // --- Notification throttling for reconnect loops ---
 const RECONNECT_NOTIFY_COOLDOWN_MS = 30_000; // Only notify once per 30s window
@@ -38,7 +40,7 @@ claude.setReplySender(async (msg: BridgeMessage, requireReply?: boolean) => {
   if (daemonDisabled) {
     return {
       success: false,
-      error: "AgentBridge is disabled by `agentbridge kill`. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.",
+      error: disabledReplyError(daemonDisabledReason ?? "killed"),
     };
   }
 
@@ -74,6 +76,23 @@ daemonClient.on("disconnect", () => {
   void reconnectToDaemon();
 });
 
+daemonClient.on("rejected", async () => {
+  if (shuttingDown || daemonDisabled) return;
+
+  log("Daemon rejected this session (close code 4001) — another Claude session is already connected");
+
+  // The daemon now rejects NEW connections when an existing session is active.
+  // This session was the latecomer, so it should enter dormant state permanently
+  // and not try to reconnect (which would just get rejected again).
+  daemonDisabled = true;
+  daemonDisabledReason = "rejected";
+  await claude.pushNotification(systemMessage(
+    "system_bridge_replaced",
+    "⚠️ AgentBridge daemon rejected this session — another Claude Code session is already connected. Close the other session first, or run `agentbridge kill` to reset. AgentBridge 守护进程拒绝了此会话——另一个 Claude Code 会话已在连接中。请先关闭另一个会话，或运行 `agentbridge kill` 重置。",
+  ));
+  await daemonClient.disconnect();
+});
+
 claude.on("ready", async () => {
   log(`MCP server ready (delivery mode: ${claude.getDeliveryMode()}) — ensuring AgentBridge daemon...`);
   if (daemonLifecycle.wasKilled()) {
@@ -96,6 +115,7 @@ async function connectToDaemon(isReconnect = false) {
     await daemonLifecycle.ensureRunning();
     await daemonClient.connect();
     daemonClient.attachClaude();
+    daemonDisabledReason = null;
     if (!isReconnect) {
       void claude.pushNotification(systemMessage(
         "system_bridge_ready",
@@ -118,6 +138,7 @@ async function enterDisabledState(logMessage: string, notificationContent: strin
   if (daemonDisabled) return;
 
   daemonDisabled = true;
+  daemonDisabledReason = "killed";
   log(logMessage);
   await claude.pushNotification(systemMessage("system_bridge_disabled", notificationContent));
   await daemonClient.disconnect();
@@ -230,6 +251,7 @@ async function pollDisabledRecovery() {
       await daemonClient.connect();
       daemonClient.attachClaude();
       daemonDisabled = false;
+      daemonDisabledReason = null;
       stopDisabledRecoveryPoller();
       void claude.pushNotification(systemMessage(
         "system_bridge_recovered",
@@ -238,6 +260,7 @@ async function pollDisabledRecovery() {
     } catch (err: any) {
       log(`Disabled-state direct reconnect failed: ${err.message}`);
       daemonDisabled = false;
+      daemonDisabledReason = null;
       stopDisabledRecoveryPoller();
       void reconnectToDaemon();
     }

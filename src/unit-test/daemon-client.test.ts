@@ -1,5 +1,5 @@
 import { describe, test, expect, beforeEach, afterEach } from "bun:test";
-import { DaemonClient } from "./daemon-client";
+import { DaemonClient } from "../daemon-client";
 
 /**
  * Tests for DaemonClient — connection, disconnection, and message routing.
@@ -88,6 +88,64 @@ describe("DaemonClient", () => {
     }
 
     await disconnected;
+  });
+
+  test("emits rejected (not disconnect) when server closes with code 4001", async () => {
+    await client.connect();
+
+    let disconnectEmitted = false;
+    client.on("disconnect", () => { disconnectEmitted = true; });
+
+    const rejected = new Promise<void>((resolve) => {
+      client.on("rejected", () => resolve());
+    });
+
+    for (const ws of serverSockets) {
+      ws.close(4001, "another Claude session is already connected");
+    }
+
+    await rejected;
+    // Give a tick for any stray disconnect to fire
+    await new Promise((r) => setTimeout(r, 50));
+    expect(disconnectEmitted).toBe(false);
+  });
+
+  test("emits disconnect (not rejected) for non-4001 close codes", async () => {
+    await client.connect();
+
+    let rejectedEmitted = false;
+    client.on("rejected", () => { rejectedEmitted = true; });
+
+    const disconnected = new Promise<void>((resolve) => {
+      client.on("disconnect", () => resolve());
+    });
+
+    for (const ws of serverSockets) {
+      ws.close(1000, "normal closure");
+    }
+
+    await disconnected;
+    await new Promise((r) => setTimeout(r, 50));
+    expect(rejectedEmitted).toBe(false);
+  });
+
+  test("pending replies rejected on rejected close (code 4001)", async () => {
+    await client.connect();
+
+    // Send a message that expects a reply — it will never be answered
+    const replyPromise = client.sendReply(
+      { id: "test-pending", source: "claude", content: "hello", timestamp: Date.now() },
+      false,
+    );
+
+    // Close with 4001 before any response
+    for (const ws of serverSockets) {
+      ws.close(4001, "another Claude session is already connected");
+    }
+
+    const result = await replyPromise;
+    expect(result.success).toBe(false);
+    expect(result.error).toBeDefined();
   });
 
   test("emits codexMessage on codex_to_claude", async () => {

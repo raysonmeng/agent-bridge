@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
-import { ClaudeAdapter, CLAUDE_INSTRUCTIONS } from "./claude-adapter";
-import { BRIDGE_CONTRACT_REMINDER } from "./message-filter";
+import { ClaudeAdapter, CLAUDE_INSTRUCTIONS } from "../claude-adapter";
+import { BRIDGE_CONTRACT_REMINDER } from "../message-filter";
 
 describe("role-aware collaboration guidance", () => {
   test("claude instructions include role keywords and thinking patterns", () => {

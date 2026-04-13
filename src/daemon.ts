@@ -14,6 +14,7 @@ import { TuiConnectionState } from "./tui-connection-state";
 import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
 import { ConfigService } from "./config-service";
+import { CLOSE_CODE_REPLACED } from "./control-protocol";
 import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
 import type { BridgeMessage } from "./types";
 
@@ -332,8 +333,14 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
 }
 
 function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
-  if (attachedClaude && attachedClaude !== ws) {
-    attachedClaude.close(4001, "replaced by a newer Claude session");
+  if (attachedClaude && attachedClaude !== ws && attachedClaude.readyState !== WebSocket.CLOSED) {
+    // Reject the new connection — don't disrupt the existing active session.
+    // Check !== CLOSED (not === OPEN) so that CLOSING state is also treated as
+    // "slot occupied", preventing a race where a new session slips in before
+    // the old one finishes its close handshake.
+    log(`Rejecting Claude frontend #${ws.data.clientId} — another session (#${attachedClaude.data.clientId}) is already attached (readyState=${attachedClaude.readyState})`);
+    ws.close(CLOSE_CODE_REPLACED, "another Claude session is already connected");
+    return;
   }
 
   clearPendingClaudeDisconnect("Claude frontend attached");

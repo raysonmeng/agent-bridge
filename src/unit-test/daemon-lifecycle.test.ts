@@ -2,8 +2,8 @@ import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { StateDirResolver } from "./state-dir";
-import { DaemonLifecycle, isProcessAlive } from "./daemon-lifecycle";
+import { StateDirResolver } from "../state-dir";
+import { DaemonLifecycle, isProcessAlive } from "../daemon-lifecycle";
 
 describe("DaemonLifecycle", () => {
   let tempDir: string;

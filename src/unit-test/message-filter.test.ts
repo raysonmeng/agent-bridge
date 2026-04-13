@@ -4,8 +4,8 @@ import {
   StatusBuffer,
   classifyMessage,
   parseMarker,
-} from "./message-filter";
-import type { BridgeMessage } from "./types";
+} from "../message-filter";
+import type { BridgeMessage } from "../types";
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 

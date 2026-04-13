@@ -6,6 +6,7 @@ coverage/
 .claude/
 codex/
 agent_collab/
+codex-plugin-cc/
 /.mcp.json
 agentbridge-context.md
 V1_PROGRESS.md

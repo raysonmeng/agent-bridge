@@ -1,5 +1,5 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { ClaudeAdapter } from "./claude-adapter";
+import { ClaudeAdapter } from "../claude-adapter";
 
 // Access internals for testing
 function createAdapter(envMode?: string): any {
