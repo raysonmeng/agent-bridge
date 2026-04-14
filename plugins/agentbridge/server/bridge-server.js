@@ -13663,6 +13663,57 @@ class StdioServerTransport {
 import { EventEmitter } from "events";
 import { randomUUID } from "crypto";
 import { appendFileSync } from "fs";
+
+// src/state-dir.ts
+import { mkdirSync, existsSync } from "fs";
+import { join } from "path";
+import { homedir, platform } from "os";
+
+class StateDirResolver {
+  stateDir;
+  constructor(envOverride) {
+    const override = envOverride ?? process.env.AGENTBRIDGE_STATE_DIR;
+    if (override) {
+      this.stateDir = override;
+    } else if (platform() === "darwin") {
+      this.stateDir = join(homedir(), "Library", "Application Support", "AgentBridge");
+    } else {
+      const xdgState = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
+      this.stateDir = join(xdgState, "agentbridge");
+    }
+  }
+  ensure() {
+    if (!existsSync(this.stateDir)) {
+      mkdirSync(this.stateDir, { recursive: true });
+    }
+  }
+  get dir() {
+    return this.stateDir;
+  }
+  get pidFile() {
+    return join(this.stateDir, "daemon.pid");
+  }
+  get tuiPidFile() {
+    return join(this.stateDir, "codex-tui.pid");
+  }
+  get lockFile() {
+    return join(this.stateDir, "daemon.lock");
+  }
+  get statusFile() {
+    return join(this.stateDir, "status.json");
+  }
+  get portsFile() {
+    return join(this.stateDir, "ports.json");
+  }
+  get logFile() {
+    return join(this.stateDir, "agentbridge.log");
+  }
+  get killedFile() {
+    return join(this.stateDir, "killed");
+  }
+}
+
+// src/claude-adapter.ts
 var CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
   "",
@@ -13697,23 +13748,27 @@ var CLAUDE_INSTRUCTIONS = [
   "- If the reply tool returns a busy error, Codex is still executing \u2014 wait and try again later."
 ].join(`
 `);
-var LOG_FILE = "/tmp/agentbridge.log";
 
 class ClaudeAdapter extends EventEmitter {
   server;
   notificationSeq = 0;
   sessionId;
   notificationIdPrefix;
+  instanceId;
   replySender = null;
+  logFile;
   configuredMode;
   resolvedMode = null;
   pendingMessages = [];
   maxBufferedMessages;
   droppedMessageCount = 0;
-  constructor() {
+  constructor(logFile = new StateDirResolver().logFile) {
     super();
+    this.logFile = logFile;
+    this.instanceId = randomUUID().slice(0, 8);
     this.sessionId = `codex_${Date.now()}`;
     this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 12);
+    this.log(`ClaudeAdapter created (instance=${this.instanceId})`);
     const envMode = process.env.AGENTBRIDGE_MODE;
     this.configuredMode = envMode && ["push", "pull", "auto"].includes(envMode) ? envMode : "auto";
     this.maxBufferedMessages = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
@@ -13791,9 +13846,10 @@ class ClaudeAdapter extends EventEmitter {
       this.log(`Message queue full, dropped oldest message (total dropped: ${this.droppedMessageCount})`);
     }
     this.pendingMessages.push(message);
-    this.log(`Queued message for pull (${this.pendingMessages.length} pending)`);
+    this.log(`Queued message for pull (${this.pendingMessages.length} pending, instance=${this.instanceId})`);
   }
   drainMessages() {
+    this.log(`get_messages called (instance=${this.instanceId}, pending=${this.pendingMessages.length}, dropped=${this.droppedMessageCount})`);
     if (this.pendingMessages.length === 0 && this.droppedMessageCount === 0) {
       return {
         content: [{ type: "text", text: "No new messages from Codex." }]
@@ -13923,7 +13979,7 @@ ${formatted}`
 `;
     process.stderr.write(line);
     try {
-      appendFileSync(LOG_FILE, line);
+      appendFileSync(this.logFile, line);
     } catch {}
   }
 }
@@ -14083,7 +14139,7 @@ class DaemonClient extends EventEmitter2 {
 
 // src/daemon-lifecycle.ts
 import { spawn, execFileSync } from "child_process";
-import { existsSync, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "fs";
+import { existsSync as existsSync2, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
 var DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY ?? "./daemon.ts";
 var DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
@@ -14221,7 +14277,7 @@ class DaemonLifecycle {
     } catch {}
   }
   wasKilled() {
-    return existsSync(this.stateDir.killedFile);
+    return existsSync2(this.stateDir.killedFile);
   }
   launch() {
     this.stateDir.ensure();
@@ -14342,116 +14398,55 @@ function isProcessAlive(pid) {
   }
 }
 
-// src/state-dir.ts
-import { mkdirSync, existsSync as existsSync2 } from "fs";
-import { join } from "path";
-import { homedir, platform } from "os";
-
-class StateDirResolver {
-  stateDir;
-  constructor(envOverride) {
-    const override = envOverride ?? process.env.AGENTBRIDGE_STATE_DIR;
-    if (override) {
-      this.stateDir = override;
-    } else if (platform() === "darwin") {
-      this.stateDir = join(homedir(), "Library", "Application Support", "AgentBridge");
-    } else {
-      const xdgState = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
-      this.stateDir = join(xdgState, "agentbridge");
-    }
-  }
-  ensure() {
-    if (!existsSync2(this.stateDir)) {
-      mkdirSync(this.stateDir, { recursive: true });
-    }
-  }
-  get dir() {
-    return this.stateDir;
-  }
-  get pidFile() {
-    return join(this.stateDir, "daemon.pid");
-  }
-  get tuiPidFile() {
-    return join(this.stateDir, "codex-tui.pid");
-  }
-  get lockFile() {
-    return join(this.stateDir, "daemon.lock");
-  }
-  get statusFile() {
-    return join(this.stateDir, "status.json");
-  }
-  get portsFile() {
-    return join(this.stateDir, "ports.json");
-  }
-  get logFile() {
-    return join(this.stateDir, "agentbridge.log");
-  }
-  get killedFile() {
-    return join(this.stateDir, "killed");
-  }
-}
-
 // src/config-service.ts
 import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync3 } from "fs";
 import { join as join2 } from "path";
 var DEFAULT_CONFIG = {
   version: "1.0",
-  daemon: {
-    port: 4500,
+  codex: {
+    appPort: 4500,
     proxyPort: 4501
   },
-  agents: {
-    claude: {
-      role: "Reviewer, Planner",
-      mode: "push"
-    },
-    codex: {
-      role: "Implementer, Executor"
-    }
-  },
-  markers: ["IMPORTANT", "STATUS", "FYI"],
   turnCoordination: {
-    attentionWindowSeconds: 15,
-    busyGuard: true
+    attentionWindowSeconds: 15
   },
   idleShutdownSeconds: 30
 };
-var DEFAULT_COLLABORATION_MD = `# Collaboration Rules
-
-## Roles
-- Claude: Reviewer, Planner, Hypothesis Challenger
-- Codex: Implementer, Executor, Reproducer/Verifier
-
-## Thinking Patterns
-- Analytical/review tasks: Independent Analysis & Convergence
-- Implementation tasks: Architect -> Builder -> Critic
-- Debugging tasks: Hypothesis -> Experiment -> Interpretation
-
-## Communication
-- Use explicit phrases: "My independent view is:", "I agree on:", "I disagree on:", "Current consensus:"
-- Tag messages with [IMPORTANT], [STATUS], or [FYI]
-
-## Review Process
-- Cross-review: author never reviews their own code
-- All changes go through feature/fix branches + PR
-- Merge via squash merge
-
-## Custom Rules
-<!-- Add your project-specific collaboration rules here -->
-`;
 var CONFIG_DIR = ".agentbridge";
 var CONFIG_FILE = "config.json";
-var COLLABORATION_FILE = "collaboration.md";
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function normalizeInteger(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+function normalizeConfig(raw) {
+  if (!isRecord(raw))
+    return null;
+  const config2 = raw;
+  const codex = isRecord(config2.codex) ? config2.codex : {};
+  const daemon = isRecord(config2.daemon) ? config2.daemon : {};
+  const turnCoordination = isRecord(config2.turnCoordination) ? config2.turnCoordination : {};
+  return {
+    version: typeof config2.version === "string" ? config2.version : DEFAULT_CONFIG.version,
+    codex: {
+      appPort: normalizeInteger(codex.appPort ?? daemon.port, DEFAULT_CONFIG.codex.appPort),
+      proxyPort: normalizeInteger(codex.proxyPort ?? daemon.proxyPort, DEFAULT_CONFIG.codex.proxyPort)
+    },
+    turnCoordination: {
+      attentionWindowSeconds: normalizeInteger(turnCoordination.attentionWindowSeconds, DEFAULT_CONFIG.turnCoordination.attentionWindowSeconds)
+    },
+    idleShutdownSeconds: normalizeInteger(config2.idleShutdownSeconds, DEFAULT_CONFIG.idleShutdownSeconds)
+  };
+}
 
 class ConfigService {
   configDir;
   configPath;
-  collaborationPath;
   constructor(projectRoot) {
     const root = projectRoot ?? process.cwd();
     this.configDir = join2(root, CONFIG_DIR);
     this.configPath = join2(this.configDir, CONFIG_FILE);
-    this.collaborationPath = join2(this.configDir, COLLABORATION_FILE);
   }
   hasConfig() {
     return existsSync3(this.configPath);
@@ -14459,7 +14454,7 @@ class ConfigService {
   load() {
     try {
       const raw = readFileSync2(this.configPath, "utf-8");
-      return JSON.parse(raw);
+      return normalizeConfig(JSON.parse(raw));
     } catch {
       return null;
     }
@@ -14472,17 +14467,6 @@ class ConfigService {
     writeFileSync2(this.configPath, JSON.stringify(config2, null, 2) + `
 `, "utf-8");
   }
-  loadCollaboration() {
-    try {
-      return readFileSync2(this.collaborationPath, "utf-8");
-    } catch {
-      return null;
-    }
-  }
-  saveCollaboration(content) {
-    this.ensureConfigDir();
-    writeFileSync2(this.collaborationPath, content, "utf-8");
-  }
   initDefaults() {
     this.ensureConfigDir();
     const created = [];
@@ -14490,17 +14474,10 @@ class ConfigService {
       this.save(DEFAULT_CONFIG);
       created.push(this.configPath);
     }
-    if (!existsSync3(this.collaborationPath)) {
-      this.saveCollaboration(DEFAULT_COLLABORATION_MD);
-      created.push(this.collaborationPath);
-    }
     return created;
   }
   get configFilePath() {
     return this.configPath;
-  }
-  get collaborationFilePath() {
-    return this.collaborationPath;
   }
   ensureConfigDir() {
     if (!existsSync3(this.configDir)) {
@@ -14521,12 +14498,13 @@ function disabledReplyError(reason) {
 
 // src/bridge.ts
 var stateDir = new StateDirResolver;
+stateDir.ensure();
 var configService = new ConfigService;
 var config2 = configService.loadOrDefault();
 var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 var CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
-var claude = new ClaudeAdapter;
+var claude = new ClaudeAdapter(stateDir.logFile);
 var daemonClient = new DaemonClient(CONTROL_WS_URL);
 var shuttingDown = false;
 var daemonDisabled = false;

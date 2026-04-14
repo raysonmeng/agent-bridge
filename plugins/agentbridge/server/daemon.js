@@ -10,6 +10,55 @@ import { createInterface } from "readline";
 import { EventEmitter } from "events";
 import { appendFileSync } from "fs";
 
+// src/state-dir.ts
+import { mkdirSync, existsSync } from "fs";
+import { join } from "path";
+import { homedir, platform } from "os";
+
+class StateDirResolver {
+  stateDir;
+  constructor(envOverride) {
+    const override = envOverride ?? process.env.AGENTBRIDGE_STATE_DIR;
+    if (override) {
+      this.stateDir = override;
+    } else if (platform() === "darwin") {
+      this.stateDir = join(homedir(), "Library", "Application Support", "AgentBridge");
+    } else {
+      const xdgState = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
+      this.stateDir = join(xdgState, "agentbridge");
+    }
+  }
+  ensure() {
+    if (!existsSync(this.stateDir)) {
+      mkdirSync(this.stateDir, { recursive: true });
+    }
+  }
+  get dir() {
+    return this.stateDir;
+  }
+  get pidFile() {
+    return join(this.stateDir, "daemon.pid");
+  }
+  get tuiPidFile() {
+    return join(this.stateDir, "codex-tui.pid");
+  }
+  get lockFile() {
+    return join(this.stateDir, "daemon.lock");
+  }
+  get statusFile() {
+    return join(this.stateDir, "status.json");
+  }
+  get portsFile() {
+    return join(this.stateDir, "ports.json");
+  }
+  get logFile() {
+    return join(this.stateDir, "agentbridge.log");
+  }
+  get killedFile() {
+    return join(this.stateDir, "killed");
+  }
+}
+
 // src/app-server-protocol.ts
 var APP_SERVER_TRACKED_REQUEST_METHODS = [
   "thread/start",
@@ -54,8 +103,6 @@ function isAppServerResponseMessage(value) {
 }
 
 // src/codex-adapter.ts
-var LOG_FILE = "/tmp/agentbridge.log";
-
 class CodexAdapter extends EventEmitter {
   static RESPONSE_TRACKING_TTL_MS = 30000;
   proc = null;
@@ -66,6 +113,7 @@ class CodexAdapter extends EventEmitter {
   nextInjectionId = -1;
   appPort;
   proxyPort;
+  logFile;
   tuiConnId = 0;
   connIdCounter = 0;
   secondaryConnections = new Map;
@@ -85,10 +133,11 @@ class CodexAdapter extends EventEmitter {
   reconnectingForNewSession = false;
   replayingBufferedMessages = false;
   appServerGeneration = 0;
-  constructor(appPort = 4500, proxyPort = 4501) {
+  constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile) {
     super();
     this.appPort = appPort;
     this.proxyPort = proxyPort;
+    this.logFile = logFile;
   }
   get appServerUrl() {
     return `ws://127.0.0.1:${this.appPort}`;
@@ -1011,7 +1060,7 @@ class CodexAdapter extends EventEmitter {
 `;
     process.stderr.write(line);
     try {
-      appendFileSync(LOG_FILE, line);
+      appendFileSync(this.logFile, line);
     } catch {}
   }
 }
@@ -1219,7 +1268,7 @@ class TuiConnectionState {
 
 // src/daemon-lifecycle.ts
 import { spawn as spawn2, execFileSync } from "child_process";
-import { existsSync, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "fs";
+import { existsSync as existsSync2, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
 var DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY ?? "./daemon.ts";
 var DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
@@ -1357,7 +1406,7 @@ class DaemonLifecycle {
     } catch {}
   }
   wasKilled() {
-    return existsSync(this.stateDir.killedFile);
+    return existsSync2(this.stateDir.killedFile);
   }
   launch() {
     this.stateDir.ensure();
@@ -1478,116 +1527,55 @@ function isProcessAlive(pid) {
   }
 }
 
-// src/state-dir.ts
-import { mkdirSync, existsSync as existsSync2 } from "fs";
-import { join } from "path";
-import { homedir, platform } from "os";
-
-class StateDirResolver {
-  stateDir;
-  constructor(envOverride) {
-    const override = envOverride ?? process.env.AGENTBRIDGE_STATE_DIR;
-    if (override) {
-      this.stateDir = override;
-    } else if (platform() === "darwin") {
-      this.stateDir = join(homedir(), "Library", "Application Support", "AgentBridge");
-    } else {
-      const xdgState = process.env.XDG_STATE_HOME ?? join(homedir(), ".local", "state");
-      this.stateDir = join(xdgState, "agentbridge");
-    }
-  }
-  ensure() {
-    if (!existsSync2(this.stateDir)) {
-      mkdirSync(this.stateDir, { recursive: true });
-    }
-  }
-  get dir() {
-    return this.stateDir;
-  }
-  get pidFile() {
-    return join(this.stateDir, "daemon.pid");
-  }
-  get tuiPidFile() {
-    return join(this.stateDir, "codex-tui.pid");
-  }
-  get lockFile() {
-    return join(this.stateDir, "daemon.lock");
-  }
-  get statusFile() {
-    return join(this.stateDir, "status.json");
-  }
-  get portsFile() {
-    return join(this.stateDir, "ports.json");
-  }
-  get logFile() {
-    return join(this.stateDir, "agentbridge.log");
-  }
-  get killedFile() {
-    return join(this.stateDir, "killed");
-  }
-}
-
 // src/config-service.ts
 import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync3 } from "fs";
 import { join as join2 } from "path";
 var DEFAULT_CONFIG = {
   version: "1.0",
-  daemon: {
-    port: 4500,
+  codex: {
+    appPort: 4500,
     proxyPort: 4501
   },
-  agents: {
-    claude: {
-      role: "Reviewer, Planner",
-      mode: "push"
-    },
-    codex: {
-      role: "Implementer, Executor"
-    }
-  },
-  markers: ["IMPORTANT", "STATUS", "FYI"],
   turnCoordination: {
-    attentionWindowSeconds: 15,
-    busyGuard: true
+    attentionWindowSeconds: 15
   },
   idleShutdownSeconds: 30
 };
-var DEFAULT_COLLABORATION_MD = `# Collaboration Rules
-
-## Roles
-- Claude: Reviewer, Planner, Hypothesis Challenger
-- Codex: Implementer, Executor, Reproducer/Verifier
-
-## Thinking Patterns
-- Analytical/review tasks: Independent Analysis & Convergence
-- Implementation tasks: Architect -> Builder -> Critic
-- Debugging tasks: Hypothesis -> Experiment -> Interpretation
-
-## Communication
-- Use explicit phrases: "My independent view is:", "I agree on:", "I disagree on:", "Current consensus:"
-- Tag messages with [IMPORTANT], [STATUS], or [FYI]
-
-## Review Process
-- Cross-review: author never reviews their own code
-- All changes go through feature/fix branches + PR
-- Merge via squash merge
-
-## Custom Rules
-<!-- Add your project-specific collaboration rules here -->
-`;
 var CONFIG_DIR = ".agentbridge";
 var CONFIG_FILE = "config.json";
-var COLLABORATION_FILE = "collaboration.md";
+function isRecord(value) {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function normalizeInteger(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+}
+function normalizeConfig(raw) {
+  if (!isRecord(raw))
+    return null;
+  const config = raw;
+  const codex = isRecord(config.codex) ? config.codex : {};
+  const daemon = isRecord(config.daemon) ? config.daemon : {};
+  const turnCoordination = isRecord(config.turnCoordination) ? config.turnCoordination : {};
+  return {
+    version: typeof config.version === "string" ? config.version : DEFAULT_CONFIG.version,
+    codex: {
+      appPort: normalizeInteger(codex.appPort ?? daemon.port, DEFAULT_CONFIG.codex.appPort),
+      proxyPort: normalizeInteger(codex.proxyPort ?? daemon.proxyPort, DEFAULT_CONFIG.codex.proxyPort)
+    },
+    turnCoordination: {
+      attentionWindowSeconds: normalizeInteger(turnCoordination.attentionWindowSeconds, DEFAULT_CONFIG.turnCoordination.attentionWindowSeconds)
+    },
+    idleShutdownSeconds: normalizeInteger(config.idleShutdownSeconds, DEFAULT_CONFIG.idleShutdownSeconds)
+  };
+}
 
 class ConfigService {
   configDir;
   configPath;
-  collaborationPath;
   constructor(projectRoot) {
     const root = projectRoot ?? process.cwd();
     this.configDir = join2(root, CONFIG_DIR);
     this.configPath = join2(this.configDir, CONFIG_FILE);
-    this.collaborationPath = join2(this.configDir, COLLABORATION_FILE);
   }
   hasConfig() {
     return existsSync3(this.configPath);
@@ -1595,7 +1583,7 @@ class ConfigService {
   load() {
     try {
       const raw = readFileSync2(this.configPath, "utf-8");
-      return JSON.parse(raw);
+      return normalizeConfig(JSON.parse(raw));
     } catch {
       return null;
     }
@@ -1608,17 +1596,6 @@ class ConfigService {
     writeFileSync2(this.configPath, JSON.stringify(config, null, 2) + `
 `, "utf-8");
   }
-  loadCollaboration() {
-    try {
-      return readFileSync2(this.collaborationPath, "utf-8");
-    } catch {
-      return null;
-    }
-  }
-  saveCollaboration(content) {
-    this.ensureConfigDir();
-    writeFileSync2(this.collaborationPath, content, "utf-8");
-  }
   initDefaults() {
     this.ensureConfigDir();
     const created = [];
@@ -1626,17 +1603,10 @@ class ConfigService {
       this.save(DEFAULT_CONFIG);
       created.push(this.configPath);
     }
-    if (!existsSync3(this.collaborationPath)) {
-      this.saveCollaboration(DEFAULT_COLLABORATION_MD);
-      created.push(this.collaborationPath);
-    }
     return created;
   }
   get configFilePath() {
     return this.configPath;
-  }
-  get collaborationFilePath() {
-    return this.collaborationPath;
   }
   ensureConfigDir() {
     if (!existsSync3(this.configDir)) {
@@ -1653,8 +1623,8 @@ var stateDir = new StateDirResolver;
 stateDir.ensure();
 var configService = new ConfigService;
 var config = configService.loadOrDefault();
-var CODEX_APP_PORT = parseInt(process.env.CODEX_WS_PORT ?? String(config.daemon.port), 10);
-var CODEX_PROXY_PORT = parseInt(process.env.CODEX_PROXY_PORT ?? String(config.daemon.proxyPort), 10);
+var CODEX_APP_PORT = parseInt(process.env.CODEX_WS_PORT ?? String(config.codex.appPort), 10);
+var CODEX_PROXY_PORT = parseInt(process.env.CODEX_PROXY_PORT ?? String(config.codex.proxyPort), 10);
 var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
 var TUI_DISCONNECT_GRACE_MS = parseInt(process.env.TUI_DISCONNECT_GRACE_MS ?? "2500", 10);
 var CLAUDE_DISCONNECT_GRACE_MS = 5000;
@@ -1663,7 +1633,7 @@ var FILTER_MODE = process.env.AGENTBRIDGE_FILTER_MODE === "full" ? "full" : "fil
 var IDLE_SHUTDOWN_MS = parseInt(process.env.AGENTBRIDGE_IDLE_SHUTDOWN_MS ?? String(config.idleShutdownSeconds * 1000), 10);
 var ATTENTION_WINDOW_MS = parseInt(process.env.AGENTBRIDGE_ATTENTION_WINDOW_MS ?? String(config.turnCoordination.attentionWindowSeconds * 1000), 10);
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
-var codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT);
+var codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile);
 var attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
 var controlServer = null;
 var attachedClaude = null;
