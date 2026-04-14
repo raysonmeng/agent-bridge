@@ -50,7 +50,12 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 function normalizeInteger(value: unknown, fallback: number): number {
-  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return fallback;
 }
 
 function normalizeConfig(raw: unknown): AgentBridgeConfig | null {

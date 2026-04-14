@@ -80,6 +80,38 @@ describe("ConfigService", () => {
     expect(loaded!.idleShutdownSeconds).toBe(45);
   });
 
+  test("load normalizes string numbers in legacy config", () => {
+    const svc = new ConfigService(tempDir);
+    const configPath = join(tempDir, ".agentbridge", "config.json");
+    mkdirSync(join(tempDir, ".agentbridge"), { recursive: true });
+    writeFileSync(
+      configPath,
+      JSON.stringify(
+        {
+          version: "1.0",
+          daemon: {
+            port: "4600",
+            proxyPort: "4601",
+          },
+          turnCoordination: {
+            attentionWindowSeconds: "20",
+          },
+          idleShutdownSeconds: "45",
+        },
+        null,
+        2,
+      ) + "\n",
+      "utf-8",
+    );
+
+    const loaded = svc.load();
+    expect(loaded).not.toBeNull();
+    expect(loaded!.codex.appPort).toBe(4600);
+    expect(loaded!.codex.proxyPort).toBe(4601);
+    expect(loaded!.turnCoordination.attentionWindowSeconds).toBe(20);
+    expect(loaded!.idleShutdownSeconds).toBe(45);
+  });
+
   test("initDefaults creates only config.json", () => {
     const svc = new ConfigService(tempDir);
     const created = svc.initDefaults();
