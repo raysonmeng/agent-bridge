@@ -576,24 +576,128 @@ describe("CodexAdapter server-to-client request passthrough", () => {
     adapter.clearResponseTrackingState();
   });
 
-  test("replays buffered server requests on TUI reconnect", () => {
+  test("defers buffered server request replay until thread/resume", () => {
     const adapter = createAdapter();
     const sent: string[] = [];
 
     adapter.pendingServerRequests = [
-      { raw: JSON.stringify({ id: 50, method: "item/fileChange/requestApproval", params: { file: "test.ts" } }), serverId: 50, method: "item/fileChange/requestApproval" },
+      {
+        raw: JSON.stringify({ id: 50, method: "item/fileChange/requestApproval", params: { threadId: "thread-A", file: "test.ts" } }),
+        serverId: 50,
+        method: "item/fileChange/requestApproval",
+        threadId: "thread-A",
+      },
     ];
 
     const ws = { data: { connId: 0 }, send: (data: string) => sent.push(data) } as any;
     adapter.onTuiConnect(ws);
 
+    // Nothing should be replayed until the TUI completes thread/resume
+    expect(adapter.pendingServerRequests.length).toBe(1);
+    expect(sent.length).toBe(0);
+
+    // Simulate thread/resume request tracking + response
+    adapter.trackPendingRequest({ id: 1, method: "thread/resume" }, adapter.tuiConnId);
+    adapter.handleTrackedResponse(
+      { id: 1, result: { thread: { id: "thread-A" } } },
+      adapter.tuiConnId,
+    );
+
     expect(adapter.pendingServerRequests.length).toBe(0);
     expect(sent.length).toBe(1);
     const parsed = JSON.parse(sent[0]);
     expect(parsed.method).toBe("item/fileChange/requestApproval");
-    expect(parsed.params).toEqual({ file: "test.ts" });
+    expect(parsed.params).toMatchObject({ file: "test.ts" });
     expect(parsed.id).not.toBe(50);
     expect(adapter.serverRequestToProxy.size).toBe(1);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("drops orphan pending request on thread/resume to a different thread", () => {
+    const adapter = createAdapter();
+    const sent: string[] = [];
+
+    adapter.pendingServerRequests = [
+      {
+        raw: JSON.stringify({ id: 51, method: "item/commandExecution/requestApproval", params: { threadId: "thread-A", command: "ls" } }),
+        serverId: 51,
+        method: "item/commandExecution/requestApproval",
+        threadId: "thread-A",
+      },
+    ];
+
+    const ws = { data: { connId: 0 }, send: (data: string) => sent.push(data) } as any;
+    adapter.onTuiConnect(ws);
+
+    // Resume to a DIFFERENT thread (thread-B)
+    adapter.trackPendingRequest({ id: 2, method: "thread/resume" }, adapter.tuiConnId);
+    adapter.handleTrackedResponse(
+      { id: 2, result: { thread: { id: "thread-B" } } },
+      adapter.tuiConnId,
+    );
+
+    expect(adapter.pendingServerRequests.length).toBe(0);
+    expect(sent.length).toBe(0);
+    expect(adapter.serverRequestToProxy.size).toBe(0);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("drops pending requests on thread/start (new session)", () => {
+    const adapter = createAdapter();
+    const sent: string[] = [];
+
+    adapter.pendingServerRequests = [
+      {
+        raw: JSON.stringify({ id: 52, method: "item/commandExecution/requestApproval", params: { threadId: "thread-A", command: "ls" } }),
+        serverId: 52,
+        method: "item/commandExecution/requestApproval",
+        threadId: "thread-A",
+      },
+    ];
+
+    const ws = { data: { connId: 0 }, send: (data: string) => sent.push(data) } as any;
+    adapter.onTuiConnect(ws);
+
+    // User starts a new session
+    adapter.trackPendingRequest({ id: 3, method: "thread/start" }, adapter.tuiConnId);
+    adapter.handleTrackedResponse(
+      { id: 3, result: { thread: { id: "thread-NEW" } } },
+      adapter.tuiConnId,
+    );
+
+    expect(adapter.pendingServerRequests.length).toBe(0);
+    expect(sent.length).toBe(0);
+    expect(adapter.serverRequestToProxy.size).toBe(0);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("fallback: entry without threadId is replayed on any thread/resume", () => {
+    const adapter = createAdapter();
+    const sent: string[] = [];
+
+    adapter.pendingServerRequests = [
+      {
+        raw: JSON.stringify({ id: 53, method: "item/permissions/requestApproval", params: {} }),
+        serverId: 53,
+        method: "item/permissions/requestApproval",
+        threadId: null,
+      },
+    ];
+
+    const ws = { data: { connId: 0 }, send: (data: string) => sent.push(data) } as any;
+    adapter.onTuiConnect(ws);
+
+    adapter.trackPendingRequest({ id: 4, method: "thread/resume" }, adapter.tuiConnId);
+    adapter.handleTrackedResponse(
+      { id: 4, result: { thread: { id: "thread-X" } } },
+      adapter.tuiConnId,
+    );
+
+    expect(adapter.pendingServerRequests.length).toBe(0);
+    expect(sent.length).toBe(1);
 
     adapter.clearResponseTrackingState();
   });
@@ -602,11 +706,24 @@ describe("CodexAdapter server-to-client request passthrough", () => {
     const adapter = createAdapter();
 
     adapter.pendingServerRequests = [
-      { raw: JSON.stringify({ id: 60, method: "item/permissions/requestApproval", params: {} }), serverId: 60, method: "item/permissions/requestApproval" },
+      {
+        raw: JSON.stringify({ id: 60, method: "item/permissions/requestApproval", params: { threadId: "thread-A" } }),
+        serverId: 60,
+        method: "item/permissions/requestApproval",
+        threadId: "thread-A",
+      },
     ];
 
     const ws = { data: { connId: 0 }, send: () => { throw new Error("connection reset"); } } as any;
     adapter.onTuiConnect(ws);
+
+    // Trigger replay via thread/resume to matching thread — send throws,
+    // but the entry must stay buffered and no phantom mapping created
+    adapter.trackPendingRequest({ id: 5, method: "thread/resume" }, adapter.tuiConnId);
+    adapter.handleTrackedResponse(
+      { id: 5, result: { thread: { id: "thread-A" } } },
+      adapter.tuiConnId,
+    );
 
     expect(adapter.serverRequestToProxy.size).toBe(0);
     expect(adapter.pendingServerRequests.length).toBe(1);
@@ -614,13 +731,13 @@ describe("CodexAdapter server-to-client request passthrough", () => {
     adapter.clearResponseTrackingState();
   });
 
-  test("requeues in-flight server requests on TUI disconnect and replays them on reconnect", () => {
+  test("requeues in-flight server requests on TUI disconnect and replays them after thread/resume", () => {
     const adapter = createAdapter();
     adapter.tuiConnId = 1;
     const raw = JSON.stringify({
       id: 70,
       method: "item/permissions/requestApproval",
-      params: { permission: "network" },
+      params: { threadId: "thread-A", permission: "network" },
     });
 
     adapter.serverRequestToProxy.set(100400, {
@@ -629,6 +746,7 @@ describe("CodexAdapter server-to-client request passthrough", () => {
       method: "item/permissions/requestApproval",
       raw,
       timestamp: Date.now(),
+      threadId: "thread-A",
     });
 
     adapter.retireConnectionState(1);
@@ -638,12 +756,24 @@ describe("CodexAdapter server-to-client request passthrough", () => {
         raw,
         serverId: 70,
         method: "item/permissions/requestApproval",
+        threadId: "thread-A",
       },
     ]);
 
     const sent: string[] = [];
     const ws = { data: { connId: 0 }, send: (data: string) => sent.push(data) } as any;
     adapter.onTuiConnect(ws);
+
+    // Replay is deferred until thread/resume
+    expect(adapter.pendingServerRequests.length).toBe(1);
+    expect(sent.length).toBe(0);
+
+    // Simulate TUI completing thread/resume to the matching thread
+    adapter.trackPendingRequest({ id: 6, method: "thread/resume" }, adapter.tuiConnId);
+    adapter.handleTrackedResponse(
+      { id: 6, result: { thread: { id: "thread-A" } } },
+      adapter.tuiConnId,
+    );
 
     expect(adapter.pendingServerRequests.length).toBe(0);
     expect(sent.length).toBe(1);
@@ -663,7 +793,7 @@ describe("CodexAdapter server-to-client request passthrough", () => {
     adapter.clearResponseTrackingState();
   });
 
-  test("new TUI connection replays in-flight server requests after old primary disconnects", () => {
+  test("new TUI connection defers replay until thread/resume after old primary disconnects", () => {
     const adapter = createAdapter();
     const sent: string[] = [];
 
@@ -675,12 +805,13 @@ describe("CodexAdapter server-to-client request passthrough", () => {
       raw: JSON.stringify({
         id: 91,
         method: "item/fileChange/requestApproval",
-        params: { file: "draft.txt" },
+        params: { threadId: "thread-A", file: "draft.txt" },
       }),
       serverId: 91,
       connId: 1,
       method: "item/fileChange/requestApproval",
       timestamp: Date.now(),
+      threadId: "thread-A",
     });
 
     // Primary disconnects — retires state, moves server requests to pending
@@ -688,14 +819,24 @@ describe("CodexAdapter server-to-client request passthrough", () => {
     expect(adapter.tuiWs).toBeNull();
     expect(adapter.pendingServerRequests.length).toBe(1);
 
-    // New TUI opens — becomes primary (no active tuiWs), replays pending requests
+    // New TUI opens — becomes primary but does NOT replay yet
     const ws = { data: { connId: 0 }, send: (data: string) => sent.push(data) } as any;
     adapter.onTuiConnect(ws);
+
+    expect(sent.length).toBe(0);
+    expect(adapter.pendingServerRequests.length).toBe(1);
+
+    // TUI completes thread/resume to the same thread — triggers replay
+    adapter.trackPendingRequest({ id: 7, method: "thread/resume" }, adapter.tuiConnId);
+    adapter.handleTrackedResponse(
+      { id: 7, result: { thread: { id: "thread-A" } } },
+      adapter.tuiConnId,
+    );
 
     expect(sent.length).toBe(1);
     const replayed = JSON.parse(sent[0]);
     expect(replayed.method).toBe("item/fileChange/requestApproval");
-    expect(replayed.params).toEqual({ file: "draft.txt" });
+    expect(replayed.params).toEqual({ threadId: "thread-A", file: "draft.txt" });
     expect(replayed.id).not.toBe(91);
     expect(adapter.serverRequestToProxy.has(100700)).toBe(false);
     expect(adapter.serverRequestToProxy.size).toBe(1);

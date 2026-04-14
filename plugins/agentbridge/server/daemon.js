@@ -251,7 +251,7 @@ class CodexAdapter extends EventEmitter {
         oldWs.close();
       } catch {}
     }
-    this.clearResponseTrackingState();
+    this.clearResponseTrackingStateForAppServerReconnect();
     this.activeTurnIds.clear();
     this.turnInProgress = false;
     try {
@@ -355,7 +355,6 @@ class CodexAdapter extends EventEmitter {
     if (previousConnId !== null) {
       this.retireConnectionState(previousConnId);
     }
-    this.replayPendingServerRequests(ws);
   }
   setupSecondaryConnection(ws, connId) {
     const appWs = new WebSocket(this.appServerUrl);
@@ -396,9 +395,14 @@ class CodexAdapter extends EventEmitter {
       }
     };
   }
-  replayPendingServerRequests(ws) {
+  replayPendingForThread(resumedThreadId, ws) {
     const remaining = [];
     for (const buffered of this.pendingServerRequests) {
+      const belongsToThread = buffered.threadId === null || buffered.threadId === resumedThreadId;
+      if (!belongsToThread) {
+        remaining.push(buffered);
+        continue;
+      }
       const proxyId = this.nextProxyId++;
       try {
         const parsed = JSON.parse(buffered.raw);
@@ -409,13 +413,32 @@ class CodexAdapter extends EventEmitter {
           serverId: buffered.serverId,
           connId: this.tuiConnId,
           method: buffered.method,
-          timestamp: Date.now()
+          timestamp: Date.now(),
+          threadId: buffered.threadId
         });
-        this.log(`Replayed buffered server request: ${buffered.method} (server id=${buffered.serverId} \u2192 proxy id=${proxyId})`);
+        if (buffered.threadId === null) {
+          this.log(`WARNING: Replaying pending server request with unknown threadId (experimental fallback, may surface orphan UI on wrong thread): ${buffered.method} (server id=${buffered.serverId} \u2192 proxy id=${proxyId})`);
+        } else {
+          this.log(`Replayed buffered server request on thread/resume: ${buffered.method} (server id=${buffered.serverId} \u2192 proxy id=${proxyId}, threadId=${buffered.threadId})`);
+        }
       } catch (e) {
         this.log(`Failed to replay buffered server request: ${buffered.method} (server id=${buffered.serverId}): ${e.message}`);
         remaining.push(buffered);
       }
+    }
+    this.pendingServerRequests = remaining;
+  }
+  dropOrphanPendingRequests(reason, matchThreadId = null) {
+    if (this.pendingServerRequests.length === 0)
+      return;
+    const remaining = [];
+    for (const buffered of this.pendingServerRequests) {
+      const shouldDrop = matchThreadId === null ? true : buffered.threadId !== null && buffered.threadId !== matchThreadId;
+      if (shouldDrop) {
+        this.log(`Dropped orphan pending server request: ${buffered.method} (server id=${buffered.serverId}, threadId=${buffered.threadId ?? "unknown"}, reason=${reason})`);
+        continue;
+      }
+      remaining.push(buffered);
     }
     this.pendingServerRequests = remaining;
   }
@@ -461,8 +484,7 @@ class CodexAdapter extends EventEmitter {
       return;
     }
     if (connId !== this.tuiConnId) {
-      const preview = data.length > 300 ? data.slice(0, 300) + "\u2026" : data;
-      this.log(`Dropping message from stale TUI conn #${connId} (current is #${this.tuiConnId}): ${preview}`);
+      this.log(`Dropping message from stale TUI conn #${connId} (current is #${this.tuiConnId})`);
       return;
     }
     try {
@@ -540,8 +562,6 @@ class CodexAdapter extends EventEmitter {
   handleAppServerPayload(raw) {
     try {
       const parsed = JSON.parse(raw);
-      const preview = raw.length > 200 ? raw.slice(0, 200) + "\u2026" : raw;
-      this.log(`app-server \u2192 proxy: ${preview}`);
       if (isAppServerNotification(parsed) || typeof parsed === "object" && parsed !== null && !("id" in parsed)) {
         const notificationLike = parsed;
         const forwarded = this.patchResponse(notificationLike, raw);
@@ -564,9 +584,10 @@ class CodexAdapter extends EventEmitter {
   handleServerRequest(parsed, raw) {
     const serverId = parsed.id;
     const method = parsed.method;
+    const threadId = this.extractThreadIdFromParams(parsed.params);
     if (!this.tuiWs) {
-      this.pendingServerRequests.push({ raw, serverId, method });
-      this.log(`Server request buffered (no TUI): ${method} (server id=${serverId})`);
+      this.pendingServerRequests.push({ raw, serverId, method, threadId });
+      this.log(`Server request buffered (no TUI): ${method} (server id=${serverId}, threadId=${threadId ?? "unknown"})`);
       return;
     }
     const proxyId = this.nextProxyId++;
@@ -575,7 +596,7 @@ class CodexAdapter extends EventEmitter {
       this.tuiWs.send(JSON.stringify(parsed));
     } catch (e) {
       this.log(`Server request send failed, buffering: ${method} (server id=${serverId}): ${e.message}`);
-      this.pendingServerRequests.push({ raw, serverId, method });
+      this.pendingServerRequests.push({ raw, serverId, method, threadId });
       return;
     }
     this.serverRequestToProxy.set(proxyId, {
@@ -583,9 +604,16 @@ class CodexAdapter extends EventEmitter {
       serverId,
       connId: this.tuiConnId,
       method,
-      timestamp: Date.now()
+      timestamp: Date.now(),
+      threadId
     });
-    this.log(`Server request: ${method} (server id=${serverId} \u2192 proxy id=${proxyId}, conn #${this.tuiConnId})`);
+    this.log(`Server request: ${method} (server id=${serverId} \u2192 proxy id=${proxyId}, conn #${this.tuiConnId}, threadId=${threadId ?? "unknown"})`);
+  }
+  extractThreadIdFromParams(params) {
+    if (typeof params !== "object" || params === null)
+      return null;
+    const tid = params.threadId;
+    return typeof tid === "string" && tid.length > 0 ? tid : null;
   }
   normalizeNumericId(id) {
     if (typeof id === "number")
@@ -742,7 +770,6 @@ class CodexAdapter extends EventEmitter {
     const rpcId = "id" in message ? message.id : undefined;
     const method = "method" in message && typeof message.method === "string" ? message.method : undefined;
     const key = this.pendingKey(rpcId, connId);
-    this.log(`[track] method=${method} id=${rpcId} (type=${typeof rpcId}) key=${key}`);
     if (!key || !isTrackedAppServerRequestMethod(method))
       return;
     const pending = { method };
@@ -780,12 +807,17 @@ class CodexAdapter extends EventEmitter {
         if (typeof threadId === "string" && threadId.length > 0) {
           this.setActiveThreadId(threadId, `thread/start response ${key}`);
         }
+        this.dropOrphanPendingRequests(`thread/start (new session)`);
         break;
       }
       case "thread/resume": {
         const threadId = message?.result?.thread?.id;
         if (typeof threadId === "string" && threadId.length > 0) {
           this.setActiveThreadId(threadId, `thread/resume response ${key}`);
+          if (this.tuiWs) {
+            this.replayPendingForThread(threadId, this.tuiWs);
+          }
+          this.dropOrphanPendingRequests(`thread/resume to ${threadId}`, threadId);
         }
         break;
       }
@@ -852,17 +884,15 @@ class CodexAdapter extends EventEmitter {
         requeuedServerRequests.push({
           raw: pending.raw,
           serverId: pending.serverId,
-          method: pending.method
+          method: pending.method,
+          threadId: pending.threadId
         });
-        this.log(`Requeued in-flight server request after TUI disconnect (proxy id=${proxyId}, server id=${pending.serverId}, method=${pending.method})`);
+        this.log(`Requeued in-flight server request after TUI disconnect (proxy id=${proxyId}, server id=${pending.serverId}, method=${pending.method}, threadId=${pending.threadId ?? "unknown"})`);
       }
     }
     if (requeuedServerRequests.length === 0)
       return;
     this.pendingServerRequests.push(...requeuedServerRequests);
-    if (this.tuiWs && this.tuiConnId !== connId) {
-      this.replayPendingServerRequests(this.tuiWs);
-    }
   }
   trackStaleProxyId(proxyId) {
     this.clearTrackedId(this.staleProxyIds, proxyId);
@@ -913,6 +943,20 @@ class CodexAdapter extends EventEmitter {
     this.clearTransientResponseTrackingState();
     this.serverRequestToProxy.clear();
     this.pendingServerRequests = [];
+    this.pendingServerResponses.clear();
+  }
+  clearResponseTrackingStateForAppServerReconnect() {
+    this.clearTransientResponseTrackingState();
+    for (const pending of this.serverRequestToProxy.values()) {
+      this.pendingServerRequests.push({
+        raw: pending.raw,
+        serverId: pending.serverId,
+        method: pending.method,
+        threadId: pending.threadId
+      });
+      this.log(`Requeued in-flight server request on app-server reconnect (server id=${pending.serverId}, method=${pending.method}, threadId=${pending.threadId ?? "unknown"})`);
+    }
+    this.serverRequestToProxy.clear();
     this.pendingServerResponses.clear();
   }
   async checkPorts() {

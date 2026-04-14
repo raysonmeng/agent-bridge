@@ -39,6 +39,14 @@ interface PendingServerRequest {
   connId: number;
   method: AppServerServerRequestMethod | string;
   timestamp: number;
+  threadId: string | null;
+}
+
+interface BufferedServerRequest {
+  raw: string;
+  serverId: number | string;
+  method: AppServerServerRequestMethod | string;
+  threadId: string | null;
 }
 
 interface PendingServerResponse {
@@ -87,7 +95,7 @@ export class CodexAdapter extends EventEmitter {
   private nextProxyId = 100000;
   private upstreamToClient = new Map<number, { connId: number; clientId: number | string }>();
   private serverRequestToProxy = new Map<number, PendingServerRequest>();
-  private pendingServerRequests: Array<{ raw: string; serverId: number | string; method: string }> = [];
+  private pendingServerRequests: BufferedServerRequest[] = [];
   private pendingServerResponses = new Map<number, PendingServerResponse>();
   private staleProxyIds = new Map<number, ReturnType<typeof setTimeout>>();
   private bridgeRequestIds = new Map<number, ReturnType<typeof setTimeout>>();
@@ -286,10 +294,10 @@ export class CodexAdapter extends EventEmitter {
       try { oldWs.close(); } catch {}
     }
 
-    // Clear ALL connection-scoped state (including upstreamToClient).
-    // Buffered messages are raw (un-rewritten), so replay through onTuiMessage
-    // will create fresh id mappings after the new connection is established.
-    this.clearResponseTrackingState();
+    // Clear connection-scoped state (upstreamToClient etc.) but preserve
+    // pendingServerRequests — those must survive the intentional reconnect
+    // so they can be replayed after the TUI completes thread/resume.
+    this.clearResponseTrackingStateForAppServerReconnect();
     this.activeTurnIds.clear();
     this.turnInProgress = false;
 
@@ -423,7 +431,9 @@ export class CodexAdapter extends EventEmitter {
     if (previousConnId !== null) {
       this.retireConnectionState(previousConnId);
     }
-    this.replayPendingServerRequests(ws);
+    // Do not replay pendingServerRequests here — defer until TUI completes its
+    // handshake (thread/resume to matching thread, or thread/start which drops
+    // orphan entries). See handleTrackedResponse and dropOrphanPendingRequests.
   }
 
   /** Set up a secondary (picker) connection with its own dedicated app-server WS. */
@@ -467,9 +477,22 @@ export class CodexAdapter extends EventEmitter {
     };
   }
 
-  private replayPendingServerRequests(ws: ServerWebSocket<TuiSocketData>) {
-    const remaining: typeof this.pendingServerRequests = [];
+  /**
+   * Replay buffered server requests that belong to the given thread.
+   *
+   * Entries are replayed when their threadId matches `resumedThreadId`, or
+   * when they have no threadId (fallback: cannot attribute, so assume they
+   * belong to whatever the TUI is resuming). Non-matching entries stay in
+   * the buffer — they may match a subsequent resume.
+   */
+  private replayPendingForThread(resumedThreadId: string, ws: ServerWebSocket<TuiSocketData>) {
+    const remaining: BufferedServerRequest[] = [];
     for (const buffered of this.pendingServerRequests) {
+      const belongsToThread = buffered.threadId === null || buffered.threadId === resumedThreadId;
+      if (!belongsToThread) {
+        remaining.push(buffered);
+        continue;
+      }
       const proxyId = this.nextProxyId++;
       try {
         const parsed = JSON.parse(buffered.raw);
@@ -481,12 +504,40 @@ export class CodexAdapter extends EventEmitter {
           connId: this.tuiConnId,
           method: buffered.method,
           timestamp: Date.now(),
+          threadId: buffered.threadId,
         });
-        this.log(`Replayed buffered server request: ${buffered.method} (server id=${buffered.serverId} → proxy id=${proxyId})`);
+        if (buffered.threadId === null) {
+          this.log(`WARNING: Replaying pending server request with unknown threadId (experimental fallback, may surface orphan UI on wrong thread): ${buffered.method} (server id=${buffered.serverId} → proxy id=${proxyId})`);
+        } else {
+          this.log(`Replayed buffered server request on thread/resume: ${buffered.method} (server id=${buffered.serverId} → proxy id=${proxyId}, threadId=${buffered.threadId})`);
+        }
       } catch (e: any) {
         this.log(`Failed to replay buffered server request: ${buffered.method} (server id=${buffered.serverId}): ${e.message}`);
         remaining.push(buffered);
       }
+    }
+    this.pendingServerRequests = remaining;
+  }
+
+  /**
+   * Drop buffered server requests that cannot be delivered because the TUI
+   * has started a brand-new thread (thread/start), or has resumed a thread
+   * that does not match the entry's threadId. The original listener in the
+   * app-server is already dead for these entries, so keeping them would
+   * just produce orphan approval UI on subsequent reconnects.
+   */
+  private dropOrphanPendingRequests(reason: string, matchThreadId: string | null = null) {
+    if (this.pendingServerRequests.length === 0) return;
+    const remaining: BufferedServerRequest[] = [];
+    for (const buffered of this.pendingServerRequests) {
+      const shouldDrop = matchThreadId === null
+        ? true
+        : buffered.threadId !== null && buffered.threadId !== matchThreadId;
+      if (shouldDrop) {
+        this.log(`Dropped orphan pending server request: ${buffered.method} (server id=${buffered.serverId}, threadId=${buffered.threadId ?? "unknown"}, reason=${reason})`);
+        continue;
+      }
+      remaining.push(buffered);
     }
     this.pendingServerRequests = remaining;
   }
@@ -668,10 +719,11 @@ export class CodexAdapter extends EventEmitter {
   private handleServerRequest(parsed: AppServerRequest, raw: string): void {
     const serverId = parsed.id;
     const method = parsed.method;
+    const threadId = this.extractThreadIdFromParams(parsed.params);
 
     if (!this.tuiWs) {
-      this.pendingServerRequests.push({ raw, serverId, method });
-      this.log(`Server request buffered (no TUI): ${method} (server id=${serverId})`);
+      this.pendingServerRequests.push({ raw, serverId, method, threadId });
+      this.log(`Server request buffered (no TUI): ${method} (server id=${serverId}, threadId=${threadId ?? "unknown"})`);
       return;
     }
 
@@ -682,7 +734,7 @@ export class CodexAdapter extends EventEmitter {
       this.tuiWs.send(JSON.stringify(parsed));
     } catch (e: any) {
       this.log(`Server request send failed, buffering: ${method} (server id=${serverId}): ${e.message}`);
-      this.pendingServerRequests.push({ raw, serverId, method });
+      this.pendingServerRequests.push({ raw, serverId, method, threadId });
       return;
     }
 
@@ -692,8 +744,15 @@ export class CodexAdapter extends EventEmitter {
       connId: this.tuiConnId,
       method,
       timestamp: Date.now(),
+      threadId,
     });
-    this.log(`Server request: ${method} (server id=${serverId} → proxy id=${proxyId}, conn #${this.tuiConnId})`);
+    this.log(`Server request: ${method} (server id=${serverId} → proxy id=${proxyId}, conn #${this.tuiConnId}, threadId=${threadId ?? "unknown"})`);
+  }
+
+  private extractThreadIdFromParams(params: unknown): string | null {
+    if (typeof params !== "object" || params === null) return null;
+    const tid = (params as Record<string, unknown>).threadId;
+    return typeof tid === "string" && tid.length > 0 ? tid : null;
   }
 
   /** Normalize a JSON-RPC id to a number. Returns NaN for non-numeric strings. */
@@ -919,12 +978,22 @@ export class CodexAdapter extends EventEmitter {
         if (typeof threadId === "string" && threadId.length > 0) {
           this.setActiveThreadId(threadId, `thread/start response ${key}`);
         }
+        // User started a brand-new session — any buffered server requests
+        // belong to a thread the user has abandoned. Drop them so they do
+        // not surface as orphan approval UI.
+        this.dropOrphanPendingRequests(`thread/start (new session)`);
         break;
       }
       case "thread/resume": {
         const threadId = message?.result?.thread?.id;
         if (typeof threadId === "string" && threadId.length > 0) {
           this.setActiveThreadId(threadId, `thread/resume response ${key}`);
+          if (this.tuiWs) {
+            this.replayPendingForThread(threadId, this.tuiWs);
+          }
+          // Drop any entries that belong to a different thread than the
+          // resumed one — the user did not return to them.
+          this.dropOrphanPendingRequests(`thread/resume to ${threadId}`, threadId);
         }
         break;
       }
@@ -992,7 +1061,7 @@ export class CodexAdapter extends EventEmitter {
       this.trackStaleProxyId(upId);
     }
 
-    const requeuedServerRequests: typeof this.pendingServerRequests = [];
+    const requeuedServerRequests: BufferedServerRequest[] = [];
     for (const [proxyId, pending] of this.serverRequestToProxy.entries()) {
       if (pending.connId === connId) {
         this.serverRequestToProxy.delete(proxyId);
@@ -1000,8 +1069,9 @@ export class CodexAdapter extends EventEmitter {
           raw: pending.raw,
           serverId: pending.serverId,
           method: pending.method,
+          threadId: pending.threadId,
         });
-        this.log(`Requeued in-flight server request after TUI disconnect (proxy id=${proxyId}, server id=${pending.serverId}, method=${pending.method})`);
+        this.log(`Requeued in-flight server request after TUI disconnect (proxy id=${proxyId}, server id=${pending.serverId}, method=${pending.method}, threadId=${pending.threadId ?? "unknown"})`);
       }
     }
 
@@ -1009,9 +1079,9 @@ export class CodexAdapter extends EventEmitter {
 
     this.pendingServerRequests.push(...requeuedServerRequests);
 
-    if (this.tuiWs && this.tuiConnId !== connId) {
-      this.replayPendingServerRequests(this.tuiWs);
-    }
+    // Do not replay immediately even if a new primary is already connected.
+    // Replay is deferred until the new TUI completes thread/resume to a
+    // matching thread — see handleTrackedResponse.
   }
 
   private trackStaleProxyId(proxyId: number) {
@@ -1073,6 +1143,31 @@ export class CodexAdapter extends EventEmitter {
     this.clearTransientResponseTrackingState();
     this.serverRequestToProxy.clear();
     this.pendingServerRequests = [];
+    this.pendingServerResponses.clear();
+  }
+
+  /**
+   * Variant used by the intentional app-server reconnect triggered by a TUI
+   * `initialize` message. Preserves `pendingServerRequests` so they can be
+   * replayed after the TUI completes `thread/resume`. In-flight server
+   * requests are moved into the pending buffer so they get the same
+   * replay-on-resume treatment. The serverIds are stale with respect to
+   * the new app-server session — the subsequent response will most likely
+   * be rejected upstream, which is precisely what the A' experiment tests.
+   */
+  private clearResponseTrackingStateForAppServerReconnect() {
+    this.clearTransientResponseTrackingState();
+    for (const pending of this.serverRequestToProxy.values()) {
+      this.pendingServerRequests.push({
+        raw: pending.raw,
+        serverId: pending.serverId,
+        method: pending.method,
+        threadId: pending.threadId,
+      });
+      this.log(`Requeued in-flight server request on app-server reconnect (server id=${pending.serverId}, method=${pending.method}, threadId=${pending.threadId ?? "unknown"})`);
+    }
+    this.serverRequestToProxy.clear();
+    // Intentionally preserve pendingServerRequests across the reconnect.
     this.pendingServerResponses.clear();
   }
 
