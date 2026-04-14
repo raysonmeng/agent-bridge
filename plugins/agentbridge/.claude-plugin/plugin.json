@@ -1,6 +1,6 @@
 {
   "name": "agentbridge",
-  "version": "0.1.4",
+  "version": "0.1.5",
   "description": "Bridge Claude Code and Codex with a shared daemon, push channel delivery, and bidirectional reply tooling.",
   "author": {
     "name": "AgentBridge Contributors",
