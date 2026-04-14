@@ -13749,8 +13749,8 @@ class ClaudeAdapter extends EventEmitter {
       this.resolvedMode = this.configuredMode;
       this.log(`Delivery mode set by AGENTBRIDGE_MODE: ${this.resolvedMode}`);
     } else {
-      this.resolvedMode = "push";
-      this.log("Delivery mode defaulting to push (set AGENTBRIDGE_MODE=pull for API key mode)");
+      this.resolvedMode = "pull";
+      this.log("Delivery mode defaulting to pull (set AGENTBRIDGE_MODE=push to opt into channel delivery)");
     }
   }
   async pushNotification(message) {
@@ -13781,6 +13781,7 @@ class ClaudeAdapter extends EventEmitter {
       this.log(`Pushed notification: ${msgId}`);
     } catch (e) {
       this.log(`Push notification failed: ${e.message}`);
+      this.queueForPull(message);
     }
   }
   queueForPull(message) {
