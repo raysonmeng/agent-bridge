@@ -323,7 +323,6 @@ What those commands do in practice:
   - checks `bun`, `claude`, and `codex`
   - enforces the minimum Claude version
   - creates `.agentbridge/config.json`
-  - creates `.agentbridge/collaboration.md`
   - attempts plugin installation as a best-effort step
 - `dev`
   - developer-only local marketplace and plugin-cache workflow
@@ -368,7 +367,6 @@ The implemented CLI chose task-specific commands instead because they map more d
 ### Important deviations from the original distribution plan
 
 - The CLI exists, but the package is not yet published as a public npm artifact.
-  - The package is still marked `private`.
 - `init` does not patch a global Claude MCP config file.
   - It generates project config and attempts plugin installation instead.
 - Claude startup still depends on the development-channel flag rather than a stable marketplace `--channels` flow.
@@ -433,7 +431,7 @@ The bridge itself should establish that shared awareness automatically when the 
 
 ### Problem
 
-The current bridge relies entirely on Claude Code's experimental Channel capability (`notifications/claude/channel`) for delivering Codex messages to Claude in real time. This requires the user to start Claude Code with `--dangerously-load-development-channels`, which in turn mandates OAuth authentication. Users who authenticate with an API key cannot use AgentBridge at all.
+The current bridge can use Claude Code's experimental Channel capability (`notifications/claude/channel`) for real-time Codex → Claude delivery, but it no longer depends on it exclusively. When channel delivery is unavailable or untrusted, AgentBridge can fall back to pull mode via `get_messages`.
 
 This is a hard adoption blocker. API key users are a significant portion of the Claude Code user base, and requiring OAuth just to use a local development tool is an unnecessary barrier.
 

@@ -59,7 +59,7 @@ export async function runCodex(args: string[]) {
   if (status?.proxyUrl) {
     proxyUrl = status.proxyUrl;
   } else {
-    proxyUrl = `ws://127.0.0.1:${config.daemon.proxyPort}`;
+    proxyUrl = `ws://127.0.0.1:${config.codex.proxyPort}`;
     console.error(`[agentbridge] No daemon status found, using config default: ${proxyUrl}`);
   }
 

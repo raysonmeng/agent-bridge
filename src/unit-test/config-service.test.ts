@@ -1,8 +1,8 @@
 import { describe, expect, test, beforeEach, afterEach } from "bun:test";
-import { mkdtempSync, rmSync, existsSync, readFileSync } from "node:fs";
+import { mkdtempSync, rmSync, existsSync, writeFileSync, mkdirSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
-import { ConfigService, DEFAULT_CONFIG, DEFAULT_COLLABORATION_MD } from "../config-service";
+import { ConfigService, DEFAULT_CONFIG } from "../config-service";
 
 describe("ConfigService", () => {
   let tempDir: string;
@@ -29,10 +29,9 @@ describe("ConfigService", () => {
     const svc = new ConfigService(tempDir);
     const config = svc.loadOrDefault();
     expect(config.version).toBe("1.0");
-    expect(config.daemon.port).toBe(4500);
-    expect(config.daemon.proxyPort).toBe(4501);
-    expect(config.agents.claude.role).toBe("Reviewer, Planner");
-    expect(config.agents.codex.role).toBe("Implementer, Executor");
+    expect(config.codex.appPort).toBe(4500);
+    expect(config.codex.proxyPort).toBe(4501);
+    expect(config.turnCoordination.attentionWindowSeconds).toBe(15);
   });
 
   test("save and load round-trips correctly", () => {
@@ -48,34 +47,50 @@ describe("ConfigService", () => {
     expect(loaded!.version).toBe("1.0");
   });
 
-  test("saveCollaboration and loadCollaboration round-trips", () => {
+  test("load normalizes legacy daemon config into codex config", () => {
     const svc = new ConfigService(tempDir);
-    const content = "# Custom rules\nBe nice.";
-    svc.saveCollaboration(content);
+    const configPath = join(tempDir, ".agentbridge", "config.json");
+    mkdirSync(join(tempDir, ".agentbridge"), { recursive: true });
+    writeFileSync(
+      configPath,
+      JSON.stringify(
+        {
+          version: "1.0",
+          daemon: {
+            port: 4600,
+            proxyPort: 4601,
+          },
+          turnCoordination: {
+            attentionWindowSeconds: 20,
+            busyGuard: true,
+          },
+          idleShutdownSeconds: 45,
+        },
+        null,
+        2,
+      ) + "\n",
+      "utf-8",
+    );
 
-    const loaded = svc.loadCollaboration();
-    expect(loaded).toBe(content);
+    const loaded = svc.load();
+    expect(loaded).not.toBeNull();
+    expect(loaded!.codex.appPort).toBe(4600);
+    expect(loaded!.codex.proxyPort).toBe(4601);
+    expect(loaded!.turnCoordination.attentionWindowSeconds).toBe(20);
+    expect(loaded!.idleShutdownSeconds).toBe(45);
   });
 
-  test("loadCollaboration returns null when file missing", () => {
-    const svc = new ConfigService(tempDir);
-    expect(svc.loadCollaboration()).toBeNull();
-  });
-
-  test("initDefaults creates both files", () => {
+  test("initDefaults creates only config.json", () => {
     const svc = new ConfigService(tempDir);
     const created = svc.initDefaults();
 
-    expect(created.length).toBe(2);
+    expect(created.length).toBe(1);
     expect(existsSync(svc.configFilePath)).toBe(true);
-    expect(existsSync(svc.collaborationFilePath)).toBe(true);
+    expect(existsSync(join(tempDir, ".agentbridge", "collaboration.md"))).toBe(false);
 
     // Verify content
     const config = svc.load();
     expect(config!.version).toBe("1.0");
-
-    const collab = svc.loadCollaboration();
-    expect(collab).toContain("# Collaboration Rules");
   });
 
   test("initDefaults does not overwrite existing files", () => {
@@ -85,9 +100,9 @@ describe("ConfigService", () => {
     const custom = { ...DEFAULT_CONFIG, idleShutdownSeconds: 99 };
     svc.save(custom);
 
-    // initDefaults should skip config.json but create collaboration.md
+    // initDefaults should skip config.json when it already exists
     const created = svc.initDefaults();
-    expect(created.length).toBe(1); // only collaboration.md
+    expect(created.length).toBe(0);
 
     const loaded = svc.load();
     expect(loaded!.idleShutdownSeconds).toBe(99); // not overwritten
@@ -96,6 +111,5 @@ describe("ConfigService", () => {
   test("config file paths are correct", () => {
     const svc = new ConfigService(tempDir);
     expect(svc.configFilePath).toBe(join(tempDir, ".agentbridge", "config.json"));
-    expect(svc.collaborationFilePath).toBe(join(tempDir, ".agentbridge", "collaboration.md"));
   });
 });
