@@ -10,6 +10,7 @@ import { disabledReplyError, type BridgeDisabledReason } from "./bridge-disabled
 import type { BridgeMessage } from "./types";
 
 const stateDir = new StateDirResolver();
+stateDir.ensure();
 const configService = new ConfigService();
 const config = configService.loadOrDefault();
 
