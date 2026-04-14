@@ -66,6 +66,7 @@ export class ClaudeAdapter extends EventEmitter {
   private notificationSeq = 0;
   private sessionId: string;
   private readonly notificationIdPrefix: string;
+  private readonly instanceId: string;
   private replySender: ReplySender | null = null;
   private readonly logFile: string;
 
@@ -79,8 +80,10 @@ export class ClaudeAdapter extends EventEmitter {
   constructor(logFile = new StateDirResolver().logFile) {
     super();
     this.logFile = logFile;
+    this.instanceId = randomUUID().slice(0, 8);
     this.sessionId = `codex_${Date.now()}`;
     this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 12);
+    this.log(`ClaudeAdapter created (instance=${this.instanceId})`);
 
     const envMode = process.env.AGENTBRIDGE_MODE as DeliveryMode | undefined;
     this.configuredMode = envMode && ["push", "pull", "auto"].includes(envMode) ? envMode : "auto";
@@ -186,12 +189,13 @@ export class ClaudeAdapter extends EventEmitter {
       this.log(`Message queue full, dropped oldest message (total dropped: ${this.droppedMessageCount})`);
     }
     this.pendingMessages.push(message);
-    this.log(`Queued message for pull (${this.pendingMessages.length} pending)`);
+    this.log(`Queued message for pull (${this.pendingMessages.length} pending, instance=${this.instanceId})`);
   }
 
   // ── get_messages ───────────────────────────────────────────
 
   private drainMessages(): { content: Array<{ type: "text"; text: string }> } {
+    this.log(`get_messages called (instance=${this.instanceId}, pending=${this.pendingMessages.length}, dropped=${this.droppedMessageCount})`);
     if (this.pendingMessages.length === 0 && this.droppedMessageCount === 0) {
       return {
         content: [{ type: "text" as const, text: "No new messages from Codex." }],
