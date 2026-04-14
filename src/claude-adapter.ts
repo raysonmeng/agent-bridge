@@ -149,6 +149,7 @@ export class ClaudeAdapter extends EventEmitter {
   // ── Message Delivery ───────────────────────────────────────
 
   async pushNotification(message: BridgeMessage) {
+    this.log(`pushNotification (instance=${this.instanceId}, mode=${this.resolvedMode}, msgId=${message.id}, len=${message.content.length})`);
     if (this.resolvedMode === "push") {
       await this.pushViaChannel(message);
     } else {
@@ -222,6 +223,7 @@ export class ClaudeAdapter extends EventEmitter {
       })
       .join("\n\n");
 
+    this.log(`get_messages returning ${count} message(s) (instance=${this.instanceId}, dropped=${dropped})`);
     return {
       content: [
         {

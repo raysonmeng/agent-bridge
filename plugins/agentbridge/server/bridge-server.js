@@ -13809,6 +13809,7 @@ class ClaudeAdapter extends EventEmitter {
     }
   }
   async pushNotification(message) {
+    this.log(`pushNotification (instance=${this.instanceId}, mode=${this.resolvedMode}, msgId=${message.id}, len=${message.content.length})`);
     if (this.resolvedMode === "push") {
       await this.pushViaChannel(message);
     } else {
@@ -13874,6 +13875,7 @@ Codex: ${msg.content}`;
     }).join(`
 
 `);
+    this.log(`get_messages returning ${count} message(s) (instance=${this.instanceId}, dropped=${dropped})`);
     return {
       content: [
         {
