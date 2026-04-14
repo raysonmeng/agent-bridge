@@ -18,7 +18,7 @@ Delivered scope:
 - Codex startup and daemon bootstrap via `agentbridge codex`.
 - Controlled daemon shutdown via `agentbridge kill`.
 - A developer-only local plugin workflow via `agentbridge dev`.
-- Project-level config generation through `.agentbridge/config.json` and `.agentbridge/collaboration.md`.
+- Project-level config generation through `.agentbridge/config.json`.
 - Shared runtime state management through `StateDirResolver`.
 - Shared daemon lifecycle logic through `DaemonLifecycle`.
 - Plugin-oriented runtime artifacts under `plugins/agentbridge/server/`.
@@ -40,7 +40,6 @@ Current behavior:
 - Verifies `bun`, `claude`, and `codex` are available.
 - Enforces a minimum Claude Code version of `2.1.80`.
 - Creates `.agentbridge/config.json` if missing.
-- Creates `.agentbridge/collaboration.md` if missing.
 - Attempts `claude plugin install agentbridge@agentbridge` as a best-effort step.
 
 Important nuance:
@@ -132,7 +131,7 @@ Phase 3 kept the two-process design, but productized it through shared lifecycle
 - `src/daemon-lifecycle.ts`
   - shared launch, health-check, pid, lock, and kill behavior
 - `src/config-service.ts`
-  - project config loading, defaults, and collaboration file generation
+  - project config loading and default generation
 - `src/state-dir.ts`
   - OS-specific shared runtime state directory resolution
 - `src/daemon-client.ts`
@@ -157,7 +156,6 @@ Phase 3 split persistent data into two layers.
 Stored in the repo under `.agentbridge/`:
 
 - `config.json`
-- `collaboration.md`
 
 This data is project-specific and travels with the working tree.
 
@@ -179,7 +177,7 @@ Files maintained there include:
 
 This split is intentional:
 
-- `.agentbridge/` is for shared project defaults and collaboration rules
+ - `.agentbridge/` is for shared project defaults
 - the state dir is for local process lifecycle and diagnostics
 
 ## Phase 3 Runtime Controls
@@ -205,16 +203,16 @@ Phase 3 shipped the intended product direction, but not every original proposal 
 
 ### Shipped differently
 
-- The CLI exists, but the package is still repository-local today.
-  - `package.json` exposes the `agentbridge` bin, but the package is still marked `private`.
+- The CLI exists, but packaging/distribution is still evolving.
+  - `package.json` exposes the `agentbridge` bin, but marketplace and npm packaging are still follow-up work.
 - The command surface is more opinionated than the original generic lifecycle proposal.
   - Shipped commands are `init`, `dev`, `claude`, `codex`, and `kill`.
   - Proposed commands such as `doctor`, `status`, `start`, `stop`, and `attach` did not ship in Phase 3.
 - `init` generates project config and attempts plugin installation, but it does not rewrite global Claude configuration files.
 - Claude startup still uses the development-channel path instead of a stable marketplace `--channels` flow.
 - Delivery mode auto-detection is intentionally conservative.
-  - `auto` resolves to push mode today.
-  - API-key users can force pull mode with `AGENTBRIDGE_MODE=pull`.
+  - `auto` resolves to pull mode today.
+  - Users can opt into channel delivery with `AGENTBRIDGE_MODE=push`.
 
 ### Why those differences are acceptable for v1
 
@@ -243,7 +241,7 @@ Phase 3 is backed by targeted automated coverage in the repository:
 
 Phase 3 is complete, but these items remain follow-up work rather than part of the shipped baseline:
 
-- publishing a non-private npm package
+- publishing a public npm package
 - stabilizing marketplace packaging and plugin manifests
 - deciding whether `doctor` or `status` are still worth adding
 - replacing development-channel startup with a stable marketplace path when available

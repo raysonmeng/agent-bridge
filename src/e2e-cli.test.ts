@@ -117,23 +117,12 @@ class CliE2EHarness {
       JSON.stringify(
         {
           version: "1.0",
-          daemon: {
-            port: appPort,
+          codex: {
+            appPort,
             proxyPort: configProxyPort,
           },
-          agents: {
-            claude: {
-              role: "Reviewer, Planner",
-              mode: "push",
-            },
-            codex: {
-              role: "Implementer, Executor",
-            },
-          },
-          markers: ["IMPORTANT", "STATUS", "FYI"],
           turnCoordination: {
             attentionWindowSeconds: 15,
-            busyGuard: true,
           },
           idleShutdownSeconds: 30,
         },
@@ -366,7 +355,7 @@ class CliE2EHarness {
 }
 
 describe("E2E: CLI surface", () => {
-  test("agentbridge init creates project config and collaboration rules", async () => {
+  test("agentbridge init creates project config", async () => {
     await withHarness(async (harness) => {
       rmSync(join(harness.projectDir, ".agentbridge"), { recursive: true, force: true });
 
@@ -374,19 +363,13 @@ describe("E2E: CLI surface", () => {
 
       expect(result.code).toBe(0);
       expect(existsSync(join(harness.projectDir, ".agentbridge", "config.json"))).toBe(true);
-      expect(existsSync(join(harness.projectDir, ".agentbridge", "collaboration.md"))).toBe(true);
+      expect(existsSync(join(harness.projectDir, ".agentbridge", "collaboration.md"))).toBe(false);
 
       const config = JSON.parse(
         readFileSync(join(harness.projectDir, ".agentbridge", "config.json"), "utf-8"),
-      ) as { daemon: { port: number; proxyPort: number } };
-      expect(config.daemon.port).toBe(4500);
-      expect(config.daemon.proxyPort).toBe(4501);
-
-      const collaboration = readFileSync(
-        join(harness.projectDir, ".agentbridge", "collaboration.md"),
-        "utf-8",
-      );
-      expect(collaboration).toContain("# Collaboration Rules");
+      ) as { codex: { appPort: number; proxyPort: number } };
+      expect(config.codex.appPort).toBe(4500);
+      expect(config.codex.proxyPort).toBe(4501);
       expect(result.stdout).toContain("Setup complete!");
       expect(harness.readShimCalls("claude").some((entry) => entry.args[0] === "plugin")).toBe(true);
       expect(harness.readShimCalls("codex").some((entry) => entry.args[0] === "--version")).toBe(true);
@@ -599,7 +582,7 @@ describe("E2E: CLI surface", () => {
 
       await waitFor(() => (pid ? !isProcessAlive(pid) : true), 60, 50);
       expect(existsSync(join(harness.projectDir, ".agentbridge", "config.json"))).toBe(true);
-      expect(existsSync(join(harness.projectDir, ".agentbridge", "collaboration.md"))).toBe(true);
+      expect(existsSync(join(harness.projectDir, ".agentbridge", "collaboration.md"))).toBe(false);
       expect(existsSync(join(harness.stateDir, "daemon.pid"))).toBe(false);
       expect(existsSync(join(harness.stateDir, "status.json"))).toBe(false);
       expect(existsSync(join(harness.stateDir, "killed"))).toBe(true);

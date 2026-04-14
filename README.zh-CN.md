@@ -154,7 +154,7 @@ agentbridge codex
 
 | 命令 | 说明 |
 |------|------|
-| `abg init` | 安装插件、检查依赖（bun/claude/codex）、生成 `.agentbridge/config.json` 和 `collaboration.md` |
+| `abg init` | 安装插件、检查依赖（bun/claude/codex）、生成 `.agentbridge/config.json` |
 | `abg claude [args...]` | 启动 Claude Code 并启用 push channel。自动清除之前 `kill` 留下的 sentinel。额外参数透传给 `claude` |
 | `abg codex [args...]` | 启动连接到 AgentBridge daemon 的 Codex TUI。管理 TUI 进程生命周期（pid 跟踪、清理）。额外参数透传给 `codex` |
 | `abg kill` | 优雅停止 daemon 和托管的 Codex TUI，清理状态文件，写入 killed sentinel |
@@ -177,8 +177,7 @@ agentbridge codex
 
 | 文件 | 用途 |
 |------|------|
-| `config.json` | 机器可读的项目配置（端口、Agent 角色、消息标记、回合协调） |
-| `collaboration.md` | 人类/Agent 可读的协作规则（角色、思考模式、沟通风格） |
+| `config.json` | 机器可读的项目配置（Codex 端口、回合协调、空闲关闭） |
 
 CLI 和 daemon 启动时会加载该配置。重复运行 `init` 是幂等的，不会覆盖已有文件。
 

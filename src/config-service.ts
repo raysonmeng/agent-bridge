@@ -1,89 +1,104 @@
 import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { join } from "node:path";
 
 /** Machine-readable project config schema. */
 export interface AgentBridgeConfig {
   version: string;
-  daemon: {
-    port: number;
+  codex: {
+    appPort: number;
     proxyPort: number;
   };
-  agents: Record<
-    string,
-    {
-      role: string;
-      mode?: string;
-    }
-  >;
-  markers: string[];
   turnCoordination: {
     attentionWindowSeconds: number;
-    busyGuard: boolean;
   };
   idleShutdownSeconds: number;
 }
 
 const DEFAULT_CONFIG: AgentBridgeConfig = {
   version: "1.0",
-  daemon: {
-    port: 4500,
+  codex: {
+    appPort: 4500,
     proxyPort: 4501,
   },
-  agents: {
-    claude: {
-      role: "Reviewer, Planner",
-      mode: "push",
-    },
-    codex: {
-      role: "Implementer, Executor",
-    },
-  },
-  markers: ["IMPORTANT", "STATUS", "FYI"],
   turnCoordination: {
     attentionWindowSeconds: 15,
-    busyGuard: true,
   },
   idleShutdownSeconds: 30,
 };
 
-const DEFAULT_COLLABORATION_MD = `# Collaboration Rules
-
-## Roles
-- Claude: Reviewer, Planner, Hypothesis Challenger
-- Codex: Implementer, Executor, Reproducer/Verifier
-
-## Thinking Patterns
-- Analytical/review tasks: Independent Analysis & Convergence
-- Implementation tasks: Architect -> Builder -> Critic
-- Debugging tasks: Hypothesis -> Experiment -> Interpretation
-
-## Communication
-- Use explicit phrases: "My independent view is:", "I agree on:", "I disagree on:", "Current consensus:"
-- Tag messages with [IMPORTANT], [STATUS], or [FYI]
-
-## Review Process
-- Cross-review: author never reviews their own code
-- All changes go through feature/fix branches + PR
-- Merge via squash merge
-
-## Custom Rules
-<!-- Add your project-specific collaboration rules here -->
-`;
-
 const CONFIG_DIR = ".agentbridge";
 const CONFIG_FILE = "config.json";
-const COLLABORATION_FILE = "collaboration.md";
+
+interface LegacyAgentBridgeConfig {
+  version?: unknown;
+  daemon?: {
+    port?: unknown;
+    proxyPort?: unknown;
+  };
+  codex?: {
+    appPort?: unknown;
+    proxyPort?: unknown;
+  };
+  turnCoordination?: {
+    attentionWindowSeconds?: unknown;
+  };
+  idleShutdownSeconds?: unknown;
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function normalizeInteger(value: unknown, fallback: number): number {
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "string") {
+    const parsed = Number(value);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  return fallback;
+}
+
+function normalizeConfig(raw: unknown): AgentBridgeConfig | null {
+  if (!isRecord(raw)) return null;
+
+  const config = raw as LegacyAgentBridgeConfig;
+  const codex = isRecord(config.codex) ? config.codex : {};
+  const daemon = isRecord(config.daemon) ? config.daemon : {};
+  const turnCoordination = isRecord(config.turnCoordination) ? config.turnCoordination : {};
+
+  return {
+    version: typeof config.version === "string" ? config.version : DEFAULT_CONFIG.version,
+    codex: {
+      appPort: normalizeInteger(
+        codex.appPort ?? daemon.port,
+        DEFAULT_CONFIG.codex.appPort,
+      ),
+      proxyPort: normalizeInteger(
+        codex.proxyPort ?? daemon.proxyPort,
+        DEFAULT_CONFIG.codex.proxyPort,
+      ),
+    },
+    turnCoordination: {
+      attentionWindowSeconds: normalizeInteger(
+        turnCoordination.attentionWindowSeconds,
+        DEFAULT_CONFIG.turnCoordination.attentionWindowSeconds,
+      ),
+    },
+    idleShutdownSeconds: normalizeInteger(
+      config.idleShutdownSeconds,
+      DEFAULT_CONFIG.idleShutdownSeconds,
+    ),
+  };
+}
 
 export class ConfigService {
   private readonly configDir: string;
   private readonly configPath: string;
-  private readonly collaborationPath: string;
 
   constructor(projectRoot?: string) {
     const root = projectRoot ?? process.cwd();
     this.configDir = join(root, CONFIG_DIR);
     this.configPath = join(this.configDir, CONFIG_FILE);
-    this.collaborationPath = join(this.configDir, COLLABORATION_FILE);
   }
 
   /** Check if project config exists. */
@@ -95,7 +110,7 @@ export class ConfigService {
   load(): AgentBridgeConfig | null {
     try {
       const raw = readFileSync(this.configPath, "utf-8");
-      return JSON.parse(raw) as AgentBridgeConfig;
+      return normalizeConfig(JSON.parse(raw));
     } catch {
       return null;
     }
@@ -112,21 +127,6 @@ export class ConfigService {
     writeFileSync(this.configPath, JSON.stringify(config, null, 2) + "\n", "utf-8");
   }
 
-  /** Load collaboration rules markdown. */
-  loadCollaboration(): string | null {
-    try {
-      return readFileSync(this.collaborationPath, "utf-8");
-    } catch {
-      return null;
-    }
-  }
-
-  /** Save collaboration rules markdown. */
-  saveCollaboration(content: string): void {
-    this.ensureConfigDir();
-    writeFileSync(this.collaborationPath, content, "utf-8");
-  }
-
   /** Generate default config files if they don't exist. Returns list of created files. */
   initDefaults(): string[] {
     this.ensureConfigDir();
@@ -137,20 +137,11 @@ export class ConfigService {
       created.push(this.configPath);
     }
 
-    if (!existsSync(this.collaborationPath)) {
-      this.saveCollaboration(DEFAULT_COLLABORATION_MD);
-      created.push(this.collaborationPath);
-    }
-
     return created;
   }
 
   get configFilePath(): string {
     return this.configPath;
-  }
-
-  get collaborationFilePath(): string {
-    return this.collaborationPath;
   }
 
   private ensureConfigDir(): void {
@@ -160,4 +151,4 @@ export class ConfigService {
   }
 }
 
-export { DEFAULT_CONFIG, DEFAULT_COLLABORATION_MD };
+export { DEFAULT_CONFIG };
