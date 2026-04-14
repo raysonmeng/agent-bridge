@@ -59,11 +59,11 @@ describe("Dual-mode transport: mode resolution", () => {
     expect(adapter.configuredMode).toBe("auto");
   });
 
-  test("auto mode defaults to push", () => {
+  test("auto mode defaults to pull", () => {
     const adapter = createAdapter();
     adapter.resolveMode();
-    expect(adapter.resolvedMode).toBe("push");
-    expect(adapter.getDeliveryMode()).toBe("push");
+    expect(adapter.resolvedMode).toBe("pull");
+    expect(adapter.getDeliveryMode()).toBe("pull");
   });
 
   test("resolveMode sets 'push' when configuredMode is 'push'", () => {
@@ -144,6 +144,22 @@ describe("Dual-mode transport: pull mode message queue", () => {
     expect(secondId).toMatch(/^codex_msg_[a-f0-9]{12}_2$/);
     expect(firstId.replace(/_1$/, "")).toBe(secondId.replace(/_2$/, ""));
     expect(firstId).not.toBe("codex_msg_1");
+  });
+
+  test("pushNotification falls back to the pull queue when push delivery throws", async () => {
+    const adapter = createAdapter("push");
+    adapter.resolveMode();
+
+    adapter.server = {
+      notification: async () => {
+        throw new Error("channel unavailable");
+      },
+    };
+
+    await adapter.pushNotification(makeBridgeMessage("fallback msg"));
+
+    expect(adapter.pendingMessages).toHaveLength(1);
+    expect(adapter.pendingMessages[0].content).toBe("fallback msg");
   });
 });
 
