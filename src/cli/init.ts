@@ -1,7 +1,15 @@
 import { execSync, execFileSync } from "node:child_process";
+import { readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { ConfigService } from "../config-service";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
 import { findPackageRoot, registerMarketplace } from "./pkg-root";
+import { upsertMarkedSection } from "../marker-section";
+import {
+  MARKER_ID,
+  CLAUDE_MD_SECTION,
+  AGENTS_MD_SECTION,
+} from "../collaboration-content";
 
 const MIN_CLAUDE_VERSION = "2.1.80";
 
@@ -29,7 +37,16 @@ export async function runInit() {
   }
   console.log("");
 
-  // Step 3: Register marketplace + install plugin (best-effort)
+  // Step 3: Write collaboration sections to CLAUDE.md and AGENTS.md
+  console.log("Writing collaboration sections...");
+  const projectRoot = process.cwd();
+  const collabResults = writeCollaborationSections(projectRoot);
+  for (const result of collabResults) {
+    console.log(`  ${result}`);
+  }
+  console.log("");
+
+  // Step 4: Register marketplace + install plugin (best-effort)
   console.log("Installing AgentBridge plugin...");
   try {
     registerMarketplace(findPackageRoot());
@@ -44,7 +61,7 @@ export async function runInit() {
   }
   console.log("");
 
-  // Step 4: Done
+  // Step 5: Done
   console.log("Setup complete!\n");
   console.log("Next steps:");
   console.log("  1. If Claude Code is already running, execute /reload-plugins in your session");
@@ -109,6 +126,46 @@ function compareVersions(a: string, b: string): number {
     if (va > vb) return 1;
   }
   return 0;
+}
+
+/**
+ * Write or update AgentBridge collaboration sections in CLAUDE.md and AGENTS.md.
+ * Returns human-readable status lines for each file.
+ */
+export function writeCollaborationSections(projectRoot: string): string[] {
+  const results: string[] = [];
+
+  const files: Array<{ name: string; path: string; section: string }> = [
+    { name: "CLAUDE.md", path: join(projectRoot, "CLAUDE.md"), section: CLAUDE_MD_SECTION },
+    { name: "AGENTS.md", path: join(projectRoot, "AGENTS.md"), section: AGENTS_MD_SECTION },
+  ];
+
+  for (const { name, path, section } of files) {
+    let existing = "";
+    try {
+      existing = readFileSync(path, "utf-8");
+    } catch {
+      // File doesn't exist — will be created
+    }
+
+    const updated = upsertMarkedSection(existing, MARKER_ID, section);
+
+    if (updated === existing) {
+      results.push(`${name}: unchanged (section already up to date)`);
+      continue;
+    }
+
+    writeFileSync(path, updated, "utf-8");
+    if (existing === "") {
+      results.push(`${name}: created with collaboration section`);
+    } else if (existing.includes(`<!-- ${MARKER_ID}:start -->`)) {
+      results.push(`${name}: updated collaboration section`);
+    } else {
+      results.push(`${name}: appended collaboration section`);
+    }
+  }
+
+  return results;
 }
 
 export { compareVersions };
