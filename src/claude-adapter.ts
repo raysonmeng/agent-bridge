@@ -21,6 +21,7 @@ import {
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
+import { StateDirResolver } from "./state-dir";
 import type { BridgeMessage } from "./types";
 
 export type ReplySender = (msg: BridgeMessage, requireReply?: boolean) => Promise<{ success: boolean; error?: string }>;
@@ -60,14 +61,13 @@ export const CLAUDE_INSTRUCTIONS = [
   "- If the reply tool returns a busy error, Codex is still executing — wait and try again later.",
 ].join("\n");
 
-const LOG_FILE = "/tmp/agentbridge.log";
-
 export class ClaudeAdapter extends EventEmitter {
   private server: Server;
   private notificationSeq = 0;
   private sessionId: string;
   private readonly notificationIdPrefix: string;
   private replySender: ReplySender | null = null;
+  private readonly logFile: string;
 
   // Dual-mode transport
   private readonly configuredMode: DeliveryMode;
@@ -76,8 +76,9 @@ export class ClaudeAdapter extends EventEmitter {
   private readonly maxBufferedMessages: number;
   private droppedMessageCount = 0;
 
-  constructor() {
+  constructor(logFile = new StateDirResolver().logFile) {
     super();
+    this.logFile = logFile;
     this.sessionId = `codex_${Date.now()}`;
     this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 12);
 
@@ -337,7 +338,7 @@ export class ClaudeAdapter extends EventEmitter {
     const line = `[${new Date().toISOString()}] [ClaudeAdapter] ${msg}\n`;
     process.stderr.write(line);
     try {
-      appendFileSync(LOG_FILE, line);
+      appendFileSync(this.logFile, line);
     } catch {}
   }
 }
