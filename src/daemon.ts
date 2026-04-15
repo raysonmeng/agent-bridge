@@ -58,6 +58,7 @@ let idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
 let claudeDisconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let claudeOnlineNoticeSent = false;
 let claudeOfflineNoticeShown = false;
+let codexCollaborationKickoffSent = false;
 let lastAttachStatusSentTs = 0;
 const ATTACH_STATUS_COOLDOWN_MS = 30_000; // Don't re-send status on rapid reattach
 
@@ -566,7 +567,21 @@ function currentReadyMessage() {
 function notifyCodexClaudeOnline() {
   claudeOnlineNoticeSent = true;
   claudeOfflineNoticeShown = false;
-  codex.injectMessage("✅ AgentBridge connected to Claude Code.");
+
+  if (!codexCollaborationKickoffSent) {
+    codexCollaborationKickoffSent = true;
+    codex.injectMessage(
+      [
+        "🤝 Claude Code has connected via AgentBridge.",
+        "You are now in a multi-agent collaboration session.",
+        "When you receive a complex task, propose a division of labor to Claude.",
+        "Claude can send you messages — they will appear as injected user messages.",
+        "Respond naturally and Claude will receive your output via AgentBridge.",
+      ].join("\n"),
+    );
+  } else {
+    codex.injectMessage("✅ AgentBridge connected to Claude Code.");
+  }
 }
 
 function shouldNotifyCodexClaudeOnline() {
