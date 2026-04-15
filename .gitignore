@@ -10,3 +10,5 @@ codex-plugin-cc/
 /.mcp.json
 agentbridge-context.md
 V1_PROGRESS.md
+# Added by code-review-graph
+.code-review-graph/

@@ -1656,6 +1656,7 @@ var idleShutdownTimer = null;
 var claudeDisconnectTimer = null;
 var claudeOnlineNoticeSent = false;
 var claudeOfflineNoticeShown = false;
+var codexCollaborationKickoffSent = false;
 var lastAttachStatusSentTs = 0;
 var ATTACH_STATUS_COOLDOWN_MS = 30000;
 var bufferedMessages = [];
@@ -2056,7 +2057,19 @@ function currentReadyMessage() {
 function notifyCodexClaudeOnline() {
   claudeOnlineNoticeSent = true;
   claudeOfflineNoticeShown = false;
-  codex.injectMessage("\u2705 AgentBridge connected to Claude Code.");
+  if (!codexCollaborationKickoffSent) {
+    codexCollaborationKickoffSent = true;
+    codex.injectMessage([
+      "\uD83E\uDD1D Claude Code has connected via AgentBridge.",
+      "You are now in a multi-agent collaboration session.",
+      "When you receive a complex task, propose a division of labor to Claude.",
+      "Claude can send you messages \u2014 they will appear as injected user messages.",
+      "Respond naturally and Claude will receive your output via AgentBridge."
+    ].join(`
+`));
+  } else {
+    codex.injectMessage("\u2705 AgentBridge connected to Claude Code.");
+  }
 }
 function shouldNotifyCodexClaudeOnline() {
   return !claudeOnlineNoticeSent || claudeOfflineNoticeShown;
