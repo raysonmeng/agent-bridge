@@ -96,21 +96,42 @@ describe("DaemonClient", () => {
     let disconnectEmitted = false;
     client.on("disconnect", () => { disconnectEmitted = true; });
 
-    const rejected = new Promise<void>((resolve) => {
-      client.on("rejected", () => resolve());
+    const rejected = new Promise<number>((resolve) => {
+      client.on("rejected", (code) => resolve(code));
     });
 
     for (const ws of serverSockets) {
       ws.close(4001, "another Claude session is already connected");
     }
 
-    await rejected;
+    const code = await rejected;
+    expect(code).toBe(4001);
     // Give a tick for any stray disconnect to fire
     await new Promise((r) => setTimeout(r, 50));
     expect(disconnectEmitted).toBe(false);
   });
 
-  test("emits disconnect (not rejected) for non-4001 close codes", async () => {
+  test("emits rejected (not disconnect) when server closes with code 4002 (evicted stale)", async () => {
+    await client.connect();
+
+    let disconnectEmitted = false;
+    client.on("disconnect", () => { disconnectEmitted = true; });
+
+    const rejected = new Promise<number>((resolve) => {
+      client.on("rejected", (code) => resolve(code));
+    });
+
+    for (const ws of serverSockets) {
+      ws.close(4002, "stale frontend evicted by newer session");
+    }
+
+    const code = await rejected;
+    expect(code).toBe(4002);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(disconnectEmitted).toBe(false);
+  });
+
+  test("emits disconnect (not rejected) for non-rejection close codes", async () => {
     await client.connect();
 
     let rejectedEmitted = false;

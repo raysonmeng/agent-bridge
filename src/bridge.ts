@@ -7,6 +7,7 @@ import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
 import { ConfigService } from "./config-service";
 import { disabledReplyError, type BridgeDisabledReason } from "./bridge-disabled-state";
+import { CLOSE_CODE_EVICTED_STALE } from "./control-protocol";
 import type { BridgeMessage } from "./types";
 
 const stateDir = new StateDirResolver();
@@ -77,19 +78,23 @@ daemonClient.on("disconnect", () => {
   void reconnectToDaemon();
 });
 
-daemonClient.on("rejected", async () => {
+daemonClient.on("rejected", async (code: number) => {
   if (shuttingDown || daemonDisabled) return;
 
-  log("Daemon rejected this session (close code 4001) — another Claude session is already connected");
+  const wasEvicted = code === CLOSE_CODE_EVICTED_STALE;
+  log(`Daemon rejected this session (close code ${code}) — ${wasEvicted ? "evicted as stale by a newer session" : "another Claude session is already connected"}`);
 
-  // The daemon now rejects NEW connections when an existing session is active.
-  // This session was the latecomer, so it should enter dormant state permanently
-  // and not try to reconnect (which would just get rejected again).
+  // Both codes mean the slot is owned by someone else now: reconnecting would
+  // either be rejected (4001) or kick the legitimate new session back out,
+  // so this session enters dormant state and waits for the user to intervene.
   daemonDisabled = true;
   daemonDisabledReason = "rejected";
+  const notificationContent = wasEvicted
+    ? "⚠️ AgentBridge evicted this session because it stopped responding to liveness probes — a newer Claude Code session has taken over. Close this session and start a new one with `agentbridge claude` if you want to reconnect. AgentBridge 因此会话未响应存活探测而将其驱逐——更新的 Claude Code 会话已接管。如需重连，请关闭此会话并运行 `agentbridge claude` 启动新会话。"
+    : "⚠️ AgentBridge daemon rejected this session — another Claude Code session is already connected. Close the other session first, or run `agentbridge kill` to reset. AgentBridge 守护进程拒绝了此会话——另一个 Claude Code 会话已在连接中。请先关闭另一个会话，或运行 `agentbridge kill` 重置。";
   await claude.pushNotification(systemMessage(
-    "system_bridge_replaced",
-    "⚠️ AgentBridge daemon rejected this session — another Claude Code session is already connected. Close the other session first, or run `agentbridge kill` to reset. AgentBridge 守护进程拒绝了此会话——另一个 Claude Code 会话已在连接中。请先关闭另一个会话，或运行 `agentbridge kill` 重置。",
+    wasEvicted ? "system_bridge_evicted" : "system_bridge_replaced",
+    notificationContent,
   ));
   await daemonClient.disconnect();
 });

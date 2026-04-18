@@ -1,12 +1,12 @@
 import { EventEmitter } from "node:events";
 import type { BridgeMessage } from "./types";
-import { CLOSE_CODE_REPLACED } from "./control-protocol";
+import { CLOSE_CODE_REPLACED, CLOSE_CODE_EVICTED_STALE } from "./control-protocol";
 import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
 
 interface DaemonClientEvents {
   codexMessage: [BridgeMessage];
   disconnect: [];
-  rejected: [];
+  rejected: [number];
   status: [DaemonStatus];
 }
 
@@ -147,8 +147,8 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       if (isCurrent) {
         this.ws = null;
         this.rejectPendingReplies("AgentBridge daemon disconnected.");
-        if (event.code === CLOSE_CODE_REPLACED) {
-          this.emit("rejected");
+        if (event.code === CLOSE_CODE_REPLACED || event.code === CLOSE_CODE_EVICTED_STALE) {
+          this.emit("rejected", event.code);
         } else {
           this.emit("disconnect");
         }
