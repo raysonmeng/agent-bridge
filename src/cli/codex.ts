@@ -8,6 +8,75 @@ import { checkOwnedFlagConflicts } from "./claude";
 /** Flags that AgentBridge owns for codex command. */
 const OWNED_FLAGS = ["--remote"];
 
+/**
+ * Codex subcommands that still launch the TUI and benefit from AgentBridge's
+ * remote proxy. Bridge flags for these must be injected *after* the subcommand
+ * name, because clap defines `--remote` / `--enable` as per-subcommand options
+ * (not `global`). See docs/issues-2026-04-18-codex-stuck-and-resume.md (Issue D).
+ */
+const TUI_SUBCOMMANDS = new Set(["resume", "fork"]);
+
+/**
+ * Codex subcommands that do NOT launch a TUI. Bridge flags are not applicable
+ * and must not be injected. Keep in sync with `codex --help` output.
+ */
+const NON_TUI_SUBCOMMANDS = new Set([
+  "exec", "e",
+  "review",
+  "login", "logout",
+  "mcp", "mcp-server",
+  "marketplace",
+  "app-server", "exec-server",
+  "app",
+  "completion",
+  "sandbox",
+  "debug",
+  "apply", "a",
+  "cloud",
+  "features",
+  "help",
+]);
+
+export interface BuildArgsResult {
+  /** Final argv for `codex`. */
+  fullArgs: string[];
+  /** Whether bridge flags (`--enable tui_app_server --remote <proxy>`) were injected. */
+  injectedBridgeFlags: boolean;
+}
+
+/**
+ * Build the final codex command-line arguments, positioning bridge flags so
+ * clap parses them as options of the actually-invoked (sub)command.
+ *
+ * - Bare `codex` / `codex --<flag>…` / `codex <prompt>` → inject at front (root TUI).
+ * - `codex resume|fork …` → inject after the subcommand name.
+ * - Any known non-TUI subcommand (`exec`, `review`, `login`, `mcp`, …) → pass
+ *   through unchanged; those do not launch a TUI and must not receive `--remote`.
+ * - Unknown first token → treat as a bare prompt (TUI mode). Safer than
+ *   silently dropping bridge flags for an unrecognized subcommand.
+ */
+export function buildCodexArgs(userArgs: string[], proxyUrl: string): BuildArgsResult {
+  const bridgeFlags = ["--enable", "tui_app_server", "--remote", proxyUrl];
+  const first = userArgs[0];
+
+  if (!first || first.startsWith("-")) {
+    return { fullArgs: [...bridgeFlags, ...userArgs], injectedBridgeFlags: true };
+  }
+
+  if (TUI_SUBCOMMANDS.has(first)) {
+    return {
+      fullArgs: [first, ...bridgeFlags, ...userArgs.slice(1)],
+      injectedBridgeFlags: true,
+    };
+  }
+
+  if (NON_TUI_SUBCOMMANDS.has(first)) {
+    return { fullArgs: userArgs, injectedBridgeFlags: false };
+  }
+
+  return { fullArgs: [...bridgeFlags, ...userArgs], injectedBridgeFlags: true };
+}
+
 export async function runCodex(args: string[]) {
   // Check for owned flag conflicts
   checkOwnedFlagConflicts(args, "agentbridge codex", OWNED_FLAGS);
@@ -123,11 +192,7 @@ export async function runCodex(args: string[]) {
     }
   }
 
-  const fullArgs = [
-    "--enable", "tui_app_server",
-    "--remote", proxyUrl,
-    ...args,
-  ];
+  const { fullArgs } = buildCodexArgs(args, proxyUrl);
 
   const child = spawn("codex", fullArgs, {
     stdio: "inherit",

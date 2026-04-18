@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { compareVersions } from "../cli/init";
 import { checkOwnedFlagConflicts } from "../cli/claude";
+import { buildCodexArgs } from "../cli/codex";
 
 describe("CLI: version comparison", () => {
   test("equal versions return 0", () => {
@@ -102,5 +103,104 @@ describe("CLI: owned flag conflict detection", () => {
     console.error = origError;
     expect(output).toContain("codex [your flags here]");
     expect(output).not.toContain("claude [your flags here]");
+  });
+});
+
+describe("CLI: buildCodexArgs", () => {
+  const PROXY = "ws://127.0.0.1:4501";
+  const BRIDGE = ["--enable", "tui_app_server", "--remote", PROXY];
+
+  test("bare codex (no args) injects bridge flags at front", () => {
+    const r = buildCodexArgs([], PROXY);
+    expect(r.fullArgs).toEqual(BRIDGE);
+    expect(r.injectedBridgeFlags).toBe(true);
+  });
+
+  test("bare codex with prompt injects bridge flags at front", () => {
+    const r = buildCodexArgs(["hello world"], PROXY);
+    expect(r.fullArgs).toEqual([...BRIDGE, "hello world"]);
+    expect(r.injectedBridgeFlags).toBe(true);
+  });
+
+  test("bare codex with leading flag treated as TUI (injected at front)", () => {
+    const r = buildCodexArgs(["--model", "opus"], PROXY);
+    expect(r.fullArgs).toEqual([...BRIDGE, "--model", "opus"]);
+    expect(r.injectedBridgeFlags).toBe(true);
+  });
+
+  test("resume subcommand: bridge flags injected after 'resume'", () => {
+    const r = buildCodexArgs(["resume", "019d9a2e-15a7-7841-a7d2-ca0e14a61f40"], PROXY);
+    expect(r.fullArgs).toEqual([
+      "resume",
+      ...BRIDGE,
+      "019d9a2e-15a7-7841-a7d2-ca0e14a61f40",
+    ]);
+    expect(r.injectedBridgeFlags).toBe(true);
+  });
+
+  test("resume --last: bridge flags injected after 'resume', --last preserved", () => {
+    const r = buildCodexArgs(["resume", "--last"], PROXY);
+    expect(r.fullArgs).toEqual(["resume", ...BRIDGE, "--last"]);
+    expect(r.injectedBridgeFlags).toBe(true);
+  });
+
+  test("resume with session-id + prompt", () => {
+    const r = buildCodexArgs(["resume", "abc-123", "continue please"], PROXY);
+    expect(r.fullArgs).toEqual(["resume", ...BRIDGE, "abc-123", "continue please"]);
+    expect(r.injectedBridgeFlags).toBe(true);
+  });
+
+  test("fork subcommand: bridge flags injected after 'fork'", () => {
+    const r = buildCodexArgs(["fork", "session-xyz"], PROXY);
+    expect(r.fullArgs).toEqual(["fork", ...BRIDGE, "session-xyz"]);
+    expect(r.injectedBridgeFlags).toBe(true);
+  });
+
+  test("exec subcommand: no bridge flags injected (non-TUI)", () => {
+    const r = buildCodexArgs(["exec", "do something"], PROXY);
+    expect(r.fullArgs).toEqual(["exec", "do something"]);
+    expect(r.injectedBridgeFlags).toBe(false);
+  });
+
+  test("login subcommand: pass-through, no bridge flags", () => {
+    const r = buildCodexArgs(["login"], PROXY);
+    expect(r.fullArgs).toEqual(["login"]);
+    expect(r.injectedBridgeFlags).toBe(false);
+  });
+
+  test("mcp subcommand: pass-through, no bridge flags", () => {
+    const r = buildCodexArgs(["mcp", "list"], PROXY);
+    expect(r.fullArgs).toEqual(["mcp", "list"]);
+    expect(r.injectedBridgeFlags).toBe(false);
+  });
+
+  test("review subcommand: pass-through, no bridge flags", () => {
+    const r = buildCodexArgs(["review", "--diff"], PROXY);
+    expect(r.fullArgs).toEqual(["review", "--diff"]);
+    expect(r.injectedBridgeFlags).toBe(false);
+  });
+
+  test("help subcommand: pass-through, no bridge flags", () => {
+    const r = buildCodexArgs(["help", "resume"], PROXY);
+    expect(r.fullArgs).toEqual(["help", "resume"]);
+    expect(r.injectedBridgeFlags).toBe(false);
+  });
+
+  test("unknown first token treated as bare prompt (TUI)", () => {
+    const r = buildCodexArgs(["some-unknown-subcmd", "arg"], PROXY);
+    expect(r.fullArgs).toEqual([...BRIDGE, "some-unknown-subcmd", "arg"]);
+    expect(r.injectedBridgeFlags).toBe(true);
+  });
+
+  test("exec alias 'e' treated as non-TUI", () => {
+    const r = buildCodexArgs(["e", "run this"], PROXY);
+    expect(r.fullArgs).toEqual(["e", "run this"]);
+    expect(r.injectedBridgeFlags).toBe(false);
+  });
+
+  test("apply alias 'a' treated as non-TUI", () => {
+    const r = buildCodexArgs(["a"], PROXY);
+    expect(r.fullArgs).toEqual(["a"]);
+    expect(r.injectedBridgeFlags).toBe(false);
   });
 });
