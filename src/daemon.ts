@@ -14,13 +14,15 @@ import { TuiConnectionState } from "./tui-connection-state";
 import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
 import { ConfigService } from "./config-service";
-import { CLOSE_CODE_REPLACED } from "./control-protocol";
+import { CLOSE_CODE_REPLACED, CLOSE_CODE_EVICTED_STALE } from "./control-protocol";
 import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
 import type { BridgeMessage } from "./types";
+import { probeLiveness as probeLivenessImpl } from "./liveness-probe";
 
 interface ControlSocketData {
   clientId: number;
   attached: boolean;
+  lastPongAt: number;
 }
 
 const stateDir = new StateDirResolver();
@@ -60,6 +62,17 @@ let claudeOnlineNoticeSent = false;
 let claudeOfflineNoticeShown = false;
 let lastAttachStatusSentTs = 0;
 const ATTACH_STATUS_COOLDOWN_MS = 30_000; // Don't re-send status on rapid reattach
+
+// Liveness probe used by challenge-on-contest admission. Issue #68: OS may never
+// surface FIN on a half-open TCP, so readyState alone can't tell us the old peer
+// is gone. When a new frontend arrives while a socket is still OPEN, we ping the
+// old peer; if no pong within this window, we evict it and accept the new one.
+const LIVENESS_PROBE_TIMEOUT_MS = parseInt(
+  process.env.AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS ?? "3000",
+  10,
+);
+const LIVENESS_PROBE_POLL_MS = 50;
+let challengeInProgress = false;
 
 const bufferedMessages: BridgeMessage[] = [];
 
@@ -231,7 +244,7 @@ function startControlServer() {
         return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
       }
 
-      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false } })) {
+      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now() } })) {
         return undefined;
       }
 
@@ -242,6 +255,7 @@ function startControlServer() {
       sendPings: true,
       open: (ws: ServerWebSocket<ControlSocketData>) => {
         ws.data.clientId = ++nextControlClientId;
+        ws.data.lastPongAt = Date.now();
         log(`Frontend socket opened (#${ws.data.clientId})`);
       },
       close: (ws: ServerWebSocket<ControlSocketData>, code: number, reason: string) => {
@@ -252,6 +266,9 @@ function startControlServer() {
       },
       message: (ws: ServerWebSocket<ControlSocketData>, raw) => {
         handleControlMessage(ws, raw);
+      },
+      pong: (ws: ServerWebSocket<ControlSocketData>) => {
+        ws.data.lastPongAt = Date.now();
       },
     },
   });
@@ -269,7 +286,9 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
 
   switch (message.type) {
     case "claude_connect":
-      attachClaude(ws);
+      attachClaude(ws).catch((err) => {
+        log(`attachClaude threw for #${ws.data.clientId}: ${err?.message ?? err}`);
+      });
       return;
     case "claude_disconnect":
       detachClaude(ws, "frontend requested disconnect");
@@ -332,13 +351,61 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
   }
 }
 
-function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
+async function attachClaude(ws: ServerWebSocket<ControlSocketData>) {
+  const occupant = attachedClaude;
+  if (occupant && occupant !== ws && occupant.readyState !== WebSocket.CLOSED) {
+    // Slot is occupied by another socket that hasn't yet shown us FIN.
+    // Issue #68: OS may never surface a FIN for a crashed peer, so readyState
+    // stays OPEN forever. Probe the incumbent with a ping before rejecting.
+    const msSincePong = Date.now() - occupant.data.lastPongAt;
+    log(
+      `Claude frontend contest: new=#${ws.data.clientId}, incumbent=#${occupant.data.clientId} ` +
+      `(readyState=${occupant.readyState}, msSincePong=${msSincePong})`,
+    );
+
+    if (challengeInProgress) {
+      log(
+        `Rejecting Claude frontend #${ws.data.clientId} — another liveness probe already in flight`,
+      );
+      ws.close(CLOSE_CODE_REPLACED, "another Claude session is already connected");
+      return;
+    }
+
+    challengeInProgress = true;
+    let incumbentAlive = false;
+    try {
+      incumbentAlive = await probeLiveness(occupant, LIVENESS_PROBE_TIMEOUT_MS);
+    } finally {
+      challengeInProgress = false;
+    }
+
+    // Slot may have cleared during the probe (real close fired, or the new ws
+    // left). Re-read state before committing a decision.
+    if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
+      log(`Contestant #${ws.data.clientId} disappeared during probe — aborting`);
+      if (!incumbentAlive) {
+        evictStale(occupant, "contestant gone but probe still failed");
+      }
+      return;
+    }
+
+    if (incumbentAlive) {
+      log(
+        `Rejecting Claude frontend #${ws.data.clientId} — incumbent #${occupant.data.clientId} responded to liveness probe`,
+      );
+      ws.close(CLOSE_CODE_REPLACED, "another Claude session is already connected");
+      return;
+    }
+
+    evictStale(occupant, `liveness probe timed out after ${LIVENESS_PROBE_TIMEOUT_MS}ms`);
+    // Fall through to accept path below.
+  }
+
   if (attachedClaude && attachedClaude !== ws && attachedClaude.readyState !== WebSocket.CLOSED) {
-    // Reject the new connection — don't disrupt the existing active session.
-    // Check !== CLOSED (not === OPEN) so that CLOSING state is also treated as
-    // "slot occupied", preventing a race where a new session slips in before
-    // the old one finishes its close handshake.
-    log(`Rejecting Claude frontend #${ws.data.clientId} — another session (#${attachedClaude.data.clientId}) is already attached (readyState=${attachedClaude.readyState})`);
+    // Another contestant may have raced in between the probe and here. Reject.
+    log(
+      `Rejecting Claude frontend #${ws.data.clientId} — slot re-acquired by #${attachedClaude.data.clientId} after probe`,
+    );
     ws.close(CLOSE_CODE_REPLACED, "another Claude session is already connected");
     return;
   }
@@ -383,6 +450,37 @@ function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
   scheduleClaudeDisconnectNotification(ws.data.clientId);
 
   scheduleIdleShutdown();
+}
+
+async function probeLiveness(
+  ws: ServerWebSocket<ControlSocketData>,
+  timeoutMs: number,
+): Promise<boolean> {
+  return probeLivenessImpl(
+    {
+      get readyState() { return ws.readyState; },
+      get lastPongAt() { return ws.data.lastPongAt; },
+      ping: () => { ws.ping(); },
+    },
+    { timeoutMs, pollMs: LIVENESS_PROBE_POLL_MS },
+  );
+}
+
+/**
+ * Evict the incumbent Claude frontend so a newer session can take over.
+ * Sends CLOSE_CODE_EVICTED_STALE (4002) and releases the slot so the next
+ * attachClaude call can accept a contestant.
+ */
+function evictStale(ws: ServerWebSocket<ControlSocketData>, reason: string) {
+  log(`Evicting stale Claude frontend #${ws.data.clientId}: ${reason}`);
+  if (attachedClaude === ws) {
+    detachClaude(ws, `evicted: ${reason}`);
+  }
+  try {
+    ws.close(CLOSE_CODE_EVICTED_STALE, "stale frontend evicted by newer session");
+  } catch (err: any) {
+    log(`Evict close threw on #${ws.data.clientId}: ${err.message}`);
+  }
 }
 
 function startAttentionWindow() {
