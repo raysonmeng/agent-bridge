@@ -93,6 +93,24 @@ describe("writeCollaborationSections", () => {
     expect(result).toContain("Multi-Agent Collaboration");
   });
 
+  test("skips malformed file instead of corrupting it", () => {
+    // User's CLAUDE.md has an orphan start marker (end deleted manually).
+    // upsertMarkedSection throws; init should skip just this file and keep going.
+    const orphaned = `# My Project\n<!-- ${MARKER_ID}:start -->\nLegacy notes preserved here\n## Other Section\nImportant user content\n`;
+    writeFileSync(join(tempDir, "CLAUDE.md"), orphaned, "utf-8");
+
+    const results = writeCollaborationSections(tempDir);
+
+    expect(results[0]).toContain("CLAUDE.md: skipped");
+    expect(results[0]).toContain("Malformed");
+    // AGENTS.md didn't exist → should still be created.
+    expect(results[1]).toContain("AGENTS.md: created");
+
+    // Critically: CLAUDE.md content is untouched.
+    const unchanged = readFileSync(join(tempDir, "CLAUDE.md"), "utf-8");
+    expect(unchanged).toBe(orphaned);
+  });
+
   test("updates when section content changes between versions", () => {
     // Simulate an older version's markers with different content
     const oldContent = `# Project\n\n${START}\nOLD COLLABORATION CONTENT\n${END}\n`;

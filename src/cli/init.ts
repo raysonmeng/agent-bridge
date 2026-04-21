@@ -148,7 +148,14 @@ export function writeCollaborationSections(projectRoot: string): string[] {
       // File doesn't exist — will be created
     }
 
-    const updated = upsertMarkedSection(existing, MARKER_ID, section);
+    let updated: string;
+    try {
+      updated = upsertMarkedSection(existing, MARKER_ID, section);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      results.push(`${name}: skipped — ${msg}`);
+      continue;
+    }
 
     if (updated === existing) {
       results.push(`${name}: unchanged (section already up to date)`);

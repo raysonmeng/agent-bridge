@@ -166,6 +166,11 @@ codex.on("turnCompleted", () => {
     ),
   );
   startAttentionWindow();
+
+  // Retry Claude-online notice if it was deferred while the turn was in progress.
+  if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
+    notifyCodexClaudeOnline();
+  }
 });
 
 codex.on("ready", (threadId: string) => {
@@ -564,24 +569,27 @@ function currentReadyMessage() {
   return `✅ Codex TUI connected (${codex.activeThreadId}). Bridge ready.`;
 }
 
-function notifyCodexClaudeOnline() {
-  claudeOnlineNoticeSent = true;
-  claudeOfflineNoticeShown = false;
-
-  if (!codexCollaborationKickoffSent) {
-    codexCollaborationKickoffSent = true;
-    codex.injectMessage(
-      [
+function notifyCodexClaudeOnline(): boolean {
+  const message = !codexCollaborationKickoffSent
+    ? [
         "🤝 Claude Code has connected via AgentBridge.",
         "You are now in a multi-agent collaboration session.",
         "When you receive a complex task, propose a division of labor to Claude.",
         "Claude can send you messages — they will appear as injected user messages.",
         "Respond naturally and Claude will receive your output via AgentBridge.",
-      ].join("\n"),
-    );
-  } else {
-    codex.injectMessage("✅ AgentBridge connected to Claude Code.");
+      ].join("\n")
+    : "✅ AgentBridge connected to Claude Code.";
+
+  const delivered = codex.injectMessage(message);
+  if (!delivered) {
+    log("Deferred Claude-online notice to Codex — will retry after current turn completes");
+    return false;
   }
+
+  claudeOnlineNoticeSent = true;
+  claudeOfflineNoticeShown = false;
+  codexCollaborationKickoffSent = true;
+  return true;
 }
 
 function shouldNotifyCodexClaudeOnline() {

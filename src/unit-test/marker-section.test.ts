@@ -64,4 +64,29 @@ describe("upsertMarkedSection", () => {
     expect(result).toContain(START);
     expect(result).toContain("New block");
   });
+
+  test("malformed: orphan start marker → throws instead of silently appending", () => {
+    // User manually deleted the end marker. A naive append would create a second
+    // start marker, and the next call would splice out content in between.
+    const existing = `# Title\n${START}\nOld notes\n## Other Section\nUser content\n`;
+    expect(() => upsertMarkedSection(existing, SECTION_ID, "NEW")).toThrow(
+      /Malformed .* markers/,
+    );
+  });
+
+  test("malformed: orphan end marker → throws", () => {
+    const existing = `# Title\nUser content\n${END}\nMore content\n`;
+    expect(() => upsertMarkedSection(existing, SECTION_ID, "NEW")).toThrow(
+      /Malformed .* markers/,
+    );
+  });
+
+  test("malformed: end marker before start marker → throws", () => {
+    // Pathological case from git merge or manual editing — markers out of order.
+    // Silently splicing here reverses slice direction and destroys content.
+    const existing = `# Title\n${END}\nUser notes\n${START}\nOld block\n`;
+    expect(() => upsertMarkedSection(existing, SECTION_ID, "NEW")).toThrow(
+      /Malformed .* markers/,
+    );
+  });
 });

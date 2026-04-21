@@ -29,12 +29,24 @@ export function upsertMarkedSection(
 
   const startIdx = content.indexOf(startMarker);
   const endIdx = content.indexOf(endMarker);
+  const hasStart = startIdx !== -1;
+  const hasEnd = endIdx !== -1;
 
-  // Case 3: markers exist → replace between them
-  if (startIdx !== -1 && endIdx !== -1) {
+  // Case 3: well-formed marker pair → replace between them.
+  if (hasStart && hasEnd && startIdx < endIdx) {
     const before = content.slice(0, startIdx);
     const after = content.slice(endIdx + endMarker.length);
     return before + block + after;
+  }
+
+  // Malformed: one marker without its pair, or end marker before start. Refuse
+  // to write — silently appending a second block would cause the next call to
+  // splice out user content between the stray marker and the new block.
+  if (hasStart || hasEnd) {
+    throw new Error(
+      `Malformed ${sectionId} markers in file (start=${startIdx}, end=${endIdx}). ` +
+        `Please repair the file manually — remove the stray marker(s) or restore the pair.`,
+    );
   }
 
   // Case 1: empty content → just the block
