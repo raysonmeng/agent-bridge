@@ -13804,8 +13804,8 @@ class ClaudeAdapter extends EventEmitter {
       this.resolvedMode = this.configuredMode;
       this.log(`Delivery mode set by AGENTBRIDGE_MODE: ${this.resolvedMode}`);
     } else {
-      this.resolvedMode = "pull";
-      this.log("Delivery mode defaulting to pull (set AGENTBRIDGE_MODE=push to opt into channel delivery)");
+      this.resolvedMode = "push";
+      this.log("Delivery mode defaulting to push (set AGENTBRIDGE_MODE=pull to use polling instead)");
     }
   }
   async pushNotification(message) {
@@ -14518,6 +14518,8 @@ var daemonClient = new DaemonClient(CONTROL_WS_URL);
 var shuttingDown = false;
 var daemonDisabled = false;
 var daemonDisabledReason = null;
+var hasSeenTuiConnect = false;
+var previousTuiConnected = false;
 var RECONNECT_NOTIFY_COOLDOWN_MS = 30000;
 var DISABLED_RECOVERY_INTERVAL_MS = 5000;
 var lastDisconnectNotifyTs = 0;
@@ -14542,6 +14544,18 @@ daemonClient.on("codexMessage", (message) => {
 });
 daemonClient.on("status", (status) => {
   log(`Daemon status: ready=${status.bridgeReady} tui=${status.tuiConnected} thread=${status.threadId ?? "none"} queued=${status.queuedMessageCount}`);
+  if (!hasSeenTuiConnect && status.tuiConnected && !previousTuiConnected) {
+    hasSeenTuiConnect = true;
+    log("First TUI connect detected \u2014 sending kickoff message to Claude");
+    claude.pushNotification(systemMessage("system_tui_kickoff", [
+      "\uD83E\uDD1D Codex has connected via AgentBridge.",
+      "You are now in a multi-agent collaboration session.",
+      "When you receive a complex task, propose a division of labor to Codex.",
+      "Use `reply` to send messages and `get_messages` to check for responses."
+    ].join(`
+`)));
+  }
+  previousTuiConnected = status.tuiConnected;
 });
 daemonClient.on("disconnect", () => {
   if (shuttingDown || daemonDisabled)

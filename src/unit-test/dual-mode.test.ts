@@ -59,11 +59,11 @@ describe("Dual-mode transport: mode resolution", () => {
     expect(adapter.configuredMode).toBe("auto");
   });
 
-  test("auto mode defaults to pull", () => {
+  test("auto mode defaults to push", () => {
     const adapter = createAdapter();
     adapter.resolveMode();
-    expect(adapter.resolvedMode).toBe("pull");
-    expect(adapter.getDeliveryMode()).toBe("pull");
+    expect(adapter.resolvedMode).toBe("push");
+    expect(adapter.getDeliveryMode()).toBe("push");
   });
 
   test("resolveMode sets 'push' when configuredMode is 'push'", () => {
