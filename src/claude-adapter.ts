@@ -5,7 +5,7 @@
  *   - Push mode (OAuth): real-time via notifications/claude/channel
  *   - Pull mode (API key): message queue + get_messages tool
  *
- * Mode defaults to pull in auto mode, or set explicitly via AGENTBRIDGE_MODE env var.
+ * Mode defaults to push in auto mode, or set explicitly via AGENTBRIDGE_MODE env var.
  *
  * Emits:
  *   - "ready"   ()                   — MCP connected, mode resolved
@@ -137,12 +137,12 @@ export class ClaudeAdapter extends EventEmitter {
       this.resolvedMode = this.configuredMode;
       this.log(`Delivery mode set by AGENTBRIDGE_MODE: ${this.resolvedMode}`);
     } else {
-      // Default to pull — Claude Code doesn't declare channel support in
-      // client capabilities, so we can't reliably detect whether channel
-      // delivery is actually working. Users can opt into push explicitly with
-      // AGENTBRIDGE_MODE=push when their setup is known to support it.
-      this.resolvedMode = "pull";
-      this.log("Delivery mode defaulting to pull (set AGENTBRIDGE_MODE=push to opt into channel delivery)");
+      // Default to push — AgentBridge always runs as a Claude Code plugin
+      // with --dangerously-load-development-channels, so channel delivery
+      // is available. If push fails, pushViaChannel already falls back to
+      // queueForPull per-message.
+      this.resolvedMode = "push";
+      this.log("Delivery mode defaulting to push (set AGENTBRIDGE_MODE=pull to use polling instead)");
     }
   }
 

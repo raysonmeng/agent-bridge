@@ -25,6 +25,10 @@ let shuttingDown = false;
 let daemonDisabled = false;
 let daemonDisabledReason: BridgeDisabledReason | null = null;
 
+// --- TUI kickoff tracking ---
+let hasSeenTuiConnect = false;
+let previousTuiConnected = false;
+
 // --- Notification throttling for reconnect loops ---
 const RECONNECT_NOTIFY_COOLDOWN_MS = 30_000; // Only notify once per 30s window
 const DISABLED_RECOVERY_INTERVAL_MS = 5_000;
@@ -57,6 +61,22 @@ daemonClient.on("status", (status) => {
   log(
     `Daemon status: ready=${status.bridgeReady} tui=${status.tuiConnected} thread=${status.threadId ?? "none"} queued=${status.queuedMessageCount}`,
   );
+
+  // Kickoff message on first TUI connect transition (not reconnects)
+  if (!hasSeenTuiConnect && status.tuiConnected && !previousTuiConnected) {
+    hasSeenTuiConnect = true;
+    log("First TUI connect detected — sending kickoff message to Claude");
+    void claude.pushNotification(systemMessage(
+      "system_tui_kickoff",
+      [
+        "🤝 Codex has connected via AgentBridge.",
+        "You are now in a multi-agent collaboration session.",
+        "When you receive a complex task, propose a division of labor to Codex.",
+        "Use `reply` to send messages and `get_messages` to check for responses.",
+      ].join("\n"),
+    ));
+  }
+  previousTuiConnected = status.tuiConnected;
 });
 
 daemonClient.on("disconnect", () => {

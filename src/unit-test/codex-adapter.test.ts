@@ -1,4 +1,6 @@
 import { describe, expect, test } from "bun:test";
+import { execSync } from "node:child_process";
+import { createServer, Socket, type Server } from "node:net";
 import { CodexAdapter } from "../codex-adapter";
 
 function createAdapter() {
@@ -1054,5 +1056,61 @@ describe("CodexAdapter initialize reconnect", () => {
 
     expect(adapter.threadId).toBeNull();
     expect(adapter.injectMessage("hello")).toBe(false);
+  });
+});
+
+describe("CodexAdapter port precheck — LISTEN-only filter", () => {
+  function runLsof(args: string): string[] {
+    try {
+      return execSync(`lsof ${args}`, {
+        encoding: "utf-8",
+        stdio: ["ignore", "pipe", "ignore"],
+      })
+        .trim()
+        .split("\n")
+        .filter(Boolean);
+    } catch {
+      return [];
+    }
+  }
+
+  test("buildPortListenLsofCommand restricts to LISTEN sockets", () => {
+    expect(CodexAdapter.buildPortListenLsofCommand(4501)).toBe(
+      "lsof -ti tcp:4501 -sTCP:LISTEN",
+    );
+  });
+
+  test("LISTEN filter ignores stale outbound FDs after listener dies", async () => {
+    const port = 40000 + Math.floor(Math.random() * 10000);
+
+    const server: Server = await new Promise((resolve, reject) => {
+      const s = createServer();
+      s.once("error", reject);
+      s.listen(port, "127.0.0.1", () => resolve(s));
+    });
+
+    const client: Socket = await new Promise((resolve, reject) => {
+      const c = new Socket();
+      c.once("error", reject);
+      c.connect(port, "127.0.0.1", () => resolve(c));
+    });
+
+    try {
+      // Sanity check: while listener is alive, LISTEN filter finds this process.
+      const withListener = runLsof(CodexAdapter.buildPortListenLsofCommand(port).slice(5));
+      expect(withListener).toContain(String(process.pid));
+
+      // Close the listener; the established outbound client FD lingers in this process.
+      await new Promise<void>((r) => server.close(() => r()));
+
+      // OLD impl `lsof -ti :PORT` (no LISTEN filter) would still find this process
+      // via the lingering outbound FD — the false positive that broke `abg claude`.
+      // NEW impl correctly returns no PIDs because nothing is LISTENING anymore.
+      const afterClose = runLsof(CodexAdapter.buildPortListenLsofCommand(port).slice(5));
+      expect(afterClose).toEqual([]);
+    } finally {
+      client.destroy();
+      if (server.listening) server.close();
+    }
   });
 });

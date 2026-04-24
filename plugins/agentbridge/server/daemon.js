@@ -1008,10 +1008,15 @@ class CodexAdapter extends EventEmitter {
     this.serverRequestToProxy.clear();
     this.pendingServerResponses.clear();
   }
+  static buildPortListenLsofCommand(port) {
+    return `lsof -ti tcp:${port} -sTCP:LISTEN`;
+  }
   async checkPorts() {
     for (const port of [this.appPort, this.proxyPort]) {
       try {
-        const pids = execSync(`lsof -ti :${port}`, { encoding: "utf-8" }).trim();
+        const pids = execSync(CodexAdapter.buildPortListenLsofCommand(port), {
+          encoding: "utf-8"
+        }).trim();
         if (!pids)
           continue;
         const pidList = pids.split(`
@@ -1041,7 +1046,9 @@ class CodexAdapter extends EventEmitter {
           throw new Error(`Port ${port} is already in use by non-Codex process(es): PID(s) ${foreignPids.join(", ")}. ` + `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`);
         }
         try {
-          const remaining = execSync(`lsof -ti :${port}`, { encoding: "utf-8" }).trim();
+          const remaining = execSync(CodexAdapter.buildPortListenLsofCommand(port), {
+            encoding: "utf-8"
+          }).trim();
           if (remaining) {
             throw new Error(`Port ${port} is still occupied (PID(s): ${remaining.replace(/\n/g, ", ")}) after cleanup. ` + `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`);
           }
@@ -1656,6 +1663,7 @@ var idleShutdownTimer = null;
 var claudeDisconnectTimer = null;
 var claudeOnlineNoticeSent = false;
 var claudeOfflineNoticeShown = false;
+var codexCollaborationKickoffSent = false;
 var lastAttachStatusSentTs = 0;
 var ATTACH_STATUS_COOLDOWN_MS = 30000;
 var bufferedMessages = [];
@@ -1722,6 +1730,9 @@ codex.on("turnCompleted", () => {
   replyReceivedDuringTurn = false;
   emitToClaude(systemMessage("system_turn_completed", "\u2705 Codex finished the current turn. You can reply now if needed."));
   startAttentionWindow();
+  if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
+    notifyCodexClaudeOnline();
+  }
 });
 codex.on("ready", (threadId) => {
   tuiConnectionState.markBridgeReady();
@@ -2054,9 +2065,23 @@ function currentReadyMessage() {
   return `\u2705 Codex TUI connected (${codex.activeThreadId}). Bridge ready.`;
 }
 function notifyCodexClaudeOnline() {
+  const message = !codexCollaborationKickoffSent ? [
+    "\uD83E\uDD1D Claude Code has connected via AgentBridge.",
+    "You are now in a multi-agent collaboration session.",
+    "When you receive a complex task, propose a division of labor to Claude.",
+    "Claude can send you messages \u2014 they will appear as injected user messages.",
+    "Respond naturally and Claude will receive your output via AgentBridge."
+  ].join(`
+`) : "\u2705 AgentBridge connected to Claude Code.";
+  const delivered = codex.injectMessage(message);
+  if (!delivered) {
+    log("Deferred Claude-online notice to Codex \u2014 will retry after current turn completes");
+    return false;
+  }
   claudeOnlineNoticeSent = true;
   claudeOfflineNoticeShown = false;
-  codex.injectMessage("\u2705 AgentBridge connected to Claude Code.");
+  codexCollaborationKickoffSent = true;
+  return true;
 }
 function shouldNotifyCodexClaudeOnline() {
   return !claudeOnlineNoticeSent || claudeOfflineNoticeShown;
