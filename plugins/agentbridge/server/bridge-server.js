@@ -13708,6 +13708,9 @@ class StateDirResolver {
   get logFile() {
     return join(this.stateDir, "agentbridge.log");
   }
+  get codexWrapperLogFile() {
+    return join(this.stateDir, "codex-wrapper.log");
+  }
   get killedFile() {
     return join(this.stateDir, "killed");
   }

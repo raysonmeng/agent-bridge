@@ -54,6 +54,9 @@ class StateDirResolver {
   get logFile() {
     return join(this.stateDir, "agentbridge.log");
   }
+  get codexWrapperLogFile() {
+    return join(this.stateDir, "codex-wrapper.log");
+  }
   get killedFile() {
     return join(this.stateDir, "killed");
   }
@@ -133,6 +136,10 @@ class CodexAdapter extends EventEmitter {
   reconnectingForNewSession = false;
   replayingBufferedMessages = false;
   appServerGeneration = 0;
+  outageQueue = [];
+  outageTimer = null;
+  static OUTAGE_QUEUE_MAX = 64;
+  static OUTAGE_TIMEOUT_MS = 5000;
   constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile) {
     super();
     this.appPort = appPort;
@@ -172,6 +179,8 @@ class CodexAdapter extends EventEmitter {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+    this.outageQueue = [];
+    this.clearOutageTimer();
     this.appServerWs?.close();
     this.appServerWs = null;
     for (const [id, sec] of this.secondaryConnections) {
@@ -253,6 +262,7 @@ class CodexAdapter extends EventEmitter {
         this.reconnectAttempts = 0;
         this.log(isReconnect ? "Reconnected to app-server" : "Connected to app-server");
         this.flushPendingServerResponses();
+        this.drainOutageQueue();
         resolve();
       };
       appWs.onmessage = (event) => {
@@ -351,13 +361,82 @@ class CodexAdapter extends EventEmitter {
     }, delay);
   }
   handleAppServerClose() {
-    this.log("App-server connection closed");
+    const intentional = this.intentionalDisconnect;
+    const tuiConnected = this.tuiWs !== null;
+    this.log(`App-server connection closed (intentional=${intentional}, tuiConnected=${tuiConnected}, turnInProgress=${this.turnInProgress})`);
     this.appServerWs = null;
     this.clearResponseTrackingState();
     this.activeTurnIds.clear();
     this.turnInProgress = false;
-    if (!this.intentionalDisconnect) {
+    if (!intentional) {
       this.scheduleReconnect();
+    }
+  }
+  bufferDuringOutage(ws, raw) {
+    if (this.outageQueue.length >= CodexAdapter.OUTAGE_QUEUE_MAX) {
+      this.log(`ERROR: outage queue overflow (${this.outageQueue.length}/${CodexAdapter.OUTAGE_QUEUE_MAX}) \u2014 closing TUI with 1011`);
+      this.outageQueue = [];
+      this.clearOutageTimer();
+      if (this.tuiWs && this.tuiWs === ws) {
+        try {
+          ws.close(1011, "agentbridge: app-server unavailable; pending TUI queue overflow");
+        } catch (e) {
+          this.log(`Failed to close TUI WS after outage queue overflow: ${e.message}`);
+        }
+      }
+      return;
+    }
+    this.outageQueue.push({ raw, connId: ws.data.connId });
+    this.log(`DIAGNOSTIC: buffered TUI message while app-server unavailable (queue size=${this.outageQueue.length}/${CodexAdapter.OUTAGE_QUEUE_MAX})`);
+    this.ensureOutageTimer();
+  }
+  ensureOutageTimer() {
+    if (this.outageTimer !== null)
+      return;
+    this.outageTimer = setTimeout(() => {
+      this.outageTimer = null;
+      const buffered = this.outageQueue.length;
+      this.outageQueue = [];
+      this.log(`ERROR: app-server did not return within ${CodexAdapter.OUTAGE_TIMEOUT_MS}ms (buffered=${buffered}) \u2014 closing TUI with 1011`);
+      const ws = this.tuiWs;
+      if (ws) {
+        try {
+          ws.close(1011, `agentbridge: app-server unavailable after ${CodexAdapter.OUTAGE_TIMEOUT_MS}ms; buffered=${buffered}`);
+        } catch (e) {
+          this.log(`Failed to close TUI WS on outage timeout: ${e.message}`);
+        }
+      }
+    }, CodexAdapter.OUTAGE_TIMEOUT_MS);
+  }
+  clearOutageTimer() {
+    if (this.outageTimer !== null) {
+      clearTimeout(this.outageTimer);
+      this.outageTimer = null;
+    }
+  }
+  drainOutageQueue() {
+    if (this.outageQueue.length === 0) {
+      this.clearOutageTimer();
+      return;
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN)
+      return;
+    const ws = this.tuiWs;
+    if (!ws) {
+      this.outageQueue = [];
+      this.clearOutageTimer();
+      return;
+    }
+    const messages = this.outageQueue;
+    this.outageQueue = [];
+    this.clearOutageTimer();
+    this.log(`DIAGNOSTIC: replaying ${messages.length} buffered TUI messages after app-server reconnect`);
+    for (const msg of messages) {
+      try {
+        this.onTuiMessage(ws, msg.raw);
+      } catch (e) {
+        this.log(`Failed to replay buffered TUI message (conn #${msg.connId}): ${e.message}`);
+      }
     }
   }
   startProxy() {
@@ -505,12 +584,18 @@ class CodexAdapter extends EventEmitter {
       return;
     }
     if (this.tuiWs === ws) {
-      this.log(`TUI disconnected (conn #${connId})`);
+      const appServerOpen = this.appServerWs?.readyState === WebSocket.OPEN;
+      this.log(`TUI disconnected (conn #${connId}, appServerOpen=${appServerOpen}, turnInProgress=${this.turnInProgress}, pendingTuiMessages=${this.pendingTuiMessages.length}, outageQueue=${this.outageQueue.length}, reconnectingForNewSession=${this.reconnectingForNewSession})`);
       this.tuiWs = null;
       if (this.reconnectingForNewSession) {
         this.log("Clearing pending TUI message buffer (TUI disconnected during app-server reconnect)");
         this.pendingTuiMessages = [];
         this.reconnectingForNewSession = false;
+      }
+      if (this.outageQueue.length > 0 || this.outageTimer !== null) {
+        this.log(`Clearing outage queue on TUI disconnect (buffered=${this.outageQueue.length})`);
+        this.outageQueue = [];
+        this.clearOutageTimer();
       }
       this.emit("tuiDisconnected", connId);
     } else {
@@ -585,6 +670,14 @@ class CodexAdapter extends EventEmitter {
         return;
       }
     }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      if (this.tuiWs && this.tuiWs === ws) {
+        this.bufferDuringOutage(ws, data);
+      } else {
+        this.log(`WARNING: non-primary TUI attempted to send while app-server down \u2014 dropped (connId=${connId})`);
+      }
+      return;
+    }
     let forwarded = data;
     try {
       const parsed = JSON.parse(data);
@@ -605,7 +698,7 @@ class CodexAdapter extends EventEmitter {
     if (this.appServerWs?.readyState === WebSocket.OPEN) {
       this.appServerWs.send(forwarded);
     } else {
-      this.log(`WARNING: app-server not connected, dropping message`);
+      this.log(`WARNING: app-server closed between OPEN check and send \u2014 message lost (connId=${ws.data.connId})`);
     }
   }
   handleAppServerPayload(raw) {
@@ -613,6 +706,11 @@ class CodexAdapter extends EventEmitter {
       const parsed = JSON.parse(raw);
       if (isAppServerNotification(parsed) || typeof parsed === "object" && parsed !== null && !("id" in parsed)) {
         const notificationLike = parsed;
+        if (notificationLike.method === "thread/closed") {
+          const params = notificationLike.params;
+          const threadId = typeof params?.threadId === "string" ? params.threadId : "unknown";
+          this.log(`DIAGNOSTIC: app-server emitted thread/closed (threadId=${threadId}) \u2014 TUI will exit(0) silently`);
+        }
         const forwarded = this.patchResponse(notificationLike, raw);
         this.interceptServerMessage(notificationLike);
         return forwarded;

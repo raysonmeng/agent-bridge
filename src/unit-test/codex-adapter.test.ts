@@ -1114,3 +1114,235 @@ describe("CodexAdapter port precheck — LISTEN-only filter", () => {
     }
   });
 });
+
+describe("CodexAdapter TUI outage recovery", () => {
+  type FakeSocket = {
+    data: { connId: number };
+    closed: Array<{ code: number; reason: string }>;
+    sent: string[];
+    close: (code: number, reason: string) => void;
+    send: (data: string) => void;
+  };
+
+  function makeFakeSocket(connId: number): FakeSocket {
+    const closed: Array<{ code: number; reason: string }> = [];
+    const sent: string[] = [];
+    return {
+      data: { connId },
+      closed,
+      sent,
+      close(code: number, reason: string) {
+        closed.push({ code, reason });
+      },
+      send(data: string) {
+        sent.push(data);
+      },
+    };
+  }
+
+  function setupAdapterWithTui(connId = 1) {
+    const adapter = createAdapter();
+    const logs: string[] = [];
+    adapter.log = (msg: string) => logs.push(msg);
+    const ws = makeFakeSocket(connId);
+    adapter.tuiConnId = connId;
+    adapter.tuiWs = ws;
+    adapter.appServerWs = null;
+    return { adapter, ws, logs };
+  }
+
+  test("buffers TUI message when app-server is not connected (does not close)", () => {
+    const { adapter, ws, logs } = setupAdapterWithTui();
+
+    adapter.onTuiMessage(ws, JSON.stringify({
+      jsonrpc: "2.0",
+      id: 42,
+      method: "test",
+      params: {},
+    }));
+
+    expect(ws.closed.length).toBe(0);
+    expect(adapter.outageQueue.length).toBe(1);
+    expect(adapter.outageTimer).not.toBeNull();
+    expect(logs.some((l) => l.startsWith("DIAGNOSTIC: buffered TUI message"))).toBe(true);
+
+    // Cleanup timer to not leak into other tests.
+    clearTimeout(adapter.outageTimer);
+    adapter.outageTimer = null;
+  });
+
+  test("overflows with 1011 when queue fills past OUTAGE_QUEUE_MAX", () => {
+    const { adapter, ws, logs } = setupAdapterWithTui();
+    const max = (adapter.constructor as any).OUTAGE_QUEUE_MAX;
+    expect(typeof max).toBe("number");
+
+    // Fill to capacity.
+    for (let i = 0; i < max; i++) {
+      adapter.onTuiMessage(ws, JSON.stringify({ jsonrpc: "2.0", id: i, method: "m", params: {} }));
+    }
+    expect(adapter.outageQueue.length).toBe(max);
+    expect(ws.closed.length).toBe(0);
+
+    // One more triggers overflow and close.
+    adapter.onTuiMessage(ws, JSON.stringify({ jsonrpc: "2.0", id: max, method: "m", params: {} }));
+
+    expect(ws.closed.length).toBe(1);
+    expect(ws.closed[0].code).toBe(1011);
+    expect(ws.closed[0].reason).toMatch(/queue overflow/);
+    expect(adapter.outageQueue.length).toBe(0);
+    expect(adapter.outageTimer).toBeNull();
+    expect(logs.some((l) => l.includes("outage queue overflow"))).toBe(true);
+  });
+
+  test("drains queued messages in order when app-server reconnects (notifications)", () => {
+    const { adapter, ws } = setupAdapterWithTui();
+    // Notifications (no id) don't trigger id-rewriting, so we can compare
+    // raw bytes exactly. The key property under test is order + count.
+    adapter.outageQueue = [
+      { raw: '{"jsonrpc":"2.0","method":"a"}', connId: 1 },
+      { raw: '{"jsonrpc":"2.0","method":"b"}', connId: 1 },
+      { raw: '{"jsonrpc":"2.0","method":"c"}', connId: 1 },
+    ];
+    adapter.outageTimer = setTimeout(() => {}, 60_000);
+
+    const sent: string[] = [];
+    adapter.appServerWs = {
+      readyState: 1 /* WebSocket.OPEN */,
+      send: (data: string) => sent.push(data),
+    };
+
+    adapter.drainOutageQueue();
+
+    expect(sent).toEqual([
+      '{"jsonrpc":"2.0","method":"a"}',
+      '{"jsonrpc":"2.0","method":"b"}',
+      '{"jsonrpc":"2.0","method":"c"}',
+    ]);
+    expect(adapter.outageQueue.length).toBe(0);
+    expect(adapter.outageTimer).toBeNull();
+    expect(ws.closed.length).toBe(0);
+  });
+
+  test("drain re-assigns fresh proxy ids for requests (no stale mapping race)", () => {
+    const { adapter, ws } = setupAdapterWithTui();
+    // A TUI → app-server REQUEST (has both id and method). On outage we
+    // store RAW, so the replay goes through onTuiMessage's rewriting path
+    // against the fresh app-server session. This prevents the race Codex
+    // flagged where handleAppServerClose() would wipe upstreamToClient
+    // and strand forwarded bytes pointing at a dead mapping.
+    adapter.outageQueue = [
+      { raw: '{"jsonrpc":"2.0","id":"client-42","method":"thread/start","params":{}}', connId: 1 },
+    ];
+    adapter.outageTimer = setTimeout(() => {}, 60_000);
+
+    const sent: string[] = [];
+    adapter.appServerWs = {
+      readyState: 1 /* WebSocket.OPEN */,
+      send: (data: string) => sent.push(data),
+    };
+    // Observe the upstreamToClient map before and after.
+    expect(adapter.upstreamToClient.size).toBe(0);
+
+    adapter.drainOutageQueue();
+
+    expect(sent.length).toBe(1);
+    const forwarded = JSON.parse(sent[0]);
+    expect(forwarded.method).toBe("thread/start");
+    expect(typeof forwarded.id).toBe("number"); // proxy id is numeric
+    expect(forwarded.id).not.toBe("client-42"); // was rewritten
+
+    // Mapping for the new proxy id was registered on the fresh session.
+    expect(adapter.upstreamToClient.size).toBe(1);
+    const mapping = adapter.upstreamToClient.get(forwarded.id);
+    expect(mapping).toEqual({ connId: 1, clientId: "client-42" });
+
+    expect(ws.closed.length).toBe(0);
+  });
+
+  test("closes TUI with 1011 when outage timer fires", async () => {
+    const { adapter, ws, logs } = setupAdapterWithTui();
+    // Shrink timeout for the test via monkey-patching the static value.
+    (adapter.constructor as any).OUTAGE_TIMEOUT_MS = 20;
+
+    adapter.onTuiMessage(ws, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "x", params: {} }));
+    expect(adapter.outageQueue.length).toBe(1);
+
+    await new Promise((resolve) => setTimeout(resolve, 60));
+
+    expect(ws.closed.length).toBe(1);
+    expect(ws.closed[0].code).toBe(1011);
+    expect(ws.closed[0].reason).toMatch(/after \d+ms/);
+    expect(adapter.outageQueue.length).toBe(0);
+    expect(adapter.outageTimer).toBeNull();
+    expect(logs.some((l) => l.includes("did not return within"))).toBe(true);
+
+    // Restore default.
+    (adapter.constructor as any).OUTAGE_TIMEOUT_MS = 5000;
+  });
+
+  test("drops non-primary outage sends with WARNING log (no close)", () => {
+    const { adapter, logs } = setupAdapterWithTui(2);
+    const stale = makeFakeSocket(1);
+
+    adapter.onTuiMessage(stale, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "x", params: {} }));
+
+    // Stale connection messages are filtered earlier by the tuiConnId guard,
+    // so we don't even reach the forward path. Verify nothing was buffered.
+    expect(adapter.outageQueue.length).toBe(0);
+    expect(adapter.outageTimer).toBeNull();
+    expect(stale.closed.length).toBe(0);
+    // The higher-layer "Dropping message from stale TUI conn" log fires instead.
+    expect(logs.some((l) => l.includes("stale TUI"))).toBe(true);
+  });
+});
+
+describe("CodexAdapter thread/closed diagnostic sniffer", () => {
+  test("logs DIAGNOSTIC line when app-server emits thread/closed", () => {
+    const adapter = createAdapter();
+    const logs: string[] = [];
+    adapter.log = (msg: string) => logs.push(msg);
+    adapter.interceptServerMessage = () => {};
+
+    adapter.handleAppServerPayload(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "thread/closed",
+      params: { threadId: "abc-123" },
+    }));
+
+    const diag = logs.filter((l) => l.startsWith("DIAGNOSTIC: app-server emitted thread/closed"));
+    expect(diag.length).toBe(1);
+    expect(diag[0]).toContain("threadId=abc-123");
+  });
+
+  test("handles thread/closed with missing params gracefully", () => {
+    const adapter = createAdapter();
+    const logs: string[] = [];
+    adapter.log = (msg: string) => logs.push(msg);
+    adapter.interceptServerMessage = () => {};
+
+    adapter.handleAppServerPayload(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "thread/closed",
+    }));
+
+    const diag = logs.filter((l) => l.startsWith("DIAGNOSTIC: app-server emitted thread/closed"));
+    expect(diag.length).toBe(1);
+    expect(diag[0]).toContain("threadId=unknown");
+  });
+
+  test("does not log DIAGNOSTIC for other notifications", () => {
+    const adapter = createAdapter();
+    const logs: string[] = [];
+    adapter.log = (msg: string) => logs.push(msg);
+    adapter.interceptServerMessage = () => {};
+
+    adapter.handleAppServerPayload(JSON.stringify({
+      jsonrpc: "2.0",
+      method: "thread/started",
+      params: { threadId: "abc-123" },
+    }));
+
+    const diag = logs.filter((l) => l.startsWith("DIAGNOSTIC:"));
+    expect(diag.length).toBe(0);
+  });
+});

@@ -17,6 +17,11 @@ export const CLAUDE_MD_SECTION = `\
 You are working in a **multi-agent environment** powered by AgentBridge.
 Another AI agent (Codex, by OpenAI) is available in a parallel session on this machine.
 
+### Communication mechanism
+- **Claude → Codex**: Use the AgentBridge MCP tools (\`reply\` / \`get_messages\`) — these are yours only.
+- **Codex → Claude**: Codex has no symmetric tool. The bridge transparently intercepts Codex's normal output and forwards it to you. Messages arrive as push notifications (or via \`get_messages\` in pull mode).
+- If Codex ever complains it can't find a "send-to-Claude" API, remind it that its side is transparent — it just writes a reply and you'll see it.
+
 ### When to collaborate vs. work solo
 - **Collaborate** when the task benefits from a second perspective, parallel execution, or capabilities you lack (e.g., sandboxed code execution, independent verification).
 - **Work solo** for simple, self-contained tasks where the coordination overhead isn't worth it.
@@ -43,7 +48,14 @@ export const AGENTS_MD_SECTION = `\
 
 You are working in a **multi-agent environment** powered by AgentBridge.
 Another AI agent (Claude, by Anthropic) is available in a parallel session on this machine.
-Communication happens via AgentBridge MCP tools — Claude has \`reply\` and \`get_messages\` tools.
+
+### Communication mechanism (read this first)
+AgentBridge is a **transparent proxy** on your side. You do **not** have a tool to "send a message to Claude".
+
+- **Codex → Claude**: Just write your normal response. The bridge intercepts your \`agentMessage\` output and forwards it to Claude automatically. No tool call needed.
+- **Claude → Codex**: Claude uses its own MCP tools (\`reply\` / \`get_messages\`). Those messages arrive in your session as new user turns — you'll see them like any other user input.
+
+**Do not** search the AgentBridge source for a Codex-side "send" / "reply" / "sendToClaude" API — it does not exist, and looking for it wastes turns. If you catch yourself thinking "I need to find how to message Claude", stop and just write your reply as normal text.
 
 ### When to collaborate vs. work solo
 - **Collaborate** when the task benefits from a second perspective, parallel execution, or capabilities the other agent has.
@@ -61,7 +73,7 @@ Communication happens via AgentBridge MCP tools — Claude has \`reply\` and \`g
 | File editing & refactoring | Yes (via sandbox) | Yes (via tools) |
 
 ### How to start collaborating
-1. When you receive a complex task, **proactively propose a division of labor**.
+1. When you receive a complex task, **proactively propose a division of labor** in your response (Claude will receive it).
 2. State what you'll handle and what you'd like Claude to take on.
 3. Ask for Claude's agreement or counter-proposal before proceeding.
 4. After task completion, **cross-review** each other's work.`;

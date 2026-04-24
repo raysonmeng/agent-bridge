@@ -62,6 +62,19 @@ export class StateDirResolver {
     return join(this.stateDir, "agentbridge.log");
   }
 
+  /**
+   * Dedicated log for `agentbridge codex` wrapper.
+   *
+   * Separate from agentbridge.log so we can see the child codex TUI's
+   * exit code, signal, runtime, args, and the last 64KB of its stderr
+   * without it being drowned in daemon noise. Critical for diagnosing
+   * silent exits (FatalExitRequest / ThreadClosed) where the TUI's
+   * "ERROR:" line on stderr is normally lost to stdio inherit.
+   */
+  get codexWrapperLogFile(): string {
+    return join(this.stateDir, "codex-wrapper.log");
+  }
+
   get killedFile(): string {
     return join(this.stateDir, "killed");
   }

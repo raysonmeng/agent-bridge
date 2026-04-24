@@ -107,6 +107,16 @@ export class CodexAdapter extends EventEmitter {
   // Generation counter to prevent stale app-server close handlers from interfering
   private appServerGeneration = 0;
 
+  // Outage recovery window — when app-server is unintentionally down, buffer
+  // outbound TUI messages briefly so short upstream blips don't kill the TUI.
+  // If the outage runs past OUTAGE_TIMEOUT_MS or the queue overflows, we
+  // fail-fast by closing the TUI WS with code 1011 so codex-rs raises a
+  // visible FatalExitRequest rather than hanging silently.
+  private outageQueue: Array<{ raw: string; connId: number }> = [];
+  private outageTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly OUTAGE_QUEUE_MAX = 64;
+  private static readonly OUTAGE_TIMEOUT_MS = 5000;
+
   constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile) {
     super();
     this.appPort = appPort;
@@ -154,6 +164,10 @@ export class CodexAdapter extends EventEmitter {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+
+    // Cancel any outage recovery in flight
+    this.outageQueue = [];
+    this.clearOutageTimer();
 
     this.appServerWs?.close();
     this.appServerWs = null;
@@ -245,6 +259,8 @@ export class CodexAdapter extends EventEmitter {
         this.reconnectAttempts = 0;
         this.log(isReconnect ? "Reconnected to app-server" : "Connected to app-server");
         this.flushPendingServerResponses();
+        // Drain outage-buffered TUI messages that arrived while upstream was down.
+        this.drainOutageQueue();
         resolve();
       };
 
@@ -365,15 +381,127 @@ export class CodexAdapter extends EventEmitter {
   }
 
   private handleAppServerClose() {
-    this.log("App-server connection closed");
+    // Extra detail helps diagnose the "TUI silent exit" path: if app-server
+    // closes first (upstream-side failure) and TUI sends anything afterwards,
+    // the outage queue absorbs the blow for up to OUTAGE_TIMEOUT_MS; after
+    // that we close the TUI with 1011 so codex-rs raises a visible
+    // FatalExitRequest. The timestamp here pairs with codex-wrapper.log.
+    const intentional = this.intentionalDisconnect;
+    const tuiConnected = this.tuiWs !== null;
+    this.log(
+      `App-server connection closed (intentional=${intentional}, tuiConnected=${tuiConnected}, turnInProgress=${this.turnInProgress})`,
+    );
     this.appServerWs = null;
     // Approval request/response ids are scoped to the current app-server session.
     // If the socket reconnects, replaying old approval state would forward stale ids.
     this.clearResponseTrackingState();
     this.activeTurnIds.clear();
     this.turnInProgress = false;
-    if (!this.intentionalDisconnect) {
+    if (!intentional) {
       this.scheduleReconnect();
+    }
+  }
+
+  // ── Outage recovery queue ─────────────────────────────────────
+
+  /**
+   * Buffer a TUI → app-server message during an upstream outage.
+   *
+   * Called when `onTuiMessage` would otherwise silently drop the message.
+   * Starts a fail-fast timer on first use; overflows close the TUI with
+   * 1011. The buffer is drained in-order when app-server reconnects.
+   */
+  private bufferDuringOutage(ws: ServerWebSocket<TuiSocketData>, raw: string): void {
+    if (this.outageQueue.length >= CodexAdapter.OUTAGE_QUEUE_MAX) {
+      this.log(
+        `ERROR: outage queue overflow (${this.outageQueue.length}/${CodexAdapter.OUTAGE_QUEUE_MAX}) — closing TUI with 1011`,
+      );
+      this.outageQueue = [];
+      this.clearOutageTimer();
+      if (this.tuiWs && this.tuiWs === ws) {
+        try {
+          ws.close(1011, "agentbridge: app-server unavailable; pending TUI queue overflow");
+        } catch (e: any) {
+          this.log(`Failed to close TUI WS after outage queue overflow: ${e.message}`);
+        }
+      }
+      return;
+    }
+
+    this.outageQueue.push({ raw, connId: ws.data.connId });
+    this.log(
+      `DIAGNOSTIC: buffered TUI message while app-server unavailable (queue size=${this.outageQueue.length}/${CodexAdapter.OUTAGE_QUEUE_MAX})`,
+    );
+    this.ensureOutageTimer();
+  }
+
+  private ensureOutageTimer(): void {
+    if (this.outageTimer !== null) return;
+    this.outageTimer = setTimeout(() => {
+      this.outageTimer = null;
+      const buffered = this.outageQueue.length;
+      this.outageQueue = [];
+      this.log(
+        `ERROR: app-server did not return within ${CodexAdapter.OUTAGE_TIMEOUT_MS}ms (buffered=${buffered}) — closing TUI with 1011`,
+      );
+      const ws = this.tuiWs;
+      if (ws) {
+        try {
+          ws.close(
+            1011,
+            `agentbridge: app-server unavailable after ${CodexAdapter.OUTAGE_TIMEOUT_MS}ms; buffered=${buffered}`,
+          );
+        } catch (e: any) {
+          this.log(`Failed to close TUI WS on outage timeout: ${e.message}`);
+        }
+      }
+    }, CodexAdapter.OUTAGE_TIMEOUT_MS);
+  }
+
+  private clearOutageTimer(): void {
+    if (this.outageTimer !== null) {
+      clearTimeout(this.outageTimer);
+      this.outageTimer = null;
+    }
+  }
+
+  /**
+   * Replay the outage queue after app-server reconnects.
+   *
+   * Messages are replayed in original order. We stored RAW TUI bytes
+   * (pre-rewrite), so re-entering `onTuiMessage` produces a fresh proxy id
+   * and a fresh `upstreamToClient` mapping against the new app-server
+   * session — avoiding the response-tracking race where the original
+   * mapping was wiped by `clearResponseTrackingState` on close.
+   */
+  private drainOutageQueue(): void {
+    if (this.outageQueue.length === 0) {
+      this.clearOutageTimer();
+      return;
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) return;
+    const ws = this.tuiWs;
+    if (!ws) {
+      // TUI disconnected between buffer and drain — safe to discard.
+      this.outageQueue = [];
+      this.clearOutageTimer();
+      return;
+    }
+
+    const messages = this.outageQueue;
+    this.outageQueue = [];
+    this.clearOutageTimer();
+    this.log(
+      `DIAGNOSTIC: replaying ${messages.length} buffered TUI messages after app-server reconnect`,
+    );
+    for (const msg of messages) {
+      try {
+        // Re-enter the full TUI message pipeline so rewriting and tracking
+        // run against the fresh app-server session.
+        this.onTuiMessage(ws, msg.raw);
+      } catch (e: any) {
+        this.log(`Failed to replay buffered TUI message (conn #${msg.connId}): ${e.message}`);
+      }
     }
   }
 
@@ -559,13 +687,29 @@ export class CodexAdapter extends EventEmitter {
 
     // Only clear tuiWs if this is still the current connection
     if (this.tuiWs === ws) {
-      this.log(`TUI disconnected (conn #${connId})`);
+      // Capture app-server state at the moment TUI disconnects — critical
+      // for diagnosing "silent exit": did the TUI drop before or after we
+      // lost app-server? This timestamp lines up with codex-wrapper.log's
+      // exit line so we can reconstruct the sequence.
+      const appServerOpen = this.appServerWs?.readyState === WebSocket.OPEN;
+      this.log(
+        `TUI disconnected (conn #${connId}, appServerOpen=${appServerOpen}, turnInProgress=${this.turnInProgress}, pendingTuiMessages=${this.pendingTuiMessages.length}, outageQueue=${this.outageQueue.length}, reconnectingForNewSession=${this.reconnectingForNewSession})`,
+      );
       this.tuiWs = null;
       // Clear any pending reconnection state
       if (this.reconnectingForNewSession) {
         this.log("Clearing pending TUI message buffer (TUI disconnected during app-server reconnect)");
         this.pendingTuiMessages = [];
         this.reconnectingForNewSession = false;
+      }
+      // Clear outage buffer and timer — no TUI to replay to, and stale
+      // messages would be wrong for whatever TUI reconnects next.
+      if (this.outageQueue.length > 0 || this.outageTimer !== null) {
+        this.log(
+          `Clearing outage queue on TUI disconnect (buffered=${this.outageQueue.length})`,
+        );
+        this.outageQueue = [];
+        this.clearOutageTimer();
       }
       this.emit("tuiDisconnected", connId);
     } else {
@@ -656,6 +800,23 @@ export class CodexAdapter extends EventEmitter {
       }
     }
 
+    // Outage-path early return: buffer RAW before any id-rewriting or
+    // upstreamToClient/serverRequestToProxy mutation. This avoids a
+    // response-tracking race where `handleAppServerClose` clears mappings
+    // that our buffered `forwarded` bytes would then point to. On drain
+    // we re-enter this method with the raw bytes and do a fresh rewrite
+    // against the new app-server session.
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      if (this.tuiWs && this.tuiWs === ws) {
+        this.bufferDuringOutage(ws, data);
+      } else {
+        this.log(
+          `WARNING: non-primary TUI attempted to send while app-server down — dropped (connId=${connId})`,
+        );
+      }
+      return;
+    }
+
     let forwarded = data;
     try {
       const parsed = JSON.parse(data);
@@ -676,11 +837,15 @@ export class CodexAdapter extends EventEmitter {
       this.log(`TUI → app-server: (unparseable)`);
     }
 
-    // Forward to app-server
+    // Forward to app-server. The OPEN check above guarantees readyState was
+    // OPEN when we started processing; the narrow race where upstream closes
+    // between that check and here is handled here as a best-effort warning.
     if (this.appServerWs?.readyState === WebSocket.OPEN) {
       this.appServerWs.send(forwarded);
     } else {
-      this.log(`WARNING: app-server not connected, dropping message`);
+      this.log(
+        `WARNING: app-server closed between OPEN check and send — message lost (connId=${ws.data.connId})`,
+      );
     }
   }
 
@@ -691,6 +856,19 @@ export class CodexAdapter extends EventEmitter {
       const parsed: unknown = JSON.parse(raw);
       if (isAppServerNotification(parsed) || (typeof parsed === "object" && parsed !== null && !("id" in parsed))) {
         const notificationLike = parsed as Record<string, unknown>;
+        // Sniff thread/closed → the ONLY signal that correlates with a
+        // silent TUI exit (code 0, empty stderr, no ERROR line). Verified
+        // via Codex's PTY reproduction: server emitting this notification
+        // causes TUI to run ExitMode::Immediate with no output. We log a
+        // high-signal line so codex-wrapper.log's `exit_0_empty_stderr`
+        // classification can be paired up by timestamp with this event.
+        if (notificationLike.method === "thread/closed") {
+          const params = notificationLike.params as Record<string, unknown> | undefined;
+          const threadId = typeof params?.threadId === "string" ? params.threadId : "unknown";
+          this.log(
+            `DIAGNOSTIC: app-server emitted thread/closed (threadId=${threadId}) — TUI will exit(0) silently`,
+          );
+        }
         const forwarded = this.patchResponse(notificationLike, raw);
         this.interceptServerMessage(notificationLike);
         return forwarded;
