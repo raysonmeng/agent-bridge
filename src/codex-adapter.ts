@@ -1173,6 +1173,19 @@ export class CodexAdapter extends EventEmitter {
   }
 
   /**
+   * Build the lsof command used to find LISTENing processes on a TCP port.
+   *
+   * Restricting to `-sTCP:LISTEN` is critical: a bare `lsof -ti :PORT` also
+   * returns processes that merely have an outbound (client) FD to that port,
+   * including stale CLOSED connections from crashed clients. Those false
+   * positives caused `abg claude` to refuse startup whenever a previous
+   * Codex TUI process lingered with a half-closed connection to port 4501.
+   */
+  static buildPortListenLsofCommand(port: number): string {
+    return `lsof -ti tcp:${port} -sTCP:LISTEN`;
+  }
+
+  /**
    * Clean up stale ports before starting.
    * Only kills `codex app-server` processes (our own spawns). If the port is
    * occupied by something else, throws with a clear message.
@@ -1180,7 +1193,9 @@ export class CodexAdapter extends EventEmitter {
   private async checkPorts() {
     for (const port of [this.appPort, this.proxyPort]) {
       try {
-        const pids = execSync(`lsof -ti :${port}`, { encoding: "utf-8" }).trim();
+        const pids = execSync(CodexAdapter.buildPortListenLsofCommand(port), {
+          encoding: "utf-8",
+        }).trim();
         if (!pids) continue;
 
         // Check if the occupying process is a codex app-server (our own stale spawn)
@@ -1220,7 +1235,9 @@ export class CodexAdapter extends EventEmitter {
 
         // Verify port is now free
         try {
-          const remaining = execSync(`lsof -ti :${port}`, { encoding: "utf-8" }).trim();
+          const remaining = execSync(CodexAdapter.buildPortListenLsofCommand(port), {
+            encoding: "utf-8",
+          }).trim();
           if (remaining) {
             throw new Error(
               `Port ${port} is still occupied (PID(s): ${remaining.replace(/\n/g, ", ")}) after cleanup. ` +

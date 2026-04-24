@@ -1008,10 +1008,15 @@ class CodexAdapter extends EventEmitter {
     this.serverRequestToProxy.clear();
     this.pendingServerResponses.clear();
   }
+  static buildPortListenLsofCommand(port) {
+    return `lsof -ti tcp:${port} -sTCP:LISTEN`;
+  }
   async checkPorts() {
     for (const port of [this.appPort, this.proxyPort]) {
       try {
-        const pids = execSync(`lsof -ti :${port}`, { encoding: "utf-8" }).trim();
+        const pids = execSync(CodexAdapter.buildPortListenLsofCommand(port), {
+          encoding: "utf-8"
+        }).trim();
         if (!pids)
           continue;
         const pidList = pids.split(`
@@ -1041,7 +1046,9 @@ class CodexAdapter extends EventEmitter {
           throw new Error(`Port ${port} is already in use by non-Codex process(es): PID(s) ${foreignPids.join(", ")}. ` + `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`);
         }
         try {
-          const remaining = execSync(`lsof -ti :${port}`, { encoding: "utf-8" }).trim();
+          const remaining = execSync(CodexAdapter.buildPortListenLsofCommand(port), {
+            encoding: "utf-8"
+          }).trim();
           if (remaining) {
             throw new Error(`Port ${port} is still occupied (PID(s): ${remaining.replace(/\n/g, ", ")}) after cleanup. ` + `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`);
           }
