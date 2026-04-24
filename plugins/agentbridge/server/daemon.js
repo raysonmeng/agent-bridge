@@ -140,6 +140,11 @@ class CodexAdapter extends EventEmitter {
   outageTimer = null;
   static OUTAGE_QUEUE_MAX = 64;
   static OUTAGE_TIMEOUT_MS = 5000;
+  lastInitializeRaw = null;
+  lastInitializedRaw = null;
+  sessionRestoreInProgress = false;
+  replayPending = new Map;
+  static SESSION_REPLAY_TIMEOUT_MS = 5000;
   constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile) {
     super();
     this.appPort = appPort;
@@ -262,7 +267,14 @@ class CodexAdapter extends EventEmitter {
         this.reconnectAttempts = 0;
         this.log(isReconnect ? "Reconnected to app-server" : "Connected to app-server");
         this.flushPendingServerResponses();
-        this.drainOutageQueue();
+        if (isReconnect) {
+          this.handleSessionRestoreAfterReconnect().finally(() => this.drainOutageQueue()).catch((e) => {
+            const m = e instanceof Error ? e.message : String(e);
+            this.log(`session restore unexpected error: ${m}`);
+          });
+        } else {
+          this.drainOutageQueue();
+        }
         resolve();
       };
       appWs.onmessage = (event) => {
@@ -413,6 +425,97 @@ class CodexAdapter extends EventEmitter {
       clearTimeout(this.outageTimer);
       this.outageTimer = null;
     }
+  }
+  async handleSessionRestoreAfterReconnect() {
+    if (!this.lastInitializeRaw) {
+      this.log("DIAGNOSTIC: no cached initialize to replay after unintentional reconnect");
+      return;
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      this.log("DIAGNOSTIC: app-server not open at session restore start \u2014 skipping");
+      return;
+    }
+    this.sessionRestoreInProgress = true;
+    try {
+      this.log(`DIAGNOSTIC: replaying cached initialize to restore session (threadId=${this.threadId ?? "none"})`);
+      await this.sendReplayAndAwait(this.lastInitializeRaw, "initialize");
+      if (this.lastInitializedRaw && this.appServerWs.readyState === WebSocket.OPEN) {
+        this.appServerWs.send(this.lastInitializedRaw);
+      }
+      if (this.threadId && this.appServerWs.readyState === WebSocket.OPEN) {
+        const replayId = `agentbridge-replay-thread-resume-${Date.now()}`;
+        const resumeRaw = JSON.stringify({
+          jsonrpc: "2.0",
+          id: replayId,
+          method: "thread/resume",
+          params: { threadId: this.threadId }
+        });
+        await this.sendReplayAndAwait(resumeRaw, "thread/resume");
+      }
+      this.log(`DIAGNOSTIC: session restored after unintentional reconnect (threadId=${this.threadId ?? "none"})`);
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log(`ERROR: session restore failed (${msg}) \u2014 closing TUI with 1011`);
+      const tuiWs = this.tuiWs;
+      if (tuiWs) {
+        try {
+          tuiWs.close(1011, `agentbridge: session restore failed: ${msg}`);
+        } catch (closeErr) {
+          const cm = closeErr instanceof Error ? closeErr.message : String(closeErr);
+          this.log(`Failed to close TUI after session restore failure: ${cm}`);
+        }
+      }
+    } finally {
+      this.sessionRestoreInProgress = false;
+    }
+  }
+  sendReplayAndAwait(raw, method) {
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("app-server not open"));
+    }
+    let id;
+    try {
+      const parsed = JSON.parse(raw);
+      if (parsed.id === undefined) {
+        return Promise.reject(new Error(`replay payload for ${method} has no id`));
+      }
+      id = parsed.id;
+    } catch (e) {
+      const m = e instanceof Error ? e.message : String(e);
+      return Promise.reject(new Error(`replay parse failed for ${method}: ${m}`));
+    }
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.replayPending.delete(id);
+        reject(new Error(`replay timeout (${CodexAdapter.SESSION_REPLAY_TIMEOUT_MS}ms) for ${method} id=${JSON.stringify(id)}`));
+      }, CodexAdapter.SESSION_REPLAY_TIMEOUT_MS);
+      this.replayPending.set(id, { method, resolve, reject, timer });
+      try {
+        this.appServerWs.send(raw);
+      } catch (e) {
+        clearTimeout(timer);
+        this.replayPending.delete(id);
+        const m = e instanceof Error ? e.message : String(e);
+        reject(new Error(`replay send failed for ${method}: ${m}`));
+      }
+    });
+  }
+  tryConsumeReplayResponse(payload) {
+    const id = payload.id;
+    if (id === undefined)
+      return false;
+    const pending = this.replayPending.get(id);
+    if (!pending)
+      return false;
+    clearTimeout(pending.timer);
+    this.replayPending.delete(id);
+    if (payload.error !== undefined) {
+      const errMsg = typeof payload.error === "object" && payload.error !== null && "message" in payload.error ? String(payload.error.message ?? "unknown") : JSON.stringify(payload.error);
+      pending.reject(new Error(`${pending.method} rejected: ${errMsg}`));
+    } else {
+      pending.resolve(payload);
+    }
+    return true;
   }
   drainOutageQueue() {
     if (this.outageQueue.length === 0) {
@@ -659,6 +762,7 @@ class CodexAdapter extends EventEmitter {
     } catch {}
     if (!this.replayingBufferedMessages) {
       if (detectedMethod === "initialize") {
+        this.lastInitializeRaw = data;
         this.log("Detected initialize \u2014 reconnecting app-server for fresh session");
         this.reconnectingForNewSession = true;
         this.pendingTuiMessages = [data];
@@ -670,7 +774,10 @@ class CodexAdapter extends EventEmitter {
         return;
       }
     }
-    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+    if (detectedMethod === "initialized") {
+      this.lastInitializedRaw = data;
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN || this.sessionRestoreInProgress) {
       if (this.tuiWs && this.tuiWs === ws) {
         this.bufferDuringOutage(ws, data);
       } else {
@@ -704,6 +811,11 @@ class CodexAdapter extends EventEmitter {
   handleAppServerPayload(raw) {
     try {
       const parsed = JSON.parse(raw);
+      if (typeof parsed === "object" && parsed !== null && "id" in parsed) {
+        if (this.tryConsumeReplayResponse(parsed)) {
+          return null;
+        }
+      }
       if (isAppServerNotification(parsed) || typeof parsed === "object" && parsed !== null && !("id" in parsed)) {
         const notificationLike = parsed;
         if (notificationLike.method === "thread/closed") {

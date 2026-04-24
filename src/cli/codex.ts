@@ -244,6 +244,8 @@ export async function runCodex(args: string[]) {
     //   - Other non-zero → likely upstream bug
     let classification = "normal";
     if (/ERROR: remote app server/.test(tail)) classification = "fatal_exit";
+    else if (/Error: .* failed: Not initialized/.test(tail)) classification = "not_initialized_after_reconnect";
+    else if (/Error: .* failed:/.test(tail)) classification = "rpc_error_exit";
     else if (signal) classification = `signal:${signal}`;
     else if (typeof code === "number" && code !== 0) classification = `nonzero_exit:${code}`;
     else if (code === 0 && tail.trim().length === 0) classification = "exit_0_empty_stderr";

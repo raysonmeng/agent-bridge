@@ -117,6 +117,29 @@ export class CodexAdapter extends EventEmitter {
   private static readonly OUTAGE_QUEUE_MAX = 64;
   private static readonly OUTAGE_TIMEOUT_MS = 5000;
 
+  // Session-state capture for unintentional-reconnect replay.
+  //
+  // When the upstream app-server drops unexpectedly and we silently
+  // reconnect, the new session has no knowledge of initialize/thread
+  // state. The TUI doesn't know the reconnect happened and continues
+  // using its stale session. The first request that requires
+  // initialized state (e.g. turn/steer) gets `"Not initialized"`,
+  // codex-rs exits with `Error: turn/steer failed: Not initialized`.
+  //
+  // To avoid that, we capture the TUI's initialize/initialized payloads
+  // and replay them against the fresh app-server session on
+  // unintentional reconnect. See handleSessionRestoreAfterReconnect.
+  private lastInitializeRaw: string | null = null;
+  private lastInitializedRaw: string | null = null;
+  private sessionRestoreInProgress = false;
+  private replayPending = new Map<number | string, {
+    method: string;
+    resolve: (response: unknown) => void;
+    reject: (err: Error) => void;
+    timer: ReturnType<typeof setTimeout>;
+  }>();
+  private static readonly SESSION_REPLAY_TIMEOUT_MS = 5000;
+
   constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile) {
     super();
     this.appPort = appPort;
@@ -259,8 +282,20 @@ export class CodexAdapter extends EventEmitter {
         this.reconnectAttempts = 0;
         this.log(isReconnect ? "Reconnected to app-server" : "Connected to app-server");
         this.flushPendingServerResponses();
-        // Drain outage-buffered TUI messages that arrived while upstream was down.
-        this.drainOutageQueue();
+        // On unintentional reconnect, restore session state (cached
+        // initialize / thread/resume) BEFORE draining any TUI messages
+        // that might require an initialized session. On first connect,
+        // there's no state to restore so drain immediately.
+        if (isReconnect) {
+          this.handleSessionRestoreAfterReconnect()
+            .finally(() => this.drainOutageQueue())
+            .catch((e: unknown) => {
+              const m = e instanceof Error ? e.message : String(e);
+              this.log(`session restore unexpected error: ${m}`);
+            });
+        } else {
+          this.drainOutageQueue();
+        }
         resolve();
       };
 
@@ -463,6 +498,151 @@ export class CodexAdapter extends EventEmitter {
       clearTimeout(this.outageTimer);
       this.outageTimer = null;
     }
+  }
+
+  // ── Session restore after unintentional reconnect ────────────
+
+  /**
+   * Restore codex-rs session state on the fresh app-server WS.
+   *
+   * Flow:
+   *   1. If no cached initialize, bail (no-op, usually because the
+   *      reconnect happened before the TUI's initial handshake).
+   *   2. Send cached initialize, await response by id.
+   *   3. Send cached `initialized` notification (fire-and-forget).
+   *   4. If we know an active threadId, send `thread/resume` and await.
+   *   5. On any failure, close the TUI with 1011 so codex-rs surfaces a
+   *      visible FatalExitRequest instead of deadlocking on the next
+   *      `"Not initialized"` response.
+   *
+   * Open questions for Codex source review:
+   *   - Is `initialize` idempotent in codex app-server?
+   *   - Does `thread/resume` work against a fresh session, or must it
+   *     follow a session handshake specific to the thread's creator?
+   *   - Are there session-unique fields in initialize that would cause
+   *     replay to be rejected?
+   * See docs/issues-2026-04-24-codex-not-initialized-after-silent-reconnect.md.
+   */
+  private async handleSessionRestoreAfterReconnect(): Promise<void> {
+    if (!this.lastInitializeRaw) {
+      this.log("DIAGNOSTIC: no cached initialize to replay after unintentional reconnect");
+      return;
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      this.log("DIAGNOSTIC: app-server not open at session restore start — skipping");
+      return;
+    }
+
+    this.sessionRestoreInProgress = true;
+    try {
+      this.log(
+        `DIAGNOSTIC: replaying cached initialize to restore session (threadId=${this.threadId ?? "none"})`,
+      );
+      await this.sendReplayAndAwait(this.lastInitializeRaw, "initialize");
+
+      if (this.lastInitializedRaw && this.appServerWs.readyState === WebSocket.OPEN) {
+        this.appServerWs.send(this.lastInitializedRaw);
+      }
+
+      if (this.threadId && this.appServerWs.readyState === WebSocket.OPEN) {
+        const replayId = `agentbridge-replay-thread-resume-${Date.now()}`;
+        const resumeRaw = JSON.stringify({
+          jsonrpc: "2.0",
+          id: replayId,
+          method: "thread/resume",
+          params: { threadId: this.threadId },
+        });
+        await this.sendReplayAndAwait(resumeRaw, "thread/resume");
+      }
+
+      this.log(
+        `DIAGNOSTIC: session restored after unintentional reconnect (threadId=${this.threadId ?? "none"})`,
+      );
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      this.log(
+        `ERROR: session restore failed (${msg}) — closing TUI with 1011`,
+      );
+      const tuiWs = this.tuiWs;
+      if (tuiWs) {
+        try {
+          tuiWs.close(1011, `agentbridge: session restore failed: ${msg}`);
+        } catch (closeErr: unknown) {
+          const cm = closeErr instanceof Error ? closeErr.message : String(closeErr);
+          this.log(`Failed to close TUI after session restore failure: ${cm}`);
+        }
+      }
+    } finally {
+      this.sessionRestoreInProgress = false;
+    }
+  }
+
+  /**
+   * Send a raw JSON-RPC payload to app-server and await the response by id.
+   *
+   * Short-circuits the normal response handler via `replayPending`, so the
+   * response is captured here and NOT forwarded to the TUI (which would
+   * confuse it — the TUI didn't send this request). Rejects on timeout
+   * or if the response carries an `error` field.
+   */
+  private sendReplayAndAwait(raw: string, method: string): Promise<unknown> {
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("app-server not open"));
+    }
+    let id: number | string;
+    try {
+      const parsed = JSON.parse(raw) as { id?: number | string };
+      if (parsed.id === undefined) {
+        return Promise.reject(new Error(`replay payload for ${method} has no id`));
+      }
+      id = parsed.id;
+    } catch (e: unknown) {
+      const m = e instanceof Error ? e.message : String(e);
+      return Promise.reject(new Error(`replay parse failed for ${method}: ${m}`));
+    }
+
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        this.replayPending.delete(id);
+        reject(new Error(`replay timeout (${CodexAdapter.SESSION_REPLAY_TIMEOUT_MS}ms) for ${method} id=${JSON.stringify(id)}`));
+      }, CodexAdapter.SESSION_REPLAY_TIMEOUT_MS);
+
+      this.replayPending.set(id, { method, resolve, reject, timer });
+      try {
+        this.appServerWs!.send(raw);
+      } catch (e: unknown) {
+        clearTimeout(timer);
+        this.replayPending.delete(id);
+        const m = e instanceof Error ? e.message : String(e);
+        reject(new Error(`replay send failed for ${method}: ${m}`));
+      }
+    });
+  }
+
+  /**
+   * Intercept an app-server response that matches a pending replay.
+   *
+   * Returns true if the response was consumed (and should NOT be forwarded
+   * to TUI). Returns false if no replay is awaiting this id.
+   */
+  private tryConsumeReplayResponse(payload: Record<string, unknown>): boolean {
+    const id = payload.id;
+    if (id === undefined) return false;
+    const pending = this.replayPending.get(id as number | string);
+    if (!pending) return false;
+
+    clearTimeout(pending.timer);
+    this.replayPending.delete(id as number | string);
+
+    if (payload.error !== undefined) {
+      const errMsg = typeof payload.error === "object" && payload.error !== null && "message" in payload.error
+        ? String((payload.error as { message?: unknown }).message ?? "unknown")
+        : JSON.stringify(payload.error);
+      pending.reject(new Error(`${pending.method} rejected: ${errMsg}`));
+    } else {
+      pending.resolve(payload);
+    }
+    return true;
   }
 
   /**
@@ -786,6 +966,10 @@ export class CodexAdapter extends EventEmitter {
     // Skip this check during replay to avoid infinite recursion.
     if (!this.replayingBufferedMessages) {
       if (detectedMethod === "initialize") {
+        // Cache the raw payload for use by unintentional-reconnect replay.
+        // Replays use the TUI's original id as-is — safe because the new
+        // app-server session has no prior mapping for it.
+        this.lastInitializeRaw = data;
         this.log("Detected initialize — reconnecting app-server for fresh session");
         this.reconnectingForNewSession = true;
         this.pendingTuiMessages = [data];
@@ -800,13 +984,28 @@ export class CodexAdapter extends EventEmitter {
       }
     }
 
+    // Cache `initialized` notification raw payload — used by
+    // handleSessionRestoreAfterReconnect to recover session state after
+    // an unintentional upstream reconnect.
+    if (detectedMethod === "initialized") {
+      this.lastInitializedRaw = data;
+    }
+
     // Outage-path early return: buffer RAW before any id-rewriting or
     // upstreamToClient/serverRequestToProxy mutation. This avoids a
     // response-tracking race where `handleAppServerClose` clears mappings
     // that our buffered `forwarded` bytes would then point to. On drain
     // we re-enter this method with the raw bytes and do a fresh rewrite
     // against the new app-server session.
-    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+    //
+    // We also treat `sessionRestoreInProgress` as an outage — while we're
+    // replaying cached initialize / thread/resume, we must not let TUI
+    // requests leak onto the still-uninitialized session.
+    if (
+      !this.appServerWs
+      || this.appServerWs.readyState !== WebSocket.OPEN
+      || this.sessionRestoreInProgress
+    ) {
       if (this.tuiWs && this.tuiWs === ws) {
         this.bufferDuringOutage(ws, data);
       } else {
@@ -854,6 +1053,14 @@ export class CodexAdapter extends EventEmitter {
   private handleAppServerPayload(raw: string): string | null {
     try {
       const parsed: unknown = JSON.parse(raw);
+      // Short-circuit: response carries an id that matches a pending
+      // session-restore replay? Consume it and suppress forwarding to
+      // the TUI (which didn't send the request and would be confused).
+      if (typeof parsed === "object" && parsed !== null && "id" in parsed) {
+        if (this.tryConsumeReplayResponse(parsed as Record<string, unknown>)) {
+          return null;
+        }
+      }
       if (isAppServerNotification(parsed) || (typeof parsed === "object" && parsed !== null && !("id" in parsed))) {
         const notificationLike = parsed as Record<string, unknown>;
         // Sniff thread/closed → the ONLY signal that correlates with a

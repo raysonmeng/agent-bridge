@@ -1296,6 +1296,268 @@ describe("CodexAdapter TUI outage recovery", () => {
   });
 });
 
+describe("CodexAdapter session restore after unintentional reconnect", () => {
+  type FakeSocket = {
+    data: { connId: number };
+    closed: Array<{ code: number; reason: string }>;
+    close: (code: number, reason: string) => void;
+    send: (data: string) => void;
+  };
+
+  function makeFakeSocket(connId: number): FakeSocket {
+    const closed: Array<{ code: number; reason: string }> = [];
+    return {
+      data: { connId },
+      closed,
+      close(code: number, reason: string) {
+        closed.push({ code, reason });
+      },
+      send() {},
+    };
+  }
+
+  function makeFakeAppServerWs() {
+    const sent: string[] = [];
+    return {
+      readyState: 1 /* WebSocket.OPEN */,
+      sent,
+      send: function (data: string) {
+        sent.push(data);
+      },
+    };
+  }
+
+  test("sendReplayAndAwait resolves when app-server responds with matching id (no error)", async () => {
+    const adapter = createAdapter();
+    adapter.log = () => {};
+
+    const server = makeFakeAppServerWs();
+    adapter.appServerWs = server;
+
+    const promise = adapter.sendReplayAndAwait(
+      JSON.stringify({ jsonrpc: "2.0", id: "replay-1", method: "initialize" }),
+      "initialize",
+    );
+
+    // Simulate app-server response arriving via handleAppServerPayload.
+    setTimeout(() => {
+      const consumed = adapter.handleAppServerPayload(JSON.stringify({
+        id: "replay-1",
+        result: { capabilities: {} },
+      }));
+      // Response should have been swallowed (not forwarded to TUI).
+      expect(consumed).toBeNull();
+    }, 5);
+
+    const response = await promise;
+    expect(response).toEqual({ id: "replay-1", result: { capabilities: {} } });
+  });
+
+  test("sendReplayAndAwait rejects when app-server responds with error field", async () => {
+    const adapter = createAdapter();
+    adapter.log = () => {};
+
+    adapter.appServerWs = makeFakeAppServerWs();
+
+    const promise = adapter.sendReplayAndAwait(
+      JSON.stringify({ jsonrpc: "2.0", id: "replay-err", method: "initialize" }),
+      "initialize",
+    );
+
+    setTimeout(() => {
+      adapter.handleAppServerPayload(JSON.stringify({
+        id: "replay-err",
+        error: { message: "already initialized" },
+      }));
+    }, 5);
+
+    await expect(promise).rejects.toThrow(/initialize rejected: already initialized/);
+  });
+
+  test("sendReplayAndAwait rejects on timeout", async () => {
+    const adapter = createAdapter();
+    adapter.log = () => {};
+    (adapter.constructor as any).SESSION_REPLAY_TIMEOUT_MS = 30;
+    adapter.appServerWs = makeFakeAppServerWs();
+
+    const promise = adapter.sendReplayAndAwait(
+      JSON.stringify({ jsonrpc: "2.0", id: "replay-timeout", method: "initialize" }),
+      "initialize",
+    );
+
+    await expect(promise).rejects.toThrow(/replay timeout/);
+    (adapter.constructor as any).SESSION_REPLAY_TIMEOUT_MS = 5000;
+  });
+
+  test("handleSessionRestoreAfterReconnect bails when no cached initialize", async () => {
+    const adapter = createAdapter();
+    const logs: string[] = [];
+    adapter.log = (m: string) => logs.push(m);
+
+    adapter.appServerWs = makeFakeAppServerWs();
+    adapter.lastInitializeRaw = null;
+
+    await adapter.handleSessionRestoreAfterReconnect();
+
+    expect(logs.some((l) => l.includes("no cached initialize"))).toBe(true);
+  });
+
+  test("handleSessionRestoreAfterReconnect closes TUI 1011 on initialize failure", async () => {
+    const adapter = createAdapter();
+    adapter.log = () => {};
+
+    const ws = makeFakeSocket(1);
+    adapter.tuiConnId = 1;
+    adapter.tuiWs = ws;
+
+    const server = makeFakeAppServerWs();
+    adapter.appServerWs = server;
+
+    adapter.lastInitializeRaw = JSON.stringify({
+      jsonrpc: "2.0",
+      id: "init-will-fail",
+      method: "initialize",
+      params: {},
+    });
+
+    const restorePromise = adapter.handleSessionRestoreAfterReconnect();
+
+    // Simulate app-server rejecting the replayed initialize.
+    setTimeout(() => {
+      adapter.handleAppServerPayload(JSON.stringify({
+        id: "init-will-fail",
+        error: { message: "schema mismatch" },
+      }));
+    }, 5);
+
+    await restorePromise;
+
+    expect(ws.closed.length).toBe(1);
+    expect(ws.closed[0].code).toBe(1011);
+    expect(ws.closed[0].reason).toMatch(/initialize rejected: schema mismatch/);
+  });
+
+  test("handleSessionRestoreAfterReconnect sends initialize + initialized + thread/resume when happy path", async () => {
+    const adapter = createAdapter();
+    const logs: string[] = [];
+    adapter.log = (m: string) => logs.push(m);
+
+    const ws = makeFakeSocket(1);
+    adapter.tuiConnId = 1;
+    adapter.tuiWs = ws;
+
+    const server = makeFakeAppServerWs();
+    adapter.appServerWs = server;
+
+    adapter.lastInitializeRaw = JSON.stringify({
+      jsonrpc: "2.0",
+      id: "replay-init",
+      method: "initialize",
+      params: {},
+    });
+    adapter.lastInitializedRaw = JSON.stringify({
+      jsonrpc: "2.0",
+      method: "initialized",
+    });
+    adapter.threadId = "thread-xyz";
+
+    const restorePromise = adapter.handleSessionRestoreAfterReconnect();
+
+    // Respond to each replayed request in order.
+    await new Promise((r) => setTimeout(r, 2));
+    adapter.handleAppServerPayload(JSON.stringify({
+      id: "replay-init",
+      result: { ok: true },
+    }));
+
+    // Give the initialize promise a chance to resolve before responding
+    // to thread/resume.
+    await new Promise((r) => setTimeout(r, 2));
+    // The thread/resume id is generated dynamically — inspect what was
+    // sent to find it.
+    const resumeSent = server.sent.find((s: string) => s.includes("thread/resume"));
+    expect(resumeSent).toBeDefined();
+    const resumeId = JSON.parse(resumeSent!).id;
+    adapter.handleAppServerPayload(JSON.stringify({
+      id: resumeId,
+      result: { thread: { id: "thread-xyz" } },
+    }));
+
+    await restorePromise;
+
+    // Expected 3 sends: initialize, initialized, thread/resume.
+    expect(server.sent.length).toBe(3);
+    expect(JSON.parse(server.sent[0]).method).toBe("initialize");
+    expect(JSON.parse(server.sent[1]).method).toBe("initialized");
+    expect(JSON.parse(server.sent[2]).method).toBe("thread/resume");
+    expect(JSON.parse(server.sent[2]).params).toEqual({ threadId: "thread-xyz" });
+
+    expect(ws.closed.length).toBe(0);
+    expect(logs.some((l) => l.includes("session restored"))).toBe(true);
+  });
+
+  test("onTuiMessage buffers during sessionRestoreInProgress (no leak to uninitialized session)", () => {
+    const adapter = createAdapter();
+    adapter.log = () => {};
+
+    const ws = makeFakeSocket(1);
+    adapter.tuiConnId = 1;
+    adapter.tuiWs = ws;
+    adapter.appServerWs = makeFakeAppServerWs();
+    adapter.sessionRestoreInProgress = true;
+
+    adapter.onTuiMessage(ws, JSON.stringify({
+      jsonrpc: "2.0",
+      id: 7,
+      method: "turn/steer",
+      params: {},
+    }));
+
+    // Message should have been pushed onto the outage queue, not sent to
+    // app-server, because restore was in progress.
+    expect(adapter.outageQueue.length).toBe(1);
+    expect(adapter.appServerWs.sent.length).toBe(0);
+
+    // Cleanup timer to avoid leaking into other tests.
+    if (adapter.outageTimer) {
+      clearTimeout(adapter.outageTimer);
+      adapter.outageTimer = null;
+    }
+  });
+
+  test("onTuiMessage caches initialize and initialized raw payloads", () => {
+    const adapter = createAdapter();
+    adapter.log = () => {};
+
+    const ws = makeFakeSocket(1);
+    adapter.tuiConnId = 1;
+    adapter.tuiWs = ws;
+    adapter.appServerWs = makeFakeAppServerWs();
+
+    // The `initialize` request triggers reconnectAppServerForNewSession
+    // which caches the raw payload.
+    const initRaw = JSON.stringify({
+      jsonrpc: "2.0",
+      id: "init-1",
+      method: "initialize",
+      params: { foo: "bar" },
+    });
+    // Stub out the reconnect to avoid real network activity.
+    adapter.reconnectAppServerForNewSession = async () => {};
+    adapter.onTuiMessage(ws, initRaw);
+    expect(adapter.lastInitializeRaw).toBe(initRaw);
+
+    // `initialized` notification is captured in the normal forward path.
+    const initedRaw = JSON.stringify({
+      jsonrpc: "2.0",
+      method: "initialized",
+    });
+    adapter.reconnectingForNewSession = false;
+    adapter.onTuiMessage(ws, initedRaw);
+    expect(adapter.lastInitializedRaw).toBe(initedRaw);
+  });
+});
+
 describe("CodexAdapter thread/closed diagnostic sniffer", () => {
   test("logs DIAGNOSTIC line when app-server emits thread/closed", () => {
     const adapter = createAdapter();
