@@ -33,6 +33,7 @@ import type { BridgeMessage } from "./types";
 
 export type ReplySender = (msg: BridgeMessage, requireReply?: boolean) => Promise<{ success: boolean; error?: string }>;
 export type DeliveryMode = "push" | "pull" | "dual" | "auto";
+export type PushMethod = "claude/channel" | "standard";
 
 export const CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
@@ -58,8 +59,9 @@ export const CLAUDE_INSTRUCTIONS = [
   "",
   "## How to interact",
   "- Use the reply tool to send messages back to Codex — pass chat_id back.",
-  "- Use the get_messages tool to check for pending messages from Codex.",
-  "- After sending a reply, call get_messages to check for responses.",
+  "- Use the get_messages tool to check for pending messages from Codex (non-blocking snapshot).",
+  "- Use the wait_for_messages tool to BLOCK until Codex replies (default 60s). Prefer this over auto-poll when you sent reply(require_reply=true) and want a real-time response — re-call after each timeout to keep listening, stop only when the user signals so or Codex sends ✅ finished.",
+  "- After sending a reply, call get_messages or wait_for_messages to receive Codex's response.",
   "- When the user asks about Codex status or progress, call get_messages.",
   "",
   "## Turn coordination",
@@ -77,6 +79,7 @@ export class ClaudeAdapter extends EventEmitter {
   private replySender: ReplySender | null = null;
   private readonly logFile: string;
   private readonly queue: PersistentMessageQueue;
+  private readonly pushMethod: PushMethod;
 
   // Dual-mode transport
   private readonly configuredMode: DeliveryMode;
@@ -98,6 +101,8 @@ export class ClaudeAdapter extends EventEmitter {
 
     const envMode = process.env.AGENTBRIDGE_MODE as DeliveryMode | undefined;
     this.configuredMode = envMode && ["push", "pull", "dual", "auto"].includes(envMode) ? envMode : "auto";
+    const envPushMethod = process.env.AGENTBRIDGE_PUSH_METHOD;
+    this.pushMethod = envPushMethod === "standard" ? "standard" : "claude/channel";
     this.maxBufferedMessages = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
 
     this.server = new Server(
@@ -105,6 +110,7 @@ export class ClaudeAdapter extends EventEmitter {
       {
         capabilities: {
           experimental: { "claude/channel": {} },
+          logging: {},
           tools: {},
         },
         instructions: CLAUDE_INSTRUCTIONS,
@@ -120,7 +126,9 @@ export class ClaudeAdapter extends EventEmitter {
     const transport = new StdioServerTransport();
     this.resolveMode();
     await this.server.connect(transport);
-    this.log(`MCP server connected (mode: ${this.resolvedMode})`);
+    const clientCapabilities = (this.server as any)._clientCapabilities;
+    this.log(`MCP server connected (mode: ${this.resolvedMode}, pushMethod: ${this.pushMethod})`);
+    this.log(`MCP client capabilities: ${JSON.stringify(clientCapabilities ?? null)}`);
     this.emit("ready");
   }
 
@@ -160,7 +168,7 @@ export class ClaudeAdapter extends EventEmitter {
   // ── Message Delivery ───────────────────────────────────────
 
   async pushNotification(message: BridgeMessage) {
-    this.log(`pushNotification (instance=${this.instanceId}, mode=${this.resolvedMode}, msgId=${message.id}, len=${message.content.length})`);
+    this.log(`pushNotification (instance=${this.instanceId}, mode=${this.resolvedMode}, pushMethod=${this.pushMethod}, msgId=${message.id}, len=${message.content.length})`);
     if (this.resolvedMode === "dual") {
       const entry = this.queueForPull(message);
       if (this.lastQueueWasDuplicate) {
@@ -180,20 +188,7 @@ export class ClaudeAdapter extends EventEmitter {
     const ts = new Date(message.timestamp).toISOString();
 
     try {
-      await this.server.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: message.content,
-          meta: {
-            chat_id: this.sessionId,
-            message_id: msgId,
-            user: "Codex",
-            user_id: "codex",
-            ts,
-            source_type: "codex",
-          },
-        },
-      });
+      await this.server.notification(this.buildPushNotification(message, msgId, ts) as any);
       this.log(`Pushed notification: ${msgId}`);
       if (persistedMessageId) {
         this.queue.markPushed(persistedMessageId);
@@ -217,6 +212,39 @@ export class ClaudeAdapter extends EventEmitter {
         this.queueForPull(message);
       }
     }
+  }
+
+  private buildPushNotification(message: BridgeMessage, msgId: string, ts: string) {
+    const meta = {
+      chat_id: this.sessionId,
+      message_id: msgId,
+      user: "Codex",
+      user_id: "codex",
+      ts,
+      source_type: "codex",
+    };
+
+    if (this.pushMethod === "standard") {
+      return {
+        method: "notifications/message",
+        params: {
+          level: "info",
+          logger: "agentbridge",
+          data: {
+            content: message.content,
+            meta,
+          },
+        },
+      };
+    }
+
+    return {
+      method: "notifications/claude/channel",
+      params: {
+        content: message.content,
+        meta,
+      },
+    };
   }
 
   private queueForPull(message: BridgeMessage): QueueEntry {
@@ -345,10 +373,25 @@ export class ClaudeAdapter extends EventEmitter {
         {
           name: "get_messages",
           description:
-            "Check for new messages from Codex. Call this after sending a reply or when you expect a response from Codex.",
+            "Check for new messages from Codex. Returns immediately with a snapshot (may be empty).",
           inputSchema: {
             type: "object" as const,
             properties: {},
+            required: [],
+          },
+        },
+        {
+          name: "wait_for_messages",
+          description:
+            "Block until Codex sends a new message, or until timeout (default 60s, max 60s). Use proactively in a listening loop after reply(require_reply=true): wait_for_messages → process arrival → reply → wait_for_messages again. On arrival, drains the queue exactly like get_messages. On timeout, returns a 'timed_out' sentinel — re-call to keep listening unless the user told you to stop.",
+          inputSchema: {
+            type: "object" as const,
+            properties: {
+              timeout_s: {
+                type: "number",
+                description: "How long to block in seconds (default 60, max 60, min 1).",
+              },
+            },
             required: [],
           },
         },
@@ -366,11 +409,49 @@ export class ClaudeAdapter extends EventEmitter {
         return this.drainMessages();
       }
 
+      if (name === "wait_for_messages") {
+        return this.waitForMessages(args as Record<string, unknown>);
+      }
+
       return {
         content: [{ type: "text" as const, text: `Unknown tool: ${name}` }],
         isError: true,
       };
     });
+  }
+
+  private async waitForMessages(args: Record<string, unknown>) {
+    const requested = Number(args?.timeout_s ?? 60);
+    const timeoutS = Math.min(Math.max(Number.isFinite(requested) ? requested : 60, 1), 60);
+    const deadline = Date.now() + timeoutS * 1000;
+    const pollIntervalMs = 500;
+
+    this.log(`wait_for_messages start (instance=${this.instanceId}, timeout_s=${timeoutS}, pending=${this.queue.countUndrained()})`);
+
+    while (Date.now() < deadline) {
+      if (this.queue.countUndrained() > 0) {
+        this.log(`wait_for_messages woke (instance=${this.instanceId}, pending=${this.queue.countUndrained()})`);
+        return this.drainMessages();
+      }
+      await new Promise((r) => setTimeout(r, pollIntervalMs));
+    }
+
+    this.log(`wait_for_messages timed out (instance=${this.instanceId}, timeout_s=${timeoutS})`);
+    this.queue.audit({
+      event: "wait_for_messages_timeout",
+      direction: "internal",
+      sender: "claude",
+      chatId: this.sessionId,
+      deliveryMode: this.getDeliveryMode(),
+    });
+    return {
+      content: [
+        {
+          type: "text" as const,
+          text: `[wait_for_messages] timed_out after ${timeoutS}s — no new Codex messages. Call wait_for_messages again to keep listening, or stop if the user signaled to stop.`,
+        },
+      ],
+    };
   }
 
   private async handleReply(args: Record<string, unknown>) {

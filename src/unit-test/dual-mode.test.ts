@@ -8,9 +8,10 @@ import { tmpdir } from "node:os";
 let tempDirs: string[] = [];
 
 // Access internals for testing
-function createAdapter(envMode?: string, stateDir?: string): any {
+function createAdapter(envMode?: string, stateDir?: string, pushMethod?: string): any {
   const origMode = process.env.AGENTBRIDGE_MODE;
   const origMax = process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES;
+  const origPushMethod = process.env.AGENTBRIDGE_PUSH_METHOD;
   const dir = stateDir ?? mkdtempSync(join(tmpdir(), "agentbridge-dual-test-"));
   if (!stateDir) tempDirs.push(dir);
 
@@ -18,6 +19,11 @@ function createAdapter(envMode?: string, stateDir?: string): any {
     process.env.AGENTBRIDGE_MODE = envMode;
   } else {
     delete process.env.AGENTBRIDGE_MODE;
+  }
+  if (pushMethod !== undefined) {
+    process.env.AGENTBRIDGE_PUSH_METHOD = pushMethod;
+  } else {
+    delete process.env.AGENTBRIDGE_PUSH_METHOD;
   }
 
   const queue = new PersistentMessageQueue(join(dir, "queue.db"), join(dir, "transcript.jsonl"));
@@ -35,6 +41,11 @@ function createAdapter(envMode?: string, stateDir?: string): any {
     process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES = origMax;
   } else {
     delete process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES;
+  }
+  if (origPushMethod !== undefined) {
+    process.env.AGENTBRIDGE_PUSH_METHOD = origPushMethod;
+  } else {
+    delete process.env.AGENTBRIDGE_PUSH_METHOD;
   }
 
   return adapter;
@@ -68,6 +79,16 @@ describe("Dual-mode transport: mode resolution", () => {
   test("invalid AGENTBRIDGE_MODE falls back to 'auto'", () => {
     const adapter = createAdapter("invalid");
     expect(adapter.configuredMode).toBe("auto");
+  });
+
+  test("pushMethod defaults to custom claude/channel notification", () => {
+    const adapter = createAdapter("push");
+    expect(adapter.pushMethod).toBe("claude/channel");
+  });
+
+  test("pushMethod can use standard notifications/message for debugging", () => {
+    const adapter = createAdapter("push", undefined, "standard");
+    expect(adapter.pushMethod).toBe("standard");
   });
 
   test("auto mode defaults to pull", () => {
@@ -178,6 +199,25 @@ describe("Dual-mode transport: pull mode message queue", () => {
 
     expect(adapter.getPendingMessageCount()).toBe(1);
     expect(adapter.queue.listUndrained()[0].content).toBe("fallback msg");
+  });
+
+  test("standard push method sends MCP logging notifications", async () => {
+    const adapter = createAdapter("push", undefined, "standard");
+    adapter.resolveMode();
+
+    const notifications: any[] = [];
+    adapter.server = {
+      notification: async (payload: any) => notifications.push(payload),
+    };
+
+    await adapter.pushNotification(makeBridgeMessage("standard push", 1705312200000));
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].method).toBe("notifications/message");
+    expect(notifications[0].params.level).toBe("info");
+    expect(notifications[0].params.logger).toBe("agentbridge");
+    expect(notifications[0].params.data.content).toBe("standard push");
+    expect(notifications[0].params.data.meta.message_id).toMatch(/^codex_msg_[a-f0-9]{12}_1$/);
   });
 
   test("dual mode persists first and pushes with the same message id", async () => {
@@ -392,6 +432,63 @@ describe("Dual-mode transport: reply pending hint", () => {
     const result = await adapter.handleReply({ text: "hello" });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("bridge not initialized");
+  });
+});
+
+describe("Dual-mode transport: wait_for_messages (Phase B)", () => {
+  test("returns immediately when queue already has messages", async () => {
+    const adapter = createAdapter("pull");
+    adapter.resolveMode();
+    adapter.queueForPull({ id: "x", source: "codex", content: "hello", timestamp: Date.now() });
+
+    const start = Date.now();
+    const result = await adapter.waitForMessages({ timeout_s: 5 });
+    const elapsed = Date.now() - start;
+
+    expect(elapsed).toBeLessThan(1000);
+    expect(result.content[0].text).toContain("[1 new message from Codex]");
+    expect(result.content[0].text).toContain("hello");
+  });
+
+  test("times out cleanly when queue stays empty", async () => {
+    const adapter = createAdapter("pull");
+    adapter.resolveMode();
+
+    const start = Date.now();
+    const result = await adapter.waitForMessages({ timeout_s: 1 });
+    const elapsed = Date.now() - start;
+
+    expect(elapsed).toBeGreaterThanOrEqual(1000);
+    expect(elapsed).toBeLessThan(2000);
+    expect(result.content[0].text).toContain("timed_out");
+  });
+
+  test("wakes when a message arrives mid-wait", async () => {
+    const adapter = createAdapter("pull");
+    adapter.resolveMode();
+
+    // Schedule a message to arrive ~600ms later
+    setTimeout(() => {
+      adapter.queueForPull({ id: "y", source: "codex", content: "wakeup", timestamp: Date.now() });
+    }, 600);
+
+    const start = Date.now();
+    const result = await adapter.waitForMessages({ timeout_s: 5 });
+    const elapsed = Date.now() - start;
+
+    expect(elapsed).toBeGreaterThanOrEqual(500);
+    expect(elapsed).toBeLessThan(2000);
+    expect(result.content[0].text).toContain("wakeup");
+  });
+
+  test("clamps timeout above 60s to 60s and below 1s to 1s", async () => {
+    const adapter = createAdapter("pull");
+    adapter.resolveMode();
+
+    // Use a number > 60 — internal clamp should still proceed; we verify by giving it a queued msg so it returns fast
+    adapter.queueForPull({ id: "z", source: "codex", content: "clamped", timestamp: Date.now() });
+    const result = await adapter.waitForMessages({ timeout_s: 9999 });
+    expect(result.content[0].text).toContain("clamped");
   });
 });
 

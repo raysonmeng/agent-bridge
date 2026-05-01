@@ -13908,8 +13908,9 @@ var CLAUDE_INSTRUCTIONS = [
   "",
   "## How to interact",
   "- Use the reply tool to send messages back to Codex \u2014 pass chat_id back.",
-  "- Use the get_messages tool to check for pending messages from Codex.",
-  "- After sending a reply, call get_messages to check for responses.",
+  "- Use the get_messages tool to check for pending messages from Codex (non-blocking snapshot).",
+  "- Use the wait_for_messages tool to BLOCK until Codex replies (default 60s). Prefer this over auto-poll when you sent reply(require_reply=true) and want a real-time response \u2014 re-call after each timeout to keep listening, stop only when the user signals so or Codex sends \u2705 finished.",
+  "- After sending a reply, call get_messages or wait_for_messages to receive Codex's response.",
   "- When the user asks about Codex status or progress, call get_messages.",
   "",
   "## Turn coordination",
@@ -13928,6 +13929,7 @@ class ClaudeAdapter extends EventEmitter {
   replySender = null;
   logFile;
   queue;
+  pushMethod;
   configuredMode;
   resolvedMode = null;
   pendingMessages = [];
@@ -13945,10 +13947,13 @@ class ClaudeAdapter extends EventEmitter {
     this.log(`ClaudeAdapter created (instance=${this.instanceId})`);
     const envMode = process.env.AGENTBRIDGE_MODE;
     this.configuredMode = envMode && ["push", "pull", "dual", "auto"].includes(envMode) ? envMode : "auto";
+    const envPushMethod = process.env.AGENTBRIDGE_PUSH_METHOD;
+    this.pushMethod = envPushMethod === "standard" ? "standard" : "claude/channel";
     this.maxBufferedMessages = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
     this.server = new Server({ name: "agentbridge", version: "0.1.0" }, {
       capabilities: {
         experimental: { "claude/channel": {} },
+        logging: {},
         tools: {}
       },
       instructions: CLAUDE_INSTRUCTIONS
@@ -13959,7 +13964,9 @@ class ClaudeAdapter extends EventEmitter {
     const transport = new StdioServerTransport;
     this.resolveMode();
     await this.server.connect(transport);
-    this.log(`MCP server connected (mode: ${this.resolvedMode})`);
+    const clientCapabilities = this.server._clientCapabilities;
+    this.log(`MCP server connected (mode: ${this.resolvedMode}, pushMethod: ${this.pushMethod})`);
+    this.log(`MCP client capabilities: ${JSON.stringify(clientCapabilities ?? null)}`);
     this.emit("ready");
   }
   setReplySender(sender) {
@@ -13983,7 +13990,7 @@ class ClaudeAdapter extends EventEmitter {
     }
   }
   async pushNotification(message) {
-    this.log(`pushNotification (instance=${this.instanceId}, mode=${this.resolvedMode}, msgId=${message.id}, len=${message.content.length})`);
+    this.log(`pushNotification (instance=${this.instanceId}, mode=${this.resolvedMode}, pushMethod=${this.pushMethod}, msgId=${message.id}, len=${message.content.length})`);
     if (this.resolvedMode === "dual") {
       const entry = this.queueForPull(message);
       if (this.lastQueueWasDuplicate) {
@@ -14001,20 +14008,7 @@ class ClaudeAdapter extends EventEmitter {
     const msgId = persistedMessageId ?? this.nextNotificationId();
     const ts = new Date(message.timestamp).toISOString();
     try {
-      await this.server.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: message.content,
-          meta: {
-            chat_id: this.sessionId,
-            message_id: msgId,
-            user: "Codex",
-            user_id: "codex",
-            ts,
-            source_type: "codex"
-          }
-        }
-      });
+      await this.server.notification(this.buildPushNotification(message, msgId, ts));
       this.log(`Pushed notification: ${msgId}`);
       if (persistedMessageId) {
         this.queue.markPushed(persistedMessageId);
@@ -14038,6 +14032,36 @@ class ClaudeAdapter extends EventEmitter {
         this.queueForPull(message);
       }
     }
+  }
+  buildPushNotification(message, msgId, ts) {
+    const meta2 = {
+      chat_id: this.sessionId,
+      message_id: msgId,
+      user: "Codex",
+      user_id: "codex",
+      ts,
+      source_type: "codex"
+    };
+    if (this.pushMethod === "standard") {
+      return {
+        method: "notifications/message",
+        params: {
+          level: "info",
+          logger: "agentbridge",
+          data: {
+            content: message.content,
+            meta: meta2
+          }
+        }
+      };
+    }
+    return {
+      method: "notifications/claude/channel",
+      params: {
+        content: message.content,
+        meta: meta2
+      }
+    };
   }
   queueForPull(message) {
     if (this.queue.countUndrained() >= this.maxBufferedMessages) {
@@ -14156,10 +14180,24 @@ ${formatted}`
         },
         {
           name: "get_messages",
-          description: "Check for new messages from Codex. Call this after sending a reply or when you expect a response from Codex.",
+          description: "Check for new messages from Codex. Returns immediately with a snapshot (may be empty).",
           inputSchema: {
             type: "object",
             properties: {},
+            required: []
+          }
+        },
+        {
+          name: "wait_for_messages",
+          description: "Block until Codex sends a new message, or until timeout (default 60s, max 60s). Use proactively in a listening loop after reply(require_reply=true): wait_for_messages \u2192 process arrival \u2192 reply \u2192 wait_for_messages again. On arrival, drains the queue exactly like get_messages. On timeout, returns a 'timed_out' sentinel \u2014 re-call to keep listening unless the user told you to stop.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              timeout_s: {
+                type: "number",
+                description: "How long to block in seconds (default 60, max 60, min 1)."
+              }
+            },
             required: []
           }
         }
@@ -14173,11 +14211,44 @@ ${formatted}`
       if (name === "get_messages") {
         return this.drainMessages();
       }
+      if (name === "wait_for_messages") {
+        return this.waitForMessages(args);
+      }
       return {
         content: [{ type: "text", text: `Unknown tool: ${name}` }],
         isError: true
       };
     });
+  }
+  async waitForMessages(args) {
+    const requested = Number(args?.timeout_s ?? 60);
+    const timeoutS = Math.min(Math.max(Number.isFinite(requested) ? requested : 60, 1), 60);
+    const deadline = Date.now() + timeoutS * 1000;
+    const pollIntervalMs = 500;
+    this.log(`wait_for_messages start (instance=${this.instanceId}, timeout_s=${timeoutS}, pending=${this.queue.countUndrained()})`);
+    while (Date.now() < deadline) {
+      if (this.queue.countUndrained() > 0) {
+        this.log(`wait_for_messages woke (instance=${this.instanceId}, pending=${this.queue.countUndrained()})`);
+        return this.drainMessages();
+      }
+      await new Promise((r) => setTimeout(r, pollIntervalMs));
+    }
+    this.log(`wait_for_messages timed out (instance=${this.instanceId}, timeout_s=${timeoutS})`);
+    this.queue.audit({
+      event: "wait_for_messages_timeout",
+      direction: "internal",
+      sender: "claude",
+      chatId: this.sessionId,
+      deliveryMode: this.getDeliveryMode()
+    });
+    return {
+      content: [
+        {
+          type: "text",
+          text: `[wait_for_messages] timed_out after ${timeoutS}s \u2014 no new Codex messages. Call wait_for_messages again to keep listening, or stop if the user signaled to stop.`
+        }
+      ]
+    };
   }
   async handleReply(args) {
     const text = args?.text;
