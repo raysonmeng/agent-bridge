@@ -14103,6 +14103,9 @@ class DaemonClient extends EventEmitter2 {
         case "status":
           this.emit("status", message.status);
           return;
+        case "session_probe":
+          this.send({ type: "session_probe_ack", probeId: message.probeId });
+          return;
       }
     };
     ws.onclose = (event) => {
