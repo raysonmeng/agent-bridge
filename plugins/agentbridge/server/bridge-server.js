@@ -6518,7 +6518,7 @@ var require_dist = __commonJS((exports, module) => {
 });
 
 // src/bridge.ts
-import { appendFileSync as appendFileSync2 } from "fs";
+import { appendFileSync as appendFileSync3 } from "fs";
 
 // node_modules/zod/v4/core/core.js
 var NEVER = Object.freeze({
@@ -13662,10 +13662,212 @@ class StdioServerTransport {
 // src/claude-adapter.ts
 import { EventEmitter } from "events";
 import { randomUUID } from "crypto";
-import { appendFileSync } from "fs";
+import { appendFileSync as appendFileSync2 } from "fs";
+import { dirname as dirname2, join as join2 } from "path";
+
+// src/message-queue.ts
+import { Database } from "bun:sqlite";
+import { appendFileSync, mkdirSync } from "fs";
+import { createHash } from "crypto";
+import { dirname } from "path";
+
+class PersistentMessageQueue {
+  db;
+  auditFile;
+  constructor(dbFile, auditFile) {
+    mkdirSync(dirname(dbFile), { recursive: true });
+    this.auditFile = auditFile;
+    this.db = new Database(dbFile);
+    this.db.exec("PRAGMA journal_mode = WAL");
+    this.db.exec("PRAGMA synchronous = NORMAL");
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS messages (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        message_id TEXT NOT NULL UNIQUE,
+        chat_id TEXT NOT NULL,
+        source TEXT NOT NULL,
+        content TEXT NOT NULL,
+        timestamp INTEGER NOT NULL,
+        marker TEXT NOT NULL,
+        content_hash TEXT NOT NULL,
+        pushed_at INTEGER,
+        push_error TEXT,
+        drained_at INTEGER,
+        acked_at INTEGER,
+        created_at INTEGER NOT NULL
+      )
+    `);
+    const cols = this.db.query("PRAGMA table_info(messages)").all();
+    if (!cols.some((c) => c.name === "acked_at")) {
+      this.db.exec("ALTER TABLE messages ADD COLUMN acked_at INTEGER");
+    }
+    this.db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_undrained_dedupe
+      ON messages(chat_id, content_hash)
+      WHERE drained_at IS NULL
+    `);
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_messages_undrained_seq ON messages(drained_at, seq)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_messages_unacked_undrained ON messages(acked_at, drained_at, seq)");
+  }
+  enqueue(input) {
+    const contentHash = hashContent(input.message.content);
+    const marker = extractMarker(input.message.content);
+    const createdAt = Date.now();
+    const insert = this.db.query(`
+      INSERT OR IGNORE INTO messages (
+        message_id, chat_id, source, content, timestamp, marker, content_hash, created_at
+      ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+    `);
+    insert.run(input.messageId, input.chatId, input.message.source, input.message.content, input.message.timestamp, marker, contentHash, createdAt);
+    const entry = this.findUndrainedByChatAndHash(input.chatId, contentHash);
+    if (!entry) {
+      throw new Error("Failed to persist AgentBridge message queue entry.");
+    }
+    return entry;
+  }
+  listUndrained() {
+    return this.db.query(`
+      SELECT
+        seq,
+        message_id AS messageId,
+        chat_id AS chatId,
+        source,
+        content,
+        timestamp,
+        marker,
+        content_hash AS contentHash,
+        pushed_at AS pushedAt,
+        push_error AS pushError,
+        drained_at AS drainedAt,
+        acked_at AS ackedAt,
+        created_at AS createdAt
+      FROM messages
+      WHERE drained_at IS NULL
+      ORDER BY seq ASC
+    `).all();
+  }
+  listUnackedUndrained() {
+    return this.db.query(`
+      SELECT
+        seq,
+        message_id AS messageId,
+        chat_id AS chatId,
+        source,
+        content,
+        timestamp,
+        marker,
+        content_hash AS contentHash,
+        pushed_at AS pushedAt,
+        push_error AS pushError,
+        drained_at AS drainedAt,
+        acked_at AS ackedAt,
+        created_at AS createdAt
+      FROM messages
+      WHERE drained_at IS NULL AND acked_at IS NULL
+      ORDER BY seq ASC
+    `).all();
+  }
+  countUnackedUndrained() {
+    const row = this.db.query("SELECT COUNT(*) AS count FROM messages WHERE drained_at IS NULL AND acked_at IS NULL").get();
+    return row.count;
+  }
+  countUndrained() {
+    const row = this.db.query("SELECT COUNT(*) AS count FROM messages WHERE drained_at IS NULL").get();
+    return row.count;
+  }
+  markPushed(messageId, pushedAt = Date.now()) {
+    this.db.query("UPDATE messages SET pushed_at = ?, push_error = NULL WHERE message_id = ?").run(pushedAt, messageId);
+  }
+  markPushFailed(messageId, error2) {
+    this.db.query("UPDATE messages SET push_error = ? WHERE message_id = ?").run(error2, messageId);
+  }
+  markDrained(messageIds, drainedAt = Date.now()) {
+    if (messageIds.length === 0)
+      return;
+    const update = this.db.query("UPDATE messages SET drained_at = ? WHERE message_id = ? AND drained_at IS NULL");
+    const transaction = this.db.transaction((ids) => {
+      for (const id of ids)
+        update.run(drainedAt, id);
+    });
+    transaction(messageIds);
+  }
+  ackByChatId(chatId, ackedAt = Date.now()) {
+    const result = this.db.query("UPDATE messages SET acked_at = ? WHERE chat_id = ? AND drained_at IS NULL AND acked_at IS NULL").run(ackedAt, chatId);
+    return Number(result.changes ?? 0);
+  }
+  markOldestUndrainedDropped(droppedAt = Date.now()) {
+    const entry = this.db.query(`
+      SELECT
+        seq,
+        message_id AS messageId,
+        chat_id AS chatId,
+        source,
+        content,
+        timestamp,
+        marker,
+        content_hash AS contentHash,
+        pushed_at AS pushedAt,
+        push_error AS pushError,
+        drained_at AS drainedAt,
+        acked_at AS ackedAt,
+        created_at AS createdAt
+      FROM messages
+      WHERE drained_at IS NULL
+      ORDER BY seq ASC
+      LIMIT 1
+    `).get();
+    if (!entry)
+      return null;
+    this.db.query("UPDATE messages SET drained_at = ? WHERE message_id = ? AND drained_at IS NULL").run(droppedAt, entry.messageId);
+    return entry;
+  }
+  audit(event) {
+    try {
+      mkdirSync(dirname(this.auditFile), { recursive: true });
+      appendFileSync(this.auditFile, JSON.stringify({ ts: Date.now(), ...event }) + `
+`, "utf-8");
+    } catch {}
+  }
+  close() {
+    this.db.close();
+  }
+  findUndrainedByChatAndHash(chatId, contentHash) {
+    return this.db.query(`
+      SELECT
+        seq,
+        message_id AS messageId,
+        chat_id AS chatId,
+        source,
+        content,
+        timestamp,
+        marker,
+        content_hash AS contentHash,
+        pushed_at AS pushedAt,
+        push_error AS pushError,
+        drained_at AS drainedAt,
+        acked_at AS ackedAt,
+        created_at AS createdAt
+      FROM messages
+      WHERE chat_id = ? AND content_hash = ? AND drained_at IS NULL
+      ORDER BY seq ASC
+      LIMIT 1
+    `).get(chatId, contentHash);
+  }
+}
+function hashContent(content) {
+  return createHash("sha256").update(content).digest("hex");
+}
+function extractMarker(content) {
+  const match = content.match(/^\[(IMPORTANT|STATUS|FYI)\]/);
+  return match?.[1] ?? "untagged";
+}
+function previewContent(content, maxLength = 160) {
+  const compact = content.replace(/\s+/g, " ").trim();
+  return compact.length > maxLength ? `${compact.slice(0, maxLength)}...` : compact;
+}
 
 // src/state-dir.ts
-import { mkdirSync, existsSync } from "fs";
+import { mkdirSync as mkdirSync2, existsSync } from "fs";
 import { join } from "path";
 import { homedir, platform } from "os";
 
@@ -13684,7 +13886,7 @@ class StateDirResolver {
   }
   ensure() {
     if (!existsSync(this.stateDir)) {
-      mkdirSync(this.stateDir, { recursive: true });
+      mkdirSync2(this.stateDir, { recursive: true });
     }
   }
   get dir() {
@@ -13707,6 +13909,12 @@ class StateDirResolver {
   }
   get logFile() {
     return join(this.stateDir, "agentbridge.log");
+  }
+  get queueDbFile() {
+    return join(this.stateDir, "queue.db");
+  }
+  get transcriptFile() {
+    return join(this.stateDir, "transcript.jsonl");
   }
   get killedFile() {
     return join(this.stateDir, "killed");
@@ -13738,8 +13946,9 @@ var CLAUDE_INSTRUCTIONS = [
   "",
   "## How to interact",
   "- Use the reply tool to send messages back to Codex \u2014 pass chat_id back.",
-  "- Use the get_messages tool to check for pending messages from Codex.",
-  "- After sending a reply, call get_messages to check for responses.",
+  "- Use the get_messages tool to check for pending messages from Codex (non-blocking snapshot).",
+  "- Use the wait_for_messages tool to BLOCK until Codex replies (default 60s). Prefer this over auto-poll when you sent reply(require_reply=true) and want a real-time response \u2014 re-call after each timeout to keep listening, stop only when the user signals so or Codex sends \u2705 finished.",
+  "- After sending a reply, call get_messages or wait_for_messages to receive Codex's response.",
   "- When the user asks about Codex status or progress, call get_messages.",
   "",
   "## Turn coordination",
@@ -13757,24 +13966,32 @@ class ClaudeAdapter extends EventEmitter {
   instanceId;
   replySender = null;
   logFile;
+  queue;
+  pushMethod;
   configuredMode;
   resolvedMode = null;
   pendingMessages = [];
   maxBufferedMessages;
   droppedMessageCount = 0;
-  constructor(logFile = new StateDirResolver().logFile) {
+  lastQueueWasDuplicate = false;
+  constructor(logFile = new StateDirResolver().logFile, queue) {
     super();
     this.logFile = logFile;
+    const stateDir = dirname2(logFile);
+    this.queue = queue ?? new PersistentMessageQueue(join2(stateDir, "queue.db"), join2(stateDir, "transcript.jsonl"));
     this.instanceId = randomUUID().slice(0, 8);
     this.sessionId = `codex_${Date.now()}`;
     this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 12);
     this.log(`ClaudeAdapter created (instance=${this.instanceId})`);
     const envMode = process.env.AGENTBRIDGE_MODE;
-    this.configuredMode = envMode && ["push", "pull", "auto"].includes(envMode) ? envMode : "auto";
+    this.configuredMode = envMode && ["push", "pull", "dual", "auto"].includes(envMode) ? envMode : "auto";
+    const envPushMethod = process.env.AGENTBRIDGE_PUSH_METHOD;
+    this.pushMethod = envPushMethod === "standard" ? "standard" : "claude/channel";
     this.maxBufferedMessages = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
     this.server = new Server({ name: "agentbridge", version: "0.1.0" }, {
       capabilities: {
         experimental: { "claude/channel": {} },
+        logging: {},
         tools: {}
       },
       instructions: CLAUDE_INSTRUCTIONS
@@ -13785,7 +14002,9 @@ class ClaudeAdapter extends EventEmitter {
     const transport = new StdioServerTransport;
     this.resolveMode();
     await this.server.connect(transport);
-    this.log(`MCP server connected (mode: ${this.resolvedMode})`);
+    const clientCapabilities = this.server._clientCapabilities;
+    this.log(`MCP server connected (mode: ${this.resolvedMode}, pushMethod: ${this.pushMethod})`);
+    this.log(`MCP client capabilities: ${JSON.stringify(clientCapabilities ?? null)}`);
     this.emit("ready");
   }
   setReplySender(sender) {
@@ -13795,12 +14014,12 @@ class ClaudeAdapter extends EventEmitter {
     return this.resolvedMode ?? "pull";
   }
   getPendingMessageCount() {
-    return this.pendingMessages.length;
+    return this.queue.countUndrained();
   }
   resolveMode() {
     if (this.resolvedMode)
       return;
-    if (this.configuredMode === "push" || this.configuredMode === "pull") {
+    if (this.configuredMode === "push" || this.configuredMode === "pull" || this.configuredMode === "dual") {
       this.resolvedMode = this.configuredMode;
       this.log(`Delivery mode set by AGENTBRIDGE_MODE: ${this.resolvedMode}`);
     } else {
@@ -13809,54 +14028,128 @@ class ClaudeAdapter extends EventEmitter {
     }
   }
   async pushNotification(message) {
-    this.log(`pushNotification (instance=${this.instanceId}, mode=${this.resolvedMode}, msgId=${message.id}, len=${message.content.length})`);
-    if (this.resolvedMode === "push") {
+    this.log(`pushNotification (instance=${this.instanceId}, mode=${this.resolvedMode}, pushMethod=${this.pushMethod}, msgId=${message.id}, len=${message.content.length})`);
+    if (this.resolvedMode === "dual") {
+      const entry = this.queueForPull(message);
+      if (this.lastQueueWasDuplicate) {
+        this.log(`Skipping duplicate dual push for message ${entry.messageId}`);
+        return;
+      }
+      await this.pushViaChannel(message, entry.messageId);
+    } else if (this.resolvedMode === "push") {
       await this.pushViaChannel(message);
     } else {
       this.queueForPull(message);
     }
   }
-  async pushViaChannel(message) {
-    const msgId = `codex_msg_${this.notificationIdPrefix}_${++this.notificationSeq}`;
+  async pushViaChannel(message, persistedMessageId) {
+    const msgId = persistedMessageId ?? this.nextNotificationId();
     const ts = new Date(message.timestamp).toISOString();
     try {
-      await this.server.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: message.content,
-          meta: {
-            chat_id: this.sessionId,
-            message_id: msgId,
-            user: "Codex",
-            user_id: "codex",
-            ts,
-            source_type: "codex"
-          }
-        }
-      });
+      await this.server.notification(this.buildPushNotification(message, msgId, ts));
       this.log(`Pushed notification: ${msgId}`);
+      if (persistedMessageId) {
+        this.queue.markPushed(persistedMessageId);
+        this.auditMessage("message_pushed", message, {
+          messageId: persistedMessageId,
+          queued: true,
+          pushed: true
+        });
+      }
     } catch (e) {
       this.log(`Push notification failed: ${e.message}`);
-      this.queueForPull(message);
+      if (persistedMessageId) {
+        this.queue.markPushFailed(persistedMessageId, e.message);
+        this.auditMessage("message_push_failed", message, {
+          messageId: persistedMessageId,
+          queued: true,
+          pushed: false,
+          pushError: e.message
+        });
+      } else {
+        this.queueForPull(message);
+      }
     }
+  }
+  buildPushNotification(message, msgId, ts) {
+    const meta2 = {
+      chat_id: this.sessionId,
+      message_id: msgId,
+      user: "Codex",
+      user_id: "codex",
+      ts,
+      source_type: "codex"
+    };
+    if (this.pushMethod === "standard") {
+      return {
+        method: "notifications/message",
+        params: {
+          level: "info",
+          logger: "agentbridge",
+          data: {
+            content: message.content,
+            meta: meta2
+          }
+        }
+      };
+    }
+    return {
+      method: "notifications/claude/channel",
+      params: {
+        content: message.content,
+        meta: meta2
+      }
+    };
   }
   queueForPull(message) {
-    if (this.pendingMessages.length >= this.maxBufferedMessages) {
-      this.pendingMessages.shift();
+    if (this.queue.countUndrained() >= this.maxBufferedMessages) {
+      const dropped = this.queue.markOldestUndrainedDropped();
       this.droppedMessageCount++;
+      if (dropped) {
+        this.queue.audit({
+          event: "message_dropped",
+          direction: "codex_to_claude",
+          sender: "codex",
+          chatId: dropped.chatId,
+          messageId: dropped.messageId,
+          marker: dropped.marker,
+          contentLen: dropped.content.length,
+          contentHash: dropped.contentHash,
+          preview: previewContent(dropped.content),
+          deliveryMode: this.getDeliveryMode(),
+          queued: false,
+          drained: true
+        });
+      }
       this.log(`Message queue full, dropped oldest message (total dropped: ${this.droppedMessageCount})`);
     }
-    this.pendingMessages.push(message);
-    this.log(`Queued message for pull (${this.pendingMessages.length} pending, instance=${this.instanceId})`);
+    const messageId = this.nextNotificationId();
+    const entry = this.queue.enqueue({
+      message,
+      chatId: this.sessionId,
+      messageId
+    });
+    this.lastQueueWasDuplicate = entry.messageId !== messageId;
+    this.pendingMessages = this.entriesToBridgeMessages(this.queue.listUndrained());
+    this.auditMessage("message_queued", message, {
+      messageId: entry.messageId,
+      queued: true,
+      pushed: entry.pushedAt !== null,
+      pushError: entry.pushError
+    });
+    this.log(`Queued message for pull (${this.queue.countUndrained()} pending, instance=${this.instanceId})`);
+    return entry;
   }
   drainMessages() {
-    this.log(`get_messages called (instance=${this.instanceId}, pending=${this.pendingMessages.length}, dropped=${this.droppedMessageCount})`);
-    if (this.pendingMessages.length === 0 && this.droppedMessageCount === 0) {
+    const entries = this.queue.listUndrained();
+    this.pendingMessages = this.entriesToBridgeMessages(entries);
+    this.log(`get_messages called (instance=${this.instanceId}, pending=${entries.length}, dropped=${this.droppedMessageCount})`);
+    if (entries.length === 0 && this.droppedMessageCount === 0) {
       return {
         content: [{ type: "text", text: "No new messages from Codex." }]
       };
     }
-    const messages = this.pendingMessages;
+    const messages = entries;
     this.pendingMessages = [];
     const dropped = this.droppedMessageCount;
     this.droppedMessageCount = 0;
@@ -13871,10 +14164,21 @@ chat_id: ${this.sessionId}`;
       const ts = new Date(msg.timestamp).toISOString();
       return `---
 [${i + 1}] ${ts}
+message_id: ${msg.messageId}
 Codex: ${msg.content}`;
     }).join(`
 
 `);
+    this.queue.markDrained(messages.map((msg) => msg.messageId));
+    this.queue.audit({
+      event: "messages_drained",
+      direction: "codex_to_claude",
+      sender: "claude",
+      chatId: this.sessionId,
+      deliveryMode: this.getDeliveryMode(),
+      count,
+      drained: true
+    });
     this.log(`get_messages returning ${count} message(s) (instance=${this.instanceId}, dropped=${dropped})`);
     return {
       content: [
@@ -13914,10 +14218,24 @@ ${formatted}`
         },
         {
           name: "get_messages",
-          description: "Check for new messages from Codex. Call this after sending a reply or when you expect a response from Codex.",
+          description: "Check for new messages from Codex. Returns immediately with a snapshot (may be empty).",
           inputSchema: {
             type: "object",
             properties: {},
+            required: []
+          }
+        },
+        {
+          name: "wait_for_messages",
+          description: "Block until Codex sends a new message, or until timeout (default 60s, max 60s). Use proactively in a listening loop after reply(require_reply=true): wait_for_messages \u2192 process arrival \u2192 reply \u2192 wait_for_messages again. On arrival, drains the queue exactly like get_messages. On timeout, returns a 'timed_out' sentinel \u2014 re-call to keep listening unless the user told you to stop.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              timeout_s: {
+                type: "number",
+                description: "How long to block in seconds (default 60, max 60, min 1)."
+              }
+            },
             required: []
           }
         }
@@ -13931,11 +14249,44 @@ ${formatted}`
       if (name === "get_messages") {
         return this.drainMessages();
       }
+      if (name === "wait_for_messages") {
+        return this.waitForMessages(args);
+      }
       return {
         content: [{ type: "text", text: `Unknown tool: ${name}` }],
         isError: true
       };
     });
+  }
+  async waitForMessages(args) {
+    const requested = Number(args?.timeout_s ?? 60);
+    const timeoutS = Math.min(Math.max(Number.isFinite(requested) ? requested : 60, 1), 60);
+    const deadline = Date.now() + timeoutS * 1000;
+    const pollIntervalMs = 500;
+    this.log(`wait_for_messages start (instance=${this.instanceId}, timeout_s=${timeoutS}, pending=${this.queue.countUndrained()})`);
+    while (Date.now() < deadline) {
+      if (this.queue.countUndrained() > 0) {
+        this.log(`wait_for_messages woke (instance=${this.instanceId}, pending=${this.queue.countUndrained()})`);
+        return this.drainMessages();
+      }
+      await new Promise((r) => setTimeout(r, pollIntervalMs));
+    }
+    this.log(`wait_for_messages timed out (instance=${this.instanceId}, timeout_s=${timeoutS})`);
+    this.queue.audit({
+      event: "wait_for_messages_timeout",
+      direction: "internal",
+      sender: "claude",
+      chatId: this.sessionId,
+      deliveryMode: this.getDeliveryMode()
+    });
+    return {
+      content: [
+        {
+          type: "text",
+          text: `[wait_for_messages] timed_out after ${timeoutS}s \u2014 no new Codex messages. Call wait_for_messages again to keep listening, or stop if the user signaled to stop.`
+        }
+      ]
+    };
   }
   async handleReply(args) {
     const text = args?.text;
@@ -13962,12 +14313,21 @@ ${formatted}`
     const result = await this.replySender(bridgeMsg, requireReply);
     if (!result.success) {
       this.log(`Reply delivery failed: ${result.error}`);
+      this.auditReply("reply_failed", bridgeMsg, requireReply, result.error);
       return {
         content: [{ type: "text", text: `Error: ${result.error}` }],
         isError: true
       };
     }
-    const pending = this.pendingMessages.length;
+    this.auditReply("reply_sent", bridgeMsg, requireReply);
+    const replyChatId = args?.chat_id;
+    if (replyChatId) {
+      const ackedCount = this.queue.ackByChatId(replyChatId);
+      if (ackedCount > 0) {
+        this.log(`reply acked ${ackedCount} message(s) on chat ${replyChatId}`);
+      }
+    }
+    const pending = this.getPendingMessageCount();
     let responseText = "Reply sent to Codex.";
     if (pending > 0) {
       responseText += ` Note: ${pending} unread Codex message${pending > 1 ? "s" : ""} already waiting \u2014 call get_messages to read them.`;
@@ -13981,8 +14341,54 @@ ${formatted}`
 `;
     process.stderr.write(line);
     try {
-      appendFileSync(this.logFile, line);
+      appendFileSync2(this.logFile, line);
     } catch {}
+  }
+  nextNotificationId() {
+    return `codex_msg_${this.notificationIdPrefix}_${++this.notificationSeq}`;
+  }
+  entriesToBridgeMessages(entries) {
+    return entries.map((entry) => ({
+      id: entry.messageId,
+      source: entry.source,
+      content: entry.content,
+      timestamp: entry.timestamp
+    }));
+  }
+  auditMessage(event, message, opts) {
+    this.queue.audit({
+      event,
+      direction: "codex_to_claude",
+      sender: "codex",
+      chatId: this.sessionId,
+      messageId: opts.messageId,
+      marker: message.content.match(/^\[(IMPORTANT|STATUS|FYI)\]/)?.[1] ?? "untagged",
+      contentLen: message.content.length,
+      contentHash: hashContent(message.content),
+      preview: previewContent(message.content),
+      deliveryMode: this.getDeliveryMode(),
+      queued: opts.queued,
+      pushed: opts.pushed,
+      pushError: opts.pushError
+    });
+  }
+  auditReply(event, message, requireReply, error2) {
+    this.queue.audit({
+      event,
+      direction: "claude_to_codex",
+      sender: "claude",
+      chatId: message.id,
+      messageId: message.id,
+      marker: message.content.match(/^\[(IMPORTANT|STATUS|FYI)\]/)?.[1] ?? "untagged",
+      contentLen: message.content.length,
+      contentHash: hashContent(message.content),
+      preview: previewContent(message.content),
+      deliveryMode: this.getDeliveryMode(),
+      queued: false,
+      pushed: false,
+      requireReply,
+      error: error2 ?? null
+    });
   }
 }
 
@@ -14401,8 +14807,8 @@ function isProcessAlive(pid) {
 }
 
 // src/config-service.ts
-import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync3 } from "fs";
-import { join as join2 } from "path";
+import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync3, existsSync as existsSync3 } from "fs";
+import { join as join3 } from "path";
 var DEFAULT_CONFIG = {
   version: "1.0",
   codex: {
@@ -14454,8 +14860,8 @@ class ConfigService {
   configPath;
   constructor(projectRoot) {
     const root = projectRoot ?? process.cwd();
-    this.configDir = join2(root, CONFIG_DIR);
-    this.configPath = join2(this.configDir, CONFIG_FILE);
+    this.configDir = join3(root, CONFIG_DIR);
+    this.configPath = join3(this.configDir, CONFIG_FILE);
   }
   hasConfig() {
     return existsSync3(this.configPath);
@@ -14490,7 +14896,7 @@ class ConfigService {
   }
   ensureConfigDir() {
     if (!existsSync3(this.configDir)) {
-      mkdirSync2(this.configDir, { recursive: true });
+      mkdirSync3(this.configDir, { recursive: true });
     }
   }
 }
@@ -14742,7 +15148,7 @@ function log(msg) {
 `;
   process.stderr.write(line);
   try {
-    appendFileSync2(stateDir.logFile, line);
+    appendFileSync3(stateDir.logFile, line);
   } catch {}
 }
 log(`Starting AgentBridge frontend (daemon ws ${CONTROL_WS_URL})`);

@@ -55,7 +55,7 @@ When Claude Code closes, the foreground MCP process exits while the background d
 
 | Direction | Path |
 |-----------|------|
-| **Codex -> Claude** | `daemon.ts` captures `agentMessage` -> control WS -> `bridge.ts` -> `notifications/claude/channel` |
+| **Codex -> Claude** | `daemon.ts` captures `agentMessage` -> control WS -> `bridge.ts` -> configured push notification method plus/or persisted pull queue |
 | **Claude -> Codex** | Claude calls the `reply` tool -> `bridge.ts` -> control WS -> `daemon.ts` -> `turn/start` injects into the Codex thread |
 
 ### Loop prevention
@@ -239,8 +239,9 @@ agent_bridge/
 | `CODEX_WS_PORT` | `4500` | Codex app-server WebSocket port |
 | `CODEX_PROXY_PORT` | `4501` | Bridge proxy port for the Codex TUI |
 | `AGENTBRIDGE_CONTROL_PORT` | `4502` | Control port between bridge.ts and daemon.ts |
-| `AGENTBRIDGE_STATE_DIR` | Platform default | State directory for pid, status, logs (macOS: `~/Library/Application Support/agentbridge/`, Linux: `$XDG_STATE_HOME/agentbridge/`) |
-| `AGENTBRIDGE_MODE` | `push` | Message delivery mode (`push` for channels, `pull` for API key mode) |
+| `AGENTBRIDGE_STATE_DIR` | Platform default | State directory for pid, status, logs, persisted pull queue, and audit transcript (macOS: `~/Library/Application Support/agentbridge/`, Linux: `$XDG_STATE_HOME/agentbridge/`) |
+| `AGENTBRIDGE_MODE` | `auto` (resolves to `pull`) | Message delivery mode (`push` for channels, `pull` for queue-only delivery, `dual` for channel push plus persisted pull queue) |
+| `AGENTBRIDGE_PUSH_METHOD` | `claude/channel` | Debug push notification method. Use `standard` to send MCP `notifications/message` instead of custom `notifications/claude/channel`. |
 | `AGENTBRIDGE_DAEMON_ENTRY` | `./daemon.ts` | Override daemon entry point (used by plugin bundles) |
 
 ### State Directory
@@ -252,7 +253,7 @@ The daemon stores runtime state in a platform-aware directory:
 | macOS | `~/Library/Application Support/agentbridge/` |
 | Linux | `$XDG_STATE_HOME/agentbridge/` (fallback: `~/.local/state/agentbridge/`) |
 
-Contents: `daemon.pid`, `status.json`, `agentbridge.log`, `killed` (sentinel), `startup.lock`
+Contents: `daemon.pid`, `status.json`, `agentbridge.log`, `queue.db`, `transcript.jsonl`, `killed` (sentinel), `startup.lock`
 
 ## Current Limitations
 

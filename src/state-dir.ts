@@ -62,6 +62,14 @@ export class StateDirResolver {
     return join(this.stateDir, "agentbridge.log");
   }
 
+  get queueDbFile(): string {
+    return join(this.stateDir, "queue.db");
+  }
+
+  get transcriptFile(): string {
+    return join(this.stateDir, "transcript.jsonl");
+  }
+
   get killedFile(): string {
     return join(this.stateDir, "killed");
   }
