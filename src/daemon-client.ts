@@ -138,6 +138,9 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
         case "status":
           this.emit("status", message.status);
           return;
+        case "session_probe":
+          this.send({ type: "session_probe_ack", probeId: message.probeId });
+          return;
       }
     };
 

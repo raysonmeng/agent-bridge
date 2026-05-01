@@ -1635,6 +1635,7 @@ var CODEX_PROXY_PORT = parseInt(process.env.CODEX_PROXY_PORT ?? String(config.co
 var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
 var TUI_DISCONNECT_GRACE_MS = parseInt(process.env.TUI_DISCONNECT_GRACE_MS ?? "2500", 10);
 var CLAUDE_DISCONNECT_GRACE_MS = 5000;
+var CLAUDE_ATTACH_PROBE_MS = parseInt(process.env.AGENTBRIDGE_CLAUDE_ATTACH_PROBE_MS ?? "1500", 10);
 var MAX_BUFFERED_MESSAGES = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
 var FILTER_MODE = process.env.AGENTBRIDGE_FILTER_MODE === "full" ? "full" : "filtered";
 var IDLE_SHUTDOWN_MS = parseInt(process.env.AGENTBRIDGE_IDLE_SHUTDOWN_MS ?? String(config.idleShutdownSeconds * 1000), 10);
@@ -1657,6 +1658,8 @@ var claudeDisconnectTimer = null;
 var claudeOnlineNoticeSent = false;
 var claudeOfflineNoticeShown = false;
 var lastAttachStatusSentTs = 0;
+var pendingAttachProbe = null;
+var nextAttachProbeId = 0;
 var ATTACH_STATUS_COOLDOWN_MS = 30000;
 var bufferedMessages = [];
 var tuiConnectionState = new TuiConnectionState({
@@ -1784,6 +1787,7 @@ function startControlServer() {
       },
       close: (ws, code, reason) => {
         log(`Frontend socket closed (#${ws.data.clientId}, code=${code}, reason=${reason || "none"}, wasAttached=${attachedClaude === ws})`);
+        cancelPendingAttachProbeFor(ws, "frontend socket closed");
         if (attachedClaude === ws) {
           detachClaude(ws, "frontend socket closed");
         }
@@ -1808,7 +1812,11 @@ function handleControlMessage(ws, raw) {
       attachClaude(ws);
       return;
     case "claude_disconnect":
+      cancelPendingAttachProbeFor(ws, "frontend requested disconnect");
       detachClaude(ws, "frontend requested disconnect");
+      return;
+    case "session_probe_ack":
+      handleAttachProbeAck(ws, message.probeId);
       return;
     case "status":
       sendStatus(ws);
@@ -1867,10 +1875,16 @@ function handleControlMessage(ws, raw) {
 }
 function attachClaude(ws) {
   if (attachedClaude && attachedClaude !== ws && attachedClaude.readyState !== WebSocket.CLOSED) {
-    log(`Rejecting Claude frontend #${ws.data.clientId} \u2014 another session (#${attachedClaude.data.clientId}) is already attached (readyState=${attachedClaude.readyState})`);
-    ws.close(CLOSE_CODE_REPLACED, "another Claude session is already connected");
+    if (attachedClaude.readyState === WebSocket.OPEN) {
+      probeAttachedClaude(ws);
+      return;
+    }
+    replaceAttachedClaude(ws, `previous attached socket state=${attachedClaude.readyState}`);
     return;
   }
+  acceptClaude(ws);
+}
+function acceptClaude(ws) {
   clearPendingClaudeDisconnect("Claude frontend attached");
   attachedClaude = ws;
   ws.data.attached = true;
@@ -1892,6 +1906,84 @@ function attachClaude(ws) {
   lastAttachStatusSentTs = now;
   if (tuiConnectionState.canReply() && shouldNotifyCodexClaudeOnline()) {
     notifyCodexClaudeOnline();
+  }
+}
+function probeAttachedClaude(candidate) {
+  const incumbent = attachedClaude;
+  if (!incumbent || incumbent === candidate) {
+    acceptClaude(candidate);
+    return;
+  }
+  if (pendingAttachProbe) {
+    if (pendingAttachProbe.candidate !== candidate && pendingAttachProbe.candidate.readyState === WebSocket.OPEN) {
+      pendingAttachProbe.candidate.close(CLOSE_CODE_REPLACED, "superseded by a newer Claude attach attempt");
+    }
+    clearTimeout(pendingAttachProbe.timer);
+    pendingAttachProbe = null;
+  }
+  const probeId = `attach_probe_${++nextAttachProbeId}_${Date.now()}`;
+  pendingAttachProbe = {
+    probeId,
+    incumbent,
+    candidate,
+    timer: setTimeout(() => {
+      if (!pendingAttachProbe || pendingAttachProbe.probeId !== probeId)
+        return;
+      log(`Claude attach probe timed out (#${incumbent.data.clientId}); accepting candidate #${candidate.data.clientId}`);
+      pendingAttachProbe = null;
+      replaceAttachedClaude(candidate, `attach probe timed out after ${CLAUDE_ATTACH_PROBE_MS}ms`);
+    }, CLAUDE_ATTACH_PROBE_MS)
+  };
+  log(`Probing attached Claude frontend #${incumbent.data.clientId} before accepting candidate #${candidate.data.clientId}`);
+  if (!trySendProtocolMessage(incumbent, { type: "session_probe", probeId })) {
+    clearTimeout(pendingAttachProbe.timer);
+    pendingAttachProbe = null;
+    replaceAttachedClaude(candidate, "attach probe send failed");
+  }
+}
+function handleAttachProbeAck(ws, probeId) {
+  if (!pendingAttachProbe || pendingAttachProbe.probeId !== probeId)
+    return;
+  if (pendingAttachProbe.incumbent !== ws) {
+    log(`Ignoring attach probe ack from non-incumbent frontend #${ws.data.clientId}`);
+    return;
+  }
+  const candidate = pendingAttachProbe.candidate;
+  clearTimeout(pendingAttachProbe.timer);
+  pendingAttachProbe = null;
+  log(`Attached Claude frontend #${ws.data.clientId} responded to probe; rejecting candidate #${candidate.data.clientId}`);
+  if (candidate.readyState === WebSocket.OPEN) {
+    candidate.close(CLOSE_CODE_REPLACED, "another Claude session is already connected");
+  }
+}
+function replaceAttachedClaude(candidate, reason) {
+  if (candidate.readyState !== WebSocket.OPEN) {
+    log(`Skipping Claude frontend replacement; candidate #${candidate.data.clientId} is not open (readyState=${candidate.readyState}, reason=${reason})`);
+    return;
+  }
+  const incumbent = attachedClaude;
+  if (incumbent && incumbent !== candidate) {
+    log(`Replacing Claude frontend #${incumbent.data.clientId} with #${candidate.data.clientId} (${reason})`);
+    incumbent.data.attached = false;
+    try {
+      incumbent.close(CLOSE_CODE_REPLACED, "replaced by a newer Claude session");
+    } catch {}
+  }
+  attachedClaude = null;
+  acceptClaude(candidate);
+}
+function cancelPendingAttachProbeFor(ws, reason) {
+  if (!pendingAttachProbe)
+    return;
+  if (pendingAttachProbe.incumbent !== ws && pendingAttachProbe.candidate !== ws)
+    return;
+  const candidate = pendingAttachProbe.candidate;
+  const incumbent = pendingAttachProbe.incumbent;
+  clearTimeout(pendingAttachProbe.timer);
+  pendingAttachProbe = null;
+  log(`Cancelled Claude attach probe involving frontend #${ws.data.clientId} (${reason})`);
+  if (incumbent === ws && candidate !== ws && candidate.readyState === WebSocket.OPEN) {
+    replaceAttachedClaude(candidate, `incumbent closed during attach probe: ${reason}`);
   }
 }
 function detachClaude(ws, reason) {
@@ -2028,10 +2120,19 @@ function broadcastStatus() {
   sendStatus(attachedClaude);
 }
 function sendProtocolMessage(ws, message) {
+  trySendProtocolMessage(ws, message);
+}
+function trySendProtocolMessage(ws, message) {
   try {
-    ws.send(JSON.stringify(message));
+    const result = ws.send(JSON.stringify(message));
+    if (typeof result === "number" && result <= 0) {
+      log(`Control message send returned ${result} (0=dropped, -1=backpressure)`);
+      return false;
+    }
+    return true;
   } catch (err) {
     log(`Failed to send control message: ${err.message}`);
+    return false;
   }
 }
 function currentStatus() {

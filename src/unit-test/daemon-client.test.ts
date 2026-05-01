@@ -286,4 +286,18 @@ describe("DaemonClient", () => {
     const msg = await received;
     expect(msg.type).toBe("claude_connect");
   });
+
+  test("responds to session_probe with session_probe_ack", async () => {
+    const received = new Promise<any>((resolve) => {
+      onServerMessage = (_ws: any, raw: any) => {
+        resolve(JSON.parse(typeof raw === "string" ? raw : raw.toString()));
+      };
+    });
+
+    await client.connect();
+    sendToClient({ type: "session_probe", probeId: "probe-1" });
+
+    const msg = await received;
+    expect(msg).toEqual({ type: "session_probe_ack", probeId: "probe-1" });
+  });
 });
