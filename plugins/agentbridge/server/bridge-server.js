@@ -13928,6 +13928,7 @@ class ClaudeAdapter extends EventEmitter {
   replySender = null;
   logFile;
   queue;
+  pushMethod;
   configuredMode;
   resolvedMode = null;
   pendingMessages = [];
@@ -13945,10 +13946,13 @@ class ClaudeAdapter extends EventEmitter {
     this.log(`ClaudeAdapter created (instance=${this.instanceId})`);
     const envMode = process.env.AGENTBRIDGE_MODE;
     this.configuredMode = envMode && ["push", "pull", "dual", "auto"].includes(envMode) ? envMode : "auto";
+    const envPushMethod = process.env.AGENTBRIDGE_PUSH_METHOD;
+    this.pushMethod = envPushMethod === "standard" ? "standard" : "claude/channel";
     this.maxBufferedMessages = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
     this.server = new Server({ name: "agentbridge", version: "0.1.0" }, {
       capabilities: {
         experimental: { "claude/channel": {} },
+        logging: {},
         tools: {}
       },
       instructions: CLAUDE_INSTRUCTIONS
@@ -13959,7 +13963,9 @@ class ClaudeAdapter extends EventEmitter {
     const transport = new StdioServerTransport;
     this.resolveMode();
     await this.server.connect(transport);
-    this.log(`MCP server connected (mode: ${this.resolvedMode})`);
+    const clientCapabilities = this.server._clientCapabilities;
+    this.log(`MCP server connected (mode: ${this.resolvedMode}, pushMethod: ${this.pushMethod})`);
+    this.log(`MCP client capabilities: ${JSON.stringify(clientCapabilities ?? null)}`);
     this.emit("ready");
   }
   setReplySender(sender) {
@@ -13983,7 +13989,7 @@ class ClaudeAdapter extends EventEmitter {
     }
   }
   async pushNotification(message) {
-    this.log(`pushNotification (instance=${this.instanceId}, mode=${this.resolvedMode}, msgId=${message.id}, len=${message.content.length})`);
+    this.log(`pushNotification (instance=${this.instanceId}, mode=${this.resolvedMode}, pushMethod=${this.pushMethod}, msgId=${message.id}, len=${message.content.length})`);
     if (this.resolvedMode === "dual") {
       const entry = this.queueForPull(message);
       if (this.lastQueueWasDuplicate) {
@@ -14001,20 +14007,7 @@ class ClaudeAdapter extends EventEmitter {
     const msgId = persistedMessageId ?? this.nextNotificationId();
     const ts = new Date(message.timestamp).toISOString();
     try {
-      await this.server.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: message.content,
-          meta: {
-            chat_id: this.sessionId,
-            message_id: msgId,
-            user: "Codex",
-            user_id: "codex",
-            ts,
-            source_type: "codex"
-          }
-        }
-      });
+      await this.server.notification(this.buildPushNotification(message, msgId, ts));
       this.log(`Pushed notification: ${msgId}`);
       if (persistedMessageId) {
         this.queue.markPushed(persistedMessageId);
@@ -14038,6 +14031,36 @@ class ClaudeAdapter extends EventEmitter {
         this.queueForPull(message);
       }
     }
+  }
+  buildPushNotification(message, msgId, ts) {
+    const meta2 = {
+      chat_id: this.sessionId,
+      message_id: msgId,
+      user: "Codex",
+      user_id: "codex",
+      ts,
+      source_type: "codex"
+    };
+    if (this.pushMethod === "standard") {
+      return {
+        method: "notifications/message",
+        params: {
+          level: "info",
+          logger: "agentbridge",
+          data: {
+            content: message.content,
+            meta: meta2
+          }
+        }
+      };
+    }
+    return {
+      method: "notifications/claude/channel",
+      params: {
+        content: message.content,
+        meta: meta2
+      }
+    };
   }
   queueForPull(message) {
     if (this.queue.countUndrained() >= this.maxBufferedMessages) {
