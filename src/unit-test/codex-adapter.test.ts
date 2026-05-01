@@ -1056,3 +1056,36 @@ describe("CodexAdapter initialize reconnect", () => {
     expect(adapter.injectMessage("hello")).toBe(false);
   });
 });
+
+describe("CodexAdapter stale app-server cleanup", () => {
+  test("kills stale codex app-server process occupying the app port", async () => {
+    const adapter = createAdapter();
+    const killed: string[] = [];
+    let appPortChecks = 0;
+
+    adapter.getPortPids = (port: number) => {
+      if (port !== 4510) return [];
+      appPortChecks += 1;
+      return appPortChecks === 1 ? ["1234"] : [];
+    };
+    adapter.getProcessCommandLine = () =>
+      "C:\\Program Files\\nodejs\\codex.exe app-server --listen ws://127.0.0.1:4510";
+    adapter.killProcess = (pid: string) => killed.push(pid);
+
+    await adapter.checkPorts();
+
+    expect(killed).toEqual(["1234"]);
+  });
+
+  test("fails without killing when port is owned by a non-Codex process", async () => {
+    const adapter = createAdapter();
+    const killed: string[] = [];
+
+    adapter.getPortPids = (port: number) => port === 4510 ? ["9876"] : [];
+    adapter.getProcessCommandLine = () => "node unrelated-server.js";
+    adapter.killProcess = (pid: string) => killed.push(pid);
+
+    await expect(adapter.checkPorts()).rejects.toThrow("non-Codex process");
+    expect(killed).toEqual([]);
+  });
+});
