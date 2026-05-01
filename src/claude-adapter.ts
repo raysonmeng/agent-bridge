@@ -21,11 +21,18 @@ import {
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
 import { appendFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import {
+  PersistentMessageQueue,
+  hashContent,
+  previewContent,
+  type QueueEntry,
+} from "./message-queue";
 import { StateDirResolver } from "./state-dir";
 import type { BridgeMessage } from "./types";
 
 export type ReplySender = (msg: BridgeMessage, requireReply?: boolean) => Promise<{ success: boolean; error?: string }>;
-export type DeliveryMode = "push" | "pull" | "auto";
+export type DeliveryMode = "push" | "pull" | "dual" | "auto";
 
 export const CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
@@ -69,24 +76,28 @@ export class ClaudeAdapter extends EventEmitter {
   private readonly instanceId: string;
   private replySender: ReplySender | null = null;
   private readonly logFile: string;
+  private readonly queue: PersistentMessageQueue;
 
   // Dual-mode transport
   private readonly configuredMode: DeliveryMode;
-  private resolvedMode: "push" | "pull" | null = null;
+  private resolvedMode: "push" | "pull" | "dual" | null = null;
   private pendingMessages: BridgeMessage[] = [];
   private readonly maxBufferedMessages: number;
   private droppedMessageCount = 0;
+  private lastQueueWasDuplicate = false;
 
-  constructor(logFile = new StateDirResolver().logFile) {
+  constructor(logFile = new StateDirResolver().logFile, queue?: PersistentMessageQueue) {
     super();
     this.logFile = logFile;
+    const stateDir = dirname(logFile);
+    this.queue = queue ?? new PersistentMessageQueue(join(stateDir, "queue.db"), join(stateDir, "transcript.jsonl"));
     this.instanceId = randomUUID().slice(0, 8);
     this.sessionId = `codex_${Date.now()}`;
     this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 12);
     this.log(`ClaudeAdapter created (instance=${this.instanceId})`);
 
     const envMode = process.env.AGENTBRIDGE_MODE as DeliveryMode | undefined;
-    this.configuredMode = envMode && ["push", "pull", "auto"].includes(envMode) ? envMode : "auto";
+    this.configuredMode = envMode && ["push", "pull", "dual", "auto"].includes(envMode) ? envMode : "auto";
     this.maxBufferedMessages = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
 
     this.server = new Server(
@@ -119,13 +130,13 @@ export class ClaudeAdapter extends EventEmitter {
   }
 
   /** Returns the resolved delivery mode. */
-  getDeliveryMode(): "push" | "pull" {
+  getDeliveryMode(): "push" | "pull" | "dual" {
     return this.resolvedMode ?? "pull";
   }
 
   /** Returns the number of messages waiting in the pull queue. */
   getPendingMessageCount(): number {
-    return this.pendingMessages.length;
+    return this.queue.countUndrained();
   }
 
   // ── Mode Detection ─────────────────────────────────────────
@@ -133,7 +144,7 @@ export class ClaudeAdapter extends EventEmitter {
   private resolveMode(): void {
     if (this.resolvedMode) return;
 
-    if (this.configuredMode === "push" || this.configuredMode === "pull") {
+    if (this.configuredMode === "push" || this.configuredMode === "pull" || this.configuredMode === "dual") {
       this.resolvedMode = this.configuredMode;
       this.log(`Delivery mode set by AGENTBRIDGE_MODE: ${this.resolvedMode}`);
     } else {
@@ -150,15 +161,22 @@ export class ClaudeAdapter extends EventEmitter {
 
   async pushNotification(message: BridgeMessage) {
     this.log(`pushNotification (instance=${this.instanceId}, mode=${this.resolvedMode}, msgId=${message.id}, len=${message.content.length})`);
-    if (this.resolvedMode === "push") {
+    if (this.resolvedMode === "dual") {
+      const entry = this.queueForPull(message);
+      if (this.lastQueueWasDuplicate) {
+        this.log(`Skipping duplicate dual push for message ${entry.messageId}`);
+        return;
+      }
+      await this.pushViaChannel(message, entry.messageId);
+    } else if (this.resolvedMode === "push") {
       await this.pushViaChannel(message);
     } else {
       this.queueForPull(message);
     }
   }
 
-  private async pushViaChannel(message: BridgeMessage) {
-    const msgId = `codex_msg_${this.notificationIdPrefix}_${++this.notificationSeq}`;
+  private async pushViaChannel(message: BridgeMessage, persistedMessageId?: string) {
+    const msgId = persistedMessageId ?? this.nextNotificationId();
     const ts = new Date(message.timestamp).toISOString();
 
     try {
@@ -177,34 +195,85 @@ export class ClaudeAdapter extends EventEmitter {
         },
       });
       this.log(`Pushed notification: ${msgId}`);
+      if (persistedMessageId) {
+        this.queue.markPushed(persistedMessageId);
+        this.auditMessage("message_pushed", message, {
+          messageId: persistedMessageId,
+          queued: true,
+          pushed: true,
+        });
+      }
     } catch (e: any) {
       this.log(`Push notification failed: ${e.message}`);
-      this.queueForPull(message);
+      if (persistedMessageId) {
+        this.queue.markPushFailed(persistedMessageId, e.message);
+        this.auditMessage("message_push_failed", message, {
+          messageId: persistedMessageId,
+          queued: true,
+          pushed: false,
+          pushError: e.message,
+        });
+      } else {
+        this.queueForPull(message);
+      }
     }
   }
 
-  private queueForPull(message: BridgeMessage) {
-    if (this.pendingMessages.length >= this.maxBufferedMessages) {
-      this.pendingMessages.shift();
+  private queueForPull(message: BridgeMessage): QueueEntry {
+    if (this.queue.countUndrained() >= this.maxBufferedMessages) {
+      const dropped = this.queue.markOldestUndrainedDropped();
       this.droppedMessageCount++;
+      if (dropped) {
+        this.queue.audit({
+          event: "message_dropped",
+          direction: "codex_to_claude",
+          sender: "codex",
+          chatId: dropped.chatId,
+          messageId: dropped.messageId,
+          marker: dropped.marker,
+          contentLen: dropped.content.length,
+          contentHash: dropped.contentHash,
+          preview: previewContent(dropped.content),
+          deliveryMode: this.getDeliveryMode(),
+          queued: false,
+          drained: true,
+        });
+      }
       this.log(`Message queue full, dropped oldest message (total dropped: ${this.droppedMessageCount})`);
     }
-    this.pendingMessages.push(message);
-    this.log(`Queued message for pull (${this.pendingMessages.length} pending, instance=${this.instanceId})`);
+
+    const messageId = this.nextNotificationId();
+    const entry = this.queue.enqueue({
+      message,
+      chatId: this.sessionId,
+      messageId,
+    });
+    this.lastQueueWasDuplicate = entry.messageId !== messageId;
+    this.pendingMessages = this.entriesToBridgeMessages(this.queue.listUndrained());
+    this.auditMessage("message_queued", message, {
+      messageId: entry.messageId,
+      queued: true,
+      pushed: entry.pushedAt !== null,
+      pushError: entry.pushError,
+    });
+    this.log(`Queued message for pull (${this.queue.countUndrained()} pending, instance=${this.instanceId})`);
+    return entry;
   }
 
   // ── get_messages ───────────────────────────────────────────
 
   private drainMessages(): { content: Array<{ type: "text"; text: string }> } {
-    this.log(`get_messages called (instance=${this.instanceId}, pending=${this.pendingMessages.length}, dropped=${this.droppedMessageCount})`);
-    if (this.pendingMessages.length === 0 && this.droppedMessageCount === 0) {
+    const entries = this.queue.listUndrained();
+    this.pendingMessages = this.entriesToBridgeMessages(entries);
+    this.log(`get_messages called (instance=${this.instanceId}, pending=${entries.length}, dropped=${this.droppedMessageCount})`);
+    if (entries.length === 0 && this.droppedMessageCount === 0) {
       return {
         content: [{ type: "text" as const, text: "No new messages from Codex." }],
       };
     }
 
-    // Snapshot and clear atomically to avoid issues with concurrent writes
-    const messages = this.pendingMessages;
+    // Snapshot and mark drained after formatting so restart replay is preserved until get_messages succeeds.
+    const messages = entries;
     this.pendingMessages = [];
     const dropped = this.droppedMessageCount;
     this.droppedMessageCount = 0;
@@ -219,9 +288,20 @@ export class ClaudeAdapter extends EventEmitter {
     const formatted = messages
       .map((msg, i) => {
         const ts = new Date(msg.timestamp).toISOString();
-        return `---\n[${i + 1}] ${ts}\nCodex: ${msg.content}`;
+        return `---\n[${i + 1}] ${ts}\nmessage_id: ${msg.messageId}\nCodex: ${msg.content}`;
       })
       .join("\n\n");
+
+    this.queue.markDrained(messages.map((msg) => msg.messageId));
+    this.queue.audit({
+      event: "messages_drained",
+      direction: "codex_to_claude",
+      sender: "claude",
+      chatId: this.sessionId,
+      deliveryMode: this.getDeliveryMode(),
+      count,
+      drained: true,
+    });
 
     this.log(`get_messages returning ${count} message(s) (instance=${this.instanceId}, dropped=${dropped})`);
     return {
@@ -322,14 +402,17 @@ export class ClaudeAdapter extends EventEmitter {
     const result = await this.replySender(bridgeMsg, requireReply);
     if (!result.success) {
       this.log(`Reply delivery failed: ${result.error}`);
+      this.auditReply("reply_failed", bridgeMsg, requireReply, result.error);
       return {
         content: [{ type: "text" as const, text: `Error: ${result.error}` }],
         isError: true,
       };
     }
 
+    this.auditReply("reply_sent", bridgeMsg, requireReply);
+
     // Include pending message hint
-    const pending = this.pendingMessages.length;
+    const pending = this.getPendingMessageCount();
     let responseText = "Reply sent to Codex.";
     if (pending > 0) {
       responseText += ` Note: ${pending} unread Codex message${pending > 1 ? "s" : ""} already waiting \u2014 call get_messages to read them.`;
@@ -346,5 +429,64 @@ export class ClaudeAdapter extends EventEmitter {
     try {
       appendFileSync(this.logFile, line);
     } catch {}
+  }
+
+  private nextNotificationId(): string {
+    return `codex_msg_${this.notificationIdPrefix}_${++this.notificationSeq}`;
+  }
+
+  private entriesToBridgeMessages(entries: QueueEntry[]): BridgeMessage[] {
+    return entries.map((entry) => ({
+      id: entry.messageId,
+      source: entry.source,
+      content: entry.content,
+      timestamp: entry.timestamp,
+    }));
+  }
+
+  private auditMessage(
+    event: string,
+    message: BridgeMessage,
+    opts: {
+      messageId: string;
+      queued: boolean;
+      pushed?: boolean;
+      pushError?: string | null;
+    },
+  ) {
+    this.queue.audit({
+      event,
+      direction: "codex_to_claude",
+      sender: "codex",
+      chatId: this.sessionId,
+      messageId: opts.messageId,
+      marker: message.content.match(/^\[(IMPORTANT|STATUS|FYI)\]/)?.[1] ?? "untagged",
+      contentLen: message.content.length,
+      contentHash: hashContent(message.content),
+      preview: previewContent(message.content),
+      deliveryMode: this.getDeliveryMode(),
+      queued: opts.queued,
+      pushed: opts.pushed,
+      pushError: opts.pushError,
+    });
+  }
+
+  private auditReply(event: string, message: BridgeMessage, requireReply: boolean, error?: string) {
+    this.queue.audit({
+      event,
+      direction: "claude_to_codex",
+      sender: "claude",
+      chatId: message.id,
+      messageId: message.id,
+      marker: message.content.match(/^\[(IMPORTANT|STATUS|FYI)\]/)?.[1] ?? "untagged",
+      contentLen: message.content.length,
+      contentHash: hashContent(message.content),
+      preview: previewContent(message.content),
+      deliveryMode: this.getDeliveryMode(),
+      queued: false,
+      pushed: false,
+      requireReply,
+      error: error ?? null,
+    });
   }
 }
