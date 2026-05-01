@@ -5,7 +5,7 @@
 import { appendFileSync as appendFileSync2 } from "fs";
 
 // src/codex-adapter.ts
-import { spawn, execSync } from "child_process";
+import { spawn, execFileSync } from "child_process";
 import { createInterface } from "readline";
 import { EventEmitter } from "events";
 import { appendFileSync } from "fs";
@@ -1010,50 +1010,75 @@ class CodexAdapter extends EventEmitter {
   }
   async checkPorts() {
     for (const port of [this.appPort, this.proxyPort]) {
-      try {
-        const pids = execSync(`lsof -ti :${port}`, { encoding: "utf-8" }).trim();
-        if (!pids)
-          continue;
-        const pidList = pids.split(`
-`).map((p) => p.trim()).filter(Boolean);
-        const staleCodexPids = [];
-        const foreignPids = [];
-        for (const pid of pidList) {
+      const pidList = this.getPortPids(port);
+      if (pidList.length === 0)
+        continue;
+      const staleCodexPids = [];
+      const foreignPids = [];
+      for (const pid of pidList) {
+        try {
+          const cmdline = this.getProcessCommandLine(pid);
+          if (this.isCodexAppServerCommandLine(cmdline)) {
+            staleCodexPids.push(pid);
+          } else {
+            foreignPids.push(pid);
+          }
+        } catch {}
+      }
+      if (staleCodexPids.length > 0) {
+        this.log(`Cleaning up stale codex app-server on port ${port}: PID(s) ${staleCodexPids.join(", ")}`);
+        for (const pid of staleCodexPids) {
           try {
-            const cmdline = execSync(`ps -p ${pid} -o args=`, { encoding: "utf-8" }).trim();
-            if (cmdline.includes("codex") && cmdline.includes("app-server")) {
-              staleCodexPids.push(pid);
-            } else {
-              foreignPids.push(pid);
-            }
+            this.killProcess(pid);
           } catch {}
         }
-        if (staleCodexPids.length > 0) {
-          this.log(`Cleaning up stale codex app-server on port ${port}: PID(s) ${staleCodexPids.join(", ")}`);
-          for (const pid of staleCodexPids) {
-            try {
-              execSync(`kill ${pid}`, { encoding: "utf-8" });
-            } catch {}
-          }
-          await new Promise((r) => setTimeout(r, 500));
-        }
-        if (foreignPids.length > 0) {
-          throw new Error(`Port ${port} is already in use by non-Codex process(es): PID(s) ${foreignPids.join(", ")}. ` + `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`);
-        }
-        try {
-          const remaining = execSync(`lsof -ti :${port}`, { encoding: "utf-8" }).trim();
-          if (remaining) {
-            throw new Error(`Port ${port} is still occupied (PID(s): ${remaining.replace(/\n/g, ", ")}) after cleanup. ` + `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`);
-          }
-        } catch (err) {
-          if (err.message?.includes("Port"))
-            throw err;
-        }
-      } catch (err) {
-        if (err.message?.includes("Port") || err.message?.includes("non-Codex"))
-          throw err;
+        await new Promise((r) => setTimeout(r, 500));
+      }
+      if (foreignPids.length > 0) {
+        throw new Error(`Port ${port} is already in use by non-Codex process(es): PID(s) ${foreignPids.join(", ")}. ` + `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`);
+      }
+      const remaining = this.getPortPids(port);
+      if (remaining.length > 0) {
+        throw new Error(`Port ${port} is still occupied (PID(s): ${remaining.join(", ")}) after cleanup. ` + `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`);
       }
     }
+  }
+  getPortPids(port) {
+    try {
+      const output = process.platform === "win32" ? execFileSync("powershell.exe", [
+        "-NoProfile",
+        "-Command",
+        `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique`
+      ], { encoding: "utf-8" }) : execFileSync("lsof", ["-ti", `:${port}`], { encoding: "utf-8" });
+      return output.split(/\r?\n/).map((pid) => pid.trim()).filter((pid, index, all) => pid.length > 0 && all.indexOf(pid) === index);
+    } catch {
+      return [];
+    }
+  }
+  getProcessCommandLine(pid) {
+    if (process.platform === "win32") {
+      return execFileSync("powershell.exe", [
+        "-NoProfile",
+        "-Command",
+        `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}" -ErrorAction SilentlyContinue; if ($p -and $p.CommandLine) { $p.CommandLine }`
+      ], { encoding: "utf-8" }).trim();
+    }
+    return execFileSync("ps", ["-p", pid, "-o", "args="], { encoding: "utf-8" }).trim();
+  }
+  killProcess(pid) {
+    if (process.platform === "win32") {
+      execFileSync("powershell.exe", [
+        "-NoProfile",
+        "-Command",
+        `Stop-Process -Id ${pid} -Force -ErrorAction Stop`
+      ], { encoding: "utf-8" });
+      return;
+    }
+    execFileSync("kill", [pid], { encoding: "utf-8" });
+  }
+  isCodexAppServerCommandLine(cmdline) {
+    const normalized = cmdline.toLowerCase();
+    return normalized.includes("codex") && normalized.includes("app-server");
   }
   log(msg) {
     const line = `[${new Date().toISOString()}] [CodexAdapter] ${msg}
@@ -1267,7 +1292,7 @@ class TuiConnectionState {
 }
 
 // src/daemon-lifecycle.ts
-import { spawn as spawn2, execFileSync } from "child_process";
+import { spawn as spawn2, execFileSync as execFileSync2 } from "child_process";
 import { existsSync as existsSync2, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
 var DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY ?? "./daemon.ts";
@@ -1506,7 +1531,7 @@ class DaemonLifecycle {
   }
   isDaemonProcess(pid) {
     try {
-      const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
+      const cmd = execFileSync2("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
       return cmd.includes("daemon") && (cmd.includes("agentbridge") || cmd.includes("agent_bridge"));
     } catch {
       return false;

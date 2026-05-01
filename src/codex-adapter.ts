@@ -9,7 +9,7 @@
  * disconnect), because TUI rapidly reconnects between bootstrap phases.
  */
 
-import { spawn, execSync, type ChildProcess } from "node:child_process";
+import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { EventEmitter } from "node:events";
 import { appendFileSync } from "node:fs";
@@ -1179,63 +1179,101 @@ export class CodexAdapter extends EventEmitter {
    */
   private async checkPorts() {
     for (const port of [this.appPort, this.proxyPort]) {
-      try {
-        const pids = execSync(`lsof -ti :${port}`, { encoding: "utf-8" }).trim();
-        if (!pids) continue;
+      const pidList = this.getPortPids(port);
+      if (pidList.length === 0) continue;
 
-        // Check if the occupying process is a codex app-server (our own stale spawn)
-        const pidList = pids.split("\n").map((p) => p.trim()).filter(Boolean);
-        const staleCodexPids: string[] = [];
-        const foreignPids: string[] = [];
+      // Check if the occupying process is a codex app-server (our own stale spawn)
+      const staleCodexPids: string[] = [];
+      const foreignPids: string[] = [];
 
-        for (const pid of pidList) {
-          try {
-            const cmdline = execSync(`ps -p ${pid} -o args=`, { encoding: "utf-8" }).trim();
-            if (cmdline.includes("codex") && cmdline.includes("app-server")) {
-              staleCodexPids.push(pid);
-            } else {
-              foreignPids.push(pid);
-            }
-          } catch {
-            // Process already gone
-          }
-        }
-
-        // Kill stale codex app-server processes (our own previous spawns)
-        if (staleCodexPids.length > 0) {
-          this.log(`Cleaning up stale codex app-server on port ${port}: PID(s) ${staleCodexPids.join(", ")}`);
-          for (const pid of staleCodexPids) {
-            try { execSync(`kill ${pid}`, { encoding: "utf-8" }); } catch {}
-          }
-          await new Promise((r) => setTimeout(r, 500));
-        }
-
-        // If foreign processes still occupy the port, fail with a clear message
-        if (foreignPids.length > 0) {
-          throw new Error(
-            `Port ${port} is already in use by non-Codex process(es): PID(s) ${foreignPids.join(", ")}. ` +
-            `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`
-          );
-        }
-
-        // Verify port is now free
+      for (const pid of pidList) {
         try {
-          const remaining = execSync(`lsof -ti :${port}`, { encoding: "utf-8" }).trim();
-          if (remaining) {
-            throw new Error(
-              `Port ${port} is still occupied (PID(s): ${remaining.replace(/\n/g, ", ")}) after cleanup. ` +
-              `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`
-            );
+          const cmdline = this.getProcessCommandLine(pid);
+          if (this.isCodexAppServerCommandLine(cmdline)) {
+            staleCodexPids.push(pid);
+          } else {
+            foreignPids.push(pid);
           }
-        } catch (err: any) {
-          if (err.message?.includes("Port")) throw err;
-          // lsof exit 1 = port free, good
+        } catch {
+          // Process already gone
         }
-      } catch (err: any) {
-        // lsof returns exit code 1 if no match — port is free
-        if (err.message?.includes("Port") || err.message?.includes("non-Codex")) throw err;
+      }
+
+      // Kill stale codex app-server processes (our own previous spawns)
+      if (staleCodexPids.length > 0) {
+        this.log(`Cleaning up stale codex app-server on port ${port}: PID(s) ${staleCodexPids.join(", ")}`);
+        for (const pid of staleCodexPids) {
+          try { this.killProcess(pid); } catch {}
+        }
+        await new Promise((r) => setTimeout(r, 500));
+      }
+
+      // If foreign processes still occupy the port, fail with a clear message
+      if (foreignPids.length > 0) {
+        throw new Error(
+          `Port ${port} is already in use by non-Codex process(es): PID(s) ${foreignPids.join(", ")}. ` +
+          `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`
+        );
+      }
+
+      // Verify port is now free
+      const remaining = this.getPortPids(port);
+      if (remaining.length > 0) {
+        throw new Error(
+          `Port ${port} is still occupied (PID(s): ${remaining.join(", ")}) after cleanup. ` +
+          `Please stop the process or set a different port via ${port === this.appPort ? "CODEX_WS_PORT" : "CODEX_PROXY_PORT"} env var.`
+        );
       }
     }
+  }
+
+  private getPortPids(port: number): string[] {
+    try {
+      const output = process.platform === "win32"
+        ? execFileSync("powershell.exe", [
+          "-NoProfile",
+          "-Command",
+          `Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -ExpandProperty OwningProcess -Unique`,
+        ], { encoding: "utf-8" })
+        : execFileSync("lsof", ["-ti", `:${port}`], { encoding: "utf-8" });
+
+      return output
+        .split(/\r?\n/)
+        .map((pid) => pid.trim())
+        .filter((pid, index, all) => pid.length > 0 && all.indexOf(pid) === index);
+    } catch {
+      return [];
+    }
+  }
+
+  private getProcessCommandLine(pid: string): string {
+    if (process.platform === "win32") {
+      return execFileSync("powershell.exe", [
+        "-NoProfile",
+        "-Command",
+        `$p = Get-CimInstance Win32_Process -Filter "ProcessId = ${pid}" -ErrorAction SilentlyContinue; if ($p -and $p.CommandLine) { $p.CommandLine }`,
+      ], { encoding: "utf-8" }).trim();
+    }
+
+    return execFileSync("ps", ["-p", pid, "-o", "args="], { encoding: "utf-8" }).trim();
+  }
+
+  private killProcess(pid: string) {
+    if (process.platform === "win32") {
+      execFileSync("powershell.exe", [
+        "-NoProfile",
+        "-Command",
+        `Stop-Process -Id ${pid} -Force -ErrorAction Stop`,
+      ], { encoding: "utf-8" });
+      return;
+    }
+
+    execFileSync("kill", [pid], { encoding: "utf-8" });
+  }
+
+  private isCodexAppServerCommandLine(cmdline: string): boolean {
+    const normalized = cmdline.toLowerCase();
+    return normalized.includes("codex") && normalized.includes("app-server");
   }
 
   private log(msg: string) {
