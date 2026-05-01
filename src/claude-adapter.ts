@@ -492,6 +492,18 @@ export class ClaudeAdapter extends EventEmitter {
 
     this.auditReply("reply_sent", bridgeMsg, requireReply);
 
+    // Phase C: ack messages on the chat we just replied to so the
+    // UserPromptSubmit hook stops re-injecting them on later turns.
+    // Skip when chat_id was synthesized (reply_<ts>) \u2014 that's a fresh
+    // conversation, no inbound messages exist on it yet.
+    const replyChatId = args?.chat_id as string | undefined;
+    if (replyChatId) {
+      const ackedCount = this.queue.ackByChatId(replyChatId);
+      if (ackedCount > 0) {
+        this.log(`reply acked ${ackedCount} message(s) on chat ${replyChatId}`);
+      }
+    }
+
     // Include pending message hint
     const pending = this.getPendingMessageCount();
     let responseText = "Reply sent to Codex.";

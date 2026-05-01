@@ -1,5 +1,5 @@
 {
-  "description": "Hint-only health checks for AgentBridge startup. These hooks never orchestrate the daemon.",
+  "description": "Hint-only health checks for AgentBridge startup, plus Phase C UserPromptSubmit injection of pending Codex messages.",
   "hooks": {
     "SessionStart": [
       {
@@ -8,6 +8,17 @@
           {
             "type": "command",
             "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/health-check.sh\""
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "matcher": "*",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "bash \"${CLAUDE_PLUGIN_ROOT}/scripts/inject-pending-codex.sh\""
           }
         ]
       }

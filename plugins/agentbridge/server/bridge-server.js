@@ -13693,15 +13693,21 @@ class PersistentMessageQueue {
         pushed_at INTEGER,
         push_error TEXT,
         drained_at INTEGER,
+        acked_at INTEGER,
         created_at INTEGER NOT NULL
       )
     `);
+    const cols = this.db.query("PRAGMA table_info(messages)").all();
+    if (!cols.some((c) => c.name === "acked_at")) {
+      this.db.exec("ALTER TABLE messages ADD COLUMN acked_at INTEGER");
+    }
     this.db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_undrained_dedupe
       ON messages(chat_id, content_hash)
       WHERE drained_at IS NULL
     `);
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_messages_undrained_seq ON messages(drained_at, seq)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_messages_unacked_undrained ON messages(acked_at, drained_at, seq)");
   }
   enqueue(input) {
     const contentHash = hashContent(input.message.content);
@@ -13733,11 +13739,37 @@ class PersistentMessageQueue {
         pushed_at AS pushedAt,
         push_error AS pushError,
         drained_at AS drainedAt,
+        acked_at AS ackedAt,
         created_at AS createdAt
       FROM messages
       WHERE drained_at IS NULL
       ORDER BY seq ASC
     `).all();
+  }
+  listUnackedUndrained() {
+    return this.db.query(`
+      SELECT
+        seq,
+        message_id AS messageId,
+        chat_id AS chatId,
+        source,
+        content,
+        timestamp,
+        marker,
+        content_hash AS contentHash,
+        pushed_at AS pushedAt,
+        push_error AS pushError,
+        drained_at AS drainedAt,
+        acked_at AS ackedAt,
+        created_at AS createdAt
+      FROM messages
+      WHERE drained_at IS NULL AND acked_at IS NULL
+      ORDER BY seq ASC
+    `).all();
+  }
+  countUnackedUndrained() {
+    const row = this.db.query("SELECT COUNT(*) AS count FROM messages WHERE drained_at IS NULL AND acked_at IS NULL").get();
+    return row.count;
   }
   countUndrained() {
     const row = this.db.query("SELECT COUNT(*) AS count FROM messages WHERE drained_at IS NULL").get();
@@ -13759,6 +13791,10 @@ class PersistentMessageQueue {
     });
     transaction(messageIds);
   }
+  ackByChatId(chatId, ackedAt = Date.now()) {
+    const result = this.db.query("UPDATE messages SET acked_at = ? WHERE chat_id = ? AND drained_at IS NULL AND acked_at IS NULL").run(ackedAt, chatId);
+    return Number(result.changes ?? 0);
+  }
   markOldestUndrainedDropped(droppedAt = Date.now()) {
     const entry = this.db.query(`
       SELECT
@@ -13773,6 +13809,7 @@ class PersistentMessageQueue {
         pushed_at AS pushedAt,
         push_error AS pushError,
         drained_at AS drainedAt,
+        acked_at AS ackedAt,
         created_at AS createdAt
       FROM messages
       WHERE drained_at IS NULL
@@ -13808,6 +13845,7 @@ class PersistentMessageQueue {
         pushed_at AS pushedAt,
         push_error AS pushError,
         drained_at AS drainedAt,
+        acked_at AS ackedAt,
         created_at AS createdAt
       FROM messages
       WHERE chat_id = ? AND content_hash = ? AND drained_at IS NULL
@@ -14282,6 +14320,13 @@ ${formatted}`
       };
     }
     this.auditReply("reply_sent", bridgeMsg, requireReply);
+    const replyChatId = args?.chat_id;
+    if (replyChatId) {
+      const ackedCount = this.queue.ackByChatId(replyChatId);
+      if (ackedCount > 0) {
+        this.log(`reply acked ${ackedCount} message(s) on chat ${replyChatId}`);
+      }
+    }
     const pending = this.getPendingMessageCount();
     let responseText = "Reply sent to Codex.";
     if (pending > 0) {

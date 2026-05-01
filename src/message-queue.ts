@@ -16,6 +16,7 @@ export interface QueueEntry {
   pushedAt: number | null;
   pushError: string | null;
   drainedAt: number | null;
+  ackedAt: number | null;
   createdAt: number;
 }
 
@@ -68,15 +69,22 @@ export class PersistentMessageQueue {
         pushed_at INTEGER,
         push_error TEXT,
         drained_at INTEGER,
+        acked_at INTEGER,
         created_at INTEGER NOT NULL
       )
     `);
+    // Phase C migration: add acked_at column if missing on pre-existing DBs.
+    const cols = this.db.query("PRAGMA table_info(messages)").all() as { name: string }[];
+    if (!cols.some((c) => c.name === "acked_at")) {
+      this.db.exec("ALTER TABLE messages ADD COLUMN acked_at INTEGER");
+    }
     this.db.exec(`
       CREATE UNIQUE INDEX IF NOT EXISTS idx_messages_undrained_dedupe
       ON messages(chat_id, content_hash)
       WHERE drained_at IS NULL
     `);
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_messages_undrained_seq ON messages(drained_at, seq)");
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_messages_unacked_undrained ON messages(acked_at, drained_at, seq)");
   }
 
   enqueue(input: EnqueueInput): QueueEntry {
@@ -122,11 +130,45 @@ export class PersistentMessageQueue {
         pushed_at AS pushedAt,
         push_error AS pushError,
         drained_at AS drainedAt,
+        acked_at AS ackedAt,
         created_at AS createdAt
       FROM messages
       WHERE drained_at IS NULL
       ORDER BY seq ASC
     `).all() as QueueEntry[];
+  }
+
+  /**
+   * Phase C: messages eligible for hook injection — undrained AND unacked.
+   * Non-consuming read; callers must not mutate state on this query alone.
+   */
+  listUnackedUndrained(): QueueEntry[] {
+    return this.db.query(`
+      SELECT
+        seq,
+        message_id AS messageId,
+        chat_id AS chatId,
+        source,
+        content,
+        timestamp,
+        marker,
+        content_hash AS contentHash,
+        pushed_at AS pushedAt,
+        push_error AS pushError,
+        drained_at AS drainedAt,
+        acked_at AS ackedAt,
+        created_at AS createdAt
+      FROM messages
+      WHERE drained_at IS NULL AND acked_at IS NULL
+      ORDER BY seq ASC
+    `).all() as QueueEntry[];
+  }
+
+  countUnackedUndrained(): number {
+    const row = this.db.query(
+      "SELECT COUNT(*) AS count FROM messages WHERE drained_at IS NULL AND acked_at IS NULL"
+    ).get() as { count: number };
+    return row.count;
   }
 
   countUndrained(): number {
@@ -151,6 +193,21 @@ export class PersistentMessageQueue {
     transaction(messageIds);
   }
 
+  /**
+   * Phase C: mark all undrained messages on a chat as acked.
+   * Called when Claude replies to that chat — signals the hook layer
+   * to stop re-injecting these on subsequent UserPromptSubmit events.
+   * Non-destructive to drained_at; get_messages can still consume.
+   * Returns the number of rows actually flipped (zero is a no-op).
+   */
+  ackByChatId(chatId: string, ackedAt = Date.now()): number {
+    const result = this.db
+      .query("UPDATE messages SET acked_at = ? WHERE chat_id = ? AND drained_at IS NULL AND acked_at IS NULL")
+      .run(ackedAt, chatId);
+    // bun:sqlite returns { changes, lastInsertRowid }
+    return Number((result as { changes?: number }).changes ?? 0);
+  }
+
   markOldestUndrainedDropped(droppedAt = Date.now()): QueueEntry | null {
     const entry = this.db.query(`
       SELECT
@@ -165,6 +222,7 @@ export class PersistentMessageQueue {
         pushed_at AS pushedAt,
         push_error AS pushError,
         drained_at AS drainedAt,
+        acked_at AS ackedAt,
         created_at AS createdAt
       FROM messages
       WHERE drained_at IS NULL
@@ -204,6 +262,7 @@ export class PersistentMessageQueue {
         pushed_at AS pushedAt,
         push_error AS pushError,
         drained_at AS drainedAt,
+        acked_at AS ackedAt,
         created_at AS createdAt
       FROM messages
       WHERE chat_id = ? AND content_hash = ? AND drained_at IS NULL
