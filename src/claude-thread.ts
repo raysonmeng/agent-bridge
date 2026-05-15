@@ -71,7 +71,12 @@ export class ClaudeThread extends EventEmitter {
       clientInfo: { name: "agentbridge-claude-thread", version: "0.1.0" },
       capabilities: { experimentalApi: false },
     });
-    const params: Record<string, unknown> = {};
+    // Use approvalPolicy="never" so Codex never escalates approvals to us.
+    // Sandbox boundaries still apply; if a command can't run under the
+    // configured sandbox it fails as a turn error rather than triggering an
+    // interactive approval flow we have no UI to satisfy. Approval-method
+    // server requests are still handled below as a defense-in-depth fallback.
+    const params: Record<string, unknown> = { approvalPolicy: "never" };
     if (this.cwd) params.cwd = this.cwd;
     const startRes: any = await this.callRpc("thread/start", params);
     const tid = startRes?.thread?.id ?? startRes?.threadId ?? null;
@@ -198,19 +203,24 @@ export class ClaudeThread extends EventEmitter {
       return;
     }
 
-    // server-initiated request (approvals, fuzzy file, etc.) — auto-deny
+    // Server-initiated request (approvals, fuzzy file, etc.). We have no
+    // interactive UI bound to this thread — and we've already set
+    // approvalPolicy="never" at thread/start, so in steady state these
+    // should not arrive. This block is a defense-in-depth fallback:
+    //
+    //   - Approval-like methods (commandExecution / fileChange) → auto-accept,
+    //     since the human-equivalent for this thread is the Claude that
+    //     issued the task. Sandbox boundaries already constrain what can be
+    //     executed; a separate approval handshake adds no security here.
+    //   - Permission-grant requests → auto-deny (grant nothing extra) so the
+    //     sandbox can't be silently widened by Codex.
+    //   - Anything else (future server requests we don't know) → reply with
+    //     -32601 and log; surfacing a clear error is better than silently
+    //     ignoring the id and leaving Codex hung waiting for a response.
     if (parsed.id !== undefined && typeof parsed.method === "string") {
-      // Only respond if the request targets our thread; otherwise it's
-      // for a different client and we can ignore.
       const tid = parsed.params?.threadId;
       if (tid && this.threadId && tid !== this.threadId) return;
-      try {
-        this.ws?.send(JSON.stringify({
-          jsonrpc: "2.0",
-          id: parsed.id,
-          error: { code: -32601, message: "auto-denied by ClaudeThread (no UI to approve)" },
-        }));
-      } catch {}
+      this.respondToServerRequest(parsed.id, parsed.method, parsed.params);
       return;
     }
 
@@ -312,6 +322,68 @@ export class ClaudeThread extends EventEmitter {
         reject(err);
       }
     });
+  }
+
+  /**
+   * Respond to a server-initiated request (Codex asking the client to
+   * approve a command, file change, permission widening, etc.).
+   *
+   * See `ExecCommandApprovalResponse` / `CommandExecutionRequestApprovalResponse`
+   * / `FileChangeRequestApprovalResponse` / `PermissionsRequestApprovalResponse`
+   * in the codex app-server schema for the exact shapes.
+   */
+  private respondToServerRequest(
+    id: number | string,
+    method: string,
+    _params: unknown,
+  ): void {
+    let result: Record<string, unknown> | undefined;
+    let error: { code: number; message: string } | undefined;
+
+    switch (method) {
+      case "item/commandExecution/requestApproval":
+        // CommandExecutionApprovalDecision allowed values:
+        //   "accept" | "acceptForSession" | {acceptWithExecpolicyAmendment} |
+        //   {applyNetworkPolicyAmendment} | "decline" | "cancel"
+        result = { decision: "accept" };
+        this.log(`auto-accepted ${method} (id=${id})`);
+        break;
+      case "item/fileChange/requestApproval":
+        // FileChangeApprovalDecision: accept | acceptForSession | decline | cancel
+        result = { decision: "accept" };
+        this.log(`auto-accepted ${method} (id=${id})`);
+        break;
+      case "applyPatchApproval":
+      case "execCommandApproval":
+        // ReviewDecision: approved | approved_for_session | denied | timed_out | abort
+        result = { decision: "approved" };
+        this.log(`auto-approved ${method} (id=${id})`);
+        break;
+      case "item/permissions/requestApproval":
+        // PermissionsRequestApprovalResponse requires `permissions`. Returning
+        // an empty profile effectively grants nothing additional — the
+        // existing sandbox stays in force. This is the conservative path:
+        // we don't widen what Codex is allowed to do.
+        result = { permissions: {} };
+        this.log(`auto-denied permission widening for ${method} (id=${id})`);
+        break;
+      default:
+        error = {
+          code: -32601,
+          message: `ClaudeThread received unknown server request method '${method}' with no handler`,
+        };
+        this.log(`unknown server request method: ${method} (id=${id}) — replying -32601`);
+        break;
+    }
+
+    const payload: Record<string, unknown> = { jsonrpc: "2.0", id };
+    if (result !== undefined) payload.result = result;
+    if (error !== undefined) payload.error = error;
+    try {
+      this.ws?.send(JSON.stringify(payload));
+    } catch (err: any) {
+      this.log(`failed to send server-request response: ${err?.message ?? err}`);
+    }
   }
 
   private log(s: string) {

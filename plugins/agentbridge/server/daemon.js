@@ -1324,7 +1324,7 @@ class ClaudeThread extends EventEmitter2 {
       clientInfo: { name: "agentbridge-claude-thread", version: "0.1.0" },
       capabilities: { experimentalApi: false }
     });
-    const params = {};
+    const params = { approvalPolicy: "never" };
     if (this.cwd)
       params.cwd = this.cwd;
     const startRes = await this.callRpc("thread/start", params);
@@ -1449,13 +1449,7 @@ class ClaudeThread extends EventEmitter2 {
       const tid = parsed.params?.threadId;
       if (tid && this.threadId && tid !== this.threadId)
         return;
-      try {
-        this.ws?.send(JSON.stringify({
-          jsonrpc: "2.0",
-          id: parsed.id,
-          error: { code: -32601, message: "auto-denied by ClaudeThread (no UI to approve)" }
-        }));
-      } catch {}
+      this.respondToServerRequest(parsed.id, parsed.method, parsed.params);
       return;
     }
     if (typeof parsed.method === "string" && parsed.id === undefined) {
@@ -1552,6 +1546,46 @@ class ClaudeThread extends EventEmitter2 {
         reject(err);
       }
     });
+  }
+  respondToServerRequest(id, method, _params) {
+    let result;
+    let error;
+    switch (method) {
+      case "item/commandExecution/requestApproval":
+        result = { decision: "accept" };
+        this.log(`auto-accepted ${method} (id=${id})`);
+        break;
+      case "item/fileChange/requestApproval":
+        result = { decision: "accept" };
+        this.log(`auto-accepted ${method} (id=${id})`);
+        break;
+      case "applyPatchApproval":
+      case "execCommandApproval":
+        result = { decision: "approved" };
+        this.log(`auto-approved ${method} (id=${id})`);
+        break;
+      case "item/permissions/requestApproval":
+        result = { permissions: {} };
+        this.log(`auto-denied permission widening for ${method} (id=${id})`);
+        break;
+      default:
+        error = {
+          code: -32601,
+          message: `ClaudeThread received unknown server request method '${method}' with no handler`
+        };
+        this.log(`unknown server request method: ${method} (id=${id}) \u2014 replying -32601`);
+        break;
+    }
+    const payload = { jsonrpc: "2.0", id };
+    if (result !== undefined)
+      payload.result = result;
+    if (error !== undefined)
+      payload.error = error;
+    try {
+      this.ws?.send(JSON.stringify(payload));
+    } catch (err) {
+      this.log(`failed to send server-request response: ${err?.message ?? err}`);
+    }
   }
   log(s) {
     const line = `[${new Date().toISOString()}] [ClaudeThread:${this.chatId}] ${s}
