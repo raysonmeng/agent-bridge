@@ -2,13 +2,14 @@
 // @bun
 
 // src/daemon.ts
-import { appendFileSync as appendFileSync2 } from "fs";
+import { appendFileSync as appendFileSync3 } from "fs";
 
 // src/codex-adapter.ts
 import { spawn, execSync } from "child_process";
 import { createInterface } from "readline";
 import { EventEmitter } from "events";
 import { appendFileSync } from "fs";
+import { createHash } from "crypto";
 
 // src/state-dir.ts
 import { mkdirSync, existsSync } from "fs";
@@ -78,7 +79,9 @@ var APP_SERVER_NOTIFICATION_METHODS = [
   "turn/completed",
   "item/started",
   "item/agentMessage/delta",
-  "item/completed"
+  "item/completed",
+  "error",
+  "thread/closed"
 ];
 var TRACKED_REQUEST_METHOD_SET = new Set(APP_SERVER_TRACKED_REQUEST_METHODS);
 var SERVER_REQUEST_METHOD_SET = new Set(APP_SERVER_SERVER_REQUEST_METHODS);
@@ -145,6 +148,12 @@ class CodexAdapter extends EventEmitter {
   sessionRestoreInProgress = false;
   replayPending = new Map;
   static SESSION_REPLAY_TIMEOUT_MS = 5000;
+  pairedChatId = null;
+  injectedTurnIds = new Map;
+  pendingInjectionHashes = new Map;
+  pendingInjectionByReqId = new Map;
+  static ECHO_DEDUP_TTL_MS = 60000;
+  static PENDING_HASH_TTL_MS = 5000;
   constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile) {
     super();
     this.appPort = appPort;
@@ -222,6 +231,10 @@ class CodexAdapter extends EventEmitter {
       this.log("Cannot inject: app-server WebSocket not connected");
       return false;
     }
+    if (this.sessionRestoreInProgress) {
+      this.log(`Rejected injection: shared Codex TUI session restore in progress`);
+      return false;
+    }
     if (this.turnInProgress) {
       this.log(`Rejected injection: Codex turn is in progress (thread ${this.threadId})`);
       return false;
@@ -229,6 +242,9 @@ class CodexAdapter extends EventEmitter {
     this.log(`Injecting message into Codex (${text.length} chars)`);
     const requestId = this.nextInjectionId--;
     this.trackBridgeRequestId(requestId);
+    const contentHash = this.hashInjectionContent(text);
+    this.pendingInjectionHashes.set(contentHash, Date.now() + CodexAdapter.PENDING_HASH_TTL_MS);
+    this.pendingInjectionByReqId.set(requestId, contentHash);
     try {
       this.appServerWs.send(JSON.stringify({
         method: "turn/start",
@@ -238,9 +254,49 @@ class CodexAdapter extends EventEmitter {
       return true;
     } catch (err) {
       this.untrackBridgeRequestId(requestId);
+      this.pendingInjectionByReqId.delete(requestId);
+      this.pendingInjectionHashes.delete(contentHash);
       this.log(`Injection send failed: ${err.message}`);
       return false;
     }
+  }
+  setPairedChat(chatId) {
+    this.pairedChatId = chatId;
+    this.log(`Paired chat set to: ${chatId ?? "<none>"}`);
+  }
+  isPaired(chatId) {
+    return this.pairedChatId !== null && this.pairedChatId === chatId;
+  }
+  get currentPairedChatId() {
+    return this.pairedChatId;
+  }
+  hashInjectionContent(text) {
+    return createHash("sha1").update(text).digest("hex").slice(0, 16);
+  }
+  isEchoOfInjection(content, turnId) {
+    if (typeof turnId === "string" && turnId.length > 0) {
+      const expiresAt = this.injectedTurnIds.get(turnId);
+      if (expiresAt !== undefined) {
+        if (Date.now() <= expiresAt)
+          return true;
+        this.injectedTurnIds.delete(turnId);
+      }
+    }
+    const hash = this.hashInjectionContent(content);
+    const hashExpiresAt = this.pendingInjectionHashes.get(hash);
+    if (hashExpiresAt !== undefined) {
+      if (Date.now() <= hashExpiresAt) {
+        this.pendingInjectionHashes.delete(hash);
+        return true;
+      }
+      this.pendingInjectionHashes.delete(hash);
+    }
+    return false;
+  }
+  recordInjectedTurnId(turnId, contentHash) {
+    this.injectedTurnIds.set(turnId, Date.now() + CodexAdapter.ECHO_DEDUP_TTL_MS);
+    if (contentHash)
+      this.pendingInjectionHashes.delete(contentHash);
   }
   async waitForHealthy(maxRetries = 20, delayMs = 500) {
     for (let i = 0;i < maxRetries; i++) {
@@ -436,6 +492,8 @@ class CodexAdapter extends EventEmitter {
       return;
     }
     this.sessionRestoreInProgress = true;
+    this.emit("sessionRestoreStart", { threadId: this.threadId });
+    let restoreSucceeded = false;
     try {
       this.log(`DIAGNOSTIC: replaying cached initialize to restore session (threadId=${this.threadId ?? "none"})`);
       await this.sendReplayAndAwait(this.lastInitializeRaw, "initialize");
@@ -453,6 +511,7 @@ class CodexAdapter extends EventEmitter {
         await this.sendReplayAndAwait(resumeRaw, "thread/resume");
       }
       this.log(`DIAGNOSTIC: session restored after unintentional reconnect (threadId=${this.threadId ?? "none"})`);
+      restoreSucceeded = true;
     } catch (err) {
       const msg = err instanceof Error ? err.message : String(err);
       this.log(`ERROR: session restore failed (${msg}) \u2014 closing TUI with 1011`);
@@ -467,7 +526,11 @@ class CodexAdapter extends EventEmitter {
       }
     } finally {
       this.sessionRestoreInProgress = false;
+      this.emit("sessionRestoreEnd", { threadId: this.threadId, ok: restoreSucceeded });
     }
+  }
+  get isSessionRestoreInProgress() {
+    return this.sessionRestoreInProgress;
   }
   sendReplayAndAwait(raw, method) {
     if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
@@ -550,11 +613,16 @@ class CodexAdapter extends EventEmitter {
       fetch(req, server) {
         const url = new URL(req.url);
         const isUpgrade = req.headers.get("upgrade")?.toLowerCase() === "websocket";
-        self.log(`HTTP ${req.method} ${url.pathname} (upgrade=${isUpgrade})`);
+        const queryToken = url.searchParams.get("abg_token") ?? "";
+        const authHeader = req.headers.get("authorization") ?? "";
+        const bearerToken = authHeader.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() ?? "";
+        const token = bearerToken || queryToken;
+        const tokenSource = bearerToken ? "authorization" : queryToken ? "query" : "none";
+        self.log(`HTTP ${req.method} ${url.pathname} (upgrade=${isUpgrade}, token=${token ? token.slice(0, 8) + "\u2026" : "<none>"}, tokenSource=${tokenSource})`);
         if (url.pathname === "/healthz" || url.pathname === "/readyz") {
           return fetch(`http://127.0.0.1:${self.appPort}${url.pathname}`);
         }
-        if (server.upgrade(req, { data: { connId: 0 } }))
+        if (server.upgrade(req, { data: { connId: 0, token } }))
           return;
         self.log(`WARNING: non-upgrade HTTP request not handled: ${req.method} ${url.pathname}`);
         return new Response("AgentBridge Codex Proxy");
@@ -573,7 +641,18 @@ class CodexAdapter extends EventEmitter {
     const connId = ++this.connIdCounter;
     ws.data.connId = connId;
     if (this.tuiWs) {
-      this.log(`Secondary TUI connected (conn #${connId}, primary is #${this.tuiConnId})`);
+      const primaryToken = this.tuiWs.data.token;
+      const newToken = ws.data.token;
+      if (primaryToken !== newToken) {
+        this.log(`Rejecting second proxy TUI: token mismatch (primary conn #${this.tuiConnId} token=${primaryToken ? primaryToken.slice(0, 8) + "\u2026" : "<none>"}, new conn #${connId} token=${newToken ? newToken.slice(0, 8) + "\u2026" : "<none>"})`);
+        try {
+          ws.close(4002, "another --via-proxy TUI is already connected");
+        } catch (err) {
+          this.log(`Failed to close rejected second TUI cleanly: ${err.message}`);
+        }
+        return;
+      }
+      this.log(`Secondary TUI connected (conn #${connId}, primary is #${this.tuiConnId}, token matches)`);
       this.setupSecondaryConnection(ws, connId);
       return;
     }
@@ -581,8 +660,8 @@ class CodexAdapter extends EventEmitter {
     this.tuiConnId = connId;
     this.tuiWs = ws;
     this.threadId = null;
-    this.log(`TUI connected (conn #${this.tuiConnId})`);
-    this.emit("tuiConnected", this.tuiConnId);
+    this.log(`TUI connected (conn #${this.tuiConnId}, token=${ws.data.token ? ws.data.token.slice(0, 8) + "\u2026" : "<none>"})`);
+    this.emit("tuiConnected", this.tuiConnId, ws.data.token);
     if (previousConnId !== null) {
       this.retireConnectionState(previousConnId);
     }
@@ -924,8 +1003,22 @@ class CodexAdapter extends EventEmitter {
     if (!isNaN(numericId) && this.consumeBridgeRequestId(numericId)) {
       if (parsed.error) {
         this.log(`Bridge-originated request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
+        const contentHash = this.pendingInjectionByReqId.get(numericId);
+        if (contentHash) {
+          this.pendingInjectionHashes.delete(contentHash);
+          this.pendingInjectionByReqId.delete(numericId);
+        }
       } else {
-        this.log(`Bridge-originated request completed (id ${responseId})`);
+        const result = parsed.result ?? {};
+        const turnId = result.turn?.id;
+        const contentHash = this.pendingInjectionByReqId.get(numericId);
+        this.pendingInjectionByReqId.delete(numericId);
+        if (typeof turnId === "string" && turnId.length > 0) {
+          this.recordInjectedTurnId(turnId, contentHash);
+          this.log(`Bridge-originated request completed (id ${responseId}, turnId=${turnId} dedup)`);
+        } else {
+          this.log(`Bridge-originated request completed (id ${responseId}, no turnId \u2014 falling back to content-hash dedup)`);
+        }
       }
       return null;
     }
@@ -968,9 +1061,10 @@ class CodexAdapter extends EventEmitter {
   handleServerNotification(msg) {
     const { method, params } = msg;
     switch (method) {
-      case "turn/started":
+      case "turn/started": {
         this.markTurnStarted(params?.turn?.id);
         break;
+      }
       case "item/started": {
         const item = params?.item;
         if (item?.type === "agentMessage")
@@ -1000,15 +1094,46 @@ class CodexAdapter extends EventEmitter {
               timestamp: Date.now()
             });
           }
+        } else if (item?.type === "userMessage") {
+          const content = this.extractContent(item);
+          if (content) {
+            const turnIdFromParams = typeof params?.turnId === "string" ? params.turnId : undefined;
+            if (this.isEchoOfInjection(content, turnIdFromParams)) {
+              this.log(`Suppressed userMessage echo (item ${item.id}, ${content.length} chars)`);
+            } else {
+              this.log(`User message from TUI (${content.length} chars)`);
+              this.emit("userMessage", {
+                id: item.id,
+                source: "codex",
+                content,
+                timestamp: Date.now(),
+                turnId: turnIdFromParams
+              });
+            }
+          }
         }
         break;
       }
       case "turn/completed": {
         const wasInProgress = this.turnInProgress;
-        this.markTurnCompleted(params?.turn?.id);
+        const turnId = params?.turn?.id;
+        this.markTurnCompleted(turnId);
         if (wasInProgress && !this.turnInProgress) {
-          this.emit("turnCompleted");
+          this.emit("turnCompleted", { turnId });
         }
+        break;
+      }
+      case "error": {
+        const errorParams = params ?? {};
+        const detail = errorParams.error?.message ?? "(no error message)";
+        const code = errorParams.error?.code;
+        this.log(`App-server error notification: ${detail}${code !== undefined ? ` (code ${code})` : ""}`);
+        this.emit("errorItem", { code, message: detail, data: errorParams.error?.data });
+        break;
+      }
+      case "thread/closed": {
+        const closedThreadId = params ?? {};
+        this.emit("threadClosed", { threadId: closedThreadId.threadId });
         break;
       }
     }
@@ -1108,7 +1233,7 @@ class CodexAdapter extends EventEmitter {
     }
     this.turnInProgress = this.activeTurnIds.size > 0;
     if (!wasInProgress && this.turnInProgress) {
-      this.emit("turnStarted");
+      this.emit("turnStarted", { turnId });
     }
   }
   markTurnCompleted(turnId) {
@@ -1278,6 +1403,321 @@ class CodexAdapter extends EventEmitter {
     process.stderr.write(line);
     try {
       appendFileSync(this.logFile, line);
+    } catch {}
+  }
+}
+
+// src/claude-thread.ts
+import { EventEmitter as EventEmitter2 } from "events";
+import { appendFileSync as appendFileSync2 } from "fs";
+var RPC_TIMEOUT_MS = 30000;
+
+class ClaudeThread extends EventEmitter2 {
+  chatId;
+  appServerUrl;
+  logFile;
+  cwd;
+  ws = null;
+  threadId = null;
+  nextId = 1;
+  pending = new Map;
+  turnInProgress = false;
+  agentMessageBuffers = new Map;
+  bootstrapped = false;
+  closed = false;
+  constructor(opts) {
+    super();
+    this.chatId = opts.chatId;
+    this.appServerUrl = opts.appServerUrl;
+    this.logFile = opts.logFile;
+    this.cwd = opts.cwd;
+  }
+  get activeThreadId() {
+    return this.threadId;
+  }
+  get isTurnInProgress() {
+    return this.turnInProgress;
+  }
+  get isReady() {
+    return this.bootstrapped && this.threadId !== null;
+  }
+  async bootstrap() {
+    if (this.bootstrapped && this.threadId)
+      return this.threadId;
+    await this.openSocket();
+    await this.callRpc("initialize", {
+      clientInfo: { name: "agentbridge-claude-thread", version: "0.1.0" },
+      capabilities: { experimentalApi: false }
+    });
+    const params = { approvalPolicy: "never" };
+    if (this.cwd)
+      params.cwd = this.cwd;
+    const startRes = await this.callRpc("thread/start", params);
+    const tid = startRes?.thread?.id ?? startRes?.threadId ?? null;
+    if (typeof tid !== "string" || tid.length === 0) {
+      throw new Error("thread/start did not return a threadId");
+    }
+    this.threadId = tid;
+    this.bootstrapped = true;
+    this.log(`bootstrap ok threadId=${tid}`);
+    this.emit("ready", tid);
+    return tid;
+  }
+  injectMessage(text) {
+    if (!this.threadId) {
+      this.log("inject rejected: not bootstrapped");
+      return false;
+    }
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      this.log("inject rejected: ws not open");
+      return false;
+    }
+    if (this.turnInProgress) {
+      this.log(`inject rejected: turn already in progress`);
+      return false;
+    }
+    const id = this.nextId++;
+    const msg = {
+      jsonrpc: "2.0",
+      id,
+      method: "turn/start",
+      params: {
+        threadId: this.threadId,
+        input: [{ type: "text", text }]
+      }
+    };
+    try {
+      this.ws.send(JSON.stringify(msg));
+      return true;
+    } catch (err) {
+      this.log(`inject send failed: ${err.message}`);
+      return false;
+    }
+  }
+  close() {
+    if (this.closed)
+      return;
+    this.closed = true;
+    if (this.ws) {
+      try {
+        this.ws.close();
+      } catch {}
+      this.ws = null;
+    }
+    for (const [, p] of this.pending) {
+      clearTimeout(p.timer);
+      p.reject(new Error("ClaudeThread closed"));
+    }
+    this.pending.clear();
+  }
+  openSocket() {
+    return new Promise((resolve, reject) => {
+      const ws = new WebSocket(this.appServerUrl);
+      let settled = false;
+      ws.onopen = () => {
+        if (settled)
+          return;
+        settled = true;
+        this.ws = ws;
+        this.attachHandlers(ws);
+        resolve();
+      };
+      ws.onerror = (e) => {
+        if (settled)
+          return;
+        settled = true;
+        reject(new Error(`ws connect failed: ${e?.message ?? "unknown"}`));
+      };
+      ws.onclose = (e) => {
+        if (!settled) {
+          settled = true;
+          reject(new Error(`ws closed during handshake (code=${e?.code})`));
+          return;
+        }
+      };
+    });
+  }
+  attachHandlers(ws) {
+    ws.onmessage = (event) => {
+      const raw = typeof event.data === "string" ? event.data : event.data.toString();
+      this.handlePayload(raw);
+    };
+    ws.onclose = () => {
+      this.log(`ws closed (chatId=${this.chatId}, threadId=${this.threadId})`);
+      this.ws = null;
+      this.emit("close");
+    };
+    ws.onerror = (e) => {
+      this.log(`ws error: ${e?.message ?? "unknown"}`);
+      this.emit("error", e);
+    };
+  }
+  handlePayload(raw) {
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch {
+      return;
+    }
+    if (typeof parsed.id === "number" && this.pending.has(parsed.id) && (parsed.result !== undefined || parsed.error !== undefined)) {
+      const pending = this.pending.get(parsed.id);
+      this.pending.delete(parsed.id);
+      clearTimeout(pending.timer);
+      if (parsed.error) {
+        pending.reject(new Error(`${pending.method} failed: ${JSON.stringify(parsed.error).slice(0, 200)}`));
+      } else {
+        pending.resolve(parsed.result);
+      }
+      return;
+    }
+    if (parsed.id !== undefined && typeof parsed.method === "string") {
+      const tid = parsed.params?.threadId;
+      if (tid && this.threadId && tid !== this.threadId)
+        return;
+      this.respondToServerRequest(parsed.id, parsed.method, parsed.params);
+      return;
+    }
+    if (typeof parsed.method === "string" && parsed.id === undefined) {
+      const tid = parsed.params?.threadId;
+      if (tid && this.threadId && tid !== this.threadId) {
+        return;
+      }
+      this.handleNotification(parsed.method, parsed.params ?? {});
+    }
+  }
+  handleNotification(method, params) {
+    switch (method) {
+      case "turn/started": {
+        if (!this.turnInProgress) {
+          this.turnInProgress = true;
+          this.emit("turnStarted");
+        }
+        break;
+      }
+      case "item/started": {
+        const item = params?.item;
+        if (item?.type === "agentMessage")
+          this.agentMessageBuffers.set(item.id, []);
+        break;
+      }
+      case "item/agentMessage/delta": {
+        const itemId = params?.itemId;
+        const delta = params?.delta;
+        if (typeof itemId === "string") {
+          const buf = this.agentMessageBuffers.get(itemId);
+          if (buf && typeof delta === "string")
+            buf.push(delta);
+        }
+        break;
+      }
+      case "item/completed": {
+        const item = params?.item;
+        if (item?.type === "agentMessage") {
+          const content = this.extractContent(item);
+          this.agentMessageBuffers.delete(item.id);
+          if (content) {
+            const bridgeMsg = {
+              id: item.id,
+              source: "codex",
+              content,
+              timestamp: Date.now()
+            };
+            this.emit("agentMessage", bridgeMsg);
+          }
+        }
+        break;
+      }
+      case "turn/completed": {
+        if (this.turnInProgress) {
+          this.turnInProgress = false;
+          this.emit("turnCompleted");
+        }
+        break;
+      }
+      case "turn/failed": {
+        if (this.turnInProgress) {
+          this.turnInProgress = false;
+          this.emit("turnCompleted");
+        }
+        this.emit("turnFailed", params);
+        break;
+      }
+    }
+  }
+  extractContent(item) {
+    if (item.content?.length) {
+      return item.content.filter((c) => c.type === "text" && c.text).map((c) => c.text).join("");
+    }
+    return this.agentMessageBuffers.get(item.id)?.join("") ?? "";
+  }
+  callRpc(method, params) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return Promise.reject(new Error("callRpc: ws not open"));
+    }
+    const id = this.nextId++;
+    const msg = JSON.stringify({ jsonrpc: "2.0", id, method, params });
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        if (this.pending.delete(id)) {
+          reject(new Error(`${method} timed out after ${RPC_TIMEOUT_MS}ms`));
+        }
+      }, RPC_TIMEOUT_MS);
+      this.pending.set(id, { resolve, reject, method, timer });
+      try {
+        this.ws.send(msg);
+      } catch (err) {
+        clearTimeout(timer);
+        this.pending.delete(id);
+        reject(err);
+      }
+    });
+  }
+  respondToServerRequest(id, method, _params) {
+    let result;
+    let error;
+    switch (method) {
+      case "item/commandExecution/requestApproval":
+        result = { decision: "accept" };
+        this.log(`auto-accepted ${method} (id=${id})`);
+        break;
+      case "item/fileChange/requestApproval":
+        result = { decision: "accept" };
+        this.log(`auto-accepted ${method} (id=${id})`);
+        break;
+      case "applyPatchApproval":
+      case "execCommandApproval":
+        result = { decision: "approved" };
+        this.log(`auto-approved ${method} (id=${id})`);
+        break;
+      case "item/permissions/requestApproval":
+        result = { permissions: {} };
+        this.log(`auto-denied permission widening for ${method} (id=${id})`);
+        break;
+      default:
+        error = {
+          code: -32601,
+          message: `ClaudeThread received unknown server request method '${method}' with no handler`
+        };
+        this.log(`unknown server request method: ${method} (id=${id}) \u2014 replying -32601`);
+        break;
+    }
+    const payload = { jsonrpc: "2.0", id };
+    if (result !== undefined)
+      payload.result = result;
+    if (error !== undefined)
+      payload.error = error;
+    try {
+      this.ws?.send(JSON.stringify(payload));
+    } catch (err) {
+      this.log(`failed to send server-request response: ${err?.message ?? err}`);
+    }
+  }
+  log(s) {
+    const line = `[${new Date().toISOString()}] [ClaudeThread:${this.chatId}] ${s}
+`;
+    process.stderr.write(line);
+    try {
+      appendFileSync2(this.logFile, line);
     } catch {}
   }
 }
@@ -1852,6 +2292,8 @@ var CODEX_PROXY_PORT = parseInt(process.env.CODEX_PROXY_PORT ?? String(config.co
 var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
 var TUI_DISCONNECT_GRACE_MS = parseInt(process.env.TUI_DISCONNECT_GRACE_MS ?? "2500", 10);
 var CLAUDE_DISCONNECT_GRACE_MS = 5000;
+var CLAUDE_REAP_AFTER_MS = parseInt(process.env.AGENTBRIDGE_CLAUDE_REAP_MS ?? "600000", 10);
+var PAIR_REAP_MS = parseInt(process.env.AGENTBRIDGE_PAIR_REAP_MS ?? "30000", 10);
 var MAX_BUFFERED_MESSAGES = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
 var FILTER_MODE = process.env.AGENTBRIDGE_FILTER_MODE === "full" ? "full" : "filtered";
 var IDLE_SHUTDOWN_MS = parseInt(process.env.AGENTBRIDGE_IDLE_SHUTDOWN_MS ?? String(config.idleShutdownSeconds * 1000), 10);
@@ -1860,123 +2302,269 @@ var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT,
 var codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile);
 var attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
 var controlServer = null;
-var attachedClaude = null;
 var nextControlClientId = 0;
-var nextSystemMessageId = 0;
 var codexBootstrapped = false;
-var attentionWindowTimer = null;
-var inAttentionWindow = false;
-var replyRequired = false;
-var replyReceivedDuringTurn = false;
 var shuttingDown = false;
 var idleShutdownTimer = null;
-var claudeDisconnectTimer = null;
-var claudeOnlineNoticeSent = false;
-var claudeOfflineNoticeShown = false;
-var codexCollaborationKickoffSent = false;
-var lastAttachStatusSentTs = 0;
-var ATTACH_STATUS_COOLDOWN_MS = 30000;
-var bufferedMessages = [];
+var chats = new Map;
+var proxyTuiSlot = null;
 var tuiConnectionState = new TuiConnectionState({
   disconnectGraceMs: TUI_DISCONNECT_GRACE_MS,
   log,
   onDisconnectPersisted: (connId) => {
-    emitToClaude(systemMessage("system_tui_disconnected", `\u26A0\uFE0F Codex TUI disconnected (conn #${connId}). Codex is still running in the background \u2014 reconnect the TUI to resume.`));
+    broadcastToAllClaudes(systemMessage("system_tui_disconnected", `\u26A0\uFE0F Codex TUI disconnected (conn #${connId}). Codex is still running in the background \u2014 reconnect the TUI to resume.`));
   },
   onReconnectAfterNotice: (connId) => {
-    emitToClaude(systemMessage("system_tui_reconnected", `\u2705 Codex TUI reconnected (conn #${connId}). Bridge restored, communication can continue.`));
-    codex.injectMessage("\u2705 Claude Code is still online, bridge restored. Bidirectional communication can continue.");
-  }
-});
-var statusBuffer = new StatusBuffer((summary) => emitToClaude(summary));
-codex.on("turnStarted", () => {
-  log("Codex turn started");
-  emitToClaude(systemMessage("system_turn_started", "\u23F3 Codex is working on the current task. Wait for completion before sending a reply."));
-});
-codex.on("agentMessage", (msg) => {
-  if (msg.source !== "codex")
-    return;
-  const result = classifyMessage(msg.content, FILTER_MODE);
-  if (replyRequired) {
-    log(`Codex \u2192 Claude [${result.marker}/force-forward-reply-required] (${msg.content.length} chars)`);
-    replyReceivedDuringTurn = true;
-    if (statusBuffer.size > 0) {
-      statusBuffer.flush("reply-required message arrived");
-    }
-    emitToClaude(msg);
-    return;
-  }
-  if (inAttentionWindow && result.marker === "status") {
-    log(`Codex \u2192 Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
-    statusBuffer.add(msg);
-    return;
-  }
-  log(`Codex \u2192 Claude [${result.marker}/${result.action}] (${msg.content.length} chars)`);
-  switch (result.action) {
-    case "forward":
-      if (result.marker === "important" && statusBuffer.size > 0) {
-        statusBuffer.flush("important message arrived");
-      }
-      emitToClaude(msg);
-      if (result.marker === "important") {
-        startAttentionWindow();
-      }
-      break;
-    case "buffer":
-      statusBuffer.add(msg);
-      break;
-    case "drop":
-      break;
-  }
-});
-codex.on("turnCompleted", () => {
-  log("Codex turn completed");
-  statusBuffer.flush("turn completed");
-  if (replyRequired && !replyReceivedDuringTurn) {
-    log("\u26A0\uFE0F Reply was required but Codex did not send any agentMessage");
-    emitToClaude(systemMessage("system_reply_missing", "\u26A0\uFE0F Codex completed the turn without sending a reply (require_reply was set). Codex may not have generated an agentMessage. You may want to retry or rephrase."));
-  }
-  replyRequired = false;
-  replyReceivedDuringTurn = false;
-  emitToClaude(systemMessage("system_turn_completed", "\u2705 Codex finished the current turn. You can reply now if needed."));
-  startAttentionWindow();
-  if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
-    notifyCodexClaudeOnline();
+    broadcastToAllClaudes(systemMessage("system_tui_reconnected", `\u2705 Codex TUI reconnected (conn #${connId}). Bridge restored.`));
   }
 });
 codex.on("ready", (threadId) => {
   tuiConnectionState.markBridgeReady();
-  log(`Codex ready \u2014 thread ${threadId}`);
-  log("Bridge fully operational");
-  emitToClaude(systemMessage("system_ready", currentReadyMessage()));
-  if (attachedClaude && shouldNotifyCodexClaudeOnline()) {
-    notifyCodexClaudeOnline();
+  log(`Codex TUI thread ready: ${threadId} (bridge fully operational)`);
+  if (proxyTuiSlot) {
+    proxyTuiSlot.readiness = "ready";
+    if (proxyTuiSlot.pairedChatId) {
+      const state = chats.get(proxyTuiSlot.pairedChatId);
+      if (state && !state.ready) {
+        state.ready = true;
+        emitToChat(state, systemMessage("system_pair_ready", `\u2705 Shared Codex TUI thread is now ready (threadId=${threadId}). Replies sent via the reply tool will appear in the right pane's TUI.`));
+      }
+    }
   }
 });
-codex.on("tuiConnected", (connId) => {
+codex.on("tuiConnected", (connId, token = "") => {
   tuiConnectionState.handleTuiConnected(connId);
   cancelIdleShutdown();
-  log(`Codex TUI connected (conn #${connId})`);
+  log(`Codex TUI connected (conn #${connId}, token=${token ? token.slice(0, 8) + "\u2026" : "<none>"})`);
+  if (token && !proxyTuiSlot) {
+    proxyTuiSlot = {
+      token,
+      pairedChatId: null,
+      readiness: "not-ready",
+      attachedAt: Date.now(),
+      pairReapTimer: null
+    };
+    log(`Proxy TUI slot allocated (token=${token.slice(0, 8)}\u2026)`);
+  }
   broadcastStatus();
 });
 codex.on("tuiDisconnected", (connId) => {
   tuiConnectionState.handleTuiDisconnected(connId);
   log(`Codex TUI disconnected (conn #${connId})`);
+  if (proxyTuiSlot) {
+    const wasPairedChat = proxyTuiSlot.pairedChatId;
+    if (proxyTuiSlot.pairReapTimer)
+      clearTimeout(proxyTuiSlot.pairReapTimer);
+    proxyTuiSlot = null;
+    codex.setPairedChat(null);
+    if (wasPairedChat) {
+      const state = chats.get(wasPairedChat);
+      if (state) {
+        log(`Transitioning paired chat ${wasPairedChat} to isolated (TUI disconnect)`);
+        transitionToIsolated(state, "Shared Codex TUI thread is gone");
+      }
+    }
+  }
   broadcastStatus();
   scheduleIdleShutdown();
 });
+codex.on("agentMessage", (msg) => {
+  const paired = getPairedChatState();
+  if (!paired)
+    return;
+  log(`[${paired.chatId}] CodexAdapter \u2192 paired Claude (agentMessage, ${msg.content.length} chars)`);
+  paired.pairedTurnSawAgentMessage = true;
+  paired.replyReceivedDuringTurn = true;
+  emitToChat(paired, msg);
+});
+codex.on("userMessage", (payload) => {
+  const paired = getPairedChatState();
+  if (!paired)
+    return;
+  if (!payload.content)
+    return;
+  log(`[${paired.chatId}] CodexAdapter \u2192 paired Claude (userMessage from TUI, ${payload.content.length} chars)`);
+  paired.replyReceivedDuringTurn = true;
+  emitToChat(paired, {
+    id: payload.id ?? `tui_user_${Date.now()}`,
+    source: "codex",
+    content: `[IMPORTANT] Human typed in the paired Codex TUI:
+${payload.content}`,
+    timestamp: Date.now()
+  });
+});
+codex.on("turnStarted", () => {
+  const paired = getPairedChatState();
+  if (!paired)
+    return;
+  paired.pairedTurnSawAgentMessage = false;
+  emitToChat(paired, systemMessage("system_codex_turn_started", "[system] Codex turn started"));
+});
+codex.on("turnCompleted", () => {
+  const paired = getPairedChatState();
+  if (!paired)
+    return;
+  if (!paired.pairedTurnSawAgentMessage && paired.replyRequired) {
+    log(`[${paired.chatId}] Codex turn completed with no agentMessage while replyRequired \u2014 surfacing as failure signal`);
+    paired.replyReceivedDuringTurn = true;
+    emitToChat(paired, systemMessage("system_codex_turn_completed_no_output", "[system] Codex turn completed without any agentMessage \u2014 likely a failure or empty response."));
+  } else {
+    emitToChat(paired, systemMessage("system_codex_turn_completed", "[system] Codex turn completed"));
+  }
+  paired.replyRequired = false;
+  paired.replyReceivedDuringTurn = false;
+});
+codex.on("errorItem", (payload) => {
+  const paired = getPairedChatState();
+  if (!paired)
+    return;
+  paired.replyReceivedDuringTurn = true;
+  emitToChat(paired, systemMessage("system_codex_error", `[error] ${payload.message ?? "(no message)"}${payload.code !== undefined ? ` (code ${payload.code})` : ""}`));
+  paired.pairedTurnSawAgentMessage = true;
+  paired.replyRequired = false;
+  paired.replyReceivedDuringTurn = false;
+});
+codex.on("sessionRestoreStart", () => {
+  if (!proxyTuiSlot)
+    return;
+  log(`Shared Codex session restore started \u2014 flipping paired readiness to not-ready`);
+  proxyTuiSlot.readiness = "not-ready";
+  const paired = getPairedChatState();
+  if (paired)
+    paired.ready = false;
+});
+codex.on("sessionRestoreEnd", (payload = {}) => {
+  if (!proxyTuiSlot)
+    return;
+  if (payload.ok === false) {
+    log(`Shared Codex session restore FAILED \u2014 keeping paired readiness=not-ready, awaiting TUI tear-down`);
+    return;
+  }
+  log(`Shared Codex session restore succeeded \u2014 flipping paired readiness back to ready`);
+  proxyTuiSlot.readiness = "ready";
+  const paired = getPairedChatState();
+  if (paired) {
+    paired.ready = true;
+    emitToChat(paired, systemMessage("system_pair_restored", "\u2705 Shared Codex TUI session restored. Replies can flow again."));
+  }
+});
+codex.on("threadClosed", () => {
+  const paired = getPairedChatState();
+  log(`Codex emitted thread/closed`);
+  if (proxyTuiSlot) {
+    const wasPairedChat = proxyTuiSlot.pairedChatId;
+    proxyTuiSlot = null;
+    codex.setPairedChat(null);
+    if (wasPairedChat && paired) {
+      log(`Transitioning paired chat ${wasPairedChat} to isolated (thread/closed)`);
+      transitionToIsolated(paired, "Shared Codex thread closed");
+    }
+  }
+});
+function getPairedChatState() {
+  if (!proxyTuiSlot?.pairedChatId)
+    return null;
+  return chats.get(proxyTuiSlot.pairedChatId) ?? null;
+}
+function pairChat(state) {
+  if (!proxyTuiSlot)
+    return;
+  if (proxyTuiSlot.pairedChatId)
+    return;
+  proxyTuiSlot.pairedChatId = state.chatId;
+  state.paired = true;
+  codex.setPairedChat(state.chatId);
+  state.ready = proxyTuiSlot.readiness === "ready";
+  log(`Paired chat ${state.chatId} with proxy TUI (readiness=${proxyTuiSlot.readiness})`);
+  if (state.ready) {
+    emitToChat(state, systemMessage("system_paired_ready", "\u2705 This Claude session is paired with the right-pane Codex TUI. Replies will appear there; user typing in the TUI will be forwarded to you with an [IMPORTANT] prefix."));
+  } else {
+    emitToChat(state, systemMessage("system_paired_provisioning", "\u2705 This Claude session is paired with the right-pane Codex TUI. Waiting for the shared thread to finish provisioning before replies can flow."));
+  }
+}
+var ISOLATED_BOOTSTRAP_MAX_ATTEMPTS = parseInt(process.env.AGENTBRIDGE_ISOLATED_BOOTSTRAP_MAX_ATTEMPTS ?? "2", 10);
+var ISOLATED_BOOTSTRAP_RETRY_DELAY_MS = parseInt(process.env.AGENTBRIDGE_ISOLATED_BOOTSTRAP_RETRY_DELAY_MS ?? "2000", 10);
+function bootstrapIsolatedThread(state, attempt = 1) {
+  state.thread.bootstrap().then((threadId) => {
+    state.ready = true;
+    emitToChat(state, systemMessage("system_isolated_ready", `\u2705 Fresh isolated Codex thread ready (threadId=${threadId}).`));
+  }).catch((err) => {
+    const errMsg = err?.message ?? String(err);
+    log(`[${state.chatId}] Isolated bootstrap attempt ${attempt}/${ISOLATED_BOOTSTRAP_MAX_ATTEMPTS} failed: ${errMsg}`);
+    if (attempt < ISOLATED_BOOTSTRAP_MAX_ATTEMPTS) {
+      emitToChat(state, systemMessage("system_isolated_retry", `\u26A0\uFE0F Bootstrap of isolated Codex thread failed (attempt ${attempt}/${ISOLATED_BOOTSTRAP_MAX_ATTEMPTS}): ${errMsg}. Retrying in ${ISOLATED_BOOTSTRAP_RETRY_DELAY_MS}ms.`));
+      setTimeout(() => {
+        try {
+          state.thread.close();
+        } catch {}
+        state.thread = new ClaudeThread({
+          appServerUrl: codex.appServerUrl,
+          chatId: state.chatId,
+          logFile: stateDir.logFile,
+          cwd: process.cwd()
+        });
+        wireClaudeThreadEvents(state);
+        bootstrapIsolatedThread(state, attempt + 1);
+      }, ISOLATED_BOOTSTRAP_RETRY_DELAY_MS);
+    } else {
+      emitToChat(state, systemMessage("system_isolated_failed", `\u274C Failed to bootstrap isolated Codex thread after ${ISOLATED_BOOTSTRAP_MAX_ATTEMPTS} attempts: ${errMsg}. Closing this chat \u2014 please reconnect Claude (close the window and re-attach) to start a fresh attempt.`));
+      reapChatState(state, "isolated bootstrap exhausted");
+    }
+  });
+}
+function reapChatState(state, reason) {
+  log(`Reaping chat state: chatId=${state.chatId} (${reason})`);
+  if (state.ws) {
+    try {
+      state.ws.close(1011, `chat reaped: ${reason}`);
+    } catch {}
+    state.ws = null;
+  }
+  if (state.attentionWindowTimer)
+    clearTimeout(state.attentionWindowTimer);
+  if (state.disconnectTimer)
+    clearTimeout(state.disconnectTimer);
+  if (state.reaperTimer)
+    clearTimeout(state.reaperTimer);
+  try {
+    state.statusBuffer.dispose();
+  } catch {}
+  try {
+    state.thread.close();
+  } catch {}
+  chats.delete(state.chatId);
+  broadcastStatus();
+}
+function transitionToIsolated(state, reason) {
+  state.paired = false;
+  state.replyRequired = false;
+  state.replyReceivedDuringTurn = false;
+  state.pairedTurnSawAgentMessage = false;
+  emitToChat(state, systemMessage("system_pair_torn_down", `[system] ${reason}. Future replies will use a fresh isolated Codex thread (no prior shared-TUI context carried over).`));
+  state.thread = new ClaudeThread({
+    appServerUrl: codex.appServerUrl,
+    chatId: state.chatId,
+    logFile: stateDir.logFile,
+    cwd: process.cwd()
+  });
+  state.ready = false;
+  wireClaudeThreadEvents(state);
+  bootstrapIsolatedThread(state);
+}
 codex.on("error", (err) => {
   log(`Codex error: ${err.message}`);
 });
 codex.on("exit", (code) => {
-  log(`Codex process exited (code ${code})`);
+  log(`Codex app-server process exited (code ${code})`);
   codexBootstrapped = false;
-  statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
-  clearPendingClaudeDisconnect("Codex process exited");
-  claudeOnlineNoticeSent = false;
-  claudeOfflineNoticeShown = false;
-  emitToClaude(systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running, but the Codex side needs to be restarted.`));
+  broadcastToAllClaudes(systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server exited (code ${code ?? "unknown"}). All ClaudeThread sessions terminated.`));
+  for (const state of chats.values()) {
+    try {
+      state.thread.close();
+    } catch {}
+    state.ready = false;
+  }
   broadcastStatus();
 });
 function startControlServer() {
@@ -1985,13 +2573,12 @@ function startControlServer() {
     hostname: "127.0.0.1",
     fetch(req, server) {
       const url = new URL(req.url);
-      if (url.pathname === "/healthz") {
+      if (url.pathname === "/healthz")
         return Response.json(currentStatus());
-      }
       if (url.pathname === "/readyz") {
         return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
       }
-      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false } })) {
+      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false, chatId: null } })) {
         return;
       }
       return new Response("AgentBridge daemon");
@@ -2004,9 +2591,13 @@ function startControlServer() {
         log(`Frontend socket opened (#${ws.data.clientId})`);
       },
       close: (ws, code, reason) => {
-        log(`Frontend socket closed (#${ws.data.clientId}, code=${code}, reason=${reason || "none"}, wasAttached=${attachedClaude === ws})`);
-        if (attachedClaude === ws) {
-          detachClaude(ws, "frontend socket closed");
+        const chatId = ws.data.chatId;
+        log(`Frontend socket closed (#${ws.data.clientId}, code=${code}, reason=${reason || "none"}, chatId=${chatId ?? "-"})`);
+        if (chatId) {
+          const state = chats.get(chatId);
+          if (state && state.ws === ws) {
+            detachClaudeWs(state, "frontend socket closed");
+          }
         }
       },
       message: (ws, raw) => {
@@ -2026,195 +2617,359 @@ function handleControlMessage(ws, raw) {
   }
   switch (message.type) {
     case "claude_connect":
-      attachClaude(ws);
+      attachClaude(ws, message.chatId);
       return;
-    case "claude_disconnect":
-      detachClaude(ws, "frontend requested disconnect");
+    case "claude_disconnect": {
+      const chatId = message.chatId ?? ws.data.chatId;
+      if (!chatId)
+        return;
+      const state = chats.get(chatId);
+      if (state)
+        detachClaudeWs(state, "frontend requested disconnect");
       return;
+    }
     case "status":
       sendStatus(ws);
       return;
-    case "claude_to_codex": {
-      if (message.message.source !== "claude") {
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: false,
-          error: "Invalid message source"
-        });
-        return;
-      }
-      if (!tuiConnectionState.canReply()) {
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: false,
-          error: "Codex is not ready. Wait for TUI to connect and create a thread."
-        });
-        return;
-      }
-      const requireReply = !!message.requireReply;
-      let contentWithReminder = message.message.content + `
-
-` + BRIDGE_CONTRACT_REMINDER;
-      if (requireReply) {
-        contentWithReminder += REPLY_REQUIRED_INSTRUCTION;
-        replyRequired = true;
-        replyReceivedDuringTurn = false;
-        log(`Reply required flag set for this message`);
-      }
-      log(`Forwarding Claude \u2192 Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
-      const injected = codex.injectMessage(contentWithReminder);
-      if (!injected) {
-        const reason = codex.turnInProgress ? "Codex is busy executing a turn. Wait for it to finish before sending another message." : "Injection failed: no active thread or WebSocket not connected.";
-        log(`Injection rejected: ${reason}`);
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: false,
-          error: reason
-        });
-        return;
-      }
-      clearAttentionWindow();
-      sendProtocolMessage(ws, {
-        type: "claude_to_codex_result",
-        requestId: message.requestId,
-        success: true
-      });
+    case "claude_to_codex":
+      handleClaudeToCodex(ws, message);
       return;
-    }
   }
 }
-function attachClaude(ws) {
-  if (attachedClaude && attachedClaude !== ws && attachedClaude.readyState !== WebSocket.CLOSED) {
-    log(`Rejecting Claude frontend #${ws.data.clientId} \u2014 another session (#${attachedClaude.data.clientId}) is already attached (readyState=${attachedClaude.readyState})`);
-    ws.close(CLOSE_CODE_REPLACED, "another Claude session is already connected");
+async function attachClaude(ws, requestedChatId) {
+  const chatId = requestedChatId ?? `auto_${ws.data.clientId}_${Date.now()}`;
+  ws.data.chatId = chatId;
+  let state = chats.get(chatId);
+  if (state) {
+    if (state.ws && state.ws !== ws && state.ws.readyState !== WebSocket.CLOSED) {
+      log(`Replacing prior WS for chatId=${chatId} (#${state.ws.data.clientId} \u2192 #${ws.data.clientId})`);
+      try {
+        state.ws.close(CLOSE_CODE_REPLACED, "replaced by newer connection for same chatId");
+      } catch {}
+    }
+    state.ws = ws;
+    ws.data.attached = true;
+    clearDisconnectTimer(state, "claude resumed");
+    clearReaperTimer(state, "claude resumed");
+    cancelIdleShutdown();
+    log(`Claude resumed chatId=${chatId} (#${ws.data.clientId})`);
+    statusBufferFlushIfPaused(state, "claude resumed");
+    flushBufferedMessages(state);
+    sendStatus(ws);
     return;
   }
-  clearPendingClaudeDisconnect("Claude frontend attached");
-  attachedClaude = ws;
+  state = createChatState(chatId);
+  chats.set(chatId, state);
+  state.ws = ws;
   ws.data.attached = true;
   cancelIdleShutdown();
-  log(`Claude frontend attached (#${ws.data.clientId})`);
-  statusBuffer.flush("claude reconnected");
+  log(`New Claude session attached: chatId=${chatId} (#${ws.data.clientId}, total=${chats.size})`);
   sendStatus(ws);
-  const now = Date.now();
-  const isRapidReattach = now - lastAttachStatusSentTs < ATTACH_STATUS_COOLDOWN_MS;
-  if (bufferedMessages.length > 0) {
-    flushBufferedMessages(ws);
-  } else if (!isRapidReattach) {
-    if (tuiConnectionState.canReply()) {
-      sendBridgeMessage(ws, systemMessage("system_ready", currentReadyMessage()));
-    } else if (codexBootstrapped) {
-      sendBridgeMessage(ws, systemMessage("system_waiting", currentWaitingMessage()));
-    }
+  if (proxyTuiSlot && proxyTuiSlot.pairedChatId === null) {
+    emitToChat(state, systemMessage("system_bridge_provisioning", "\u2705 AgentBridge daemon attached. Pairing with the right-pane Codex TUI for shared-thread mode..."));
+    pairChat(state);
+    broadcastStatus();
+    return;
   }
-  lastAttachStatusSentTs = now;
-  if (tuiConnectionState.canReply() && shouldNotifyCodexClaudeOnline()) {
-    notifyCodexClaudeOnline();
+  emitToChat(state, systemMessage("system_bridge_provisioning", "\u2705 AgentBridge daemon attached. Provisioning your dedicated Codex thread..."));
+  try {
+    const threadId = await state.thread.bootstrap();
+    state.ready = true;
+    log(`ClaudeThread ready: chatId=${chatId} threadId=${threadId}`);
+    emitToChat(state, systemMessage("system_thread_ready", `\u2705 Your Codex thread is ready (threadId=${threadId}). You can now send messages via the reply tool.`));
+    broadcastStatus();
+  } catch (err) {
+    log(`ClaudeThread bootstrap failed for chatId=${chatId}: ${err?.message ?? err}`);
+    emitToChat(state, systemMessage("system_thread_failed", `\u274C Failed to provision Codex thread: ${err?.message ?? err}. Reconnect to retry.`));
   }
 }
-function detachClaude(ws, reason) {
-  if (attachedClaude !== ws)
+function createChatState(chatId) {
+  const state = {
+    chatId,
+    ws: null,
+    thread: new ClaudeThread({
+      appServerUrl: codex.appServerUrl,
+      chatId,
+      logFile: stateDir.logFile,
+      cwd: process.cwd()
+    }),
+    ready: false,
+    paired: false,
+    pairedTurnSawAgentMessage: false,
+    inAttentionWindow: false,
+    attentionWindowTimer: null,
+    replyRequired: false,
+    replyReceivedDuringTurn: false,
+    bufferedMessages: [],
+    statusBuffer: null,
+    disconnectTimer: null,
+    reaperTimer: null,
+    lastAttachStatusSentTs: 0,
+    onlineNoticeSent: false,
+    nextSystemMessageId: 0
+  };
+  state.statusBuffer = new StatusBuffer((summary) => emitToChat(state, summary));
+  wireClaudeThreadEvents(state);
+  return state;
+}
+function wireClaudeThreadEvents(state) {
+  const chatId = state.chatId;
+  state.thread.on("agentMessage", (msg) => {
+    if (msg.source !== "codex")
+      return;
+    const result = classifyMessage(msg.content, FILTER_MODE);
+    if (state.replyRequired) {
+      log(`[${chatId}] Codex \u2192 Claude [${result.marker}/force-forward-reply-required] (${msg.content.length} chars)`);
+      state.replyReceivedDuringTurn = true;
+      if (state.statusBuffer.size > 0) {
+        state.statusBuffer.flush("reply-required message arrived");
+      }
+      emitToChat(state, msg);
+      return;
+    }
+    if (state.inAttentionWindow && result.marker === "status") {
+      log(`[${chatId}] Codex \u2192 Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
+      state.statusBuffer.add(msg);
+      return;
+    }
+    log(`[${chatId}] Codex \u2192 Claude [${result.marker}/${result.action}] (${msg.content.length} chars)`);
+    switch (result.action) {
+      case "forward":
+        if (result.marker === "important" && state.statusBuffer.size > 0) {
+          state.statusBuffer.flush("important message arrived");
+        }
+        emitToChat(state, msg);
+        if (result.marker === "important")
+          startAttentionWindow(state);
+        break;
+      case "buffer":
+        state.statusBuffer.add(msg);
+        break;
+      case "drop":
+        break;
+    }
+  });
+  state.thread.on("turnStarted", () => {
+    log(`[${chatId}] Codex turn started`);
+    emitToChat(state, systemMessage("system_turn_started", "\u23F3 Codex is working on the current task. Wait for completion before sending a reply."));
+  });
+  state.thread.on("turnCompleted", () => {
+    log(`[${chatId}] Codex turn completed`);
+    state.statusBuffer.flush("turn completed");
+    if (state.replyRequired && !state.replyReceivedDuringTurn) {
+      log(`[${chatId}] \u26A0\uFE0F Reply was required but Codex did not send any agentMessage`);
+      emitToChat(state, systemMessage("system_reply_missing", "\u26A0\uFE0F Codex completed the turn without sending a reply (require_reply was set)."));
+    }
+    state.replyRequired = false;
+    state.replyReceivedDuringTurn = false;
+    emitToChat(state, systemMessage("system_turn_completed", "\u2705 Codex finished the current turn. You can reply now if needed."));
+    startAttentionWindow(state);
+  });
+  state.thread.on("close", () => {
+    log(`[${chatId}] ClaudeThread WS closed`);
+    state.ready = false;
+  });
+  state.thread.on("error", (err) => {
+    log(`[${chatId}] ClaudeThread error: ${err?.message ?? err}`);
+  });
+}
+function detachClaudeWs(state, reason) {
+  if (!state.ws)
     return;
-  attachedClaude = null;
-  ws.data.attached = false;
-  log(`Claude frontend detached (#${ws.data.clientId}, ${reason})`);
-  scheduleClaudeDisconnectNotification(ws.data.clientId);
+  log(`Claude WS detached: chatId=${state.chatId} (#${state.ws.data.clientId}, ${reason}, paired=${state.paired})`);
+  state.ws = null;
+  scheduleDisconnectTimer(state);
+  scheduleReaperTimer(state);
+  if (state.paired && proxyTuiSlot && proxyTuiSlot.pairedChatId === state.chatId) {
+    if (proxyTuiSlot.pairReapTimer)
+      clearTimeout(proxyTuiSlot.pairReapTimer);
+    proxyTuiSlot.pairReapTimer = setTimeout(() => {
+      if (!proxyTuiSlot)
+        return;
+      const currentState = chats.get(state.chatId);
+      if (currentState?.ws) {
+        log(`Paired Claude ${state.chatId} reconnected during grace; not clearing pair`);
+        return;
+      }
+      log(`Paired Claude ${state.chatId} did not reconnect within ${PAIR_REAP_MS}ms \u2014 clearing pair slot and reaping chat state`);
+      proxyTuiSlot.pairedChatId = null;
+      proxyTuiSlot.pairReapTimer = null;
+      codex.setPairedChat(null);
+      if (currentState) {
+        try {
+          currentState.thread.close();
+        } catch {}
+        currentState.statusBuffer.dispose();
+        if (currentState.attentionWindowTimer)
+          clearTimeout(currentState.attentionWindowTimer);
+        if (currentState.disconnectTimer)
+          clearTimeout(currentState.disconnectTimer);
+        if (currentState.reaperTimer)
+          clearTimeout(currentState.reaperTimer);
+        chats.delete(state.chatId);
+        broadcastStatus();
+      }
+    }, PAIR_REAP_MS);
+  }
   scheduleIdleShutdown();
 }
-function startAttentionWindow() {
-  clearAttentionWindow();
-  inAttentionWindow = true;
-  statusBuffer.pause();
-  log(`Attention window started (${ATTENTION_WINDOW_MS}ms)`);
-  attentionWindowTimer = setTimeout(() => {
-    attentionWindowTimer = null;
-    inAttentionWindow = false;
-    statusBuffer.resume();
-    log("Attention window ended");
-  }, ATTENTION_WINDOW_MS);
-}
-function clearAttentionWindow() {
-  if (attentionWindowTimer) {
-    clearTimeout(attentionWindowTimer);
-    attentionWindowTimer = null;
-  }
-  if (inAttentionWindow) {
-    statusBuffer.resume();
-  }
-  inAttentionWindow = false;
-}
-function scheduleIdleShutdown() {
-  cancelIdleShutdown();
-  if (attachedClaude)
-    return;
-  const snapshot = tuiConnectionState.snapshot();
-  if (snapshot.tuiConnected)
-    return;
-  log(`No clients connected. Daemon will shut down in ${IDLE_SHUTDOWN_MS}ms if no one reconnects.`);
-  idleShutdownTimer = setTimeout(() => {
-    if (attachedClaude || tuiConnectionState.snapshot().tuiConnected) {
-      log("Idle shutdown cancelled: client reconnected during grace period");
+function scheduleReaperTimer(state) {
+  if (state.reaperTimer)
+    clearTimeout(state.reaperTimer);
+  state.reaperTimer = setTimeout(() => {
+    state.reaperTimer = null;
+    if (state.ws)
       return;
-    }
-    shutdown("idle \u2014 no clients connected");
-  }, IDLE_SHUTDOWN_MS);
+    log(`Reaping idle chat: chatId=${state.chatId} (no WS for ${CLAUDE_REAP_AFTER_MS}ms)`);
+    try {
+      state.thread.close();
+    } catch {}
+    state.statusBuffer.dispose();
+    if (state.attentionWindowTimer)
+      clearTimeout(state.attentionWindowTimer);
+    chats.delete(state.chatId);
+    broadcastStatus();
+  }, CLAUDE_REAP_AFTER_MS);
 }
-function cancelIdleShutdown() {
-  if (idleShutdownTimer) {
-    clearTimeout(idleShutdownTimer);
-    idleShutdownTimer = null;
+function clearReaperTimer(state, _reason) {
+  if (state.reaperTimer) {
+    clearTimeout(state.reaperTimer);
+    state.reaperTimer = null;
   }
 }
-function clearPendingClaudeDisconnect(reason) {
-  if (!claudeDisconnectTimer)
-    return;
-  clearTimeout(claudeDisconnectTimer);
-  claudeDisconnectTimer = null;
-  if (reason) {
-    log(`Cleared pending Claude disconnect notification (${reason})`);
-  }
-}
-function scheduleClaudeDisconnectNotification(clientId) {
-  clearPendingClaudeDisconnect("rescheduled");
-  claudeDisconnectTimer = setTimeout(() => {
-    claudeDisconnectTimer = null;
-    if (attachedClaude) {
-      log(`Skipping Claude disconnect notification for client #${clientId} because Claude already reconnected`);
-      return;
-    }
-    if (!tuiConnectionState.canReply()) {
-      log(`Suppressing Claude disconnect notification for client #${clientId} because Codex cannot reply`);
-      return;
-    }
-    if (!claudeOnlineNoticeSent) {
-      log(`Suppressing Claude disconnect notification for client #${clientId} because Claude was never announced online`);
-      return;
-    }
-    codex.injectMessage("\u26A0\uFE0F Claude Code went offline. AgentBridge is still running in the background; it will reconnect automatically when Claude reopens.");
-    claudeOnlineNoticeSent = false;
-    claudeOfflineNoticeShown = true;
-    log(`Claude disconnect persisted past grace window (client #${clientId})`);
+function scheduleDisconnectTimer(state) {
+  if (state.disconnectTimer)
+    clearTimeout(state.disconnectTimer);
+  state.disconnectTimer = setTimeout(() => {
+    state.disconnectTimer = null;
   }, CLAUDE_DISCONNECT_GRACE_MS);
 }
-function emitToClaude(message) {
-  if (attachedClaude && attachedClaude.readyState === WebSocket.OPEN) {
-    if (trySendBridgeMessage(attachedClaude, message))
-      return;
-    log("Send to Claude failed, buffering message for retry on reconnect");
-  }
-  bufferedMessages.push(message);
-  if (bufferedMessages.length > MAX_BUFFERED_MESSAGES) {
-    const dropped = bufferedMessages.length - MAX_BUFFERED_MESSAGES;
-    bufferedMessages.splice(0, dropped);
-    log(`Message buffer overflow: dropped ${dropped} oldest message(s), ${MAX_BUFFERED_MESSAGES} remaining`);
+function clearDisconnectTimer(state, _reason) {
+  if (state.disconnectTimer) {
+    clearTimeout(state.disconnectTimer);
+    state.disconnectTimer = null;
   }
 }
-function trySendBridgeMessage(ws, message) {
+function statusBufferFlushIfPaused(state, reason) {
+  if (state.statusBuffer.size > 0)
+    state.statusBuffer.flush(reason);
+}
+function handleClaudeToCodex(ws, message) {
+  const chatId = message.chatId ?? ws.data.chatId;
+  if (!chatId) {
+    return sendProtocolMessage(ws, {
+      type: "claude_to_codex_result",
+      requestId: message.requestId,
+      success: false,
+      error: "No chatId \u2014 claude_connect was never sent."
+    });
+  }
+  const state = chats.get(chatId);
+  if (!state) {
+    return sendProtocolMessage(ws, {
+      type: "claude_to_codex_result",
+      requestId: message.requestId,
+      success: false,
+      error: `Unknown chatId ${chatId}. Reattach via claude_connect.`
+    });
+  }
+  if (message.message.source !== "claude") {
+    return sendProtocolMessage(ws, {
+      type: "claude_to_codex_result",
+      requestId: message.requestId,
+      success: false,
+      error: "Invalid message source"
+    });
+  }
+  if (!state.ready) {
+    let errorMsg;
+    if (state.paired) {
+      if (codex.isSessionRestoreInProgress) {
+        errorMsg = "Restoring shared Codex TUI session, retry shortly.";
+      } else if (proxyTuiSlot) {
+        errorMsg = "Shared Codex TUI thread is still provisioning. Retry shortly.";
+      } else {
+        errorMsg = "Shared Codex TUI is no longer connected. Wait for transition to isolated mode.";
+      }
+    } else {
+      errorMsg = "Your Codex thread is still provisioning. Wait for system_thread_ready.";
+    }
+    return sendProtocolMessage(ws, {
+      type: "claude_to_codex_result",
+      requestId: message.requestId,
+      success: false,
+      error: errorMsg
+    });
+  }
+  const requireReply = !!message.requireReply;
+  let contentWithReminder = message.message.content + `
+
+` + BRIDGE_CONTRACT_REMINDER;
+  if (requireReply) {
+    contentWithReminder += REPLY_REQUIRED_INSTRUCTION;
+    state.replyRequired = true;
+    state.replyReceivedDuringTurn = false;
+    log(`[${chatId}] Reply required flag set`);
+  }
+  log(`[${chatId}] Forwarding Claude \u2192 Codex (${message.message.content.length} chars, requireReply=${requireReply}, paired=${state.paired})`);
+  const injected = state.paired ? codex.injectMessage(contentWithReminder) : state.thread.injectMessage(contentWithReminder);
+  if (!injected) {
+    const reason = state.paired ? "Shared Codex TUI is busy with another turn. Retry." : state.thread.isTurnInProgress ? "Codex is busy executing a turn on your thread. Wait for it to finish." : "Injection failed: thread WS not connected.";
+    if (requireReply) {
+      state.replyRequired = false;
+    }
+    return sendProtocolMessage(ws, {
+      type: "claude_to_codex_result",
+      requestId: message.requestId,
+      success: false,
+      error: reason
+    });
+  }
+  clearAttentionWindow(state);
+  sendProtocolMessage(ws, {
+    type: "claude_to_codex_result",
+    requestId: message.requestId,
+    success: true
+  });
+}
+function startAttentionWindow(state) {
+  clearAttentionWindow(state);
+  state.inAttentionWindow = true;
+  state.statusBuffer.pause();
+  log(`[${state.chatId}] Attention window started (${ATTENTION_WINDOW_MS}ms)`);
+  state.attentionWindowTimer = setTimeout(() => {
+    state.attentionWindowTimer = null;
+    state.inAttentionWindow = false;
+    state.statusBuffer.resume();
+    log(`[${state.chatId}] Attention window ended`);
+  }, ATTENTION_WINDOW_MS);
+}
+function clearAttentionWindow(state) {
+  if (state.attentionWindowTimer) {
+    clearTimeout(state.attentionWindowTimer);
+    state.attentionWindowTimer = null;
+  }
+  if (state.inAttentionWindow)
+    state.statusBuffer.resume();
+  state.inAttentionWindow = false;
+}
+function emitToChat(state, message) {
+  if (state.ws && state.ws.readyState === WebSocket.OPEN) {
+    if (trySendBridgeMessage(state.ws, message, state.chatId))
+      return;
+    log(`[${state.chatId}] Send to Claude failed, buffering`);
+  }
+  state.bufferedMessages.push(message);
+  if (state.bufferedMessages.length > MAX_BUFFERED_MESSAGES) {
+    const dropped = state.bufferedMessages.length - MAX_BUFFERED_MESSAGES;
+    state.bufferedMessages.splice(0, dropped);
+    log(`[${state.chatId}] Message buffer overflow: dropped ${dropped} oldest`);
+  }
+}
+function trySendBridgeMessage(ws, message, chatId) {
   try {
-    const result = ws.send(JSON.stringify({ type: "codex_to_claude", message }));
+    const payload = { type: "codex_to_claude", chatId, message };
+    const result = ws.send(JSON.stringify(payload));
     if (typeof result === "number" && result <= 0) {
       log(`Bridge message send returned ${result} (0=dropped, -1=backpressure)`);
       return false;
@@ -2225,28 +2980,31 @@ function trySendBridgeMessage(ws, message) {
     return false;
   }
 }
-function flushBufferedMessages(ws) {
-  const messages = bufferedMessages.splice(0, bufferedMessages.length);
+function flushBufferedMessages(state) {
+  if (!state.ws || state.bufferedMessages.length === 0)
+    return;
+  const messages = state.bufferedMessages.splice(0, state.bufferedMessages.length);
   for (const message of messages) {
-    if (!trySendBridgeMessage(ws, message)) {
-      const failedIndex = messages.indexOf(message);
-      const remaining = messages.slice(failedIndex);
-      bufferedMessages.unshift(...remaining);
-      log(`Flush interrupted: re-buffered ${remaining.length} message(s) after send failure`);
+    if (!trySendBridgeMessage(state.ws, message, state.chatId)) {
+      const idx = messages.indexOf(message);
+      state.bufferedMessages.unshift(...messages.slice(idx));
+      log(`[${state.chatId}] Flush interrupted: re-buffered ${messages.length - idx} message(s)`);
       return;
     }
   }
 }
-function sendBridgeMessage(ws, message) {
-  trySendBridgeMessage(ws, message);
+function broadcastToAllClaudes(message) {
+  for (const state of chats.values())
+    emitToChat(state, message);
 }
 function sendStatus(ws) {
   sendProtocolMessage(ws, { type: "status", status: currentStatus() });
 }
 function broadcastStatus() {
-  if (!attachedClaude)
-    return;
-  sendStatus(attachedClaude);
+  for (const state of chats.values()) {
+    if (state.ws && state.ws.readyState === WebSocket.OPEN)
+      sendStatus(state.ws);
+  }
 }
 function sendProtocolMessage(ws, message) {
   try {
@@ -2258,51 +3016,45 @@ function sendProtocolMessage(ws, message) {
 function currentStatus() {
   const snapshot = tuiConnectionState.snapshot();
   return {
-    bridgeReady: tuiConnectionState.canReply(),
+    bridgeReady: tuiConnectionState.canReply() || codexBootstrapped,
     tuiConnected: snapshot.tuiConnected,
     threadId: codex.activeThreadId,
-    queuedMessageCount: bufferedMessages.length + statusBuffer.size,
+    queuedMessageCount: [...chats.values()].reduce((n, s) => n + s.bufferedMessages.length + s.statusBuffer.size, 0),
     proxyUrl: codex.proxyUrl,
     appServerUrl: codex.appServerUrl,
-    pid: process.pid
+    pid: process.pid,
+    attachedClaudeCount: [...chats.values()].filter((s) => s.ws).length,
+    proxyTuiConnected: proxyTuiSlot !== null
   };
-}
-function currentWaitingMessage() {
-  return `\u23F3 Waiting for Codex TUI to connect. Run in another terminal:
-${attachCmd}`;
-}
-function currentReadyMessage() {
-  return `\u2705 Codex TUI connected (${codex.activeThreadId}). Bridge ready.`;
-}
-function notifyCodexClaudeOnline() {
-  const message = !codexCollaborationKickoffSent ? [
-    "\uD83E\uDD1D Claude Code has connected via AgentBridge.",
-    "You are now in a multi-agent collaboration session.",
-    "When you receive a complex task, propose a division of labor to Claude.",
-    "Claude can send you messages \u2014 they will appear as injected user messages.",
-    "Respond naturally and Claude will receive your output via AgentBridge."
-  ].join(`
-`) : "\u2705 AgentBridge connected to Claude Code.";
-  const delivered = codex.injectMessage(message);
-  if (!delivered) {
-    log("Deferred Claude-online notice to Codex \u2014 will retry after current turn completes");
-    return false;
-  }
-  claudeOnlineNoticeSent = true;
-  claudeOfflineNoticeShown = false;
-  codexCollaborationKickoffSent = true;
-  return true;
-}
-function shouldNotifyCodexClaudeOnline() {
-  return !claudeOnlineNoticeSent || claudeOfflineNoticeShown;
 }
 function systemMessage(idPrefix, content) {
   return {
-    id: `${idPrefix}_${++nextSystemMessageId}`,
+    id: `${idPrefix}_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
     source: "codex",
     content,
     timestamp: Date.now()
   };
+}
+function scheduleIdleShutdown() {
+  cancelIdleShutdown();
+  if ([...chats.values()].some((s) => s.ws !== null))
+    return;
+  if (tuiConnectionState.snapshot().tuiConnected)
+    return;
+  log(`No clients connected. Daemon will shut down in ${IDLE_SHUTDOWN_MS}ms if no one reconnects.`);
+  idleShutdownTimer = setTimeout(() => {
+    if ([...chats.values()].some((s) => s.ws !== null) || tuiConnectionState.snapshot().tuiConnected) {
+      log("Idle shutdown cancelled: client reconnected during grace period");
+      return;
+    }
+    shutdown("idle \u2014 no clients connected");
+  }, IDLE_SHUTDOWN_MS);
+}
+function cancelIdleShutdown() {
+  if (idleShutdownTimer) {
+    clearTimeout(idleShutdownTimer);
+    idleShutdownTimer = null;
+  }
 }
 function writePidFile() {
   daemonLifecycle.writePid();
@@ -2322,7 +3074,7 @@ function removeStatusFile() {
   daemonLifecycle.removeStatusFile();
 }
 async function bootCodex() {
-  log("Starting AgentBridge daemon...");
+  log("Starting AgentBridge daemon (multi-Claude variant)...");
   log(`Codex app-server: ${codex.appServerUrl}`);
   log(`Codex proxy: ${codex.proxyUrl}`);
   log(`Control server: ws://127.0.0.1:${CONTROL_PORT}/ws`);
@@ -2330,11 +3082,10 @@ async function bootCodex() {
     await codex.start();
     codexBootstrapped = true;
     writeStatusFile();
-    emitToClaude(systemMessage("system_waiting", currentWaitingMessage()));
     broadcastStatus();
   } catch (err) {
     log(`Failed to start Codex: ${err.message}`);
-    emitToClaude(systemMessage("system_codex_start_failed", `\u274C AgentBridge failed to start Codex app-server: ${err.message}`));
+    broadcastToAllClaudes(systemMessage("system_codex_start_failed", `\u274C AgentBridge failed to start Codex app-server: ${err.message}`));
     broadcastStatus();
   }
 }
@@ -2344,7 +3095,19 @@ function shutdown(reason) {
   shuttingDown = true;
   log(`Shutting down daemon (${reason})...`);
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);
-  clearPendingClaudeDisconnect(`daemon shutdown (${reason})`);
+  for (const state of chats.values()) {
+    if (state.attentionWindowTimer)
+      clearTimeout(state.attentionWindowTimer);
+    if (state.disconnectTimer)
+      clearTimeout(state.disconnectTimer);
+    if (state.reaperTimer)
+      clearTimeout(state.reaperTimer);
+    state.statusBuffer.dispose();
+    try {
+      state.thread.close();
+    } catch {}
+  }
+  chats.clear();
   controlServer?.stop();
   controlServer = null;
   codex.stop();
@@ -2369,13 +3132,71 @@ function log(msg) {
 `;
   process.stderr.write(line);
   try {
-    appendFileSync2(stateDir.logFile, line);
+    appendFileSync3(stateDir.logFile, line);
   } catch {}
 }
-if (daemonLifecycle.wasKilled()) {
-  log("Killed sentinel found \u2014 daemon was intentionally stopped. Exiting immediately.");
-  process.exit(0);
+function startDaemon() {
+  if (daemonLifecycle.wasKilled()) {
+    log("Killed sentinel found \u2014 daemon was intentionally stopped. Exiting immediately.");
+    process.exit(0);
+  }
+  writePidFile();
+  startControlServer();
+  bootCodex();
 }
-writePidFile();
-startControlServer();
-bootCodex();
+if (import.meta.main) {
+  startDaemon();
+}
+var __testing = {
+  get proxyTuiSlot() {
+    return proxyTuiSlot;
+  },
+  setProxyTuiSlot(next) {
+    proxyTuiSlot = next;
+  },
+  chats,
+  codex,
+  fns: {
+    pairChat,
+    transitionToIsolated,
+    bootstrapIsolatedThread,
+    getPairedChatState,
+    createChatState,
+    detachClaudeWs,
+    emitToChat
+  },
+  config: {
+    PAIR_REAP_MS,
+    CLAUDE_REAP_AFTER_MS,
+    ISOLATED_BOOTSTRAP_MAX_ATTEMPTS,
+    ISOLATED_BOOTSTRAP_RETRY_DELAY_MS
+  },
+  reset() {
+    if (proxyTuiSlot?.pairReapTimer) {
+      clearTimeout(proxyTuiSlot.pairReapTimer);
+    }
+    for (const state of chats.values()) {
+      if (state.attentionWindowTimer)
+        clearTimeout(state.attentionWindowTimer);
+      if (state.disconnectTimer)
+        clearTimeout(state.disconnectTimer);
+      if (state.reaperTimer)
+        clearTimeout(state.reaperTimer);
+      try {
+        state.statusBuffer.dispose();
+      } catch {}
+      try {
+        state.thread.close();
+      } catch {}
+    }
+    chats.clear();
+    proxyTuiSlot = null;
+    try {
+      codex.setPairedChat(null);
+    } catch {}
+  },
+  reapChatState
+};
+export {
+  __testing
+};

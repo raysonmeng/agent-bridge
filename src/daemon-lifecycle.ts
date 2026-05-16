@@ -124,7 +124,12 @@ export class DaemonLifecycle {
   }
 
   /** Read daemon status from status.json. */
-  readStatus(): { proxyUrl?: string; controlPort?: number; pid?: number } | null {
+  readStatus(): {
+    proxyUrl?: string;
+    appServerUrl?: string;
+    controlPort?: number;
+    pid?: number;
+  } | null {
     try {
       const raw = readFileSync(this.stateDir.statusFile, "utf-8");
       return JSON.parse(raw);

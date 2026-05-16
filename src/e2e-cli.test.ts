@@ -236,7 +236,11 @@ class CliE2EHarness {
     );
   }
 
-  readShimCalls(command: "claude" | "codex"): Array<{ args: string[]; cwd: string }> {
+  readShimCalls(command: "claude" | "codex"): Array<{
+    args: string[];
+    cwd: string;
+    env?: Record<string, string | null>;
+  }> {
     const logPath = join(this.shimLogDir, `${command}.jsonl`);
     return readJsonLines(logPath);
   }
@@ -415,7 +419,7 @@ describe("E2E: CLI surface", () => {
     });
   });
 
-  test("agentbridge codex ensures daemon is running and injects remote args", async () => {
+  test("agentbridge codex ensures daemon is running and injects direct remote args", async () => {
     await withHarness(async (harness) => {
       const result = await harness.runCli(["codex", "--model", "o3"]);
 
@@ -425,6 +429,7 @@ describe("E2E: CLI surface", () => {
       expect(harness.readLaunches()).toHaveLength(1);
       expect(harness.readPid()).not.toBeNull();
       expect(harness.readStatus()?.proxyUrl).toBe(`ws://127.0.0.1:${harness.proxyPort}`);
+      expect(harness.readStatus()?.appServerUrl).toBe(`ws://127.0.0.1:${harness.appPort}`);
       expect(harness.readTuiPid()).toBeNull();
 
       const invocations = harness
@@ -435,10 +440,36 @@ describe("E2E: CLI surface", () => {
         "--enable",
         "tui_app_server",
         "--remote",
-        `ws://127.0.0.1:${harness.proxyPort}`,
+        `ws://127.0.0.1:${harness.appPort}`,
         "--model",
         "o3",
       ]);
+    });
+  }, 20000);
+
+  test("agentbridge codex --via-proxy uses bearer auth token instead of query URL", async () => {
+    await withHarness(async (harness) => {
+      const result = await harness.runCli(["codex", "--via-proxy", "--model", "o3"]);
+
+      expect(result.code).toBe(0);
+      await harness.waitForHealth();
+
+      const invocations = harness
+        .readShimCalls("codex")
+        .filter((entry) => entry.args[0] !== "--version");
+      expect(invocations).toHaveLength(1);
+      expect(invocations[0]?.args).toEqual([
+        "--enable",
+        "tui_app_server",
+        "--remote",
+        `ws://127.0.0.1:${harness.proxyPort}`,
+        "--remote-auth-token-env",
+        "AGENTBRIDGE_PROXY_TOKEN",
+        "--model",
+        "o3",
+      ]);
+      expect(invocations[0]?.args.join(" ")).not.toContain("abg_token=");
+      expect(invocations[0]?.env?.AGENTBRIDGE_PROXY_TOKEN).toMatch(/^[0-9a-f]{16}$/);
     });
   }, 20000);
 
@@ -447,6 +478,10 @@ describe("E2E: CLI surface", () => {
       const remoteConflict = await harness.runCli(["codex", "--remote", "ws://127.0.0.1:7777"]);
       expect(remoteConflict.code).toBe(1);
       expect(remoteConflict.stderr).toContain("\"--remote\" is automatically set by agentbridge codex");
+
+      const remoteAuthConflict = await harness.runCli(["codex", "--remote-auth-token-env", "TOKEN"]);
+      expect(remoteAuthConflict.code).toBe(1);
+      expect(remoteAuthConflict.stderr).toContain("\"--remote-auth-token-env\" is automatically set by agentbridge codex");
 
       const enableConflict = await harness.runCli(["codex", "--enable", "tui_app_server"]);
       expect(enableConflict.code).toBe(1);
@@ -457,7 +492,7 @@ describe("E2E: CLI surface", () => {
     });
   });
 
-  test("agentbridge codex reuses healthy daemon and prefers status.json proxyUrl", async () => {
+  test("agentbridge codex reuses healthy daemon and prefers status.json appServerUrl", async () => {
     await withHarness({ configProxyPort: 49991 }, async (harness) => {
       const daemonProc = await harness.startManagedFakeDaemon();
       const pidBefore = harness.readPid();
@@ -478,7 +513,7 @@ describe("E2E: CLI surface", () => {
         "--enable",
         "tui_app_server",
         "--remote",
-        `ws://127.0.0.1:${harness.proxyPort}`,
+        `ws://127.0.0.1:${harness.appPort}`,
         "--profile",
         "default",
       ]);
@@ -505,7 +540,7 @@ describe("E2E: CLI surface", () => {
       for (const invocation of invocations) {
         expect(invocation.args[0]).toBe("--enable");
         expect(invocation.args[2]).toBe("--remote");
-        expect(invocation.args[3]).toBe(`ws://127.0.0.1:${harness.proxyPort}`);
+        expect(invocation.args[3]).toBe(`ws://127.0.0.1:${harness.appPort}`);
       }
     });
   }, 30000);
@@ -595,7 +630,7 @@ describe("E2E: CLI surface", () => {
       const codexRun = harness
         .readShimCalls("codex")
         .find((entry) => entry.args[0] === "--enable");
-      expect(codexRun?.args[3]).toBe(`ws://127.0.0.1:${harness.proxyPort}`);
+      expect(codexRun?.args[3]).toBe(`ws://127.0.0.1:${harness.appPort}`);
     });
   }, 30000);
 });
@@ -789,7 +824,13 @@ mkdirSync(dirname(logPath), { recursive: true });
 const args = process.argv.slice(2);
 appendFileSync(
   logPath,
-  JSON.stringify({ args, cwd: process.cwd() }) + "\\n",
+  JSON.stringify({
+    args,
+    cwd: process.cwd(),
+    env: {
+      AGENTBRIDGE_PROXY_TOKEN: process.env.AGENTBRIDGE_PROXY_TOKEN ?? null,
+    },
+  }) + "\\n",
   "utf-8",
 );
 
@@ -910,6 +951,18 @@ const server = Bun.serve({
   },
 });
 
+const appServer = Bun.serve({
+  port: appPort,
+  hostname: "127.0.0.1",
+  fetch(req) {
+    const url = new URL(req.url);
+    if (url.pathname === "/healthz" || url.pathname === "/readyz") {
+      return Response.json({ ok: true, appServerUrl });
+    }
+    return new Response("fake codex app-server");
+  },
+});
+
 const proxyServer = Bun.serve({
   port: proxyPort,
   hostname: "127.0.0.1",
@@ -925,6 +978,7 @@ const proxyServer = Bun.serve({
 function shutdown() {
   cleanupFiles();
   server.stop();
+  appServer.stop();
   proxyServer.stop();
   process.exit(0);
 }

@@ -67,6 +67,13 @@ export class ClaudeAdapter extends EventEmitter {
   private sessionId: string;
   private readonly notificationIdPrefix: string;
   private readonly instanceId: string;
+  /**
+   * `chatId` uniquely identifies THIS MCP/Claude session to the daemon so
+   * the daemon can route messages to the right ClaudeThread. We reuse
+   * `sessionId` (already shown to Claude as `chat_id:` in channel headers)
+   * so the human-visible value and the routing key are the same string.
+   */
+  readonly chatId: string;
   private replySender: ReplySender | null = null;
   private readonly logFile: string;
 
@@ -81,7 +88,8 @@ export class ClaudeAdapter extends EventEmitter {
     super();
     this.logFile = logFile;
     this.instanceId = randomUUID().slice(0, 8);
-    this.sessionId = `codex_${Date.now()}`;
+    this.sessionId = `codex_${Date.now()}_${this.instanceId}`;
+    this.chatId = this.sessionId;
     this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 12);
     this.log(`ClaudeAdapter created (instance=${this.instanceId})`);
 

@@ -23,9 +23,15 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       timer: ReturnType<typeof setTimeout>;
     }
   >();
+  private chatId: string | undefined;
 
-  constructor(private readonly url: string) {
+  constructor(private readonly url: string, opts?: { chatId?: string }) {
     super();
+    this.chatId = opts?.chatId;
+  }
+
+  setChatId(chatId: string) {
+    this.chatId = chatId;
   }
 
   async connect() {
@@ -72,14 +78,14 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   }
 
   attachClaude() {
-    this.send({ type: "claude_connect" });
+    this.send({ type: "claude_connect", chatId: this.chatId });
   }
 
   async disconnect() {
     if (!this.ws) return;
 
     try {
-      this.send({ type: "claude_disconnect" });
+      this.send({ type: "claude_disconnect", chatId: this.chatId });
     } catch {}
 
     try {
@@ -106,6 +112,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       this.send({
         type: "claude_to_codex",
         requestId,
+        chatId: this.chatId,
         message,
         ...(requireReply ? { requireReply: true } : {}),
       });

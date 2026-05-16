@@ -13,6 +13,7 @@ import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { EventEmitter } from "node:events";
 import { appendFileSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { StateDirResolver } from "./state-dir";
 import type { BridgeMessage } from "./types";
 import type { ServerWebSocket } from "bun";
@@ -32,6 +33,18 @@ import {
 
 interface TuiSocketData {
   connId: number;
+  /**
+   * Spec v2.2 §4.6: bearer token (or legacy `abg_token` query fallback) at
+   * WS upgrade time. Used to distinguish codex-rs's own secondary picker
+   * (same token) from a second unrelated `abg codex --via-proxy` instance
+   * (different token).
+   *
+   * Empty string for legacy connections without a token — backward compat:
+   * legacy mode treats first connection as primary with empty token, and
+   * accepts subsequent legacy (empty-token) connections too. Mixing token
+   * and non-token connections triggers reject (spec §4.6).
+   */
+  token: string;
 }
 
 interface PendingServerRequest {
@@ -140,6 +153,21 @@ export class CodexAdapter extends EventEmitter {
   }>();
   private static readonly SESSION_REPLAY_TIMEOUT_MS = 5000;
 
+  // ── Shared Thread Mode (spec v2.2) ─────────────────────────
+  //
+  // When a Claude session is paired with this CodexAdapter's tuiWs (the
+  // proxy TUI), its replies are injected on the TUI's thread. To prevent
+  // those injections from echoing back to the same Claude as user input,
+  // we track the resulting turnId (primary, 60s TTL) and the injected
+  // content hash (race fallback for the pre-response window, 5s one-shot).
+  // See docs/shared-thread-mode-spec.md §4.5.
+  private pairedChatId: string | null = null;
+  private injectedTurnIds = new Map<string, number>(); // turnId → expiresAt
+  private pendingInjectionHashes = new Map<string, number>(); // contentHash → expiresAt
+  private pendingInjectionByReqId = new Map<number, string>(); // bridge requestId → contentHash
+  private static readonly ECHO_DEDUP_TTL_MS = 60_000;
+  private static readonly PENDING_HASH_TTL_MS = 5_000;
+
   constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile) {
     super();
     this.appPort = appPort;
@@ -221,7 +249,12 @@ export class CodexAdapter extends EventEmitter {
     }
   }
 
-  /** Inject a message into the active Codex thread via turn/start. Returns true if sent. */
+  /**
+   * Inject a message into the active Codex thread via turn/start. Returns
+   * true if sent. Spec v2.2 §8 E8: rejects while `sessionRestoreInProgress`
+   * so paired Claude gets a clear "restoring shared Codex TUI session"
+   * error instead of an inject sent against a not-yet-restored app-server.
+   */
   injectMessage(text: string): boolean {
     if (!this.threadId) {
       this.log("Cannot inject: no active thread");
@@ -231,6 +264,10 @@ export class CodexAdapter extends EventEmitter {
       this.log("Cannot inject: app-server WebSocket not connected");
       return false;
     }
+    if (this.sessionRestoreInProgress) {
+      this.log(`Rejected injection: shared Codex TUI session restore in progress`);
+      return false;
+    }
     if (this.turnInProgress) {
       this.log(`Rejected injection: Codex turn is in progress (thread ${this.threadId})`);
       return false;
@@ -238,6 +275,12 @@ export class CodexAdapter extends EventEmitter {
     this.log(`Injecting message into Codex (${text.length} chars)`);
     const requestId = this.nextInjectionId--;
     this.trackBridgeRequestId(requestId);
+    // Spec v2.2 §4.5 race protection: hash the content + remember expiry so we
+    // can suppress an echo userMessage notification that arrives before the
+    // turn/start response gives us a turnId to dedup on.
+    const contentHash = this.hashInjectionContent(text);
+    this.pendingInjectionHashes.set(contentHash, Date.now() + CodexAdapter.PENDING_HASH_TTL_MS);
+    this.pendingInjectionByReqId.set(requestId, contentHash);
     try {
       this.appServerWs.send(JSON.stringify({
         method: "turn/start",
@@ -247,9 +290,67 @@ export class CodexAdapter extends EventEmitter {
       return true;
     } catch (err: any) {
       this.untrackBridgeRequestId(requestId);
+      this.pendingInjectionByReqId.delete(requestId);
+      this.pendingInjectionHashes.delete(contentHash);
       this.log(`Injection send failed: ${err.message}`);
       return false;
     }
+  }
+
+  // ── Shared Thread Mode API (spec v2.2 §4.1) ────────────────
+
+  /** Set the chatId that this CodexAdapter is currently paired with (or null to clear). */
+  setPairedChat(chatId: string | null): void {
+    this.pairedChatId = chatId;
+    this.log(`Paired chat set to: ${chatId ?? "<none>"}`);
+  }
+
+  /** True if the given chatId is the current paired chat. */
+  isPaired(chatId: string): boolean {
+    return this.pairedChatId !== null && this.pairedChatId === chatId;
+  }
+
+  /** Read-only getter for daemon's pairing state machine. */
+  get currentPairedChatId(): string | null {
+    return this.pairedChatId;
+  }
+
+  private hashInjectionContent(text: string): string {
+    return createHash("sha1").update(text).digest("hex").slice(0, 16);
+  }
+
+  /**
+   * Spec v2.2 §4.5: check if a userMessage notification is an echo of a
+   * bridge-originated injection. Primary check is turnId match; fallback is
+   * content-hash match for the race window before turn/start response lands.
+   */
+  private isEchoOfInjection(content: string, turnId: string | undefined): boolean {
+    if (typeof turnId === "string" && turnId.length > 0) {
+      const expiresAt = this.injectedTurnIds.get(turnId);
+      if (expiresAt !== undefined) {
+        if (Date.now() <= expiresAt) return true;
+        this.injectedTurnIds.delete(turnId);
+      }
+    }
+    const hash = this.hashInjectionContent(content);
+    const hashExpiresAt = this.pendingInjectionHashes.get(hash);
+    if (hashExpiresAt !== undefined) {
+      if (Date.now() <= hashExpiresAt) {
+        this.pendingInjectionHashes.delete(hash); // one-shot consumption
+        return true;
+      }
+      this.pendingInjectionHashes.delete(hash);
+    }
+    return false;
+  }
+
+  private recordInjectedTurnId(turnId: string, contentHash: string | undefined) {
+    this.injectedTurnIds.set(turnId, Date.now() + CodexAdapter.ECHO_DEDUP_TTL_MS);
+    // Once we have a turnId, the content-hash entry is redundant (turnId is
+    // the canonical correlator). Clear it eagerly to free memory and avoid
+    // the rare case where a same-text user message gets falsely suppressed
+    // after the injection's response has landed.
+    if (contentHash) this.pendingInjectionHashes.delete(contentHash);
   }
 
   // ── Health Check ───────────────────────────────────────────
@@ -534,6 +635,8 @@ export class CodexAdapter extends EventEmitter {
     }
 
     this.sessionRestoreInProgress = true;
+    this.emit("sessionRestoreStart", { threadId: this.threadId });
+    let restoreSucceeded = false;
     try {
       this.log(
         `DIAGNOSTIC: replaying cached initialize to restore session (threadId=${this.threadId ?? "none"})`,
@@ -558,6 +661,7 @@ export class CodexAdapter extends EventEmitter {
       this.log(
         `DIAGNOSTIC: session restored after unintentional reconnect (threadId=${this.threadId ?? "none"})`,
       );
+      restoreSucceeded = true;
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       this.log(
@@ -574,7 +678,18 @@ export class CodexAdapter extends EventEmitter {
       }
     } finally {
       this.sessionRestoreInProgress = false;
+      // Spec v2.2 §8 E8: emit ok=false on failure so daemon keeps paired
+      // readiness=not-ready. The TUI is being closed (1011) in the catch
+      // branch; the resulting tuiDisconnected event tears down the pair
+      // cleanly. Without ok=false, daemon would briefly flip to "ready" and
+      // tell paired Claude "session restored" — a lie.
+      this.emit("sessionRestoreEnd", { threadId: this.threadId, ok: restoreSucceeded });
     }
+  }
+
+  /** Spec v2.2 §8 E8: daemon checks this so paired `reply` returns restore error. */
+  get isSessionRestoreInProgress(): boolean {
+    return this.sessionRestoreInProgress;
   }
 
   /**
@@ -695,11 +810,19 @@ export class CodexAdapter extends EventEmitter {
       fetch(req, server) {
         const url = new URL(req.url);
         const isUpgrade = req.headers.get("upgrade")?.toLowerCase() === "websocket";
-        self.log(`HTTP ${req.method} ${url.pathname} (upgrade=${isUpgrade})`);
+        const queryToken = url.searchParams.get("abg_token") ?? "";
+        const authHeader = req.headers.get("authorization") ?? "";
+        const bearerToken = authHeader.match(/^Bearer\s+(.+)$/i)?.[1]?.trim() ?? "";
+        const token = bearerToken || queryToken;
+        const tokenSource = bearerToken ? "authorization" : queryToken ? "query" : "none";
+        self.log(`HTTP ${req.method} ${url.pathname} (upgrade=${isUpgrade}, token=${token ? token.slice(0, 8) + "…" : "<none>"}, tokenSource=${tokenSource})`);
         if (url.pathname === "/healthz" || url.pathname === "/readyz") {
           return fetch(`http://127.0.0.1:${self.appPort}${url.pathname}`);
         }
-        if (server.upgrade(req, { data: { connId: 0 } })) return undefined;
+        // Spec v2.2 §4.6: token discrimination is enforced in onTuiConnect after
+        // upgrade, so we can return a clean WS close with code 4002. Rejecting
+        // at fetch time would surface as a confusing HTTP 4xx to codex-rs.
+        if (server.upgrade(req, { data: { connId: 0, token } })) return undefined;
         self.log(`WARNING: non-upgrade HTTP request not handled: ${req.method} ${url.pathname}`);
         return new Response("AgentBridge Codex Proxy");
       },
@@ -723,7 +846,23 @@ export class CodexAdapter extends EventEmitter {
     // the main session connection stays open. Give the secondary its own
     // app-server WS so the primary is not disturbed.
     if (this.tuiWs) {
-      this.log(`Secondary TUI connected (conn #${connId}, primary is #${this.tuiConnId})`);
+      // Spec v2.2 §4.6: distinguish codex-rs's own secondary picker (carries
+      // the SAME bearer token as the primary) from a second unrelated
+      // `abg codex --via-proxy` instance (different token). Reject the latter
+      // with WS close 4002 so the CLI's pre-flight check surfaces a clear
+      // error rather than the primary getting silently disrupted.
+      const primaryToken = this.tuiWs.data.token;
+      const newToken = ws.data.token;
+      if (primaryToken !== newToken) {
+        this.log(`Rejecting second proxy TUI: token mismatch (primary conn #${this.tuiConnId} token=${primaryToken ? primaryToken.slice(0, 8) + "…" : "<none>"}, new conn #${connId} token=${newToken ? newToken.slice(0, 8) + "…" : "<none>"})`);
+        try {
+          ws.close(4002, "another --via-proxy TUI is already connected");
+        } catch (err: any) {
+          this.log(`Failed to close rejected second TUI cleanly: ${err.message}`);
+        }
+        return;
+      }
+      this.log(`Secondary TUI connected (conn #${connId}, primary is #${this.tuiConnId}, token matches)`);
       this.setupSecondaryConnection(ws, connId);
       return;
     }
@@ -735,8 +874,8 @@ export class CodexAdapter extends EventEmitter {
     // Reset threadId to prevent premature message injection before TUI completes
     // its handshake (initialize → thread/start or thread/resume).
     this.threadId = null;
-    this.log(`TUI connected (conn #${this.tuiConnId})`);
-    this.emit("tuiConnected", this.tuiConnId);
+    this.log(`TUI connected (conn #${this.tuiConnId}, token=${ws.data.token ? ws.data.token.slice(0, 8) + "…" : "<none>"})`);
+    this.emit("tuiConnected", this.tuiConnId, ws.data.token);
     if (previousConnId !== null) {
       this.retireConnectionState(previousConnId);
     }
@@ -1202,8 +1341,27 @@ export class CodexAdapter extends EventEmitter {
     if (!isNaN(numericId) && this.consumeBridgeRequestId(numericId)) {
       if (parsed.error) {
         this.log(`Bridge-originated request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
+        // Clear the pending injection-hash entry so a future legitimate
+        // identical user-typed message isn't suppressed.
+        const contentHash = this.pendingInjectionByReqId.get(numericId);
+        if (contentHash) {
+          this.pendingInjectionHashes.delete(contentHash);
+          this.pendingInjectionByReqId.delete(numericId);
+        }
       } else {
-        this.log(`Bridge-originated request completed (id ${responseId})`);
+        // Spec v2.2 §4.5 primary echo dedup: capture the turnId returned by
+        // codex-rs so subsequent userMessage notifications for this turn can
+        // be recognized as echoes of our own injection.
+        const result = (parsed.result ?? {}) as { turn?: { id?: string } };
+        const turnId = result.turn?.id;
+        const contentHash = this.pendingInjectionByReqId.get(numericId);
+        this.pendingInjectionByReqId.delete(numericId);
+        if (typeof turnId === "string" && turnId.length > 0) {
+          this.recordInjectedTurnId(turnId, contentHash);
+          this.log(`Bridge-originated request completed (id ${responseId}, turnId=${turnId} dedup)`);
+        } else {
+          this.log(`Bridge-originated request completed (id ${responseId}, no turnId — falling back to content-hash dedup)`);
+        }
       }
       return null;
     }
@@ -1255,9 +1413,15 @@ export class CodexAdapter extends EventEmitter {
   private handleServerNotification(msg: AppServerNotification) {
     const { method, params } = msg;
     switch (method) {
-      case "turn/started":
+      case "turn/started": {
+        // markTurnStarted emits "turnStarted" only on idle→busy transition
+        // (symmetric with turnCompleted on busy→idle). Spec v2.2 §4.3
+        // forwards turnStarted as a non-satisfying signal to paired Claude;
+        // daemon listens on that emit. The turnId arg is added so consumers
+        // can track per-turn state (e.g. sawAgentMessage).
         this.markTurnStarted(params?.turn?.id);
         break;
+      }
       case "item/started": {
         const item: AppServerItem | undefined = params?.item;
         if (item?.type === "agentMessage") this.agentMessageBuffers.set(item.id, []);
@@ -1281,16 +1445,57 @@ export class CodexAdapter extends EventEmitter {
               id: item.id, source: "codex" as const, content, timestamp: Date.now(),
             } satisfies BridgeMessage);
           }
+        } else if (item?.type === "userMessage") {
+          // Spec v2.2 §4.3: route human-typed TUI messages to paired Claude,
+          // but suppress echoes of paired Claude's own injection.
+          const content = this.extractContent(item);
+          if (content) {
+            const turnIdFromParams = typeof (params as Record<string, unknown> | undefined)?.turnId === "string"
+              ? ((params as Record<string, unknown>).turnId as string)
+              : undefined;
+            if (this.isEchoOfInjection(content, turnIdFromParams)) {
+              this.log(`Suppressed userMessage echo (item ${item.id}, ${content.length} chars)`);
+            } else {
+              this.log(`User message from TUI (${content.length} chars)`);
+              this.emit("userMessage", {
+                id: item.id,
+                source: "codex" as const,
+                content,
+                timestamp: Date.now(),
+                turnId: turnIdFromParams,
+              } satisfies BridgeMessage & { turnId?: string });
+            }
+          }
         }
         break;
       }
       case "turn/completed": {
         const wasInProgress = this.turnInProgress;
-        this.markTurnCompleted(params?.turn?.id);
-        // Only emit when all turns are done (symmetric with turnStarted)
+        const turnId = params?.turn?.id;
+        this.markTurnCompleted(turnId);
+        // Only emit when all turns are done (symmetric with turnStarted).
+        // Spec v2.2 §4.3: daemon tracks per-turnId sawAgentMessage to decide
+        // satisfiesRequireReply on the forwarded system message.
         if (wasInProgress && !this.turnInProgress) {
-          this.emit("turnCompleted");
+          this.emit("turnCompleted", { turnId });
         }
+        break;
+      }
+      case "error": {
+        // Spec v2.2 §4.3: top-level error notification (NOT a ThreadItem).
+        // Forward to daemon so paired Claude's requireReply releases.
+        const errorParams = (params ?? {}) as { error?: { code?: number; message?: string; data?: unknown } };
+        const detail = errorParams.error?.message ?? "(no error message)";
+        const code = errorParams.error?.code;
+        this.log(`App-server error notification: ${detail}${code !== undefined ? ` (code ${code})` : ""}`);
+        this.emit("errorItem", { code, message: detail, data: errorParams.error?.data });
+        break;
+      }
+      case "thread/closed": {
+        // Spec v2.2 §4.3: top-level thread lifecycle notification. Triggers
+        // daemon's TUI-disconnect-equivalent pair teardown (§5).
+        const closedThreadId = (params ?? {}) as { threadId?: string };
+        this.emit("threadClosed", { threadId: closedThreadId.threadId });
         break;
       }
     }
@@ -1416,7 +1621,7 @@ export class CodexAdapter extends EventEmitter {
 
     this.turnInProgress = this.activeTurnIds.size > 0;
     if (!wasInProgress && this.turnInProgress) {
-      this.emit("turnStarted");
+      this.emit("turnStarted", { turnId });
     }
   }
 

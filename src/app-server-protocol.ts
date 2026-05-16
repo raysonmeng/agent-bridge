@@ -33,6 +33,8 @@ export const APP_SERVER_NOTIFICATION_METHODS = [
   "item/started",
   "item/agentMessage/delta",
   "item/completed",
+  "error",
+  "thread/closed",
 ] as const;
 
 export type AppServerNotificationMethod = typeof APP_SERVER_NOTIFICATION_METHODS[number];
@@ -120,12 +122,20 @@ export type AppServerServerRequest =
   | AppServerRequest<"item/fileChange/requestApproval", Record<string, unknown>>
   | AppServerRequest<"item/commandExecution/requestApproval", Record<string, unknown>>;
 
+export interface AppServerErrorPayload {
+  code?: number;
+  message?: string;
+  data?: unknown;
+}
+
 export type AppServerNotification =
   | { jsonrpc?: "2.0"; id?: undefined; method: "turn/started"; params?: { turn?: AppServerTurn; [key: string]: unknown } }
   | { jsonrpc?: "2.0"; id?: undefined; method: "turn/completed"; params?: { turn?: AppServerTurn; [key: string]: unknown } }
   | { jsonrpc?: "2.0"; id?: undefined; method: "item/started"; params?: { item?: AppServerItem; [key: string]: unknown } }
   | { jsonrpc?: "2.0"; id?: undefined; method: "item/completed"; params?: { item?: AppServerItem; [key: string]: unknown } }
-  | { jsonrpc?: "2.0"; id?: undefined; method: "item/agentMessage/delta"; params?: { itemId?: string; delta?: string; [key: string]: unknown } };
+  | { jsonrpc?: "2.0"; id?: undefined; method: "item/agentMessage/delta"; params?: { itemId?: string; delta?: string; [key: string]: unknown } }
+  | { jsonrpc?: "2.0"; id?: undefined; method: "error"; params?: { error?: AppServerErrorPayload; [key: string]: unknown } }
+  | { jsonrpc?: "2.0"; id?: undefined; method: "thread/closed"; params?: { threadId?: string; [key: string]: unknown } };
 
 function isObjectRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);

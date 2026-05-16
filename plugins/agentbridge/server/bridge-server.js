@@ -13758,6 +13758,7 @@ class ClaudeAdapter extends EventEmitter {
   sessionId;
   notificationIdPrefix;
   instanceId;
+  chatId;
   replySender = null;
   logFile;
   configuredMode;
@@ -13769,7 +13770,8 @@ class ClaudeAdapter extends EventEmitter {
     super();
     this.logFile = logFile;
     this.instanceId = randomUUID().slice(0, 8);
-    this.sessionId = `codex_${Date.now()}`;
+    this.sessionId = `codex_${Date.now()}_${this.instanceId}`;
+    this.chatId = this.sessionId;
     this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 12);
     this.log(`ClaudeAdapter created (instance=${this.instanceId})`);
     const envMode = process.env.AGENTBRIDGE_MODE;
@@ -14004,9 +14006,14 @@ class DaemonClient extends EventEmitter2 {
   wsId = 0;
   nextRequestId = 1;
   pendingReplies = new Map;
-  constructor(url) {
+  chatId;
+  constructor(url, opts) {
     super();
     this.url = url;
+    this.chatId = opts?.chatId;
+  }
+  setChatId(chatId) {
+    this.chatId = chatId;
   }
   async connect() {
     if (this.ws?.readyState === WebSocket.OPEN) {
@@ -14048,13 +14055,13 @@ class DaemonClient extends EventEmitter2 {
     });
   }
   attachClaude() {
-    this.send({ type: "claude_connect" });
+    this.send({ type: "claude_connect", chatId: this.chatId });
   }
   async disconnect() {
     if (!this.ws)
       return;
     try {
-      this.send({ type: "claude_disconnect" });
+      this.send({ type: "claude_disconnect", chatId: this.chatId });
     } catch {}
     try {
       this.ws.close();
@@ -14076,6 +14083,7 @@ class DaemonClient extends EventEmitter2 {
       this.send({
         type: "claude_to_codex",
         requestId,
+        chatId: this.chatId,
         message,
         ...requireReply ? { requireReply: true } : {}
       });
@@ -14517,7 +14525,7 @@ var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 var CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 var claude = new ClaudeAdapter(stateDir.logFile);
-var daemonClient = new DaemonClient(CONTROL_WS_URL);
+var daemonClient = new DaemonClient(CONTROL_WS_URL, { chatId: claude.chatId });
 var shuttingDown = false;
 var daemonDisabled = false;
 var daemonDisabledReason = null;

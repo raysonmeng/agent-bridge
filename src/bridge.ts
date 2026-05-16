@@ -19,7 +19,7 @@ const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_POR
 const CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 
 const claude = new ClaudeAdapter(stateDir.logFile);
-const daemonClient = new DaemonClient(CONTROL_WS_URL);
+const daemonClient = new DaemonClient(CONTROL_WS_URL, { chatId: claude.chatId });
 
 let shuttingDown = false;
 let daemonDisabled = false;
