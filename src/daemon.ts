@@ -266,11 +266,14 @@ codex.on("turnStarted", () => {
 codex.on("turnCompleted", () => {
   const paired = getPairedChatState();
   if (!paired) return;
-  // Spec v2.2 §4.3: satisfies requireReply ONLY if the turn produced no
-  // agentMessage (the "no-output failure" signal). Otherwise the agentMessage
-  // already released requireReply earlier.
-  if (!paired.pairedTurnSawAgentMessage) {
-    log(`[${paired.chatId}] Codex turn completed with no agentMessage — surfacing as failure signal`);
+  // Bug fix (2026-05-16): only surface "no-output failure" when Claude was
+  // actually waiting for a reply (replyRequired=true). User-typed TUI turns
+  // can legitimately complete without an agentMessage (e.g. silent ack) —
+  // emitting failure wording there confused paired Claude. Spec v2.2 §4.3
+  // describes this as the "no-output failure signal" but does not require
+  // it for non-Claude-originated turns.
+  if (!paired.pairedTurnSawAgentMessage && paired.replyRequired) {
+    log(`[${paired.chatId}] Codex turn completed with no agentMessage while replyRequired — surfacing as failure signal`);
     paired.replyReceivedDuringTurn = true;
     emitToChat(paired, systemMessage("system_codex_turn_completed_no_output",
       "[system] Codex turn completed without any agentMessage — likely a failure or empty response."));
@@ -290,8 +293,17 @@ codex.on("errorItem", (payload: { code?: number; message?: string }) => {
   paired.replyReceivedDuringTurn = true;
   emitToChat(paired, systemMessage("system_codex_error",
     `[error] ${payload.message ?? "(no message)"}${payload.code !== undefined ? ` (code ${payload.code})` : ""}`));
-  // Cleanup paired flags — error is a terminal signal for this turn.
+  // Bug fix (2026-05-16): mark the turn as "Claude has been informed" so a
+  // subsequent turn/completed does not fire a spurious no-output failure on
+  // top of the error we already surfaced. Naming is slightly stretched here
+  // ("sawAgentMessage" is now "saw something Claude needs to know about")
+  // but renaming would touch too many call sites for a minor fix.
+  paired.pairedTurnSawAgentMessage = true;
   paired.replyRequired = false;
+  // Symmetric reset (Codex review 2026-05-16): match the cleanup in the
+  // turn/completed handler so an error doesn't leave a stale "received during
+  // turn" flag that could confuse later logic.
+  paired.replyReceivedDuringTurn = false;
 });
 
 // Spec v2.2 §8 E8: app-server reconnect restore flips paired readiness back
@@ -361,8 +373,98 @@ function pairChat(state: ChatState): void {
   }
 }
 
+/**
+ * Bug fix (2026-05-16): isolated-bootstrap retry helper.
+ *
+ * Previously `transitionToIsolated` did a one-shot `bootstrap()` whose catch
+ * branch only emitted a system_isolated_failed message and left state.ready
+ * stuck at false — paired Claude was effectively stranded with no recovery
+ * path. This helper retries up to ISOLATED_BOOTSTRAP_MAX_ATTEMPTS times with
+ * a delay between attempts, and surfaces a definitive "give up" message
+ * only after exhausting them, including explicit instructions for the user.
+ */
+const ISOLATED_BOOTSTRAP_MAX_ATTEMPTS = parseInt(
+  process.env.AGENTBRIDGE_ISOLATED_BOOTSTRAP_MAX_ATTEMPTS ?? "2",
+  10,
+);
+const ISOLATED_BOOTSTRAP_RETRY_DELAY_MS = parseInt(
+  process.env.AGENTBRIDGE_ISOLATED_BOOTSTRAP_RETRY_DELAY_MS ?? "2000",
+  10,
+);
+
+function bootstrapIsolatedThread(state: ChatState, attempt = 1): void {
+  state.thread.bootstrap()
+    .then((threadId) => {
+      state.ready = true;
+      emitToChat(state, systemMessage("system_isolated_ready",
+        `✅ Fresh isolated Codex thread ready (threadId=${threadId}).`));
+    })
+    .catch((err: any) => {
+      const errMsg = err?.message ?? String(err);
+      log(`[${state.chatId}] Isolated bootstrap attempt ${attempt}/${ISOLATED_BOOTSTRAP_MAX_ATTEMPTS} failed: ${errMsg}`);
+      if (attempt < ISOLATED_BOOTSTRAP_MAX_ATTEMPTS) {
+        emitToChat(state, systemMessage("system_isolated_retry",
+          `⚠️ Bootstrap of isolated Codex thread failed (attempt ${attempt}/${ISOLATED_BOOTSTRAP_MAX_ATTEMPTS}): ${errMsg}. Retrying in ${ISOLATED_BOOTSTRAP_RETRY_DELAY_MS}ms.`));
+        setTimeout(() => {
+          // Codex review (2026-05-16): close the prior ClaudeThread before
+          // constructing a replacement so a half-open WS / RPC handle from
+          // the failed attempt does not leak.
+          try { state.thread.close(); } catch {}
+          state.thread = new ClaudeThread({
+            appServerUrl: codex.appServerUrl,
+            chatId: state.chatId,
+            logFile: stateDir.logFile,
+            cwd: process.cwd(),
+          });
+          wireClaudeThreadEvents(state);
+          bootstrapIsolatedThread(state, attempt + 1);
+        }, ISOLATED_BOOTSTRAP_RETRY_DELAY_MS);
+      } else {
+        emitToChat(state, systemMessage("system_isolated_failed",
+          `❌ Failed to bootstrap isolated Codex thread after ${ISOLATED_BOOTSTRAP_MAX_ATTEMPTS} attempts: ${errMsg}. Closing this chat — please reconnect Claude (close the window and re-attach) to start a fresh attempt.`));
+        // Bug fix (Codex review 2026-05-16): reap the chat so the advertised
+        // recovery path ("reconnect Claude") actually works. Without this,
+        // attachClaude takes the resume branch for the same chatId, never
+        // re-enters bootstrapIsolatedThread, and the user follows our own
+        // instructions but stays stuck. Reaping forces the next attach to
+        // construct a fresh ChatState with a fresh bootstrap.
+        reapChatState(state, "isolated bootstrap exhausted");
+      }
+    });
+}
+
+/**
+ * Forcefully tear down a chat: close the active WS (clients can reconnect
+ * fresh), clear timers, dispose StatusBuffer, close the ClaudeThread, and
+ * remove the entry from `chats`. Used both for natural reaper expiry paths
+ * and for the isolated-bootstrap final-failure path.
+ */
+function reapChatState(state: ChatState, reason: string): void {
+  log(`Reaping chat state: chatId=${state.chatId} (${reason})`);
+  if (state.ws) {
+    try { state.ws.close(1011, `chat reaped: ${reason}`); } catch {}
+    state.ws = null;
+  }
+  if (state.attentionWindowTimer) clearTimeout(state.attentionWindowTimer);
+  if (state.disconnectTimer) clearTimeout(state.disconnectTimer);
+  if (state.reaperTimer) clearTimeout(state.reaperTimer);
+  try { state.statusBuffer.dispose(); } catch {}
+  try { state.thread.close(); } catch {}
+  chats.delete(state.chatId);
+  broadcastStatus();
+}
+
 function transitionToIsolated(state: ChatState, reason: string): void {
   state.paired = false;
+  // Bug fix (Codex review 2026-05-16): pair teardown is a terminal boundary
+  // for the old shared turn. Reset paired-turn flags so they don't bleed
+  // into the fresh isolated thread — a stale `replyRequired=true` would
+  // otherwise force-forward the first isolated message via the
+  // require-reply path in wireClaudeThreadEvents and could fire a bogus
+  // "missing reply" warning at turn/completed.
+  state.replyRequired = false;
+  state.replyReceivedDuringTurn = false;
+  state.pairedTurnSawAgentMessage = false;
   emitToChat(state, systemMessage("system_pair_torn_down",
     `[system] ${reason}. Future replies will use a fresh isolated Codex thread (no prior shared-TUI context carried over).`));
   // Re-bootstrap as isolated. Same chatId, new ClaudeThread.
@@ -374,16 +476,7 @@ function transitionToIsolated(state: ChatState, reason: string): void {
   });
   state.ready = false;
   wireClaudeThreadEvents(state);
-  state.thread.bootstrap()
-    .then((threadId) => {
-      state.ready = true;
-      emitToChat(state, systemMessage("system_isolated_ready",
-        `✅ Fresh isolated Codex thread ready (threadId=${threadId}).`));
-    })
-    .catch((err: any) => {
-      emitToChat(state, systemMessage("system_isolated_failed",
-        `❌ Failed to bootstrap isolated Codex thread: ${err?.message ?? err}.`));
-    });
+  bootstrapIsolatedThread(state);
 }
 
 codex.on("error", (err: Error) => {
@@ -1059,16 +1152,85 @@ function log(msg: string) {
   } catch {}
 }
 
-// Refuse to start if user intentionally killed the daemon.
-if (daemonLifecycle.wasKilled()) {
-  log("Killed sentinel found — daemon was intentionally stopped. Exiting immediately.");
-  process.exit(0);
+function startDaemon() {
+  // Refuse to start if user intentionally killed the daemon.
+  if (daemonLifecycle.wasKilled()) {
+    log("Killed sentinel found — daemon was intentionally stopped. Exiting immediately.");
+    process.exit(0);
+  }
+
+  writePidFile();
+  startControlServer();
+  void bootCodex();
 }
 
-writePidFile();
-startControlServer();
-void bootCodex();
+// `import.meta.main` is true only when this module is the entrypoint (run via
+// `bun daemon.js` or the bundled CLI). When imported as a library (e.g. by
+// `src/unit-test/daemon.test.ts`), the side-effectful boot is skipped so
+// tests can exercise the state machine without spinning up sockets or
+// spawning the Codex app-server.
+if (import.meta.main) {
+  startDaemon();
+}
 
 // Silence unused-warning for the legacy import; we keep the symbol around in
 // case future tooling wants to surface the attach command in status.
 void attachCmd;
+
+// ── Testing harness ─────────────────────────────────────────────
+//
+// Exported strictly for `src/unit-test/daemon.test.ts`. Not part of any
+// public API; do not import from production code. The shape and guarantees
+// here are subject to change to suit testing needs.
+
+export const __testing = {
+  /** Read current single-slot proxy TUI state. */
+  get proxyTuiSlot(): ProxyTuiSlot | null {
+    return proxyTuiSlot;
+  },
+  /** Overwrite the slot (set to null to clear). Tests use this to seed scenarios. */
+  setProxyTuiSlot(next: ProxyTuiSlot | null): void {
+    proxyTuiSlot = next;
+  },
+  /** Direct handle to the chat registry — tests can read/write/clear. */
+  chats,
+  /** Direct handle to the singleton CodexAdapter — tests can emit events on it. */
+  codex,
+  /** Daemon-level functions exposed for direct invocation in tests. */
+  fns: {
+    pairChat,
+    transitionToIsolated,
+    bootstrapIsolatedThread,
+    getPairedChatState,
+    createChatState,
+    detachClaudeWs,
+    emitToChat,
+  } as const,
+  /** Constants captured at module load — useful for asserting timer behavior. */
+  config: {
+    PAIR_REAP_MS,
+    CLAUDE_REAP_AFTER_MS,
+    ISOLATED_BOOTSTRAP_MAX_ATTEMPTS,
+    ISOLATED_BOOTSTRAP_RETRY_DELAY_MS,
+  } as const,
+  /** Reset every mutable module-level field to its clean state. Call in beforeEach. */
+  reset(): void {
+    if (proxyTuiSlot?.pairReapTimer) {
+      clearTimeout(proxyTuiSlot.pairReapTimer);
+    }
+    for (const state of chats.values()) {
+      if (state.attentionWindowTimer) clearTimeout(state.attentionWindowTimer);
+      if (state.disconnectTimer) clearTimeout(state.disconnectTimer);
+      if (state.reaperTimer) clearTimeout(state.reaperTimer);
+      try { state.statusBuffer.dispose(); } catch {}
+      try { state.thread.close(); } catch {}
+    }
+    chats.clear();
+    proxyTuiSlot = null;
+    // Codex review (2026-05-16): also clear CodexAdapter's internal
+    // pairedChatId so it does not leak across tests.
+    try { codex.setPairedChat(null); } catch {}
+  },
+  /** Direct reap helper exposed for tests that need to assert the reap behavior. */
+  reapChatState,
+};

@@ -2404,8 +2404,8 @@ codex.on("turnCompleted", () => {
   const paired = getPairedChatState();
   if (!paired)
     return;
-  if (!paired.pairedTurnSawAgentMessage) {
-    log(`[${paired.chatId}] Codex turn completed with no agentMessage \u2014 surfacing as failure signal`);
+  if (!paired.pairedTurnSawAgentMessage && paired.replyRequired) {
+    log(`[${paired.chatId}] Codex turn completed with no agentMessage while replyRequired \u2014 surfacing as failure signal`);
     paired.replyReceivedDuringTurn = true;
     emitToChat(paired, systemMessage("system_codex_turn_completed_no_output", "[system] Codex turn completed without any agentMessage \u2014 likely a failure or empty response."));
   } else {
@@ -2420,7 +2420,9 @@ codex.on("errorItem", (payload) => {
     return;
   paired.replyReceivedDuringTurn = true;
   emitToChat(paired, systemMessage("system_codex_error", `[error] ${payload.message ?? "(no message)"}${payload.code !== undefined ? ` (code ${payload.code})` : ""}`));
+  paired.pairedTurnSawAgentMessage = true;
   paired.replyRequired = false;
+  paired.replyReceivedDuringTurn = false;
 });
 codex.on("sessionRestoreStart", () => {
   if (!proxyTuiSlot)
@@ -2480,8 +2482,64 @@ function pairChat(state) {
     emitToChat(state, systemMessage("system_paired_provisioning", "\u2705 This Claude session is paired with the right-pane Codex TUI. Waiting for the shared thread to finish provisioning before replies can flow."));
   }
 }
+var ISOLATED_BOOTSTRAP_MAX_ATTEMPTS = parseInt(process.env.AGENTBRIDGE_ISOLATED_BOOTSTRAP_MAX_ATTEMPTS ?? "2", 10);
+var ISOLATED_BOOTSTRAP_RETRY_DELAY_MS = parseInt(process.env.AGENTBRIDGE_ISOLATED_BOOTSTRAP_RETRY_DELAY_MS ?? "2000", 10);
+function bootstrapIsolatedThread(state, attempt = 1) {
+  state.thread.bootstrap().then((threadId) => {
+    state.ready = true;
+    emitToChat(state, systemMessage("system_isolated_ready", `\u2705 Fresh isolated Codex thread ready (threadId=${threadId}).`));
+  }).catch((err) => {
+    const errMsg = err?.message ?? String(err);
+    log(`[${state.chatId}] Isolated bootstrap attempt ${attempt}/${ISOLATED_BOOTSTRAP_MAX_ATTEMPTS} failed: ${errMsg}`);
+    if (attempt < ISOLATED_BOOTSTRAP_MAX_ATTEMPTS) {
+      emitToChat(state, systemMessage("system_isolated_retry", `\u26A0\uFE0F Bootstrap of isolated Codex thread failed (attempt ${attempt}/${ISOLATED_BOOTSTRAP_MAX_ATTEMPTS}): ${errMsg}. Retrying in ${ISOLATED_BOOTSTRAP_RETRY_DELAY_MS}ms.`));
+      setTimeout(() => {
+        try {
+          state.thread.close();
+        } catch {}
+        state.thread = new ClaudeThread({
+          appServerUrl: codex.appServerUrl,
+          chatId: state.chatId,
+          logFile: stateDir.logFile,
+          cwd: process.cwd()
+        });
+        wireClaudeThreadEvents(state);
+        bootstrapIsolatedThread(state, attempt + 1);
+      }, ISOLATED_BOOTSTRAP_RETRY_DELAY_MS);
+    } else {
+      emitToChat(state, systemMessage("system_isolated_failed", `\u274C Failed to bootstrap isolated Codex thread after ${ISOLATED_BOOTSTRAP_MAX_ATTEMPTS} attempts: ${errMsg}. Closing this chat \u2014 please reconnect Claude (close the window and re-attach) to start a fresh attempt.`));
+      reapChatState(state, "isolated bootstrap exhausted");
+    }
+  });
+}
+function reapChatState(state, reason) {
+  log(`Reaping chat state: chatId=${state.chatId} (${reason})`);
+  if (state.ws) {
+    try {
+      state.ws.close(1011, `chat reaped: ${reason}`);
+    } catch {}
+    state.ws = null;
+  }
+  if (state.attentionWindowTimer)
+    clearTimeout(state.attentionWindowTimer);
+  if (state.disconnectTimer)
+    clearTimeout(state.disconnectTimer);
+  if (state.reaperTimer)
+    clearTimeout(state.reaperTimer);
+  try {
+    state.statusBuffer.dispose();
+  } catch {}
+  try {
+    state.thread.close();
+  } catch {}
+  chats.delete(state.chatId);
+  broadcastStatus();
+}
 function transitionToIsolated(state, reason) {
   state.paired = false;
+  state.replyRequired = false;
+  state.replyReceivedDuringTurn = false;
+  state.pairedTurnSawAgentMessage = false;
   emitToChat(state, systemMessage("system_pair_torn_down", `[system] ${reason}. Future replies will use a fresh isolated Codex thread (no prior shared-TUI context carried over).`));
   state.thread = new ClaudeThread({
     appServerUrl: codex.appServerUrl,
@@ -2491,12 +2549,7 @@ function transitionToIsolated(state, reason) {
   });
   state.ready = false;
   wireClaudeThreadEvents(state);
-  state.thread.bootstrap().then((threadId) => {
-    state.ready = true;
-    emitToChat(state, systemMessage("system_isolated_ready", `\u2705 Fresh isolated Codex thread ready (threadId=${threadId}).`));
-  }).catch((err) => {
-    emitToChat(state, systemMessage("system_isolated_failed", `\u274C Failed to bootstrap isolated Codex thread: ${err?.message ?? err}.`));
-  });
+  bootstrapIsolatedThread(state);
 }
 codex.on("error", (err) => {
   log(`Codex error: ${err.message}`);
@@ -3082,10 +3135,68 @@ function log(msg) {
     appendFileSync3(stateDir.logFile, line);
   } catch {}
 }
-if (daemonLifecycle.wasKilled()) {
-  log("Killed sentinel found \u2014 daemon was intentionally stopped. Exiting immediately.");
-  process.exit(0);
+function startDaemon() {
+  if (daemonLifecycle.wasKilled()) {
+    log("Killed sentinel found \u2014 daemon was intentionally stopped. Exiting immediately.");
+    process.exit(0);
+  }
+  writePidFile();
+  startControlServer();
+  bootCodex();
 }
-writePidFile();
-startControlServer();
-bootCodex();
+if (import.meta.main) {
+  startDaemon();
+}
+var __testing = {
+  get proxyTuiSlot() {
+    return proxyTuiSlot;
+  },
+  setProxyTuiSlot(next) {
+    proxyTuiSlot = next;
+  },
+  chats,
+  codex,
+  fns: {
+    pairChat,
+    transitionToIsolated,
+    bootstrapIsolatedThread,
+    getPairedChatState,
+    createChatState,
+    detachClaudeWs,
+    emitToChat
+  },
+  config: {
+    PAIR_REAP_MS,
+    CLAUDE_REAP_AFTER_MS,
+    ISOLATED_BOOTSTRAP_MAX_ATTEMPTS,
+    ISOLATED_BOOTSTRAP_RETRY_DELAY_MS
+  },
+  reset() {
+    if (proxyTuiSlot?.pairReapTimer) {
+      clearTimeout(proxyTuiSlot.pairReapTimer);
+    }
+    for (const state of chats.values()) {
+      if (state.attentionWindowTimer)
+        clearTimeout(state.attentionWindowTimer);
+      if (state.disconnectTimer)
+        clearTimeout(state.disconnectTimer);
+      if (state.reaperTimer)
+        clearTimeout(state.reaperTimer);
+      try {
+        state.statusBuffer.dispose();
+      } catch {}
+      try {
+        state.thread.close();
+      } catch {}
+    }
+    chats.clear();
+    proxyTuiSlot = null;
+    try {
+      codex.setPairedChat(null);
+    } catch {}
+  },
+  reapChatState
+};
+export {
+  __testing
+};
