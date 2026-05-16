@@ -3,7 +3,7 @@ import { assert, sha1_16 } from "./lib";
 import { CodexAdapter } from "../../src/codex-adapter";
 
 const text = `agentbridge-p14-echo-race-${Date.now()}`;
-const adapter = new CodexAdapter(1, 2, "/tmp/agentbridge-p14-no-daemon.log") as any;
+const adapter = new CodexAdapter({ appPort: 1, proxyPort: 2, logFile: "/tmp/agentbridge-p14-no-daemon.log" }) as any;
 
 let emittedUserMessages = 0;
 adapter.on("userMessage", () => {
