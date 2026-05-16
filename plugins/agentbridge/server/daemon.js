@@ -61,6 +61,21 @@ class StateDirResolver {
   get killedFile() {
     return join(this.stateDir, "killed");
   }
+  pairDir(pairId) {
+    return join(this.stateDir, "pairs", pairId);
+  }
+  pairCodexPidFile(pairId) {
+    return join(this.pairDir(pairId), "codex.pid");
+  }
+  pairCodexWrapperLogFile(pairId) {
+    return join(this.pairDir(pairId), "codex-wrapper.log");
+  }
+  ensurePairDir(pairId) {
+    const dir = this.pairDir(pairId);
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true });
+    }
+  }
 }
 
 // src/app-server-protocol.ts
@@ -2847,7 +2862,7 @@ function startControlServer() {
       if (url.pathname === "/healthz")
         return Response.json(currentStatus());
       if (url.pathname === "/readyz") {
-        return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
+        return Response.json(currentStatus(), { status: 200 });
       }
       if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false, chatId: null } })) {
         return;

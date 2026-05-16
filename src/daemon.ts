@@ -676,7 +676,15 @@ function startControlServer() {
 
       if (url.pathname === "/healthz") return Response.json(currentStatus());
       if (url.pathname === "/readyz") {
-        return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
+        // STM v2.3 §D6 P3d: readiness means "control plane ready" — the
+        // daemon can accept WS connections and answer ensure_pair. Pair
+        // liveness is conveyed by `pair_ensured.isLive` and `status.pairs`
+        // entries, not by /readyz. v2.2 returned 503 until codexBootstrapped
+        // (= default pair's `codex.start` succeeded); that conflated "I'm
+        // up" with "default pair is up". In a lazy / multi-pair world the
+        // daemon may be fully serving with no pair live yet (e.g. before
+        // first `abg codex --via-proxy`), and that's still ready.
+        return Response.json(currentStatus(), { status: 200 });
       }
       if (url.pathname === "/ws" &&
           server.upgrade(req, { data: { clientId: 0, attached: false, chatId: null } })) {

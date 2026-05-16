@@ -78,4 +78,37 @@ export class StateDirResolver {
   get killedFile(): string {
     return join(this.stateDir, "killed");
   }
+
+  // ── STM v2.3 §D5 P3d — per-pair file paths ────────────────────────────
+  //
+  // The pair registry already lives under `pairs/` (see PairRegistry).
+  // P3d adds the per-pair subdirectories and file accessors so a future
+  // commit (and P4's CLI `--pair` flag) can populate them. Until that
+  // commit lands, the root-level `tuiPidFile` and `codexWrapperLogFile`
+  // accessors are retained as the canonical paths so v2.2 behavior is
+  // preserved end-to-end. Both v2.2 and v2.3 readers will coexist during
+  // the transition (the kill walker reads both).
+
+  /** Subdirectory for a specific pair's runtime state. */
+  pairDir(pairId: string): string {
+    return join(this.stateDir, "pairs", pairId);
+  }
+
+  /** Per-pair Codex app-server / TUI pid file. */
+  pairCodexPidFile(pairId: string): string {
+    return join(this.pairDir(pairId), "codex.pid");
+  }
+
+  /** Per-pair codex-wrapper log (matches the format of root codexWrapperLogFile). */
+  pairCodexWrapperLogFile(pairId: string): string {
+    return join(this.pairDir(pairId), "codex-wrapper.log");
+  }
+
+  /** Ensure a pair's subdirectory exists; safe to call repeatedly. */
+  ensurePairDir(pairId: string): void {
+    const dir = this.pairDir(pairId);
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true });
+    }
+  }
 }

@@ -53,4 +53,36 @@ describe("StateDirResolver", () => {
     const resolver = new StateDirResolver();
     expect(resolver.dir.length).toBeGreaterThan(0);
   });
+
+  // ── STM v2.3 §D5 P3d — per-pair file path methods ─────────────────────
+
+  test("pairDir returns <stateDir>/pairs/<pairId>", () => {
+    const resolver = new StateDirResolver(tempDir);
+    expect(resolver.pairDir("default")).toBe(join(tempDir, "pairs", "default"));
+    expect(resolver.pairDir("work")).toBe(join(tempDir, "pairs", "work"));
+  });
+
+  test("pairCodexPidFile returns <stateDir>/pairs/<pairId>/codex.pid", () => {
+    const resolver = new StateDirResolver(tempDir);
+    expect(resolver.pairCodexPidFile("default")).toBe(join(tempDir, "pairs", "default", "codex.pid"));
+    expect(resolver.pairCodexPidFile("work")).toBe(join(tempDir, "pairs", "work", "codex.pid"));
+  });
+
+  test("pairCodexWrapperLogFile returns <stateDir>/pairs/<pairId>/codex-wrapper.log", () => {
+    const resolver = new StateDirResolver(tempDir);
+    expect(resolver.pairCodexWrapperLogFile("default")).toBe(
+      join(tempDir, "pairs", "default", "codex-wrapper.log"),
+    );
+  });
+
+  test("ensurePairDir creates the per-pair subdir, idempotent", () => {
+    const resolver = new StateDirResolver(tempDir);
+    resolver.ensure();
+    resolver.ensurePairDir("default");
+    resolver.ensurePairDir("default"); // idempotent
+
+    const { writeFileSync, existsSync } = require("node:fs");
+    writeFileSync(join(resolver.pairDir("default"), "marker"), "ok");
+    expect(existsSync(join(resolver.pairDir("default"), "marker"))).toBe(true);
+  });
 });
