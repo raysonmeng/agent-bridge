@@ -2903,7 +2903,7 @@ function handleControlMessage(ws, raw) {
   }
   switch (message.type) {
     case "claude_connect":
-      attachClaude(ws, message.chatId);
+      attachClaude(ws, message.chatId, message.pairId, message.requestId);
       return;
     case "claude_disconnect": {
       const chatId = message.chatId ?? ws.data.chatId;
@@ -3066,9 +3066,42 @@ function handleListPairs(ws, message) {
     pairs: result
   });
 }
-async function attachClaude(ws, requestedChatId) {
+async function attachClaude(ws, requestedChatId, requestedPairId, requestId) {
   const chatId = requestedChatId ?? `auto_${ws.data.clientId}_${Date.now()}`;
   ws.data.chatId = chatId;
+  if (requestedPairId !== undefined) {
+    if (!isValidPairName(requestedPairId)) {
+      sendProtocolMessage(ws, {
+        type: "claude_connect_result",
+        requestId,
+        ok: false,
+        error: "INVALID_PAIR_NAME",
+        message: `pair name "${requestedPairId}" fails validation`
+      });
+      return;
+    }
+    const targetPair2 = pairs.get(requestedPairId);
+    if (!targetPair2?.isLive) {
+      sendProtocolMessage(ws, {
+        type: "claude_connect_result",
+        requestId,
+        ok: false,
+        error: "PAIR_NOT_FOUND",
+        message: `pair "${requestedPairId}" is not live; start it with abg codex --pair ${requestedPairId} --via-proxy first`
+      });
+      return;
+    }
+    if (targetPair2.proxyTuiSlot?.pairedChatId && targetPair2.proxyTuiSlot.pairedChatId !== chatId) {
+      sendProtocolMessage(ws, {
+        type: "claude_connect_result",
+        requestId,
+        ok: false,
+        error: "PAIR_BUSY",
+        message: `pair "${requestedPairId}" already has paired chat "${targetPair2.proxyTuiSlot.pairedChatId}"`
+      });
+      return;
+    }
+  }
   let state = chats.get(chatId);
   if (state) {
     if (state.ws && state.ws !== ws && state.ws.readyState !== WebSocket.CLOSED) {
@@ -3086,6 +3119,14 @@ async function attachClaude(ws, requestedChatId) {
     statusBufferFlushIfPaused(state, "claude resumed");
     flushBufferedMessages(state);
     sendStatus(ws);
+    sendProtocolMessage(ws, {
+      type: "claude_connect_result",
+      requestId,
+      ok: true,
+      chatId,
+      homePairId: state.homePairId,
+      paired: state.paired
+    });
     return;
   }
   state = createChatState(chatId);
@@ -3093,15 +3134,51 @@ async function attachClaude(ws, requestedChatId) {
   state.ws = ws;
   ws.data.attached = true;
   cancelIdleShutdown();
-  log(`New Claude session attached: chatId=${chatId} (#${ws.data.clientId}, total=${chats.size})`);
+  log(`New Claude session attached: chatId=${chatId} (#${ws.data.clientId}, total=${chats.size}, requestedPair=${requestedPairId ?? "-"})`);
   sendStatus(ws);
+  const targetPair = requestedPairId ? pairs.get(requestedPairId) : null;
+  if (targetPair?.isLive && !targetPair.proxyTuiSlot?.pairedChatId && targetPair.proxyTuiSlot) {
+    state.homePairId = requestedPairId;
+    targetPair.proxyTuiSlot.pairedChatId = chatId;
+    state.paired = true;
+    targetPair.codex.setPairedChat(chatId);
+    state.ready = targetPair.proxyTuiSlot.readiness === "ready";
+    log(`[${chatId}] Paired with pair="${requestedPairId}" via explicit attach (readiness=${targetPair.proxyTuiSlot.readiness})`);
+    emitToChat(state, systemMessage(state.ready ? "system_paired_ready" : "system_paired_provisioning", state.ready ? `\u2705 This Claude session is paired with the right-pane Codex TUI on pair "${requestedPairId}". Replies will appear there.` : `\u2705 This Claude session is paired with the right-pane Codex TUI on pair "${requestedPairId}". Waiting for shared-thread provisioning.`));
+    sendProtocolMessage(ws, {
+      type: "claude_connect_result",
+      requestId,
+      ok: true,
+      chatId,
+      homePairId: state.homePairId,
+      paired: state.paired
+    });
+    broadcastStatus();
+    return;
+  }
   if (proxyTuiSlot && proxyTuiSlot.pairedChatId === null) {
     emitToChat(state, systemMessage("system_bridge_provisioning", "\u2705 AgentBridge daemon attached. Pairing with the right-pane Codex TUI for shared-thread mode..."));
     pairChat(state);
     broadcastStatus();
+    sendProtocolMessage(ws, {
+      type: "claude_connect_result",
+      requestId,
+      ok: true,
+      chatId,
+      homePairId: state.homePairId,
+      paired: state.paired
+    });
     return;
   }
   emitToChat(state, systemMessage("system_bridge_provisioning", "\u2705 AgentBridge daemon attached. Provisioning your dedicated Codex thread..."));
+  sendProtocolMessage(ws, {
+    type: "claude_connect_result",
+    requestId,
+    ok: true,
+    chatId,
+    homePairId: state.homePairId,
+    paired: state.paired
+  });
   try {
     const threadId = await state.thread.bootstrap();
     state.ready = true;
@@ -3515,10 +3592,24 @@ function writeStatusFile() {
 function removeStatusFile() {
   daemonLifecycle.removeStatusFile();
 }
+var ensurePairInFlight = new Map;
 async function ensurePair(pairId) {
   if (!isValidPairName(pairId)) {
     throw new PairError("INVALID_PAIR_NAME", `pair name "${pairId}" fails validation`);
   }
+  const existingFast = pairs.get(pairId);
+  if (existingFast?.isLive)
+    return existingFast;
+  const inFlight = ensurePairInFlight.get(pairId);
+  if (inFlight)
+    return inFlight;
+  const promise = ensurePairCore(pairId).finally(() => {
+    ensurePairInFlight.delete(pairId);
+  });
+  ensurePairInFlight.set(pairId, promise);
+  return promise;
+}
+async function ensurePairCore(pairId) {
   const existing = pairs.get(pairId);
   if (existing?.isLive)
     return existing;
@@ -3586,14 +3677,32 @@ async function destroyPair(pairId) {
   const pair = pairs.get(pairId);
   if (!pair)
     return;
-  log(`[pair=${pair.pairId}] destroyPair: stopping codex + detaching handlers`);
+  log(`[pair=${pair.pairId}] destroyPair: full teardown (isLive=${pair.isLive})`);
+  if (pair.proxyTuiSlot?.pairReapTimer) {
+    clearTimeout(pair.proxyTuiSlot.pairReapTimer);
+    pair.proxyTuiSlot.pairReapTimer = null;
+  }
   detachPairHandlers(pair);
+  const pairedChatId = pair.proxyTuiSlot?.pairedChatId ?? null;
+  if (pairedChatId) {
+    const state = chats.get(pairedChatId);
+    if (state) {
+      log(`[pair=${pair.pairId}] destroyPair: transitioning paired chat "${pairedChatId}" to isolated`);
+      transitionToIsolated(state, `Pair "${pair.pairId}" destroyed`);
+    }
+  }
+  pair.proxyTuiSlot = null;
   try {
     pair.codex.stop();
   } catch (err) {
     log(`[pair=${pair.pairId}] destroyPair: codex.stop() threw \u2014 ${err?.message ?? err}`);
   }
   pair.isLive = false;
+  if (pairId !== "default") {
+    pairs.delete(pairId);
+    log(`[pair=${pair.pairId}] destroyPair: removed from pairs Map`);
+  }
+  broadcastStatus();
 }
 async function bootCodex() {
   log("Starting AgentBridge daemon (multi-Claude variant)...");

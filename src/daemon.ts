@@ -729,7 +729,7 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
 
   switch (message.type) {
     case "claude_connect":
-      void attachClaude(ws, message.chatId);
+      void attachClaude(ws, message.chatId, message.pairId, message.requestId);
       return;
     case "claude_disconnect": {
       const chatId = message.chatId ?? ws.data.chatId;
@@ -930,9 +930,50 @@ function handleListPairs(
 async function attachClaude(
   ws: ServerWebSocket<ControlSocketData>,
   requestedChatId?: string,
+  requestedPairId?: string,
+  requestId?: string,
 ) {
   const chatId = requestedChatId ?? `auto_${ws.data.clientId}_${Date.now()}`;
   ws.data.chatId = chatId;
+
+  // STM v2.3 §D4 / §D6 P3-cleanup: validate explicit pair id BEFORE state
+  // mutation so a bad request doesn't side-effect chat creation. Also
+  // emit a typed claude_connect_result back per spec §D6 — bridges that
+  // sent a `requestId` consume the response to surface PAIR_NOT_FOUND /
+  // PAIR_BUSY as a user-visible disabled state.
+  if (requestedPairId !== undefined) {
+    if (!isValidPairName(requestedPairId)) {
+      sendProtocolMessage(ws, {
+        type: "claude_connect_result",
+        requestId,
+        ok: false,
+        error: "INVALID_PAIR_NAME",
+        message: `pair name "${requestedPairId}" fails validation`,
+      });
+      return;
+    }
+    const targetPair = pairs.get(requestedPairId);
+    if (!targetPair?.isLive) {
+      sendProtocolMessage(ws, {
+        type: "claude_connect_result",
+        requestId,
+        ok: false,
+        error: "PAIR_NOT_FOUND",
+        message: `pair "${requestedPairId}" is not live; start it with abg codex --pair ${requestedPairId} --via-proxy first`,
+      });
+      return;
+    }
+    if (targetPair.proxyTuiSlot?.pairedChatId && targetPair.proxyTuiSlot.pairedChatId !== chatId) {
+      sendProtocolMessage(ws, {
+        type: "claude_connect_result",
+        requestId,
+        ok: false,
+        error: "PAIR_BUSY",
+        message: `pair "${requestedPairId}" already has paired chat "${targetPair.proxyTuiSlot.pairedChatId}"`,
+      });
+      return;
+    }
+  }
 
   let state = chats.get(chatId);
   if (state) {
@@ -950,6 +991,14 @@ async function attachClaude(
     statusBufferFlushIfPaused(state, "claude resumed");
     flushBufferedMessages(state);
     sendStatus(ws);
+    sendProtocolMessage(ws, {
+      type: "claude_connect_result",
+      requestId,
+      ok: true,
+      chatId,
+      homePairId: state.homePairId,
+      paired: state.paired,
+    });
     return;
   }
 
@@ -960,20 +1009,69 @@ async function attachClaude(
   state.ws = ws;
   ws.data.attached = true;
   cancelIdleShutdown();
-  log(`New Claude session attached: chatId=${chatId} (#${ws.data.clientId}, total=${chats.size})`);
+  log(`New Claude session attached: chatId=${chatId} (#${ws.data.clientId}, total=${chats.size}, requestedPair=${requestedPairId ?? "-"})`);
 
   sendStatus(ws);
+
+  // P3-cleanup: explicit-pair Claude binds to the requested pair's slot if
+  // it's unpaired. Default-only behavior (P1-P3) is preserved when no
+  // pairId is supplied — pair with default's slot via the P1 alias.
+  const targetPair = requestedPairId ? pairs.get(requestedPairId) : null;
+  if (targetPair?.isLive && !targetPair.proxyTuiSlot?.pairedChatId && targetPair.proxyTuiSlot) {
+    state.homePairId = requestedPairId!;
+    targetPair.proxyTuiSlot.pairedChatId = chatId;
+    state.paired = true;
+    targetPair.codex.setPairedChat(chatId);
+    state.ready = targetPair.proxyTuiSlot.readiness === "ready";
+    log(`[${chatId}] Paired with pair="${requestedPairId}" via explicit attach (readiness=${targetPair.proxyTuiSlot.readiness})`);
+    emitToChat(state, systemMessage(state.ready ? "system_paired_ready" : "system_paired_provisioning",
+      state.ready
+        ? `✅ This Claude session is paired with the right-pane Codex TUI on pair "${requestedPairId}". Replies will appear there.`
+        : `✅ This Claude session is paired with the right-pane Codex TUI on pair "${requestedPairId}". Waiting for shared-thread provisioning.`));
+    sendProtocolMessage(ws, {
+      type: "claude_connect_result",
+      requestId,
+      ok: true,
+      chatId,
+      homePairId: state.homePairId,
+      paired: state.paired,
+    });
+    broadcastStatus();
+    return;
+  }
 
   if (proxyTuiSlot && proxyTuiSlot.pairedChatId === null) {
     emitToChat(state, systemMessage("system_bridge_provisioning",
       "✅ AgentBridge daemon attached. Pairing with the right-pane Codex TUI for shared-thread mode..."));
     pairChat(state);
     broadcastStatus();
+    sendProtocolMessage(ws, {
+      type: "claude_connect_result",
+      requestId,
+      ok: true,
+      chatId,
+      homePairId: state.homePairId,
+      paired: state.paired,
+    });
     return; // paired chats skip ClaudeThread.bootstrap (shared transport)
   }
 
   emitToChat(state, systemMessage("system_bridge_provisioning",
     "✅ AgentBridge daemon attached. Provisioning your dedicated Codex thread..."));
+
+  // Emit the typed claude_connect_result now — the chat is attached even
+  // if the ClaudeThread bootstrap still has work to do. Bootstrap status
+  // is conveyed by subsequent system_thread_ready / system_thread_failed
+  // messages, not by claude_connect_result. (Per spec §D6, ok=true means
+  // "attached successfully", not "thread fully bootstrapped".)
+  sendProtocolMessage(ws, {
+    type: "claude_connect_result",
+    requestId,
+    ok: true,
+    chatId,
+    homePairId: state.homePairId,
+    paired: state.paired,
+  });
 
   try {
     const threadId = await state.thread.bootstrap();
@@ -1481,12 +1579,39 @@ function removeStatusFile() { daemonLifecycle.removeStatusFile(); }
  * racing. PairState construction and codex.start() happen outside the
  * mutex to avoid serializing all spawns through one chain.
  */
+/**
+ * STM v2.3 §6.2 P3-cleanup: same-pair in-flight dedup mutex. Two concurrent
+ * `ensure_pair("work")` calls subscribe to the same promise instead of
+ * racing into PairState construction / codex.start. The daemon-wide
+ * `registryWriteMutex` only protects registry writes; this Map protects
+ * the broader allocate→construct→start→isLive flow per pair.
+ */
+const ensurePairInFlight = new Map<string, Promise<PairState>>();
+
 async function ensurePair(pairId: string): Promise<PairState> {
+  // Validate upfront so a bad name doesn't get stuck in the dedup map.
   if (!isValidPairName(pairId)) {
     throw new PairError("INVALID_PAIR_NAME", `pair name "${pairId}" fails validation`);
   }
-
   // Fast path: pair already constructed and live.
+  const existingFast = pairs.get(pairId);
+  if (existingFast?.isLive) return existingFast;
+  // Same-pair dedup: if another ensure for this exact pairId is mid-flight,
+  // await it rather than racing.
+  const inFlight = ensurePairInFlight.get(pairId);
+  if (inFlight) return inFlight;
+  const promise = ensurePairCore(pairId).finally(() => {
+    ensurePairInFlight.delete(pairId);
+  });
+  ensurePairInFlight.set(pairId, promise);
+  return promise;
+}
+
+async function ensurePairCore(pairId: string): Promise<PairState> {
+  // Fast path is checked once more inside the core (a same-pair waiter
+  // may have already finished by the time the dedup map handed us the
+  // promise — but since the promise resolves with that result, this
+  // path is effectively unreachable; included for defense-in-depth).
   const existing = pairs.get(pairId);
   if (existing?.isLive) return existing;
 
@@ -1571,16 +1696,77 @@ class PairError extends Error {
  * arrive in P3 with the `destroy_pair` control protocol; P2 just defines
  * the symmetric counterpart of `ensurePair` so the lifecycle is closed.
  */
+/**
+ * STM v2.3 §6.3 P3-cleanup: full live teardown per spec.
+ *
+ * Originally a P2 stub that just detached handlers + stopped codex. Codex
+ * P3-series review (codex_msg_5753c73beafc_107) flagged HIGH gaps:
+ *
+ *   - timers (`tuiReapTimer`, `pairReapTimer`) were not cleared
+ *   - paired chats (if any) were not transitioned to isolated via §6.5
+ *   - non-default pairs were never removed from the `pairs` Map, so
+ *     `list_pairs` would still report a torn-down pair as "registry-only
+ *     entry" with stale isLive=false but a live PairState behind it
+ *   - status was not broadcast to surviving Claude WS clients
+ *
+ * Default pair stays in the Map even after teardown so the v2.2-style
+ * top-level `proxyTuiSlot` alias keeps resolving; only non-default
+ * pairs are dropped. Tests that rely on the default pair entry being
+ * present continue to work.
+ */
 async function destroyPair(pairId: string): Promise<void> {
   const pair = pairs.get(pairId);
   if (!pair) return;
-  log(`[pair=${pair.pairId}] destroyPair: stopping codex + detaching handlers`);
+  log(`[pair=${pair.pairId}] destroyPair: full teardown (isLive=${pair.isLive})`);
+
+  // 1. Cancel any timers attached to this pair's slot before we drop the slot.
+  if (pair.proxyTuiSlot?.pairReapTimer) {
+    clearTimeout(pair.proxyTuiSlot.pairReapTimer);
+    pair.proxyTuiSlot.pairReapTimer = null;
+  }
+
+  // 2. Detach event handlers (D9 targeted off). MUST happen before
+  //    codex.stop() so the exit handler's `pair.isLive = false` doesn't
+  //    fire and confuse downstream observers — we're about to set
+  //    isLive=false explicitly here anyway.
   detachPairHandlers(pair);
+
+  // 3. Transition the paired Claude (if any) to isolated per §6.5
+  //    BEFORE killing the codex app-server, so the new ClaudeThread
+  //    has time to bootstrap against default's app-server (the
+  //    existing transitionToIsolated targets `codex.appServerUrl`).
+  const pairedChatId = pair.proxyTuiSlot?.pairedChatId ?? null;
+  if (pairedChatId) {
+    const state = chats.get(pairedChatId);
+    if (state) {
+      log(`[pair=${pair.pairId}] destroyPair: transitioning paired chat "${pairedChatId}" to isolated`);
+      transitionToIsolated(state, `Pair "${pair.pairId}" destroyed`);
+    }
+  }
+
+  // 4. Clear the slot itself.
+  pair.proxyTuiSlot = null;
+
+  // 5. Stop the Codex app-server child. Wrapped in try/catch because
+  //    stop() can throw if the app-server already exited.
   try { pair.codex.stop(); } catch (err: any) {
     log(`[pair=${pair.pairId}] destroyPair: codex.stop() threw — ${err?.message ?? err}`);
   }
+
   pair.isLive = false;
-  // P3+ will also remove from the pairs Map for non-default pairs.
+
+  // 6. Non-default pairs leave the `pairs` Map entirely so `list_pairs`
+  //    won't keep reporting them and so reallocations don't conflict
+  //    with stale PairState. Default stays in the Map (its P1 alias
+  //    for proxyTuiSlot is consumed by `let proxyTuiSlot` reads
+  //    elsewhere in the daemon — removing it would dangle that alias).
+  if (pairId !== "default") {
+    pairs.delete(pairId);
+    log(`[pair=${pair.pairId}] destroyPair: removed from pairs Map`);
+  }
+
+  // 7. Broadcast so any attached Claude reads the new aggregate status.
+  broadcastStatus();
 }
 
 async function bootCodex() {
