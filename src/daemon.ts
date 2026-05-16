@@ -1123,19 +1123,40 @@ function sendProtocolMessage(ws: ServerWebSocket<ControlSocketData>, message: Co
 
 function currentStatus(): DaemonStatus {
   const snapshot = tuiConnectionState.snapshot();
+  // STM v2.3 §D7 P3: aggregate status. v2.2 top-level fields are kept
+  // populated from the default pair (URLs always — they're config; runtime
+  // fields reflect actual state). New v2.3 code reads detail from `pairs`.
   return {
     bridgeReady: tuiConnectionState.canReply() || codexBootstrapped,
+    pid: process.pid,
+    // URLs are config: always populated from the default pair's registered ports.
+    proxyUrl: codex.proxyUrl,
+    appServerUrl: codex.appServerUrl,
     tuiConnected: snapshot.tuiConnected,
+    proxyTuiConnected: proxyTuiSlot !== null,
     threadId: codex.activeThreadId,
+    // Aggregates across all chats / pairs.
+    attachedClaudeCount: [...chats.values()].filter((s) => s.ws).length,
     queuedMessageCount: [...chats.values()].reduce(
       (n, s) => n + s.bufferedMessages.length + s.statusBuffer.size,
       0,
     ),
-    proxyUrl: codex.proxyUrl,
-    appServerUrl: codex.appServerUrl,
-    pid: process.pid,
-    attachedClaudeCount: [...chats.values()].filter((s) => s.ws).length,
-    proxyTuiConnected: proxyTuiSlot !== null,
+    // P3 sub-commit 1: protocol shape only — wire the array but keep
+    // population trivial (just the default pair) until P3 sub-commit 2
+    // adds the registry / pair-introspection helpers.
+    pairs: [...pairs.values()].map((pair) => ({
+      pairId: pair.pairId,
+      isLive: pair.isLive,
+      appServerUrl: pair.codex.appServerUrl,
+      proxyUrl: pair.codex.proxyUrl,
+      tuiConnected: pair.tuiConnectionState.snapshot().tuiConnected,
+      proxyTuiConnected: pair.proxyTuiSlot !== null,
+      pairedChatId: pair.proxyTuiSlot?.pairedChatId ?? null,
+      threadId: pair.codex.activeThreadId,
+      attachedClaudes: [...chats.values()]
+        .filter((s) => s.homePairId === pair.pairId)
+        .map((s) => ({ chatId: s.chatId, paired: s.paired })),
+    })),
   };
 }
 

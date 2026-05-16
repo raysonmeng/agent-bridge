@@ -3060,14 +3060,25 @@ function currentStatus() {
   const snapshot = tuiConnectionState.snapshot();
   return {
     bridgeReady: tuiConnectionState.canReply() || codexBootstrapped,
-    tuiConnected: snapshot.tuiConnected,
-    threadId: codex.activeThreadId,
-    queuedMessageCount: [...chats.values()].reduce((n, s) => n + s.bufferedMessages.length + s.statusBuffer.size, 0),
+    pid: process.pid,
     proxyUrl: codex.proxyUrl,
     appServerUrl: codex.appServerUrl,
-    pid: process.pid,
+    tuiConnected: snapshot.tuiConnected,
+    proxyTuiConnected: proxyTuiSlot !== null,
+    threadId: codex.activeThreadId,
     attachedClaudeCount: [...chats.values()].filter((s) => s.ws).length,
-    proxyTuiConnected: proxyTuiSlot !== null
+    queuedMessageCount: [...chats.values()].reduce((n, s) => n + s.bufferedMessages.length + s.statusBuffer.size, 0),
+    pairs: [...pairs.values()].map((pair) => ({
+      pairId: pair.pairId,
+      isLive: pair.isLive,
+      appServerUrl: pair.codex.appServerUrl,
+      proxyUrl: pair.codex.proxyUrl,
+      tuiConnected: pair.tuiConnectionState.snapshot().tuiConnected,
+      proxyTuiConnected: pair.proxyTuiSlot !== null,
+      pairedChatId: pair.proxyTuiSlot?.pairedChatId ?? null,
+      threadId: pair.codex.activeThreadId,
+      attachedClaudes: [...chats.values()].filter((s) => s.homePairId === pair.pairId).map((s) => ({ chatId: s.chatId, paired: s.paired }))
+    }))
   };
 }
 function systemMessage(idPrefix, content) {
