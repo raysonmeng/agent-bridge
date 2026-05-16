@@ -2500,6 +2500,7 @@ ${payload.content}`,
   on("exit", (code) => {
     log(`[pair=${pair.pairId}] Codex app-server process exited (code ${code})`);
     codexBootstrapped = false;
+    pair.isLive = false;
     pair.tuiConnectionState.handleCodexExit();
     broadcastToAllClaudes(systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server exited (code ${code ?? "unknown"}). All ClaudeThread sessions terminated.`));
     for (const state of chats.values()) {
@@ -2510,6 +2511,12 @@ ${payload.content}`,
     }
     broadcastStatus();
   });
+}
+function detachPairHandlers(pair) {
+  for (const { eventName, handler } of pair.handlerRefs) {
+    pair.codex.off(eventName, handler);
+  }
+  pair.handlerRefs = [];
 }
 attachPairHandlers(defaultPairState);
 function getPairedChatState() {
@@ -3119,10 +3126,27 @@ async function ensurePair(pairId) {
   }
   if (pair.isLive)
     return pair;
+  if (pair.handlerRefs.length === 0) {
+    log(`[pair=${pair.pairId}] ensurePair: reattaching handlers before start`);
+    attachPairHandlers(pair);
+  }
   log(`[pair=${pair.pairId}] ensurePair: starting codex app-server (appPort=${pair.codex.appServerUrl}, proxyPort=${pair.codex.proxyUrl})`);
   await pair.codex.start();
   pair.isLive = true;
   return pair;
+}
+async function destroyPair(pairId) {
+  const pair = pairs.get(pairId);
+  if (!pair)
+    return;
+  log(`[pair=${pair.pairId}] destroyPair: stopping codex + detaching handlers`);
+  detachPairHandlers(pair);
+  try {
+    pair.codex.stop();
+  } catch (err) {
+    log(`[pair=${pair.pairId}] destroyPair: codex.stop() threw \u2014 ${err?.message ?? err}`);
+  }
+  pair.isLive = false;
 }
 async function bootCodex() {
   log("Starting AgentBridge daemon (multi-Claude variant)...");
@@ -3215,7 +3239,11 @@ var __testing = {
     getPairedChatState,
     createChatState,
     detachClaudeWs,
-    emitToChat
+    emitToChat,
+    attachPairHandlers,
+    detachPairHandlers,
+    ensurePair,
+    destroyPair
   },
   config: {
     PAIR_REAP_MS,

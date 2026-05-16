@@ -433,6 +433,11 @@ function attachPairHandlers(pair: PairState): void {
   on("exit", (code: number | null) => {
     log(`[pair=${pair.pairId}] Codex app-server process exited (code ${code})`);
     codexBootstrapped = false;
+    // Bug fix (Codex P2 review codex_msg_5753c73beafc_95): clear `isLive`
+    // so a subsequent `ensurePair(pair.pairId)` re-spawns the app-server
+    // rather than no-op'ing on stale liveness state. Without this, ME6
+    // "next ensure_pair re-spawns after crash" would silently fail in P3.
+    pair.isLive = false;
     pair.tuiConnectionState.handleCodexExit();
     broadcastToAllClaudes(
       systemMessage(
@@ -1209,6 +1214,16 @@ async function ensurePair(pairId: string): Promise<PairState> {
     throw new Error(`ensurePair: pair "${pairId}" missing from registry (P2 invariant violated)`);
   }
   if (pair.isLive) return pair;
+  // Bug fix (Codex P2 review codex_msg_5753c73beafc_95): if this is a
+  // re-ensure after a prior destroyPair (or after an `exit` cleared
+  // isLive), handler refs were cleared too. Reattach before starting
+  // so the new codex.start() fires `ready` / `tuiConnected` / etc. into
+  // live event listeners. Without this, ensurePair-after-destroyPair
+  // produced a live-but-event-deaf pair.
+  if (pair.handlerRefs.length === 0) {
+    log(`[pair=${pair.pairId}] ensurePair: reattaching handlers before start`);
+    attachPairHandlers(pair);
+  }
   log(`[pair=${pair.pairId}] ensurePair: starting codex app-server (appPort=${pair.codex.appServerUrl}, proxyPort=${pair.codex.proxyUrl})`);
   await pair.codex.start();
   pair.isLive = true;
@@ -1357,6 +1372,11 @@ export const __testing = {
     createChatState,
     detachClaudeWs,
     emitToChat,
+    /** STM v2.3 P2 lifecycle entry points (added 2026-05-16). */
+    attachPairHandlers,
+    detachPairHandlers,
+    ensurePair,
+    destroyPair,
   } as const,
   /** Constants captured at module load — useful for asserting timer behavior. */
   config: {

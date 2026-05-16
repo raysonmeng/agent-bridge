@@ -336,6 +336,89 @@ describe("daemon bug regressions (2026-05-16 STM v2.2 review)", () => {
     expect(config.ISOLATED_BOOTSTRAP_RETRY_DELAY_MS).toBe(5);
   });
 
+  // ── STM v2.3 P2 lifecycle (Codex P2 review codex_msg_5753c73beafc_95) ──
+
+  test("P2 lifecycle: attachPairHandlers is idempotent (no duplicate handler refs)", () => {
+    const defaultPair = __testing.pairs.get("default")!;
+    const baseline = defaultPair.handlerRefs.length;
+    expect(baseline).toBeGreaterThan(0); // module-load registration already ran
+
+    fns.attachPairHandlers(defaultPair);
+    expect(defaultPair.handlerRefs.length).toBe(baseline);
+  });
+
+  test("P2 lifecycle: detachPairHandlers uses targeted off(), preserves unrelated listeners", () => {
+    const defaultPair = __testing.pairs.get("default")!;
+    const baseline = defaultPair.handlerRefs.length;
+
+    // Register an unrelated listener that detachPairHandlers must NOT remove.
+    const unrelatedHandler = () => {};
+    defaultPair.codex.on("ready", unrelatedHandler);
+    const readyBefore = defaultPair.codex.listenerCount("ready");
+
+    fns.detachPairHandlers(defaultPair);
+    expect(defaultPair.handlerRefs.length).toBe(0);
+
+    // The unrelated handler stays attached; only the daemon's own "ready"
+    // handler should have been removed (count drops by exactly 1).
+    expect(defaultPair.codex.listenerCount("ready")).toBe(readyBefore - 1);
+
+    // Cleanup + restore so subsequent tests see a normal default pair.
+    defaultPair.codex.off("ready", unrelatedHandler);
+    fns.attachPairHandlers(defaultPair);
+    expect(defaultPair.handlerRefs.length).toBe(baseline);
+  });
+
+  test("P2 lifecycle: destroyPair → ensurePair reattaches handlers (no event-deaf pair)", async () => {
+    const defaultPair = __testing.pairs.get("default")!;
+    // Stub codex.start()/stop() so we don't spawn a real Codex app-server here.
+    const originalStart = defaultPair.codex.start.bind(defaultPair.codex);
+    const originalStop = defaultPair.codex.stop.bind(defaultPair.codex);
+    (defaultPair.codex as any).start = async () => {};
+    (defaultPair.codex as any).stop = () => {};
+
+    try {
+      defaultPair.isLive = true;
+      const baseline = defaultPair.handlerRefs.length;
+      expect(baseline).toBeGreaterThan(0);
+
+      await fns.destroyPair("default");
+      expect(defaultPair.isLive).toBe(false);
+      expect(defaultPair.handlerRefs.length).toBe(0);
+
+      await fns.ensurePair("default");
+      expect(defaultPair.isLive).toBe(true);
+      // Handlers reattached — pair is no longer event-deaf.
+      expect(defaultPair.handlerRefs.length).toBe(baseline);
+    } finally {
+      (defaultPair.codex as any).start = originalStart;
+      (defaultPair.codex as any).stop = originalStop;
+    }
+  });
+
+  test("P2 lifecycle: codex exit clears pair.isLive so a future ensurePair re-spawns (Codex P2 review finding HIGH#2)", async () => {
+    const defaultPair = __testing.pairs.get("default")!;
+    const originalStart = defaultPair.codex.start.bind(defaultPair.codex);
+    (defaultPair.codex as any).start = async () => {};
+
+    try {
+      defaultPair.isLive = true;
+      // Simulate codex app-server crash.
+      defaultPair.codex.emit("exit", 137);
+      expect(defaultPair.isLive).toBe(false);
+
+      // ensurePair must now proceed past the early-return guard.
+      await fns.ensurePair("default");
+      expect(defaultPair.isLive).toBe(true);
+    } finally {
+      (defaultPair.codex as any).start = originalStart;
+    }
+  });
+
+  test("P2 lifecycle: ensurePair rejects non-default pairId in P2", async () => {
+    await expect(fns.ensurePair("work")).rejects.toThrow(/not yet supported in P2/);
+  });
+
   test("Bug B: transitionToIsolated exercises the retry loop and emits a definitive 'failed' message when all attempts fail", async () => {
     __testing.setProxyTuiSlot(makeSlot({ readiness: "ready" }));
 
