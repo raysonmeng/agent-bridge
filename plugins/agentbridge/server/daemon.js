@@ -2379,10 +2379,10 @@ import { readFileSync as readFileSync3, writeFileSync as writeFileSync3, renameS
 import { dirname as dirname2 } from "path";
 import { randomBytes } from "crypto";
 var DEFAULT_PAIR_PORTS = { appPort: 4500, proxyPort: 4501 };
-var STRIDE_BASE = 4510;
-var STRIDE_STEP_DEFAULT = 10;
-var STRIDE_MAX_DEFAULT = 20;
-var MAX_PAIRS_DEFAULT = 8;
+var STRIDE_BASE = parseInt(process.env.AGENTBRIDGE_PAIR_STRIDE_BASE ?? "4510", 10);
+var STRIDE_STEP_DEFAULT = parseInt(process.env.AGENTBRIDGE_PAIR_STRIDE_STEP ?? "10", 10);
+var STRIDE_MAX_DEFAULT = parseInt(process.env.AGENTBRIDGE_PAIR_STRIDE_MAX ?? "20", 10);
+var MAX_PAIRS_DEFAULT = parseInt(process.env.AGENTBRIDGE_PAIR_MAX_PAIRS ?? "8", 10);
 var PAIR_NAME_REGEX = /^[a-z0-9][a-z0-9_-]{0,31}$/;
 function isValidPairName(name) {
   if (typeof name !== "string")
@@ -2827,8 +2827,15 @@ ${payload.content}`,
     codexBootstrapped = false;
     pair.isLive = false;
     pair.tuiConnectionState.handleCodexExit();
-    broadcastToAllClaudes(systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server exited (code ${code ?? "unknown"}). All ClaudeThread sessions terminated.`));
+    const affectedChats = [];
     for (const state of chats.values()) {
+      if (state.homePairId !== pair.pairId)
+        continue;
+      affectedChats.push(state);
+    }
+    log(`[pair=${pair.pairId}] codex exit affects ${affectedChats.length}/${chats.size} chats (homed on this pair)`);
+    for (const state of affectedChats) {
+      emitToChat(state, systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server on pair "${pair.pairId}" exited (code ${code ?? "unknown"}). Your thread on this pair was terminated.`));
       try {
         state.thread.close();
       } catch {}

@@ -528,13 +528,24 @@ function attachPairHandlers(pair: PairState): void {
     // "next ensure_pair re-spawns after crash" would silently fail in P3.
     pair.isLive = false;
     pair.tuiConnectionState.handleCodexExit();
-    broadcastToAllClaudes(
-      systemMessage(
-        "system_codex_exit",
-        `⚠️ Codex app-server exited (code ${code ?? "unknown"}). All ClaudeThread sessions terminated.`,
-      ),
-    );
+
+    // Issue #83 risk #3 (M02 probe found 2026-05-17): the previous code
+    // broadcast system_codex_exit to ALL Claudes and closed EVERY chat
+    // thread + flipped state.ready=false — violating multi-pair crash
+    // isolation. Scope the cascade to chats homed on THIS pair only.
+    // Chats on other pairs (or isolated) are unaffected by this pair's
+    // crash and must continue operating.
+    const affectedChats: ChatState[] = [];
     for (const state of chats.values()) {
+      if (state.homePairId !== pair.pairId) continue;
+      affectedChats.push(state);
+    }
+    log(`[pair=${pair.pairId}] codex exit affects ${affectedChats.length}/${chats.size} chats (homed on this pair)`);
+    for (const state of affectedChats) {
+      emitToChat(state, systemMessage(
+        "system_codex_exit",
+        `⚠️ Codex app-server on pair "${pair.pairId}" exited (code ${code ?? "unknown"}). Your thread on this pair was terminated.`,
+      ));
       try { state.thread.close(); } catch {}
       state.ready = false;
     }
