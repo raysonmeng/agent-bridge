@@ -3167,19 +3167,32 @@ async function attachClaude(ws, requestedChatId, requestedPairId, requestId) {
     broadcastStatus();
     return;
   }
-  if (proxyTuiSlot && proxyTuiSlot.pairedChatId === null) {
-    emitToChat(state, systemMessage("system_bridge_provisioning", "\u2705 AgentBridge daemon attached. Pairing with the right-pane Codex TUI for shared-thread mode..."));
-    pairChat(state);
-    broadcastStatus();
-    sendProtocolMessage(ws, {
-      type: "claude_connect_result",
-      requestId,
-      ok: true,
-      chatId,
-      homePairId: state.homePairId,
-      paired: state.paired
-    });
-    return;
+  if (!requestedPairId) {
+    for (const [iterPairId, iterPair] of pairs.entries()) {
+      if (!iterPair.isLive)
+        continue;
+      if (!iterPair.proxyTuiSlot)
+        continue;
+      if (iterPair.proxyTuiSlot.pairedChatId !== null)
+        continue;
+      state.homePairId = iterPairId;
+      iterPair.proxyTuiSlot.pairedChatId = chatId;
+      state.paired = true;
+      iterPair.codex.setPairedChat(chatId);
+      state.ready = iterPair.proxyTuiSlot.readiness === "ready";
+      log(`[${chatId}] FIFO-claimed pair "${iterPairId}" (readiness=${iterPair.proxyTuiSlot.readiness})`);
+      emitToChat(state, systemMessageForChat(state, state.ready ? "system_paired_ready" : "system_paired_provisioning", state.ready ? `\u2705 This Claude session is paired with the right-pane Codex TUI on pair "${iterPairId}". Replies will appear there; user typing in the TUI will be forwarded to you with an [IMPORTANT] prefix.` : `\u2705 This Claude session is paired with the right-pane Codex TUI on pair "${iterPairId}". Waiting for the shared thread to finish provisioning before replies can flow.`));
+      sendProtocolMessage(ws, {
+        type: "claude_connect_result",
+        requestId,
+        ok: true,
+        chatId,
+        homePairId: state.homePairId,
+        paired: state.paired
+      });
+      broadcastStatus();
+      return;
+    }
   }
   emitToChat(state, systemMessage("system_bridge_provisioning", "\u2705 AgentBridge daemon attached. Provisioning your dedicated Codex thread..."));
   sendProtocolMessage(ws, {
@@ -3556,6 +3569,15 @@ function currentStatus() {
       attachedClaudes: [...chats.values()].filter((s) => s.homePairId === pair.pairId).map((s) => ({ chatId: s.chatId, paired: s.paired }))
     }))
   };
+}
+function systemMessageForChat(state, idPrefix, content) {
+  if (state.homePairId) {
+    const livePairCount = [...pairs.values()].filter((p) => p.isLive).length;
+    if (livePairCount > 1) {
+      return systemMessage(idPrefix, `[pair: ${state.homePairId}] ${content}`);
+    }
+  }
+  return systemMessage(idPrefix, content);
 }
 function systemMessage(idPrefix, content) {
   return {

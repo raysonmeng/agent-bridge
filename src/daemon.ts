@@ -1074,20 +1074,41 @@ async function attachClaude(
     return;
   }
 
-  if (proxyTuiSlot && proxyTuiSlot.pairedChatId === null) {
-    emitToChat(state, systemMessage("system_bridge_provisioning",
-      "✅ AgentBridge daemon attached. Pairing with the right-pane Codex TUI for shared-thread mode..."));
-    pairChat(state);
-    broadcastStatus();
-    sendProtocolMessage(ws, {
-      type: "claude_connect_result",
-      requestId,
-      ok: true,
-      chatId,
-      homePairId: state.homePairId,
-      paired: state.paired,
-    });
-    return; // paired chats skip ClaudeThread.bootstrap (shared transport)
+  // STM v2.3 §6.4 / §D4 P5a — FIFO claim across live pairs in registry
+  // insertion order. If any live pair has a `proxyTuiSlot` with no
+  // paired chat, this Claude becomes its paired chat. Iterating the
+  // `pairs` Map honors the spec's "registry insertion order" — default
+  // is inserted first at module load, named pairs append as they
+  // ensure_pair, so default is always preferred when free.
+  if (!requestedPairId) {
+    for (const [iterPairId, iterPair] of pairs.entries()) {
+      if (!iterPair.isLive) continue;
+      if (!iterPair.proxyTuiSlot) continue;            // pair has no --via-proxy TUI yet
+      if (iterPair.proxyTuiSlot.pairedChatId !== null) continue; // already paired
+      // Claim this pair.
+      state.homePairId = iterPairId;
+      iterPair.proxyTuiSlot.pairedChatId = chatId;
+      state.paired = true;
+      iterPair.codex.setPairedChat(chatId);
+      state.ready = iterPair.proxyTuiSlot.readiness === "ready";
+      log(`[${chatId}] FIFO-claimed pair "${iterPairId}" (readiness=${iterPair.proxyTuiSlot.readiness})`);
+      emitToChat(state, systemMessageForChat(state,
+        state.ready ? "system_paired_ready" : "system_paired_provisioning",
+        state.ready
+          ? `✅ This Claude session is paired with the right-pane Codex TUI on pair "${iterPairId}". Replies will appear there; user typing in the TUI will be forwarded to you with an [IMPORTANT] prefix.`
+          : `✅ This Claude session is paired with the right-pane Codex TUI on pair "${iterPairId}". Waiting for the shared thread to finish provisioning before replies can flow.`,
+      ));
+      sendProtocolMessage(ws, {
+        type: "claude_connect_result",
+        requestId,
+        ok: true,
+        chatId,
+        homePairId: state.homePairId,
+        paired: state.paired,
+      });
+      broadcastStatus();
+      return;
+    }
   }
 
   emitToChat(state, systemMessage("system_bridge_provisioning",
@@ -1548,6 +1569,23 @@ function currentStatus(): DaemonStatus {
         .map((s) => ({ chatId: s.chatId, paired: s.paired })),
     })),
   };
+}
+
+/**
+ * STM v2.3 §7.3 P5a — pair-aware system message.
+ *
+ * Prepends `[pair: NAME] ` to the content when multiple pairs are live
+ * AND the chat is bound to one of them. Single-pair scenarios (the v2.2
+ * baseline) get the unadorned message so existing UX is preserved.
+ */
+function systemMessageForChat(state: ChatState, idPrefix: string, content: string): BridgeMessage {
+  if (state.homePairId) {
+    const livePairCount = [...pairs.values()].filter((p) => p.isLive).length;
+    if (livePairCount > 1) {
+      return systemMessage(idPrefix, `[pair: ${state.homePairId}] ${content}`);
+    }
+  }
+  return systemMessage(idPrefix, content);
 }
 
 function systemMessage(idPrefix: string, content: string): BridgeMessage {

@@ -655,6 +655,98 @@ describe("daemon bug regressions (2026-05-16 STM v2.2 review)", () => {
     expect(result?.error).toBe("PAIR_BUSY");
   });
 
+  // ── P5a FIFO claim across pairs (spec §6.4) ──────────────────────────
+
+  test("P5a FIFO claim: Claude without explicit pairId claims first live unpaired pair (default if free)", async () => {
+    const defaultPair = __testing.pairs.get("default")!;
+    defaultPair.isLive = true;
+    __testing.setProxyTuiSlot({
+      token: "t-default",
+      pairedChatId: null,
+      readiness: "ready",
+      attachedAt: Date.now(),
+      pairReapTimer: null,
+    });
+
+    const { ws, sent } = makeAttachMockWs(1);
+    await (fns as any).attachClaude(ws, "chat-fifo-1", undefined, "req-fifo-1");
+    const result = findResult(sent);
+    expect(result?.ok).toBe(true);
+    expect(result?.homePairId).toBe("default");
+    expect(result?.paired).toBe(true);
+
+    __testing.setProxyTuiSlot(null);
+    __testing.chats.delete("chat-fifo-1");
+  });
+
+  test("P5a FIFO claim: when default's slot is taken, second Claude claims next live unpaired pair", async () => {
+    const { CodexAdapter } = await import("../codex-adapter");
+    const originalStart = (CodexAdapter.prototype as any).start;
+    (CodexAdapter.prototype as any).start = async () => {};
+    try {
+      const defaultPair = __testing.pairs.get("default")!;
+      defaultPair.isLive = true;
+      __testing.setProxyTuiSlot({
+        token: "t-default",
+        pairedChatId: "existing-chat-on-default",
+        readiness: "ready",
+        attachedAt: Date.now(),
+        pairReapTimer: null,
+      });
+
+      await fns.ensurePair("fifo-work");
+      const workPair = __testing.pairs.get("fifo-work")!;
+      workPair.proxyTuiSlot = {
+        token: "t-work",
+        pairedChatId: null,
+        readiness: "ready",
+        attachedAt: Date.now(),
+        pairReapTimer: null,
+      };
+
+      const { ws, sent } = makeAttachMockWs(2);
+      await (fns as any).attachClaude(ws, "chat-fifo-2", undefined, "req-fifo-2");
+      const result = findResult(sent);
+      expect(result?.ok).toBe(true);
+      expect(result?.homePairId).toBe("fifo-work");
+      expect(result?.paired).toBe(true);
+    } finally {
+      (CodexAdapter.prototype as any).start = originalStart;
+      __testing.setProxyTuiSlot(null);
+      __testing.chats.delete("chat-fifo-2");
+      const pair = __testing.pairs.get("fifo-work");
+      if (pair) {
+        try { fns.detachPairHandlers(pair); } catch {}
+        __testing.pairs.delete("fifo-work");
+      }
+      await __testing.runUnderRegistryMutex(async () => {
+        __testing.pairRegistry.remove("fifo-work");
+        __testing.pairRegistry.save();
+      });
+    }
+  });
+
+  test("P5a FIFO claim: no live pair with slot → falls through to isolated bootstrap", async () => {
+    const defaultPair = __testing.pairs.get("default")!;
+    defaultPair.isLive = true;
+    __testing.setProxyTuiSlot(null);
+
+    const { ClaudeThread } = await import("../claude-thread");
+    const originalBootstrap = (ClaudeThread.prototype as any).bootstrap;
+    (ClaudeThread.prototype as any).bootstrap = async () => "stub-thread-id";
+    try {
+      const { ws, sent } = makeAttachMockWs(3);
+      await (fns as any).attachClaude(ws, "chat-fifo-3", undefined, "req-fifo-3");
+      const result = findResult(sent);
+      expect(result?.ok).toBe(true);
+      expect(result?.paired).toBe(false);
+      expect(result?.homePairId).toBe("default");
+    } finally {
+      (ClaudeThread.prototype as any).bootstrap = originalBootstrap;
+      __testing.chats.delete("chat-fifo-3");
+    }
+  });
+
   test("P3-cleanup claude_connect: ok=true with paired claim on explicit live+unpaired pair", async () => {
     const defaultPair = __testing.pairs.get("default")!;
     defaultPair.isLive = true;
