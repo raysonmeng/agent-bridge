@@ -281,9 +281,136 @@ describe("DaemonClient", () => {
     });
 
     await client.connect();
-    client.attachClaude();
+    void client.attachClaude(1000);  // fire-and-forget; will timeout-to-ok
 
     const msg = await received;
     expect(msg.type).toBe("claude_connect");
+  });
+
+  // ── STM v2.3 §D4 / §D6 P4-cleanup HIGH#2 regression tests ─────────────
+
+  test("P4 attachClaude: sends requestId so daemon responses can correlate", async () => {
+    const received = new Promise<any>((resolve) => {
+      onServerMessage = (_ws: any, raw: any) => {
+        resolve(JSON.parse(typeof raw === "string" ? raw : raw.toString()));
+      };
+    });
+    await client.connect();
+    void client.attachClaude(1000);
+    const msg = await received;
+    expect(msg.type).toBe("claude_connect");
+    expect(typeof msg.requestId).toBe("string");
+    expect(msg.requestId.length).toBeGreaterThan(0);
+  });
+
+  test("P4 attachClaude: forwards pairId from constructor", async () => {
+    await client.disconnect();
+    const pairedClient = new DaemonClient(
+      `ws://127.0.0.1:${serverPort}/ws`,
+      { chatId: "chat-abc", pairId: "work" },
+    );
+    const received = new Promise<any>((resolve) => {
+      onServerMessage = (_ws: any, raw: any) => {
+        resolve(JSON.parse(typeof raw === "string" ? raw : raw.toString()));
+      };
+    });
+    await pairedClient.connect();
+    void pairedClient.attachClaude(1000);
+    const msg = await received;
+    expect(msg.pairId).toBe("work");
+    expect(msg.chatId).toBe("chat-abc");
+    await pairedClient.disconnect();
+  });
+
+  test("P4 attachClaude: resolves ok=true when daemon emits matching claude_connect_result", async () => {
+    let capturedRequestId: string | undefined;
+    onServerMessage = (ws: any, raw: any) => {
+      const incoming = JSON.parse(typeof raw === "string" ? raw : raw.toString());
+      if (incoming.type === "claude_connect") {
+        capturedRequestId = incoming.requestId;
+        // Daemon side replies with typed result.
+        ws.send(JSON.stringify({
+          type: "claude_connect_result",
+          requestId: capturedRequestId,
+          ok: true,
+          chatId: incoming.chatId ?? "test-chat",
+          homePairId: "default",
+          paired: false,
+        }));
+      }
+    };
+    await client.connect();
+    const result = await client.attachClaude(5000);
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.homePairId).toBe("default");
+      expect(result.paired).toBe(false);
+    }
+  });
+
+  test("P4 attachClaude: resolves ok=false when daemon emits PAIR_NOT_FOUND", async () => {
+    await client.disconnect();
+    const pairedClient = new DaemonClient(
+      `ws://127.0.0.1:${serverPort}/ws`,
+      { chatId: "chat-ghost", pairId: "ghost-pair" },
+    );
+    onServerMessage = (ws: any, raw: any) => {
+      const incoming = JSON.parse(typeof raw === "string" ? raw : raw.toString());
+      if (incoming.type === "claude_connect") {
+        ws.send(JSON.stringify({
+          type: "claude_connect_result",
+          requestId: incoming.requestId,
+          ok: false,
+          error: "PAIR_NOT_FOUND",
+          message: `pair "${incoming.pairId}" is not live`,
+        }));
+      }
+    };
+    await pairedClient.connect();
+    const result = await pairedClient.attachClaude(5000);
+    expect(result.ok).toBe(false);
+    if (!result.ok) {
+      expect(result.error).toBe("PAIR_NOT_FOUND");
+      expect(result.message).toContain("ghost-pair");
+    }
+    await pairedClient.disconnect();
+  });
+
+  test("P4 attachClaude: timeout-to-ok lets v2.2 daemon (no typed response) keep working", async () => {
+    // Server doesn't send any response — should fall through to ok=true
+    // after the short timeout (backwards-compat).
+    onServerMessage = () => { /* swallow */ };
+    await client.connect();
+    const start = Date.now();
+    const result = await client.attachClaude(300);
+    const elapsed = Date.now() - start;
+    expect(result.ok).toBe(true);
+    if (result.ok) {
+      expect(result.homePairId).toBeNull();
+      expect(result.paired).toBe(false);
+    }
+    // Timed out close to the configured budget (give some slack for CI).
+    expect(elapsed).toBeGreaterThanOrEqual(290);
+    expect(elapsed).toBeLessThan(2000);
+  });
+
+  test("P4 attachClaude: ignores claude_connect_result with mismatched requestId", async () => {
+    // Daemon sends a response with WRONG requestId (e.g. crossed wires).
+    // attachClaude should treat this as no response and timeout-to-ok.
+    onServerMessage = (ws: any, raw: any) => {
+      const incoming = JSON.parse(typeof raw === "string" ? raw : raw.toString());
+      if (incoming.type === "claude_connect") {
+        ws.send(JSON.stringify({
+          type: "claude_connect_result",
+          requestId: "WRONG-ID",
+          ok: false,
+          error: "PAIR_NOT_FOUND",
+          message: "should be ignored",
+        }));
+      }
+    };
+    await client.connect();
+    const result = await client.attachClaude(300);
+    expect(result.ok).toBe(true); // timeout-to-ok, did NOT pick up the WRONG-ID response
   });
 });
