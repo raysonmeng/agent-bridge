@@ -1361,19 +1361,32 @@ function detachClaudeWs(state: ChatState, reason: string) {
   // becomes available for a new Claude to pair AND the orphan chat state is
   // reaped (it never bootstrapped its own ClaudeThread; without the pair, it
   // has no transport and cannot serve a future resume meaningfully).
-  if (state.paired && proxyTuiSlot && proxyTuiSlot.pairedChatId === state.chatId) {
-    if (proxyTuiSlot.pairReapTimer) clearTimeout(proxyTuiSlot.pairReapTimer);
-    proxyTuiSlot.pairReapTimer = setTimeout(() => {
-      if (!proxyTuiSlot) return;
+  //
+  // Issue #83 risk #2 (M06b probe found 2026-05-17): the pair-reap path
+  // was using the module-level `proxyTuiSlot` (default pair's slot) and
+  // `codex.setPairedChat(null)` (default's adapter) regardless of the
+  // chat's homePairId. For a Claude paired with a non-default pair,
+  // detach left the OTHER pair's pairedChatId stuck and the chat's home
+  // pair's slot never reset — subsequent attaches couldn't reclaim that
+  // pair. Route everything through `pairs.get(state.homePairId)`.
+  const homePair = state.paired && state.homePairId ? pairs.get(state.homePairId) : undefined;
+  if (state.paired && homePair && homePair.proxyTuiSlot && homePair.proxyTuiSlot.pairedChatId === state.chatId) {
+    const slot = homePair.proxyTuiSlot;
+    if (slot.pairReapTimer) clearTimeout(slot.pairReapTimer);
+    slot.pairReapTimer = setTimeout(() => {
+      // Re-fetch in case the pair was destroyed during the grace window.
+      const currentPair = pairs.get(state.homePairId!);
+      const currentSlot = currentPair?.proxyTuiSlot;
+      if (!currentSlot) return;
       const currentState = chats.get(state.chatId);
       if (currentState?.ws) {
-        log(`Paired Claude ${state.chatId} reconnected during grace; not clearing pair`);
+        log(`[pair=${state.homePairId}] Paired Claude ${state.chatId} reconnected during grace; not clearing pair`);
         return;
       }
-      log(`Paired Claude ${state.chatId} did not reconnect within ${PAIR_REAP_MS}ms — clearing pair slot and reaping chat state`);
-      proxyTuiSlot.pairedChatId = null;
-      proxyTuiSlot.pairReapTimer = null;
-      codex.setPairedChat(null);
+      log(`[pair=${state.homePairId}] Paired Claude ${state.chatId} did not reconnect within ${PAIR_REAP_MS}ms — clearing pair slot and reaping chat state`);
+      currentSlot.pairedChatId = null;
+      currentSlot.pairReapTimer = null;
+      currentPair!.codex.setPairedChat(null);
       // Full reap of the orphaned paired chat (matches the 10-min idle reaper's
       // cleanup: close any thread WS, dispose buffers, delete from map). A
       // future Claude with the same chatId gets a fresh chat state.
