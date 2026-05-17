@@ -293,7 +293,24 @@ async function pollDisabledRecovery() {
     log("Disabled-state recovery conditions met — attempting direct daemon reconnect");
     try {
       await daemonClient.connect();
-      daemonClient.attachClaude();
+      // STM v2.3 §D6 P4-cleanup (Codex P4 final re-pass codex_msg_5753c73beafc_128):
+      // recovery path was also fire-and-forget — could silently claim
+      // "recovered" while the daemon rejected the pair binding. Now
+      // await the typed attach result and respect ok=false the same way
+      // connectToDaemon does.
+      const attachResult = await daemonClient.attachClaude();
+      if (!attachResult.ok) {
+        const pairCtx = PAIR_ID ? ` (requested pair: "${PAIR_ID}")` : "";
+        log(`Recovery attach rejected: ${attachResult.error} — ${attachResult.message}${pairCtx}`);
+        daemonDisabled = true;
+        daemonDisabledReason = "daemon_rejected_attach";
+        stopDisabledRecoveryPoller();
+        await claude.pushNotification(systemMessage(
+          "system_bridge_disabled",
+          `❌ AgentBridge recovery failed: ${attachResult.error}. ${attachResult.message}${pairCtx}`,
+        ));
+        return;
+      }
       daemonDisabled = false;
       daemonDisabledReason = null;
       stopDisabledRecoveryPoller();

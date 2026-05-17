@@ -14194,6 +14194,15 @@ class DaemonClient extends EventEmitter2 {
       pending.resolve({ success: false, error: error2 });
       this.pendingReplies.delete(requestId);
     }
+    for (const [requestId, pending] of this.pendingAttachReplies.entries()) {
+      clearTimeout(pending.timer);
+      pending.resolve({
+        ok: false,
+        error: "DAEMON_SHUTTING_DOWN",
+        message: `claude_connect interrupted: ${error2}`
+      });
+      this.pendingAttachReplies.delete(requestId);
+    }
   }
   send(message) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
@@ -14777,7 +14786,16 @@ async function pollDisabledRecovery() {
     log("Disabled-state recovery conditions met \u2014 attempting direct daemon reconnect");
     try {
       await daemonClient.connect();
-      daemonClient.attachClaude();
+      const attachResult = await daemonClient.attachClaude();
+      if (!attachResult.ok) {
+        const pairCtx = PAIR_ID ? ` (requested pair: "${PAIR_ID}")` : "";
+        log(`Recovery attach rejected: ${attachResult.error} \u2014 ${attachResult.message}${pairCtx}`);
+        daemonDisabled = true;
+        daemonDisabledReason = "daemon_rejected_attach";
+        stopDisabledRecoveryPoller();
+        await claude.pushNotification(systemMessage("system_bridge_disabled", `\u274C AgentBridge recovery failed: ${attachResult.error}. ${attachResult.message}${pairCtx}`));
+        return;
+      }
       daemonDisabled = false;
       daemonDisabledReason = null;
       stopDisabledRecoveryPoller();

@@ -259,6 +259,20 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       pending.resolve({ success: false, error });
       this.pendingReplies.delete(requestId);
     }
+    // STM v2.3 §D6 P4-cleanup (Codex P4 final re-pass codex_msg_5753c73beafc_128):
+    // also drain pending attach promises so a close-before-response does
+    // not silently timeout-to-ok after the daemon is gone. Resolves with
+    // ok=false carrying a synthetic DAEMON_SHUTTING_DOWN code so callers
+    // (bridge.ts) enter the disabled-state path uniformly.
+    for (const [requestId, pending] of this.pendingAttachReplies.entries()) {
+      clearTimeout(pending.timer);
+      pending.resolve({
+        ok: false,
+        error: "DAEMON_SHUTTING_DOWN",
+        message: `claude_connect interrupted: ${error}`,
+      });
+      this.pendingAttachReplies.delete(requestId);
+    }
   }
 
   private send(message: ControlClientMessage) {
