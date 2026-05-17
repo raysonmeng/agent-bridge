@@ -756,35 +756,94 @@ describe("daemon bug regressions (2026-05-16 STM v2.2 review)", () => {
   // the "Reconnect to retry" instruction in `system_thread_failed`
   // was a lie. Reaping forces the next attach to construct a fresh
   // ChatState.
-  test("attachClaude bootstrap-failure reaps chat (so reconnect can retry)", async () => {
+  //
+  // Test hardening (Codex cross-review 2026-05-17 codex_msg_..._164):
+  // assert (a) system_thread_failed is emitted BEFORE close (so the
+  // user-facing recovery message lands while the WS is still up),
+  // (b) close uses code 1011 + the chat-reap reason — the contract
+  // reapChatState commits to, and (c) re-attaching the same chatId
+  // after the reap actually goes down the new-chat path with a fresh
+  // bootstrap (proving the resume-skipped-bootstrap pathological
+  // case can no longer happen).
+  test("attachClaude bootstrap-failure reaps chat + reconnect bootstraps fresh", async () => {
     const defaultPair = __testing.pairs.get("default")!;
     defaultPair.isLive = true;
     __testing.setProxyTuiSlot(null);
 
     const { ClaudeThread } = await import("../claude-thread");
     const originalBootstrap = (ClaudeThread.prototype as any).bootstrap;
-    (ClaudeThread.prototype as any).bootstrap = async () => {
-      throw new Error("app-server unreachable");
+    let bootstrapShouldFail = true;
+    (ClaudeThread.prototype as any).bootstrap = async function () {
+      if (bootstrapShouldFail) throw new Error("app-server unreachable");
+      return "stub-thread-id";
     };
+
+    function makeOrderedWs(clientId: number) {
+      const events: Array<
+        | { kind: "send"; payload: any }
+        | { kind: "close"; code?: number; reason?: string }
+      > = [];
+      const ws: any = {
+        // Positive send return — matches Bun's "delivered" contract so
+        // emitToChat actually goes through the WS (not buffered to state).
+        send: (payload: string) => { events.push({ kind: "send", payload: JSON.parse(payload) }); return 1; },
+        data: { clientId, attached: true, chatId: null },
+        readyState: 1,
+        close: (code?: number, reason?: string) => { events.push({ kind: "close", code, reason }); },
+      };
+      return { ws, events };
+    }
+
     try {
-      const { ws, sent } = makeAttachMockWs(9);
+      // ─── Phase 1: bootstrap fails → reap ──────────────────────────
+      const { ws, events } = makeOrderedWs(9);
       await (fns as any).attachClaude(ws, "chat-boot-fail", undefined, "req-boot-fail");
 
-      // claude_connect_result is sent BEFORE bootstrap awaits, so the
-      // attach itself reports ok=true (per spec §D6: ok means attached,
-      // not bootstrapped).
-      const result = findResult(sent);
-      expect(result?.ok).toBe(true);
+      // claude_connect_result is sent BEFORE bootstrap awaits, so attach
+      // reports ok=true (per spec §D6: ok means attached, not bootstrapped).
+      const result = events.find((e) => e.kind === "send" && e.payload.type === "claude_connect_result");
+      expect(result && (result as any).payload?.ok).toBe(true);
 
-      // system_thread_failed must have been emitted to the chat's buffer
-      // before reap (the user-facing recovery instruction).
-      const chat = __testing.chats.get("chat-boot-fail");
-      // After reap, the chat is gone — buffered messages were on the
-      // pre-reap ChatState. Capture them indirectly via the WS sends
-      // ... actually emitToChat for a chat without `ws.attached` buffers
-      // on the state, so we have to assert reap happened (entry removed)
-      // and trust the emit-then-reap ordering in the daemon code.
-      expect(chat).toBeUndefined();
+      // (a) system_thread_failed must precede the WS close.
+      const failIdx = events.findIndex((e) =>
+        e.kind === "send" &&
+        (e as any).payload.type === "codex_to_claude" &&
+        (e as any).payload.message?.id?.startsWith("system_thread_failed_"));
+      const closeIdx = events.findIndex((e) => e.kind === "close");
+      expect(failIdx).toBeGreaterThanOrEqual(0);
+      expect(closeIdx).toBeGreaterThanOrEqual(0);
+      expect(failIdx).toBeLessThan(closeIdx);
+
+      // (b) close uses 1011 + chat-reap reason — the contract.
+      const closeEvt = events[closeIdx] as { kind: "close"; code?: number; reason?: string };
+      expect(closeEvt.code).toBe(1011);
+      expect(closeEvt.reason ?? "").toMatch(/chat reaped: bootstrap failed/);
+
+      // Chat is gone from `chats` → next attach hits new-chat path.
+      expect(__testing.chats.get("chat-boot-fail")).toBeUndefined();
+
+      // ─── Phase 2: re-attach same chatId, bootstrap now succeeds ───
+      bootstrapShouldFail = false;
+      const { ws: ws2, events: events2 } = makeOrderedWs(10);
+      await (fns as any).attachClaude(ws2, "chat-boot-fail", undefined, "req-boot-fail-2");
+
+      const result2 = events2.find((e) => e.kind === "send" && e.payload.type === "claude_connect_result");
+      expect(result2 && (result2 as any).payload?.ok).toBe(true);
+
+      // (c) fresh ChatState exists and bootstrapped → ready=true.
+      // Proves the "resume branch skips bootstrap" pathological case
+      // can no longer happen: chats was empty, so the new attach went
+      // through createChatState + bootstrap fresh.
+      const freshChat = __testing.chats.get("chat-boot-fail");
+      expect(freshChat).toBeDefined();
+      expect(freshChat!.ready).toBe(true);
+
+      // system_thread_ready emitted (success path).
+      const readyEvt = events2.find((e) =>
+        e.kind === "send" &&
+        (e as any).payload.type === "codex_to_claude" &&
+        (e as any).payload.message?.id?.startsWith("system_thread_ready_"));
+      expect(readyEvt).toBeDefined();
     } finally {
       (ClaudeThread.prototype as any).bootstrap = originalBootstrap;
       __testing.chats.delete("chat-boot-fail");
