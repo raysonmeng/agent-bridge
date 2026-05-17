@@ -3279,6 +3279,7 @@ async function attachClaude(ws, requestedChatId, requestedPairId, requestId) {
   } catch (err) {
     log(`ClaudeThread bootstrap failed for chatId=${chatId}: ${err?.message ?? err}`);
     emitToChat(state, systemMessage("system_thread_failed", `\u274C Failed to provision Codex thread: ${err?.message ?? err}. Reconnect to retry.`));
+    reapChatState(state, `bootstrap failed: ${err?.message ?? err}`);
   }
 }
 function createChatState(chatId) {

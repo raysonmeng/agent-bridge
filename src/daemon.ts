@@ -1145,6 +1145,15 @@ async function attachClaude(
     log(`ClaudeThread bootstrap failed for chatId=${chatId}: ${err?.message ?? err}`);
     emitToChat(state, systemMessage("system_thread_failed",
       `❌ Failed to provision Codex thread: ${err?.message ?? err}. Reconnect to retry.`));
+    // Bug fix (2026-05-17): reap the half-initialized chat so the
+    // advertised "Reconnect to retry" path actually works. Without
+    // this, the chat stays in `chats` with `state.ready=false` forever:
+    // subsequent reply attempts hit the "thread still provisioning"
+    // error, and a bridge reconnect with the same chatId takes the
+    // resume branch and skips bootstrap. Reaping forces the next
+    // attach to construct a fresh ChatState and re-bootstrap. Mirrors
+    // the §6.5 P3c isolated-bootstrap-exhausted reap.
+    reapChatState(state, `bootstrap failed: ${err?.message ?? err}`);
   }
 }
 

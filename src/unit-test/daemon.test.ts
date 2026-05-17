@@ -747,6 +747,50 @@ describe("daemon bug regressions (2026-05-16 STM v2.2 review)", () => {
     }
   });
 
+  // Bug regression D (2026-05-17): attachClaude bootstrap failure reaps
+  // the half-initialized chat. Before the fix, a bootstrap that threw
+  // (e.g. codex app-server unreachable during daemon restart) left
+  // `state.ready=false` permanently in `chats`. Subsequent reply attempts
+  // hit "thread still provisioning", and a bridge reconnect with the
+  // same chatId took the resume branch and skipped re-bootstrap, so
+  // the "Reconnect to retry" instruction in `system_thread_failed`
+  // was a lie. Reaping forces the next attach to construct a fresh
+  // ChatState.
+  test("attachClaude bootstrap-failure reaps chat (so reconnect can retry)", async () => {
+    const defaultPair = __testing.pairs.get("default")!;
+    defaultPair.isLive = true;
+    __testing.setProxyTuiSlot(null);
+
+    const { ClaudeThread } = await import("../claude-thread");
+    const originalBootstrap = (ClaudeThread.prototype as any).bootstrap;
+    (ClaudeThread.prototype as any).bootstrap = async () => {
+      throw new Error("app-server unreachable");
+    };
+    try {
+      const { ws, sent } = makeAttachMockWs(9);
+      await (fns as any).attachClaude(ws, "chat-boot-fail", undefined, "req-boot-fail");
+
+      // claude_connect_result is sent BEFORE bootstrap awaits, so the
+      // attach itself reports ok=true (per spec §D6: ok means attached,
+      // not bootstrapped).
+      const result = findResult(sent);
+      expect(result?.ok).toBe(true);
+
+      // system_thread_failed must have been emitted to the chat's buffer
+      // before reap (the user-facing recovery instruction).
+      const chat = __testing.chats.get("chat-boot-fail");
+      // After reap, the chat is gone — buffered messages were on the
+      // pre-reap ChatState. Capture them indirectly via the WS sends
+      // ... actually emitToChat for a chat without `ws.attached` buffers
+      // on the state, so we have to assert reap happened (entry removed)
+      // and trust the emit-then-reap ordering in the daemon code.
+      expect(chat).toBeUndefined();
+    } finally {
+      (ClaudeThread.prototype as any).bootstrap = originalBootstrap;
+      __testing.chats.delete("chat-boot-fail");
+    }
+  });
+
   test("P3-cleanup claude_connect: ok=true with paired claim on explicit live+unpaired pair", async () => {
     const defaultPair = __testing.pairs.get("default")!;
     defaultPair.isLive = true;
