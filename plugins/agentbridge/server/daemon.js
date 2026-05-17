@@ -3413,20 +3413,26 @@ function detachClaudeWs(state, reason) {
   scheduleReaperTimer(state);
   const homePair = state.paired && state.homePairId ? pairs.get(state.homePairId) : undefined;
   if (state.paired && homePair && homePair.proxyTuiSlot && homePair.proxyTuiSlot.pairedChatId === state.chatId) {
+    const scheduledPairId = state.homePairId;
     const slot = homePair.proxyTuiSlot;
     if (slot.pairReapTimer)
       clearTimeout(slot.pairReapTimer);
     slot.pairReapTimer = setTimeout(() => {
-      const currentPair = pairs.get(state.homePairId);
+      const currentPair = pairs.get(scheduledPairId);
       const currentSlot = currentPair?.proxyTuiSlot;
       if (!currentSlot)
         return;
       const currentState = chats.get(state.chatId);
       if (currentState?.ws) {
-        log(`[pair=${state.homePairId}] Paired Claude ${state.chatId} reconnected during grace; not clearing pair`);
+        log(`[pair=${scheduledPairId}] Paired Claude ${state.chatId} reconnected during grace; not clearing pair`);
         return;
       }
-      log(`[pair=${state.homePairId}] Paired Claude ${state.chatId} did not reconnect within ${PAIR_REAP_MS}ms \u2014 clearing pair slot and reaping chat state`);
+      if (currentSlot.pairedChatId !== state.chatId) {
+        log(`[pair=${scheduledPairId}] reap-timer fired for ${state.chatId} but slot now holds ${currentSlot.pairedChatId ?? "<unpaired>"} \u2014 skipping clear`);
+        currentSlot.pairReapTimer = null;
+        return;
+      }
+      log(`[pair=${scheduledPairId}] Paired Claude ${state.chatId} did not reconnect within ${PAIR_REAP_MS}ms \u2014 clearing pair slot and reaping chat state`);
       currentSlot.pairedChatId = null;
       currentSlot.pairReapTimer = null;
       currentPair.codex.setPairedChat(null);

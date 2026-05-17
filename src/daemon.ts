@@ -1371,19 +1371,34 @@ function detachClaudeWs(state: ChatState, reason: string) {
   // pair. Route everything through `pairs.get(state.homePairId)`.
   const homePair = state.paired && state.homePairId ? pairs.get(state.homePairId) : undefined;
   if (state.paired && homePair && homePair.proxyTuiSlot && homePair.proxyTuiSlot.pairedChatId === state.chatId) {
+    // Capture the pairId at schedule time. `state.homePairId` is mutable
+    // (transitionToIsolated flips it to "default"); without capture, a
+    // stale timer firing after a transition would consult the WRONG
+    // pair's slot. Codex M06b re-pass msg ..._214.
+    const scheduledPairId = state.homePairId!;
     const slot = homePair.proxyTuiSlot;
     if (slot.pairReapTimer) clearTimeout(slot.pairReapTimer);
     slot.pairReapTimer = setTimeout(() => {
-      // Re-fetch in case the pair was destroyed during the grace window.
-      const currentPair = pairs.get(state.homePairId!);
+      // Re-fetch via the CAPTURED pairId — not state.homePairId — so
+      // we never clear the wrong pair's slot if state was re-homed
+      // during the grace window.
+      const currentPair = pairs.get(scheduledPairId);
       const currentSlot = currentPair?.proxyTuiSlot;
       if (!currentSlot) return;
       const currentState = chats.get(state.chatId);
       if (currentState?.ws) {
-        log(`[pair=${state.homePairId}] Paired Claude ${state.chatId} reconnected during grace; not clearing pair`);
+        log(`[pair=${scheduledPairId}] Paired Claude ${state.chatId} reconnected during grace; not clearing pair`);
         return;
       }
-      log(`[pair=${state.homePairId}] Paired Claude ${state.chatId} did not reconnect within ${PAIR_REAP_MS}ms — clearing pair slot and reaping chat state`);
+      // Defense in depth: only clear if the slot still references THIS
+      // chat. A different chat may have FIFO-claimed the slot if our
+      // earlier mutation already ran (or if there's a parallel race).
+      if (currentSlot.pairedChatId !== state.chatId) {
+        log(`[pair=${scheduledPairId}] reap-timer fired for ${state.chatId} but slot now holds ${currentSlot.pairedChatId ?? "<unpaired>"} — skipping clear`);
+        currentSlot.pairReapTimer = null;
+        return;
+      }
+      log(`[pair=${scheduledPairId}] Paired Claude ${state.chatId} did not reconnect within ${PAIR_REAP_MS}ms — clearing pair slot and reaping chat state`);
       currentSlot.pairedChatId = null;
       currentSlot.pairReapTimer = null;
       currentPair!.codex.setPairedChat(null);
