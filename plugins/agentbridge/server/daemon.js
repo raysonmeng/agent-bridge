@@ -3092,7 +3092,17 @@ async function attachClaude(ws, requestedChatId, requestedPairId, requestId) {
       });
       return;
     }
-    if (targetPair2.proxyTuiSlot?.pairedChatId && targetPair2.proxyTuiSlot.pairedChatId !== chatId) {
+    if (!targetPair2.proxyTuiSlot) {
+      sendProtocolMessage(ws, {
+        type: "claude_connect_result",
+        requestId,
+        ok: false,
+        error: "PAIR_NOT_FOUND",
+        message: `pair "${requestedPairId}" has no proxy TUI connected yet; start \`abg codex --pair ${requestedPairId} --via-proxy\` first, then attach Claude`
+      });
+      return;
+    }
+    if (targetPair2.proxyTuiSlot.pairedChatId && targetPair2.proxyTuiSlot.pairedChatId !== chatId) {
       sendProtocolMessage(ws, {
         type: "claude_connect_result",
         requestId,
@@ -3822,7 +3832,8 @@ var __testing = {
     destroyPair,
     handleEnsurePair,
     handleDestroyPair,
-    handleListPairs
+    handleListPairs,
+    attachClaude
   },
   pairRegistry,
   runUnderRegistryMutex,

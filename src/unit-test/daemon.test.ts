@@ -587,6 +587,94 @@ describe("daemon bug regressions (2026-05-16 STM v2.2 review)", () => {
     expect(sent[0].code).toBe("PAIR_BUSY_NOT_FORCED");
   });
 
+  // ── P3-cleanup claude_connect_result (Codex P3 close re-pass HIGH#1) ───
+
+  function makeAttachMockWs(clientId = 7) {
+    const sent: any[] = [];
+    const ws: any = {
+      send: (payload: string) => { sent.push(JSON.parse(payload)); return 0; },
+      data: { clientId, attached: false, chatId: null },
+      readyState: 1,
+      close: () => {},
+    };
+    return { sent, ws };
+  }
+
+  function findResult(sent: any[]) {
+    return sent.find((m) => m.type === "claude_connect_result");
+  }
+
+  test("P3-cleanup claude_connect: INVALID_PAIR_NAME for bad explicit pairId", async () => {
+    const { ws, sent } = makeAttachMockWs();
+    await (fns as any).attachClaude(ws, "chat-cc-1", "BAD CASE", "req-cc-1");
+    const result = findResult(sent);
+    expect(result?.ok).toBe(false);
+    expect(result?.error).toBe("INVALID_PAIR_NAME");
+    expect(result?.requestId).toBe("req-cc-1");
+  });
+
+  test("P3-cleanup claude_connect: PAIR_NOT_FOUND when explicit pair is not live", async () => {
+    const { ws, sent } = makeAttachMockWs();
+    await (fns as any).attachClaude(ws, "chat-cc-2", "ghost-pair", "req-cc-2");
+    const result = findResult(sent);
+    expect(result?.ok).toBe(false);
+    expect(result?.error).toBe("PAIR_NOT_FOUND");
+  });
+
+  test("P3-cleanup claude_connect: PAIR_NOT_FOUND when explicit pair is live but has no proxy TUI slot (Codex re-pass strict semantics)", async () => {
+    // Force-set default's slot to null then explicit-attach to it.
+    const defaultPair = __testing.pairs.get("default")!;
+    defaultPair.isLive = true;
+    // Clear the slot if anything is attached.
+    __testing.setProxyTuiSlot(null);
+    expect(defaultPair.proxyTuiSlot).toBeNull();
+
+    const { ws, sent } = makeAttachMockWs();
+    await (fns as any).attachClaude(ws, "chat-cc-3", "default", "req-cc-3");
+    const result = findResult(sent);
+    expect(result?.ok).toBe(false);
+    expect(result?.error).toBe("PAIR_NOT_FOUND");
+    expect(result?.message).toMatch(/no proxy TUI/i);
+  });
+
+  test("P3-cleanup claude_connect: PAIR_BUSY when explicit pair already has a different paired chat", async () => {
+    const defaultPair = __testing.pairs.get("default")!;
+    defaultPair.isLive = true;
+    __testing.setProxyTuiSlot({
+      token: "t",
+      pairedChatId: "another-chat",
+      readiness: "ready",
+      attachedAt: Date.now(),
+      pairReapTimer: null,
+    });
+
+    const { ws, sent } = makeAttachMockWs();
+    await (fns as any).attachClaude(ws, "chat-cc-4", "default", "req-cc-4");
+    const result = findResult(sent);
+    expect(result?.ok).toBe(false);
+    expect(result?.error).toBe("PAIR_BUSY");
+  });
+
+  test("P3-cleanup claude_connect: ok=true with paired claim on explicit live+unpaired pair", async () => {
+    const defaultPair = __testing.pairs.get("default")!;
+    defaultPair.isLive = true;
+    __testing.setProxyTuiSlot({
+      token: "t",
+      pairedChatId: null,
+      readiness: "ready",
+      attachedAt: Date.now(),
+      pairReapTimer: null,
+    });
+
+    const { ws, sent } = makeAttachMockWs();
+    await (fns as any).attachClaude(ws, "chat-cc-5", "default", "req-cc-5");
+    const result = findResult(sent);
+    expect(result?.ok).toBe(true);
+    expect(result?.chatId).toBe("chat-cc-5");
+    expect(result?.homePairId).toBe("default");
+    expect(result?.paired).toBe(true);
+  });
+
   // ── P3-cleanup (Codex P3-series review codex_msg_5753c73beafc_107) ─────
 
   test("P3-cleanup HIGH#2: same-pair concurrent ensurePair calls dedupe via ensurePairInFlight", async () => {

@@ -954,6 +954,12 @@ async function attachClaude(
   // emit a typed claude_connect_result back per spec §D6 — bridges that
   // sent a `requestId` consume the response to surface PAIR_NOT_FOUND /
   // PAIR_BUSY as a user-visible disabled state.
+  //
+  // Strict explicit-pair semantics (Codex P3 close re-pass HIGH#1
+  // codex_msg_5753c73beafc_112): if the user asked for a specific pair,
+  // we never silently fall through to default pairing or isolated
+  // bootstrap. Any reason the requested pair can't accept the chat
+  // surfaces as a typed error and aborts the attach.
   if (requestedPairId !== undefined) {
     if (!isValidPairName(requestedPairId)) {
       sendProtocolMessage(ws, {
@@ -976,7 +982,22 @@ async function attachClaude(
       });
       return;
     }
-    if (targetPair.proxyTuiSlot?.pairedChatId && targetPair.proxyTuiSlot.pairedChatId !== chatId) {
+    if (!targetPair.proxyTuiSlot) {
+      // Live pair without a proxy-TUI slot — codex is running but no
+      // `--via-proxy` TUI has connected yet, so there's nothing for
+      // Claude to pair against. Per Codex P3 close re-pass: do NOT
+      // fall through to default pairing or isolated bootstrap. Surface
+      // as PAIR_NOT_FOUND with a clarifying message.
+      sendProtocolMessage(ws, {
+        type: "claude_connect_result",
+        requestId,
+        ok: false,
+        error: "PAIR_NOT_FOUND",
+        message: `pair "${requestedPairId}" has no proxy TUI connected yet; start \`abg codex --pair ${requestedPairId} --via-proxy\` first, then attach Claude`,
+      });
+      return;
+    }
+    if (targetPair.proxyTuiSlot.pairedChatId && targetPair.proxyTuiSlot.pairedChatId !== chatId) {
       sendProtocolMessage(ws, {
         type: "claude_connect_result",
         requestId,
@@ -1947,6 +1968,8 @@ export const __testing = {
     handleEnsurePair,
     handleDestroyPair,
     handleListPairs,
+    /** STM v2.3 §D4 / §D6 P3-cleanup — attach flow exposed so tests can verify claude_connect_result. */
+    attachClaude,
   } as const,
   /** STM v2.3 §D2 P3b — registry handle (read for assertions; mutate via handlers). */
   pairRegistry,
