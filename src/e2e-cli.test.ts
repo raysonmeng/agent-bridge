@@ -633,6 +633,69 @@ describe("E2E: CLI surface", () => {
       expect(codexRun?.args[3]).toBe(`ws://127.0.0.1:${harness.appPort}`);
     });
   }, 30000);
+
+  // ── Sprint #5 (2026-05-17 codex_msg_..._177): CLI e2e for --pair / pairs ──
+  //
+  // Unit tests already cover pair-registry logic, control-protocol shapes,
+  // and CLI flag parsing in isolation. These e2e tests verify that the
+  // user-facing entry points (`abg pairs ls`, `abg pairs rm`, `abg codex
+  // --pair NAME`) actually round-trip with a daemon and surface the right
+  // exit codes + error messages. Fake daemon (above) handles the pair WS
+  // protocol with a minimal in-memory pairs Map.
+
+  test("agentbridge pairs ls lists the default pair after daemon spins up", async () => {
+    await withHarness(async (harness) => {
+      // Spin up daemon via `codex` (creates it as a side-effect of ensureRunning).
+      const codexResult = await harness.runCli(["codex", "--model", "o3"]);
+      expect(codexResult.code).toBe(0);
+      await harness.waitForHealth();
+
+      const lsResult = await harness.runCli(["pairs", "ls"]);
+      expect(lsResult.code).toBe(0);
+      // Default pair should be in the listing. Output uses table format
+      // — assert on the pairId text without depending on column layout.
+      expect(lsResult.stdout).toContain("default");
+    });
+  }, 30000);
+
+  test("agentbridge pairs rm rejects 'default' (PAIR_PROTECTED) with non-zero exit", async () => {
+    await withHarness(async (harness) => {
+      const codexResult = await harness.runCli(["codex", "--model", "o3"]);
+      expect(codexResult.code).toBe(0);
+      await harness.waitForHealth();
+
+      const rmResult = await harness.runCli(["pairs", "rm", "default", "--force"]);
+      expect(rmResult.code).not.toBe(0);
+      // CLI surfaces the daemon's pair_error to the user — assert the
+      // error code or human message is shown.
+      const errOutput = `${rmResult.stdout}${rmResult.stderr}`;
+      expect(errOutput).toMatch(/PAIR_PROTECTED|cannot be destroyed/);
+    });
+  }, 30000);
+
+  test("agentbridge pairs rm rejects unknown pair (PAIR_NOT_FOUND)", async () => {
+    await withHarness(async (harness) => {
+      const codexResult = await harness.runCli(["codex", "--model", "o3"]);
+      expect(codexResult.code).toBe(0);
+      await harness.waitForHealth();
+
+      const rmResult = await harness.runCli(["pairs", "rm", "nonexistent-pair", "--force"]);
+      expect(rmResult.code).not.toBe(0);
+      const errOutput = `${rmResult.stdout}${rmResult.stderr}`;
+      expect(errOutput).toMatch(/PAIR_NOT_FOUND|not found/);
+    });
+  }, 30000);
+
+  test("agentbridge codex --pair rejects invalid pair name locally (no daemon round-trip)", async () => {
+    await withHarness(async (harness) => {
+      // No daemon needed — local validation should kick in immediately.
+      // Invalid name violates D1: uppercase letters not allowed.
+      const result = await harness.runCli(["codex", "--pair", "BadName", "--via-proxy"]);
+      expect(result.code).not.toBe(0);
+      const errOutput = `${result.stdout}${result.stderr}`;
+      expect(errOutput).toMatch(/--pair value .*invalid|Allowed: lowercase/);
+    });
+  }, 15000);
 });
 
 async function withHarness(
@@ -890,6 +953,11 @@ if (delayMs > 0) {
 
 writeFileSync(pidFile, \`\${process.pid}\\n\`, "utf-8");
 
+// STM v2.3 pair state — in-memory only. Default pre-populated with the
+// harness-allocated ports. ensure_pair adds entries; destroy_pair removes.
+const pairs = new Map();
+pairs.set("default", { appPort, proxyPort, isLive: true });
+
 function currentStatus() {
   return {
     bridgeReady: false,
@@ -946,6 +1014,80 @@ const server = Bun.serve({
 
       if (message.type === "claude_connect" || message.type === "status") {
         ws.send(JSON.stringify({ type: "status", status: currentStatus() }));
+        return;
+      }
+
+      // STM v2.3 pair protocol — minimal fake-daemon implementation so
+      // CLI e2e tests can exercise the \`abg pairs ls/rm\` and
+      // \`abg codex --pair\` round-trips. Real daemon logic (registry
+      // persistence, port allocation strategy, etc.) is covered by unit
+      // tests; here we just need to respond with the protocol-correct
+      // shapes the CLI expects.
+      if (message.type === "list_pairs") {
+        const entries = Array.from(pairs.entries()).map(([pairId, p]) => ({
+          pairId,
+          isLive: p.isLive,
+          appServerUrl: \`ws://127.0.0.1:\${p.appPort}\`,
+          proxyUrl: \`ws://127.0.0.1:\${p.proxyPort}\`,
+          tuiConnected: false,
+          proxyTuiConnected: false,
+          pairedChatId: null,
+          threadId: null,
+          attachedClaudes: [],
+        }));
+        ws.send(JSON.stringify({ type: "pair_list", requestId: message.requestId, pairs: entries }));
+        return;
+      }
+
+      if (message.type === "ensure_pair") {
+        let entry = pairs.get(message.pairId);
+        if (!entry) {
+          // Allocate in 50000+ band so we never collide with real codex
+          // or the harness-reserved ports.
+          const newAppPort = 50000 + pairs.size * 2;
+          const newProxyPort = newAppPort + 1;
+          entry = { appPort: newAppPort, proxyPort: newProxyPort, isLive: true };
+          pairs.set(message.pairId, entry);
+        }
+        ws.send(JSON.stringify({
+          type: "pair_ensured",
+          requestId: message.requestId,
+          pairId: message.pairId,
+          appServerUrl: \`ws://127.0.0.1:\${entry.appPort}\`,
+          proxyUrl: \`ws://127.0.0.1:\${entry.proxyPort}\`,
+        }));
+        return;
+      }
+
+      if (message.type === "destroy_pair") {
+        if (message.pairId === "default") {
+          ws.send(JSON.stringify({
+            type: "pair_error",
+            requestId: message.requestId,
+            pairId: message.pairId,
+            code: "PAIR_PROTECTED",
+            message: "default pair cannot be destroyed",
+          }));
+          return;
+        }
+        if (!pairs.has(message.pairId)) {
+          ws.send(JSON.stringify({
+            type: "pair_error",
+            requestId: message.requestId,
+            pairId: message.pairId,
+            code: "PAIR_NOT_FOUND",
+            message: \`pair "\${message.pairId}" not found\`,
+          }));
+          return;
+        }
+        pairs.delete(message.pairId);
+        ws.send(JSON.stringify({
+          type: "pair_destroyed",
+          requestId: message.requestId,
+          pairId: message.pairId,
+          forgotten: Boolean(message.forget),
+        }));
+        return;
       }
     },
   },
