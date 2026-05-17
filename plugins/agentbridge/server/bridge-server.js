@@ -13714,6 +13714,21 @@ class StateDirResolver {
   get killedFile() {
     return join(this.stateDir, "killed");
   }
+  pairDir(pairId) {
+    return join(this.stateDir, "pairs", pairId);
+  }
+  pairCodexPidFile(pairId) {
+    return join(this.pairDir(pairId), "codex.pid");
+  }
+  pairCodexWrapperLogFile(pairId) {
+    return join(this.pairDir(pairId), "codex-wrapper.log");
+  }
+  ensurePairDir(pairId) {
+    const dir = this.pairDir(pairId);
+    if (!existsSync(dir)) {
+      mkdirSync(dir, { recursive: true });
+    }
+  }
 }
 
 // src/claude-adapter.ts
@@ -14007,13 +14022,18 @@ class DaemonClient extends EventEmitter2 {
   nextRequestId = 1;
   pendingReplies = new Map;
   chatId;
+  pairId;
   constructor(url, opts) {
     super();
     this.url = url;
     this.chatId = opts?.chatId;
+    this.pairId = opts?.pairId;
   }
   setChatId(chatId) {
     this.chatId = chatId;
+  }
+  setPairId(pairId) {
+    this.pairId = pairId;
   }
   async connect() {
     if (this.ws?.readyState === WebSocket.OPEN) {
@@ -14055,7 +14075,7 @@ class DaemonClient extends EventEmitter2 {
     });
   }
   attachClaude() {
-    this.send({ type: "claude_connect", chatId: this.chatId });
+    this.send({ type: "claude_connect", chatId: this.chatId, pairId: this.pairId });
   }
   async disconnect() {
     if (!this.ws)
@@ -14525,7 +14545,8 @@ var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 var CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 var claude = new ClaudeAdapter(stateDir.logFile);
-var daemonClient = new DaemonClient(CONTROL_WS_URL, { chatId: claude.chatId });
+var PAIR_ID = process.env.AGENTBRIDGE_PAIR;
+var daemonClient = new DaemonClient(CONTROL_WS_URL, { chatId: claude.chatId, pairId: PAIR_ID });
 var shuttingDown = false;
 var daemonDisabled = false;
 var daemonDisabledReason = null;

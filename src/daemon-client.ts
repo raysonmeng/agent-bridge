@@ -24,14 +24,30 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     }
   >();
   private chatId: string | undefined;
+  /**
+   * STM v2.3 §D4 P4b: optional explicit pair binding. Read from
+   * `AGENTBRIDGE_PAIR` env at bridge.ts startup and forwarded to the
+   * daemon's `attachClaude` via the `claude_connect` control message.
+   * The daemon validates per D1 / D4 and responds with a typed
+   * `claude_connect_result` (PAIR_NOT_FOUND / PAIR_BUSY / ok=true).
+   */
+  private pairId: string | undefined;
 
-  constructor(private readonly url: string, opts?: { chatId?: string }) {
+  constructor(
+    private readonly url: string,
+    opts?: { chatId?: string; pairId?: string },
+  ) {
     super();
     this.chatId = opts?.chatId;
+    this.pairId = opts?.pairId;
   }
 
   setChatId(chatId: string) {
     this.chatId = chatId;
+  }
+
+  setPairId(pairId: string | undefined) {
+    this.pairId = pairId;
   }
 
   async connect() {
@@ -78,7 +94,9 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   }
 
   attachClaude() {
-    this.send({ type: "claude_connect", chatId: this.chatId });
+    // STM v2.3 §D4 P4b: forward pairId if AGENTBRIDGE_PAIR was set. The
+    // daemon validates and responds with a typed claude_connect_result.
+    this.send({ type: "claude_connect", chatId: this.chatId, pairId: this.pairId });
   }
 
   async disconnect() {

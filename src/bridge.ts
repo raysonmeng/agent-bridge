@@ -19,7 +19,11 @@ const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_POR
 const CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 
 const claude = new ClaudeAdapter(stateDir.logFile);
-const daemonClient = new DaemonClient(CONTROL_WS_URL, { chatId: claude.chatId });
+// STM v2.3 §D4 P4b: AGENTBRIDGE_PAIR env (set by `agentbridge claude --pair NAME`)
+// pre-binds this Claude to a specific pair. Empty / unset → daemon's
+// FIFO claim logic decides (P3-cleanup attachClaude flow).
+const PAIR_ID = process.env.AGENTBRIDGE_PAIR;
+const daemonClient = new DaemonClient(CONTROL_WS_URL, { chatId: claude.chatId, pairId: PAIR_ID });
 
 let shuttingDown = false;
 let daemonDisabled = false;
