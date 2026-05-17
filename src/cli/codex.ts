@@ -17,22 +17,129 @@ import { StderrRingBuffer } from "../stderr-ring-buffer";
 import { checkOwnedFlagConflicts } from "./claude";
 
 /**
- * Spec v2.2 §7: fetch live daemon /healthz JSON for pre-flight checks.
- * Returns null if the daemon is unreachable (CLI falls through to its normal
- * "ensure running" flow and surfaces a clearer error elsewhere).
+ * STM v2.3 §D6 P4: one-shot control-WS request helper. Opens a short-lived
+ * WebSocket to the daemon, sends a request that carries a unique
+ * `requestId`, and resolves with the first response whose requestId
+ * matches (or the first match by message-type if the request was
+ * untagged). Closes the socket and returns.
+ *
+ * Used by the CLI for `ensure_pair` and `list_pairs` pre-flight calls.
+ * Bun has native WebSocket — no extra dependency.
  */
-async function fetchLiveDaemonStatus(
+async function controlWsRequest<TReq extends { type: string; requestId: string }, TRes>(
   controlPort: number,
-): Promise<{ proxyTuiConnected?: boolean } | null> {
-  try {
-    const res = await fetch(`http://127.0.0.1:${controlPort}/healthz`, {
-      signal: AbortSignal.timeout(2000),
+  request: TReq,
+  matchResponse: (msg: any) => msg is TRes,
+  timeoutMs = 5000,
+): Promise<TRes> {
+  const url = `ws://127.0.0.1:${controlPort}/ws`;
+  return new Promise<TRes>((resolve, reject) => {
+    let settled = false;
+    const ws = new WebSocket(url);
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      try { ws.close(); } catch {}
+      reject(new Error(`control-WS request timed out after ${timeoutMs}ms (type=${request.type})`));
+    }, timeoutMs);
+    ws.addEventListener("open", () => {
+      try { ws.send(JSON.stringify(request)); } catch (err: any) {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        try { ws.close(); } catch {}
+        reject(new Error(`control-WS send failed: ${err?.message ?? err}`));
+      }
     });
-    if (!res.ok) return null;
-    return (await res.json()) as { proxyTuiConnected?: boolean };
-  } catch {
-    return null;
+    ws.addEventListener("message", (ev) => {
+      if (settled) return;
+      try {
+        const msg = JSON.parse(ev.data.toString());
+        if (matchResponse(msg)) {
+          settled = true;
+          clearTimeout(timer);
+          try { ws.close(); } catch {}
+          resolve(msg);
+        }
+      } catch { /* ignore non-JSON / non-matching */ }
+    });
+    ws.addEventListener("error", () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error("control-WS connection error"));
+    });
+    ws.addEventListener("close", () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      reject(new Error("control-WS closed before response"));
+    });
+  });
+}
+
+/**
+ * Send `ensure_pair(pairId)` over the control WS. Returns the URLs the
+ * CLI should pass to `codex --remote`, or throws a structured error
+ * carrying the daemon's `pair_error` code.
+ */
+async function ensurePairViaControl(
+  controlPort: number,
+  pairId: string,
+  timeoutMs = 5000,
+): Promise<{ appServerUrl: string; proxyUrl: string }> {
+  const requestId = `cli-ensure-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const response = await controlWsRequest<
+    { type: "ensure_pair"; requestId: string; pairId: string },
+    { type: "pair_ensured" | "pair_error"; requestId: string; [k: string]: any }
+  >(
+    controlPort,
+    { type: "ensure_pair", requestId, pairId },
+    (msg): msg is { type: "pair_ensured" | "pair_error"; requestId: string; [k: string]: any } => {
+      return msg
+        && (msg.type === "pair_ensured" || msg.type === "pair_error")
+        && msg.requestId === requestId;
+    },
+    timeoutMs,
+  );
+  if (response.type === "pair_error") {
+    const err = new Error(response.message ?? "ensure_pair failed") as Error & {
+      code?: string;
+      details?: any;
+    };
+    err.code = response.code;
+    err.details = response.details;
+    throw err;
   }
+  return { appServerUrl: response.appServerUrl, proxyUrl: response.proxyUrl };
+}
+
+/**
+ * Send `list_pairs` over the control WS. Returns the pairs array.
+ */
+async function listPairsViaControl(
+  controlPort: number,
+  timeoutMs = 5000,
+): Promise<Array<{
+  pairId: string;
+  isLive: boolean;
+  proxyTuiConnected: boolean;
+  pairedChatId: string | null;
+  [k: string]: any;
+}>> {
+  const requestId = `cli-list-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  const response = await controlWsRequest<
+    { type: "list_pairs"; requestId: string },
+    { type: "pair_list"; requestId: string; pairs: any[] }
+  >(
+    controlPort,
+    { type: "list_pairs", requestId },
+    (msg): msg is { type: "pair_list"; requestId: string; pairs: any[] } => {
+      return msg && msg.type === "pair_list" && msg.requestId === requestId;
+    },
+    timeoutMs,
+  );
+  return response.pairs ?? [];
 }
 
 /**
@@ -87,10 +194,16 @@ const OWNED_FLAGS = ["--remote", "--remote-auth-token-env"];
  */
 type CodexConnectionMode = "direct" | "proxy";
 
-function extractConnectionMode(args: string[]): { mode: CodexConnectionMode; rest: string[] } {
+function extractCliFlags(args: string[]): {
+  mode: CodexConnectionMode;
+  pairId: string;
+  rest: string[];
+} {
   const rest: string[] = [];
   let mode: CodexConnectionMode = "direct";
-  for (const a of args) {
+  let pairId = "default";
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
     if (a === "--via-proxy") {
       mode = "proxy";
       continue;
@@ -99,13 +212,39 @@ function extractConnectionMode(args: string[]): { mode: CodexConnectionMode; res
       mode = "direct";
       continue;
     }
+    // STM v2.3 §8.1 P4: --pair NAME selects which pair this TUI joins.
+    // Default is "default" (v2.2-compat). Multiple TUIs on different
+    // pairs can coexist; each spawns its own Codex app-server on a
+    // separate port via daemon's ensure_pair flow.
+    if (a === "--pair" && i + 1 < args.length) {
+      pairId = args[i + 1];
+      i++;
+      continue;
+    }
+    if (a.startsWith("--pair=")) {
+      pairId = a.slice("--pair=".length);
+      continue;
+    }
     rest.push(a);
   }
-  return { mode, rest };
+  return { mode, pairId, rest };
 }
 
 export async function runCodex(rawArgs: string[]) {
-  const { mode, rest: args } = extractConnectionMode(rawArgs);
+  const { mode, pairId, rest: args } = extractCliFlags(rawArgs);
+
+  // STM v2.3 §D1 P4: CLI-side validation of --pair NAME. Reject locally
+  // with a clear message before any daemon round-trip — the daemon's
+  // INVALID_PAIR_NAME would surface a less ergonomic generic message.
+  const { isValidPairName } = await import("../pair-registry");
+  if (!isValidPairName(pairId)) {
+    console.error(`Error: --pair value "${pairId}" is invalid.`);
+    console.error("");
+    console.error("Allowed: lowercase letters, digits, underscore, hyphen.");
+    console.error("First character must be alphanumeric. Length 1-32 chars.");
+    console.error("Examples: default, work, side, project-2, my_pair");
+    process.exit(1);
+  }
 
   // Check for owned flag conflicts
   checkOwnedFlagConflicts(args, "agentbridge codex", OWNED_FLAGS);
@@ -153,9 +292,16 @@ export async function runCodex(rawArgs: string[]) {
 
   // Resolve the WebSocket URL to hand to codex --remote.
   //
+  // STM v2.3 §8.1 P4: the URL comes from the daemon's `ensure_pair(pairId)`
+  // response, not from `status.json` directly. This makes multi-pair
+  // possible — each pair has its own (appPort, proxyPort) tuple, and the
+  // daemon allocates them under the registry mutex. For backwards-compat
+  // when daemon is not yet reachable for ensure_pair (rare; daemon was
+  // ensured above), falls back to status.json / config.
+  //
   // direct mode → app-server port (each TUI is an independent client of the
   //               same codex backend; gets its own thread; no proxy).
-  // proxy mode  → daemon's proxy port. Spec v2.2 §4.6: `--via-proxy` now
+  // proxy mode  → daemon's proxy port. Spec v2.2 §4.6: `--via-proxy`
   //               participates in the shared-thread pairing protocol. A
   //               unique bearer token is passed via Codex's native
   //               --remote-auth-token-env option so the daemon can
@@ -166,31 +312,82 @@ export async function runCodex(rawArgs: string[]) {
   const childEnv: NodeJS.ProcessEnv = {};
   const remoteAuthArgs: string[] = [];
   const status = lifecycle.readStatus();
+
+  // Ensure the target pair is live and get its URLs. For "default" this
+  // is idempotent against bootCodex's eager ensure; for named pairs it
+  // triggers allocation + spawn in the daemon. Short 2s timeout so an
+  // older v2.2 daemon (or test fake) that doesn't handle ensure_pair
+  // gracefully falls through to status.json URLs.
+  let pairUrls: { appServerUrl: string; proxyUrl: string } | null = null;
+  try {
+    pairUrls = await ensurePairViaControl(controlPort, pairId, 2000);
+    console.error(`[agentbridge] Pair "${pairId}" ready (app=${pairUrls.appServerUrl}, proxy=${pairUrls.proxyUrl})`);
+  } catch (err: any) {
+    if (err.code === "PAIR_PORTS_BUSY") {
+      console.error("");
+      console.error(`[agentbridge] Error: ports for pair "${pairId}" are held by another process.`);
+      console.error(`  ${err.message ?? ""}`);
+      const conflictPort = err.details?.conflictPort;
+      if (conflictPort) {
+        console.error(`  Conflicting port: ${conflictPort}`);
+        console.error(`  Stop that process or use \`abg pairs rm ${pairId} --forget\` to release the registry entry and try again.`);
+      } else {
+        console.error(`  Stop the conflicting process or use \`abg pairs rm ${pairId} --forget\` to release the registry entry.`);
+      }
+      console.error("");
+      process.exit(1);
+    }
+    if (err.code === "INVALID_PAIR_NAME") {
+      console.error(`[agentbridge] Error: pair name "${pairId}" is invalid.`);
+      process.exit(1);
+    }
+    if (err.code === "MAX_PAIRS") {
+      console.error(`[agentbridge] Error: daemon is at the max live pairs limit.`);
+      console.error(`  ${err.message ?? ""}`);
+      console.error(`  Destroy an unused pair with \`abg pairs rm NAME\` and retry.`);
+      process.exit(1);
+    }
+    console.error(`[agentbridge] Failed to ensure pair "${pairId}": ${err.message ?? err}`);
+    console.error(`  Falling back to status.json URLs.`);
+  }
+
   if (mode === "direct") {
-    if (status?.appServerUrl) {
+    if (pairUrls) {
+      remoteUrl = pairUrls.appServerUrl;
+    } else if (status?.appServerUrl) {
       remoteUrl = status.appServerUrl;
     } else {
       remoteUrl = `ws://127.0.0.1:${config.codex.appPort}`;
       console.error(`[agentbridge] No daemon status found, using config default app-server URL: ${remoteUrl}`);
     }
   } else {
-    // Spec v2.2 §7: pre-flight check — daemon should only have one proxy TUI
-    // at a time. Hit /healthz for the live state (status.json is stale).
-    const liveStatus = await fetchLiveDaemonStatus(controlPort);
-    if (liveStatus?.proxyTuiConnected) {
-      console.error("");
-      console.error("[agentbridge] Error: another `agentbridge codex --via-proxy` TUI is already connected to the daemon.");
-      console.error("");
-      console.error("Shared-thread mode supports at most one proxy TUI at a time.");
-      console.error("Either close the other TUI window first, or use `agentbridge codex` (direct mode) to run an independent parallel session.");
-      console.error("");
-      process.exit(1);
+    // Pre-flight check (proxy mode only): is the target pair already
+    // connected to a `--via-proxy` TUI? Each pair allows at most one.
+    // Short timeout so we don't stall on a daemon that doesn't speak
+    // list_pairs (older or stubbed).
+    try {
+      const pairsList = await listPairsViaControl(controlPort, 2000);
+      const target = pairsList.find((p) => p.pairId === pairId);
+      if (target?.proxyTuiConnected) {
+        console.error("");
+        console.error(`[agentbridge] Error: another \`agentbridge codex --pair ${pairId} --via-proxy\` TUI is already connected.`);
+        console.error("");
+        console.error(`Shared-thread mode supports at most one proxy TUI per pair (pair="${pairId}").`);
+        console.error(`Either close the other TUI window for this pair first, or use a different --pair NAME, or use \`agentbridge codex --direct\` to skip pairing.`);
+        console.error("");
+        process.exit(1);
+      }
+    } catch (err: any) {
+      console.error(`[agentbridge] Warning: list_pairs pre-flight check failed: ${err?.message ?? err}`);
+      console.error(`[agentbridge] Proceeding anyway — daemon may reject the second TUI via WS-upgrade token check.`);
     }
 
     // Spec v2.2 §4.6: generate the token so codex-rs's primary AND secondary
     // picker connections inherit it via the Authorization header.
     const abgToken = (await import("node:crypto")).randomBytes(8).toString("hex");
-    if (status?.proxyUrl) {
+    if (pairUrls) {
+      remoteUrl = pairUrls.proxyUrl;
+    } else if (status?.proxyUrl) {
       remoteUrl = status.proxyUrl;
     } else {
       remoteUrl = `ws://127.0.0.1:${config.codex.proxyPort}`;
@@ -198,7 +395,7 @@ export async function runCodex(rawArgs: string[]) {
     }
     childEnv.AGENTBRIDGE_PROXY_TOKEN = abgToken;
     remoteAuthArgs.push("--remote-auth-token-env", "AGENTBRIDGE_PROXY_TOKEN");
-    console.error(`[agentbridge] Shared-thread mode active. Token=${abgToken.slice(0, 8)}…`);
+    console.error(`[agentbridge] Shared-thread mode active. pair="${pairId}" token=${abgToken.slice(0, 8)}…`);
   }
 
   try {
