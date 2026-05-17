@@ -1350,3 +1350,145 @@ describe("Issue #82 — ClaudeThread WS close lifecycle (2026-05-17)", () => {
     expect(chat.ready).toBe(true);
   });
 });
+
+// ── M01 probe bug regression (2026-05-17 paired-inject routing) ──────
+//
+// M01 multi-pair probe caught: paired-inject path in handleClaudeToCodex
+// was calling the module-level `codex` (default pair's CodexAdapter)
+// instead of looking up the chat's home-pair adapter. For a Claude
+// paired with the "work" pair, this attempted injection into the
+// default pair's TUI/thread (which had no active TUI), surfacing
+// "Cannot inject: no active thread" + "Shared Codex TUI is busy"
+// — multi-pair was actually broken for non-default paired Claudes.
+//
+// Fix: handleClaudeToCodex now reads pairs.get(state.homePairId)?.codex
+// and injects through THAT adapter. Plus surfaces a clear error if
+// the home pair vanished mid-flight.
+
+describe("M01 regression — paired-inject routes to homePair's CodexAdapter (2026-05-17)", () => {
+  test("paired chat with homePairId='work' injects into work's adapter, not default's", () => {
+    // Set up a fake "work" pair with a stubbed CodexAdapter that
+    // records its injectMessage calls. Default pair's codex also
+    // recorded so we can assert it was NOT touched.
+    const defaultPair = __testing.pairs.get("default")!;
+    const defaultCalls: string[] = [];
+    const workCalls: string[] = [];
+
+    // Stub default pair's injectMessage.
+    const defaultOriginalInject = defaultPair.codex.injectMessage.bind(defaultPair.codex);
+    (defaultPair.codex as any).injectMessage = (text: string) => {
+      defaultCalls.push(text);
+      return true;
+    };
+
+    // Build a fake "work" pair with its own stubbed CodexAdapter.
+    const fakeWorkCodex = {
+      injectMessage: (text: string) => { workCalls.push(text); return true; },
+    } as any;
+    const fakeWorkPair = {
+      pairId: "work",
+      codex: fakeWorkCodex,
+      tuiConnectionState: defaultPair.tuiConnectionState,
+      proxyTuiSlot: null,
+      handlerRefs: [],
+      isLive: true,
+    } as any;
+    __testing.pairs.set("work", fakeWorkPair);
+
+    // Create a paired chat homed on "work".
+    const chat = fns.createChatState("chat-m01-routing");
+    chat.paired = true;
+    chat.homePairId = "work";
+    chat.ready = true;  // bypass the "still provisioning" guard
+    chats.set(chat.chatId, chat);
+
+    // Minimal WS mock for handleClaudeToCodex result responses.
+    const sent: any[] = [];
+    const ws: any = {
+      send: (payload: string) => { sent.push(JSON.parse(payload)); return 1; },
+      data: { clientId: 99, attached: true, chatId: chat.chatId },
+      readyState: 1,
+      close: () => {},
+    };
+
+    try {
+      (fns as any).handleClaudeToCodex(ws, {
+        type: "claude_to_codex",
+        requestId: "req-m01-routing",
+        chatId: chat.chatId,
+        message: {
+          id: "msg-m01-routing",
+          source: "claude",
+          content: "test payload",
+          timestamp: Date.now(),
+        },
+      });
+
+      // Work's stubbed injectMessage should have been called exactly
+      // once with the chat's content. Default's must NOT have been
+      // called — that was the bug.
+      expect(workCalls.length).toBe(1);
+      expect(workCalls[0]).toContain("test payload");
+      expect(defaultCalls.length).toBe(0);
+
+      // claude_to_codex_result success=true since stubbed injectMessage
+      // returned true.
+      const result = sent.find((m) => m.type === "claude_to_codex_result");
+      expect(result?.success).toBe(true);
+    } finally {
+      (defaultPair.codex as any).injectMessage = defaultOriginalInject;
+      __testing.pairs.delete("work");
+      chats.delete(chat.chatId);
+    }
+  });
+
+  test("paired chat whose homePair is no longer live surfaces clean error (no injection)", () => {
+    const defaultPair = __testing.pairs.get("default")!;
+    const defaultCalls: string[] = [];
+    const defaultOriginalInject = defaultPair.codex.injectMessage.bind(defaultPair.codex);
+    (defaultPair.codex as any).injectMessage = (text: string) => {
+      defaultCalls.push(text);
+      return true;
+    };
+
+    const chat = fns.createChatState("chat-m01-gone-pair");
+    chat.paired = true;
+    chat.homePairId = "deleted-pair"; // never registered
+    chat.ready = true;  // bypass the "still provisioning" guard
+    chats.set(chat.chatId, chat);
+
+    const sent: any[] = [];
+    const ws: any = {
+      send: (payload: string) => { sent.push(JSON.parse(payload)); return 1; },
+      data: { clientId: 100, attached: true, chatId: chat.chatId },
+      readyState: 1,
+      close: () => {},
+    };
+
+    try {
+      (fns as any).handleClaudeToCodex(ws, {
+        type: "claude_to_codex",
+        requestId: "req-m01-gone",
+        chatId: chat.chatId,
+        message: {
+          id: "msg-m01-gone",
+          source: "claude",
+          content: "should not reach any adapter",
+          timestamp: Date.now(),
+        },
+      });
+
+      // No adapter should have been called.
+      expect(defaultCalls.length).toBe(0);
+      // Clean error surfaced with home-pair-not-live message (NOT the
+      // generic "Shared Codex TUI is busy" — that would be a silent
+      // wrong-pair injection symptom).
+      const result = sent.find((m) => m.type === "claude_to_codex_result");
+      expect(result?.success).toBe(false);
+      expect(result?.error ?? "").toMatch(/Home pair "deleted-pair" is no longer live/);
+    } finally {
+      (defaultPair.codex as any).injectMessage = defaultOriginalInject;
+      chats.delete(chat.chatId);
+    }
+  });
+});

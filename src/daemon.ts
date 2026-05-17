@@ -1489,12 +1489,32 @@ function handleClaudeToCodex(
     log(`[${chatId}] Reply required flag set`);
   }
 
-  log(`[${chatId}] Forwarding Claude → Codex (${message.message.content.length} chars, requireReply=${requireReply}, paired=${state.paired})`);
+  log(`[${chatId}] Forwarding Claude → Codex (${message.message.content.length} chars, requireReply=${requireReply}, paired=${state.paired}, homePair=${state.homePairId})`);
 
   // Spec v2.2 §6: paired chats route through CodexAdapter (shared transport);
   // isolated chats keep using their own ClaudeThread.
+  //
+  // STM v2.3 multi-pair bug found by M01 probe (2026-05-17): paired
+  // injects MUST go through the chat's home pair's CodexAdapter, not
+  // the module-level `codex` (which is just the default pair's). For a
+  // Claude paired with the "work" pair, using the default's codex meant
+  // injecting into a TUI/thread that didn't exist — "Cannot inject: no
+  // active thread" was the symptom and "Shared Codex TUI is busy" the
+  // user-facing error. Look up the per-pair adapter via homePairId.
+  const homePair = state.paired && state.homePairId ? pairs.get(state.homePairId) : undefined;
+  if (state.paired && (!homePair || !homePair.isLive)) {
+    // Pair vanished or went down between FIFO claim and this reply
+    // (e.g. concurrent `destroy_pair --force` race). Surface explicitly
+    // rather than silently injecting into the wrong pair.
+    return sendProtocolMessage(ws, {
+      type: "claude_to_codex_result",
+      requestId: message.requestId,
+      success: false,
+      error: `Home pair "${state.homePairId}" is no longer live; reconnect Claude to re-home.`,
+    });
+  }
   const injected = state.paired
-    ? codex.injectMessage(contentWithReminder)
+    ? homePair!.codex.injectMessage(contentWithReminder)
     : state.thread.injectMessage(contentWithReminder);
 
   if (!injected) {
@@ -2120,6 +2140,10 @@ export const __testing = {
     /** Issue #82 (2026-05-17): exposed so tests can flip `shuttingDown`
      * to assert close-handler guard behavior during shutdown. */
     setShuttingDownForTest(value: boolean) { shuttingDown = value; },
+    /** M01 probe bug regression (2026-05-17): exposed so a unit test
+     * can assert paired-inject routes to the chat's homePair adapter
+     * (not the module-level default `codex`). */
+    handleClaudeToCodex,
   } as const,
   /** STM v2.3 §D2 P3b — registry handle (read for assertions; mutate via handlers). */
   pairRegistry,

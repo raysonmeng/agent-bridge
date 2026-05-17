@@ -3535,8 +3535,17 @@ function handleClaudeToCodex(ws, message) {
     state.replyReceivedDuringTurn = false;
     log(`[${chatId}] Reply required flag set`);
   }
-  log(`[${chatId}] Forwarding Claude \u2192 Codex (${message.message.content.length} chars, requireReply=${requireReply}, paired=${state.paired})`);
-  const injected = state.paired ? codex.injectMessage(contentWithReminder) : state.thread.injectMessage(contentWithReminder);
+  log(`[${chatId}] Forwarding Claude \u2192 Codex (${message.message.content.length} chars, requireReply=${requireReply}, paired=${state.paired}, homePair=${state.homePairId})`);
+  const homePair = state.paired && state.homePairId ? pairs.get(state.homePairId) : undefined;
+  if (state.paired && (!homePair || !homePair.isLive)) {
+    return sendProtocolMessage(ws, {
+      type: "claude_to_codex_result",
+      requestId: message.requestId,
+      success: false,
+      error: `Home pair "${state.homePairId}" is no longer live; reconnect Claude to re-home.`
+    });
+  }
+  const injected = state.paired ? homePair.codex.injectMessage(contentWithReminder) : state.thread.injectMessage(contentWithReminder);
   if (!injected) {
     const reason = state.paired ? "Shared Codex TUI is busy with another turn. Retry." : state.thread.isTurnInProgress ? "Codex is busy executing a turn on your thread. Wait for it to finish." : "Injection failed: thread WS not connected.";
     if (requireReply) {
@@ -3969,7 +3978,8 @@ var __testing = {
     wireClaudeThreadEvents,
     setShuttingDownForTest(value) {
       shuttingDown = value;
-    }
+    },
+    handleClaudeToCodex
   },
   pairRegistry,
   runUnderRegistryMutex,
