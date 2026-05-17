@@ -1499,11 +1499,22 @@ function handleClaudeToCodex(
     // Spec v2.2 §5 + §8 E8: paired-but-not-ready returns a transient error so
     // paired Claude can retry once the shared thread is provisioned or
     // session-restored. Distinguish first-time provisioning from restore.
+    //
+    // Issue #83 risk #1 (M06c probe found 2026-05-17): the paired branch
+    // previously consulted module-level `codex.isSessionRestoreInProgress`
+    // and `proxyTuiSlot` — both default-pair globals. For a chat homed
+    // on a non-default pair, this lied: default's proxyTuiSlot=null
+    // would surface "Shared Codex TUI is no longer connected" even
+    // when the chat's home pair (e.g. "work") has a TUI connected but
+    // not yet thread-started. Route through `pairs.get(state.homePairId)`.
     let errorMsg: string;
     if (state.paired) {
-      if (codex.isSessionRestoreInProgress) {
+      const homePair = state.homePairId ? pairs.get(state.homePairId) : undefined;
+      const homeCodex = homePair?.codex;
+      const homeSlot = homePair?.proxyTuiSlot;
+      if (homeCodex?.isSessionRestoreInProgress) {
         errorMsg = "Restoring shared Codex TUI session, retry shortly.";
-      } else if (proxyTuiSlot) {
+      } else if (homeSlot) {
         errorMsg = "Shared Codex TUI thread is still provisioning. Retry shortly.";
       } else {
         errorMsg = "Shared Codex TUI is no longer connected. Wait for transition to isolated mode.";

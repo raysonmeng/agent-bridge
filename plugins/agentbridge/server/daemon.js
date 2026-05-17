@@ -3525,9 +3525,12 @@ function handleClaudeToCodex(ws, message) {
   if (!state.ready) {
     let errorMsg;
     if (state.paired) {
-      if (codex.isSessionRestoreInProgress) {
+      const homePair2 = state.homePairId ? pairs.get(state.homePairId) : undefined;
+      const homeCodex = homePair2?.codex;
+      const homeSlot = homePair2?.proxyTuiSlot;
+      if (homeCodex?.isSessionRestoreInProgress) {
         errorMsg = "Restoring shared Codex TUI session, retry shortly.";
-      } else if (proxyTuiSlot) {
+      } else if (homeSlot) {
         errorMsg = "Shared Codex TUI thread is still provisioning. Retry shortly.";
       } else {
         errorMsg = "Shared Codex TUI is no longer connected. Wait for transition to isolated mode.";
