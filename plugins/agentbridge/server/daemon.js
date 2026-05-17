@@ -3383,13 +3383,13 @@ function wireClaudeThreadEvents(state) {
   const threadAtRegistration = state.thread;
   state.thread.on("close", () => {
     log(`[${chatId}] ClaudeThread WS closed`);
-    state.ready = false;
     if (shuttingDown)
       return;
     if (state.thread !== threadAtRegistration)
       return;
     if (chats.get(chatId) !== state)
       return;
+    state.ready = false;
     emitToChat(state, systemMessage("system_thread_failed", "\u274C Lost connection to Codex app-server. Reconnect to retry \u2014 bridge will provision a fresh thread."));
     reapChatState(state, "ClaudeThread WS closed unexpectedly (app-server crash or upstream failure)");
   });

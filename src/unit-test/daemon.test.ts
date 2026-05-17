@@ -1324,6 +1324,11 @@ describe("Issue #82 — ClaudeThread WS close lifecycle (2026-05-17)", () => {
       cwd: "/tmp",
     });
 
+    // Per Codex batch re-pass msg ..._188: simulate the replacement
+    // having successfully bootstrapped so ready=true is the LIVE state.
+    // The stale OLD-thread close must NOT flip this back to false.
+    chat.ready = true;
+
     const beforeChatsCount = chats.size;
     const beforeBuffered = chat.bufferedMessages.length;
 
@@ -1338,5 +1343,10 @@ describe("Issue #82 — ClaudeThread WS close lifecycle (2026-05-17)", () => {
     expect(chat.bufferedMessages.length).toBe(beforeBuffered);
     // The new thread is still the live one.
     expect(chat.thread).not.toBe(oldThread);
+    // CRITICAL (Codex re-pass): ready must NOT have been flipped to false.
+    // Without the ordering fix, the stale handler ran `state.ready = false`
+    // before the guards — leaving the live thread effectively stuck in
+    // a soft "still provisioning" state even though no reap happened.
+    expect(chat.ready).toBe(true);
   });
 });

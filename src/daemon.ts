@@ -1287,7 +1287,6 @@ function wireClaudeThreadEvents(state: ChatState): void {
   const threadAtRegistration = state.thread;
   state.thread.on("close", () => {
     log(`[${chatId}] ClaudeThread WS closed`);
-    state.ready = false;
 
     // Issue #82 (2026-05-17): app-server crash / unexpected upstream WS
     // close. Before this guard the chat stayed in `chats` with
@@ -1299,7 +1298,11 @@ function wireClaudeThreadEvents(state: ChatState): void {
     // bootstrap succeeds; if not, the bootstrap-failure reap kicks in
     // and bridge enters disabled state cleanly.
     //
-    // Three guards prevent unwanted re-reaping:
+    // Three guards prevent unwanted re-reaping (and unwanted ready-flip
+    // — Codex batch review re-pass msg ..._188 caught that ready=false
+    // must also be gated, else a stale OLD-thread close after replacement
+    // marks the live new thread not-ready without reaping, recreating a
+    // softer "still provisioning" symptom):
     //  1. shuttingDown — during daemon SIGTERM all ClaudeThread WSs
     //     close in cascade; reaping during shutdown is pointless (state
     //     will be discarded) and writes noise to logs.
@@ -1318,6 +1321,12 @@ function wireClaudeThreadEvents(state: ChatState): void {
     if (shuttingDown) return;
     if (state.thread !== threadAtRegistration) return;
     if (chats.get(chatId) !== state) return;
+
+    // Only flip ready=false once we've confirmed this close is for the
+    // current live thread (not a stale OLD-thread close after intentional
+    // replacement). Otherwise the live chat gets stuck in a soft
+    // "still provisioning" state without being reaped.
+    state.ready = false;
 
     emitToChat(state, systemMessage("system_thread_failed",
       "❌ Lost connection to Codex app-server. Reconnect to retry — bridge will provision a fresh thread."));
