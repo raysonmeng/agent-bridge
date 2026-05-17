@@ -1506,6 +1506,16 @@ function handleClaudeToCodex(
     // Pair vanished or went down between FIFO claim and this reply
     // (e.g. concurrent `destroy_pair --force` race). Surface explicitly
     // rather than silently injecting into the wrong pair.
+    //
+    // Codex re-review of ebea1d3 (msg ..._197) — must roll back
+    // replyRequired here because we set it above (line 1487) before
+    // attempting the injection. Without rollback, a racing requireReply
+    // reply against pair teardown leaves the chat in stale reply-
+    // required state even though no injection happened, mirroring the
+    // later `!injected` branch's rollback contract.
+    if (requireReply) {
+      state.replyRequired = false;
+    }
     return sendProtocolMessage(ws, {
       type: "claude_to_codex_result",
       requestId: message.requestId,

@@ -1442,6 +1442,63 @@ describe("M01 regression — paired-inject routes to homePair's CodexAdapter (20
     }
   });
 
+  // Codex re-review of ebea1d3 (msg ..._197): the new home-pair-gone
+  // early return must roll back state.replyRequired when it was set
+  // by this same call. Without rollback, a requireReply reply racing
+  // with pair teardown leaves the chat stuck in stale reply-required
+  // state — mirrors the later `!injected` branch's rollback contract.
+  test("paired chat home-pair-gone with requireReply=true rolls back replyRequired", () => {
+    const defaultPair = __testing.pairs.get("default")!;
+    const defaultCalls: string[] = [];
+    const defaultOriginalInject = defaultPair.codex.injectMessage.bind(defaultPair.codex);
+    (defaultPair.codex as any).injectMessage = (text: string) => {
+      defaultCalls.push(text);
+      return true;
+    };
+
+    const chat = fns.createChatState("chat-m01-gone-requirereply");
+    chat.paired = true;
+    chat.homePairId = "vanished";
+    chat.ready = true;
+    chat.replyRequired = false;
+    chats.set(chat.chatId, chat);
+
+    const sent: any[] = [];
+    const ws: any = {
+      send: (payload: string) => { sent.push(JSON.parse(payload)); return 1; },
+      data: { clientId: 101, attached: true, chatId: chat.chatId },
+      readyState: 1,
+      close: () => {},
+    };
+
+    try {
+      (fns as any).handleClaudeToCodex(ws, {
+        type: "claude_to_codex",
+        requestId: "req-m01-rollback",
+        chatId: chat.chatId,
+        message: {
+          id: "msg-m01-rollback",
+          source: "claude",
+          content: "racing reply",
+          timestamp: Date.now(),
+        },
+        requireReply: true,  // ← critical
+      });
+
+      expect(defaultCalls.length).toBe(0);
+      const result = sent.find((m) => m.type === "claude_to_codex_result");
+      expect(result?.success).toBe(false);
+      expect(result?.error ?? "").toMatch(/no longer live/);
+      // CRITICAL: replyRequired must have been rolled back. Without the
+      // fix, it would stay true because the requireReply path on line
+      // 1487 set it to true before reaching the home-pair-gone branch.
+      expect(chat.replyRequired).toBe(false);
+    } finally {
+      (defaultPair.codex as any).injectMessage = defaultOriginalInject;
+      chats.delete(chat.chatId);
+    }
+  });
+
   test("paired chat whose homePair is no longer live surfaces clean error (no injection)", () => {
     const defaultPair = __testing.pairs.get("default")!;
     const defaultCalls: string[] = [];

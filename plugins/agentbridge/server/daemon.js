@@ -3538,6 +3538,9 @@ function handleClaudeToCodex(ws, message) {
   log(`[${chatId}] Forwarding Claude \u2192 Codex (${message.message.content.length} chars, requireReply=${requireReply}, paired=${state.paired}, homePair=${state.homePairId})`);
   const homePair = state.paired && state.homePairId ? pairs.get(state.homePairId) : undefined;
   if (state.paired && (!homePair || !homePair.isLive)) {
+    if (requireReply) {
+      state.replyRequired = false;
+    }
     return sendProtocolMessage(ws, {
       type: "claude_to_codex_result",
       requestId: message.requestId,
