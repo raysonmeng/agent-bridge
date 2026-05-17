@@ -469,10 +469,16 @@ export async function runCodex(rawArgs: string[]) {
   // codex-rs on ExitReason::Fatal survives even when stdio is inherited by
   // a terminal that clears on exit. See codex-rs/cli/src/main.rs:553.
   const stderrTail = new StderrRingBuffer();
-  const wrapperLogPath = stateDir.codexWrapperLogFile;
+  // STM v2.3 §D5 P4d: write per-pair pid + wrapper log so multiple
+  // concurrent `abg codex --pair NAME` invocations don't fight over a
+  // single root-level file. StateDirResolver helpers landed in P3d;
+  // they're now actually used here.
+  stateDir.ensure();
+  stateDir.ensurePairDir(pairId);
+  const wrapperLogPath = stateDir.pairCodexWrapperLogFile(pairId);
+  const tuiPidPath = stateDir.pairCodexPidFile(pairId);
   const startedAt = Date.now();
 
-  stateDir.ensure();
   appendWrapperLog(
     wrapperLogPath,
     `spawn: codex ${fullArgs.map((a) => (a.includes(" ") ? JSON.stringify(a) : a)).join(" ")}`,
@@ -485,7 +491,14 @@ export async function runCodex(rawArgs: string[]) {
   });
 
   if (typeof child.pid === "number") {
-    writeFileSync(stateDir.tuiPidFile, `${child.pid}\n`, "utf-8");
+    writeFileSync(tuiPidPath, `${child.pid}\n`, "utf-8");
+    // Also write the legacy root-level pid for backwards-compat readers
+    // (notably `abg kill` walking the root path; P4d updates kill to
+    // walk pairs/*/codex.pid too, but other tools may still poll the
+    // old location).
+    if (pairId === "default") {
+      try { writeFileSync(stateDir.tuiPidFile, `${child.pid}\n`, "utf-8"); } catch {}
+    }
     appendWrapperLog(wrapperLogPath, `child pid=${child.pid}`);
   }
 
@@ -505,9 +518,12 @@ export async function runCodex(rawArgs: string[]) {
   function cleanupTuiPidFile() {
     if (cleanedTuiPid) return;
     cleanedTuiPid = true;
-    try {
-      unlinkSync(stateDir.tuiPidFile);
-    } catch {}
+    try { unlinkSync(tuiPidPath); } catch {}
+    // P4d: also clean the legacy root-level pid file if this is the
+    // default pair (we wrote it for backwards-compat above).
+    if (pairId === "default") {
+      try { unlinkSync(stateDir.tuiPidFile); } catch {}
+    }
   }
 
   process.on("exit", () => { restoreTerminal(); cleanupTuiPidFile(); });
