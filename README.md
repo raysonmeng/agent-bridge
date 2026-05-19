@@ -248,6 +248,7 @@ agent_bridge/
 | `CODEX_WS_PORT` | `4500` | Codex app-server WebSocket port |
 | `CODEX_PROXY_PORT` | `4501` | Bridge proxy port for the Codex TUI |
 | `AGENTBRIDGE_CONTROL_PORT` | `4502` | Control port between bridge.ts and daemon.ts |
+| `AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS` | `3000` | Maximum wait for incumbent Claude pong before evicting on contention (issue #68) |
 | `AGENTBRIDGE_STATE_DIR` | Platform default | State directory for pid, status, logs (macOS: `~/Library/Application Support/agentbridge/`, Linux: `$XDG_STATE_HOME/agentbridge/`) |
 | `AGENTBRIDGE_MODE` | `push` | Message delivery mode (`push` for channels, `pull` for API key mode) |
 | `AGENTBRIDGE_DAEMON_ENTRY` | `./daemon.ts` | Override daemon entry point (used by plugin bundles) |
@@ -262,6 +263,18 @@ The daemon stores runtime state in a platform-aware directory:
 | Linux | `$XDG_STATE_HOME/agentbridge/` (fallback: `~/.local/state/agentbridge/`) |
 
 Contents: `daemon.pid`, `status.json`, `agentbridge.log`, `killed` (sentinel), `startup.lock`
+
+### Disabled Bridge States
+
+The bridge can enter several dormant states when it cannot accept new MCP replies. Each state surfaces to the agent as an error message (and, for the transient ones, an in-band push notification):
+
+| State | Cause | Recovery |
+|-------|-------|----------|
+| `killed` | `agentbridge kill` was run, sentinel file present. | Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume`. |
+| `rejected` | Daemon rejected the connection: another Claude session is already attached. | Close the other session, or run `agentbridge kill` to reset, then `agentbridge claude` again. |
+| `evicted` | A newer session evicted this one after the incumbent failed a liveness probe (issue #68). | Close this session and start a fresh one with `agentbridge claude`. |
+| `probe_in_progress` | A liveness probe is currently checking the incumbent — contention window. Transient (auto-recovers within `DISABLED_RECOVERY_INTERVAL_MS` × cap, ~30 s). | None needed; the recovery poller reconnects automatically when the slot clears. |
+| `auto_recovery_exhausted` | The auto-recovery poller for `probe_in_progress` ran its full retry budget (6 attempts, ~30 s) without succeeding. Terminal. | Retry manually with `agentbridge claude`. |
 
 ## Current Limitations
 

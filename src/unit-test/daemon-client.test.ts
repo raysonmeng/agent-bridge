@@ -96,21 +96,116 @@ describe("DaemonClient", () => {
     let disconnectEmitted = false;
     client.on("disconnect", () => { disconnectEmitted = true; });
 
-    const rejected = new Promise<void>((resolve) => {
-      client.on("rejected", () => resolve());
+    const rejected = new Promise<number>((resolve) => {
+      client.on("rejected", (code) => resolve(code));
     });
 
     for (const ws of serverSockets) {
       ws.close(4001, "another Claude session is already connected");
     }
 
-    await rejected;
+    const code = await rejected;
+    expect(code).toBe(4001);
     // Give a tick for any stray disconnect to fire
     await new Promise((r) => setTimeout(r, 50));
     expect(disconnectEmitted).toBe(false);
   });
 
-  test("emits disconnect (not rejected) for non-4001 close codes", async () => {
+  test("emits rejected (not disconnect) when server closes with code 4002 (evicted stale)", async () => {
+    await client.connect();
+
+    let disconnectEmitted = false;
+    client.on("disconnect", () => { disconnectEmitted = true; });
+
+    const rejected = new Promise<number>((resolve) => {
+      client.on("rejected", (code) => resolve(code));
+    });
+
+    for (const ws of serverSockets) {
+      ws.close(4002, "stale frontend evicted by newer session");
+    }
+
+    const code = await rejected;
+    expect(code).toBe(4002);
+    await new Promise((r) => setTimeout(r, 50));
+    expect(disconnectEmitted).toBe(false);
+  });
+
+  test("emits rejected (not disconnect) when server closes with code 4003 (probe in progress)", async () => {
+    await client.connect();
+
+    let disconnectEmitted = false;
+    client.on("disconnect", () => { disconnectEmitted = true; });
+
+    const rejected = new Promise<number>((resolve) => {
+      client.on("rejected", (code) => resolve(code));
+    });
+
+    for (const ws of serverSockets) {
+      ws.close(4003, "liveness probe in progress, retry shortly");
+    }
+
+    const code = await rejected;
+    expect(code).toBe(4003);
+    await new Promise((r) => setTimeout(r, 50));
+    // Critical: must NOT trigger the disconnect path, which would cause the
+    // contestant to reconnect-loop during the probe window.
+    expect(disconnectEmitted).toBe(false);
+  });
+
+  test("attachClaudeAndWaitForStatus resolves true when the daemon confirms attachment", async () => {
+    onServerMessage = (ws, raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.type === "claude_connect") {
+        ws.send(JSON.stringify({
+          type: "status",
+          status: {
+            bridgeReady: true,
+            tuiConnected: false,
+            threadId: null,
+            queuedMessageCount: 0,
+            proxyUrl: "ws://127.0.0.1:4501",
+            appServerUrl: "ws://127.0.0.1:4500",
+            pid: 12345,
+          },
+        }));
+      }
+    };
+
+    await client.connect();
+    await expect(client.attachClaudeAndWaitForStatus(250)).resolves.toBe(true);
+  });
+
+  test("attachClaudeAndWaitForStatus resolves false when the daemon rejects the attach", async () => {
+    onServerMessage = (ws, raw) => {
+      const message = JSON.parse(raw.toString());
+      if (message.type === "claude_connect") {
+        ws.close(4003, "liveness probe in progress, retry shortly");
+      }
+    };
+
+    await client.connect();
+    await expect(client.attachClaudeAndWaitForStatus(250)).resolves.toBe(false);
+  });
+
+  test("attachClaudeAndWaitForStatus resolves false on timeout when daemon never responds", async () => {
+    // Server intentionally swallows claude_connect — no status, no close, no anything.
+    // Critical path for the recovery poller: a hung daemon must let the caller proceed.
+    onServerMessage = () => {};
+
+    await client.connect();
+    const start = Date.now();
+    const result = await client.attachClaudeAndWaitForStatus(150);
+    const elapsed = Date.now() - start;
+
+    expect(result).toBe(false);
+    // Must actually wait for the timeout, not resolve instantly.
+    expect(elapsed).toBeGreaterThanOrEqual(140);
+    // Sanity check on upper bound to catch event-listener leaks that delay GC.
+    expect(elapsed).toBeLessThan(2_000);
+  });
+
+  test("emits disconnect (not rejected) for non-rejection close codes", async () => {
     await client.connect();
 
     let rejectedEmitted = false;

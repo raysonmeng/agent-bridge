@@ -1,12 +1,16 @@
 import { EventEmitter } from "node:events";
 import type { BridgeMessage } from "./types";
-import { CLOSE_CODE_REPLACED } from "./control-protocol";
+import {
+  CLOSE_CODE_REPLACED,
+  CLOSE_CODE_EVICTED_STALE,
+  CLOSE_CODE_PROBE_IN_PROGRESS,
+} from "./control-protocol";
 import type { ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
 
 interface DaemonClientEvents {
   codexMessage: [BridgeMessage];
   disconnect: [];
-  rejected: [];
+  rejected: [number];
   status: [DaemonStatus];
 }
 
@@ -73,6 +77,52 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
 
   attachClaude() {
     this.send({ type: "claude_connect" });
+  }
+
+  async attachClaudeAndWaitForStatus(timeoutMs = 1000): Promise<boolean> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+
+    return await new Promise<boolean>((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+
+      const cleanup = () => {
+        if (settled) return;
+        settled = true;
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        this.off("status", onStatus);
+        this.off("rejected", onRejected);
+        this.off("disconnect", onDisconnect);
+      };
+
+      const finish = (value: boolean) => {
+        cleanup();
+        resolve(value);
+      };
+
+      const onStatus = () => finish(true);
+      const onRejected = () => finish(false);
+      const onDisconnect = () => finish(false);
+
+      this.on("status", onStatus);
+      this.on("rejected", onRejected);
+      this.on("disconnect", onDisconnect);
+
+      timer = setTimeout(() => {
+        finish(false);
+      }, timeoutMs);
+
+      try {
+        this.attachClaude();
+      } catch {
+        finish(false);
+      }
+    });
   }
 
   async disconnect() {
@@ -147,8 +197,12 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       if (isCurrent) {
         this.ws = null;
         this.rejectPendingReplies("AgentBridge daemon disconnected.");
-        if (event.code === CLOSE_CODE_REPLACED) {
-          this.emit("rejected");
+        if (
+          event.code === CLOSE_CODE_REPLACED ||
+          event.code === CLOSE_CODE_EVICTED_STALE ||
+          event.code === CLOSE_CODE_PROBE_IN_PROGRESS
+        ) {
+          this.emit("rejected", event.code);
         } else {
           this.emit("disconnect");
         }

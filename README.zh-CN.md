@@ -246,6 +246,7 @@ agent_bridge/
 | `CODEX_WS_PORT` | `4500` | Codex app-server WebSocket 端口 |
 | `CODEX_PROXY_PORT` | `4501` | Bridge 代理端口，Codex TUI 连接此端口 |
 | `AGENTBRIDGE_CONTROL_PORT` | `4502` | bridge.ts 与 daemon.ts 之间的控制端口 |
+| `AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS` | `3000` | 等待在位 Claude pong 的最长时间，超时后在争用时驱逐（issue #68） |
 | `AGENTBRIDGE_STATE_DIR` | 平台默认 | 状态目录（pid、status、日志）。macOS: `~/Library/Application Support/agentbridge/`，Linux: `$XDG_STATE_HOME/agentbridge/` |
 | `AGENTBRIDGE_MODE` | `push` | 消息投递模式（`push` 用于 channel，`pull` 用于 API key 模式） |
 | `AGENTBRIDGE_DAEMON_ENTRY` | `./daemon.ts` | 覆盖 daemon 入口（插件包使用） |
@@ -260,6 +261,18 @@ daemon 在平台感知的目录中存储运行时状态：
 | Linux | `$XDG_STATE_HOME/agentbridge/`（回退：`~/.local/state/agentbridge/`） |
 
 内容：`daemon.pid`、`status.json`、`agentbridge.log`、`killed`（sentinel）、`startup.lock`
+
+### Bridge 禁用状态
+
+Bridge 在无法接受新 MCP 回复时会进入若干休眠状态。每种状态都会以错误信息返回给 agent；瞬态状态还会推送一条带内通知：
+
+| 状态 | 原因 | 恢复方式 |
+|------|------|---------|
+| `killed` | 运行过 `agentbridge kill`，存在 sentinel 文件。 | 重启 Claude Code（`agentbridge claude`），切换到新会话，或运行 `/resume`。 |
+| `rejected` | daemon 拒绝连接：已有另一个 Claude 会话连接中。 | 先关闭另一个会话，或运行 `agentbridge kill` 重置，然后重新 `agentbridge claude`。 |
+| `evicted` | 在位会话未响应存活探测，被更新的会话驱逐（issue #68）。 | 关闭本会话，用 `agentbridge claude` 重新启动一个。 |
+| `probe_in_progress` | 当前正在对在位会话执行存活探测——争用窗口期。瞬态（在 `DISABLED_RECOVERY_INTERVAL_MS` × 重试上限内自动恢复，约 30 秒）。 | 无需操作；恢复轮询会在槽位释放后自动重连。 |
+| `auto_recovery_exhausted` | `probe_in_progress` 的自动恢复轮询用尽了完整的重试预算（6 次，约 30 秒）仍未成功。终态。 | 手动用 `agentbridge claude` 重试。 |
 
 ## 当前限制
 

@@ -7,6 +7,10 @@ import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
 import { ConfigService } from "./config-service";
 import { disabledReplyError, type BridgeDisabledReason } from "./bridge-disabled-state";
+import {
+  CLOSE_CODE_EVICTED_STALE,
+  CLOSE_CODE_PROBE_IN_PROGRESS,
+} from "./control-protocol";
 import type { BridgeMessage } from "./types";
 
 const stateDir = new StateDirResolver();
@@ -36,6 +40,10 @@ let lastDisconnectNotifyTs = 0;
 let lastReconnectNotifyTs = 0;
 let disabledRecoveryTimer: ReturnType<typeof setInterval> | null = null;
 let disabledRecoveryInFlight = false;
+let disabledRecoveryAttempts = 0;
+
+const DISABLED_RECOVERY_MAX_ATTEMPTS = 6;
+const DISABLED_RECOVERY_CONFIRM_TIMEOUT_MS = 1000;
 
 claude.setReplySender(async (msg: BridgeMessage, requireReply?: boolean) => {
   if (msg.source !== "claude") {
@@ -97,21 +105,44 @@ daemonClient.on("disconnect", () => {
   void reconnectToDaemon();
 });
 
-daemonClient.on("rejected", async () => {
+daemonClient.on("rejected", async (code: number) => {
   if (shuttingDown || daemonDisabled) return;
 
-  log("Daemon rejected this session (close code 4001) — another Claude session is already connected");
+  let reason: BridgeDisabledReason;
+  let notificationId: string;
+  let notificationContent: string;
+  switch (code) {
+    case CLOSE_CODE_EVICTED_STALE:
+      reason = "evicted";
+      notificationId = "system_bridge_evicted";
+      notificationContent = "⚠️ AgentBridge evicted this session because it stopped responding to liveness probes — a newer Claude Code session has taken over. Close this session and start a new one with `agentbridge claude` if you want to reconnect. AgentBridge 因此会话未响应存活探测而将其驱逐——更新的 Claude Code 会话已接管。如需重连，请关闭此会话并运行 `agentbridge claude` 启动新会话。";
+      break;
+    case CLOSE_CODE_PROBE_IN_PROGRESS:
+      reason = "probe_in_progress";
+      notificationId = "system_bridge_probe_in_progress";
+      notificationContent = "⚠️ AgentBridge rejected this session — a liveness probe is currently checking whether the incumbent Claude session is still alive. Retry in a few seconds with `agentbridge claude`. AgentBridge 拒绝了此会话——正在通过存活探测检查现有 Claude 会话是否仍然在线。请稍后用 `agentbridge claude` 重试。";
+      break;
+    default:
+      reason = "rejected";
+      notificationId = "system_bridge_replaced";
+      notificationContent = "⚠️ AgentBridge daemon rejected this session — another Claude Code session is already connected. Close the other session first, or run `agentbridge kill` to reset. AgentBridge 守护进程拒绝了此会话——另一个 Claude Code 会话已在连接中。请先关闭另一个会话，或运行 `agentbridge kill` 重置。";
+      break;
+  }
+  log(`Daemon rejected this session (close code ${code}, reason=${reason})`);
 
-  // The daemon now rejects NEW connections when an existing session is active.
-  // This session was the latecomer, so it should enter dormant state permanently
-  // and not try to reconnect (which would just get rejected again).
+  // Eviction and replacement are terminal until the user intervenes: the
+  // legitimate new session must not be kicked out by an auto-reconnect. But
+  // probe_in_progress is transient by definition (the probe resolves within
+  // LIVENESS_PROBE_TIMEOUT_MS, default 3s), so we start the recovery poller
+  // and let it auto-reconnect once the slot becomes available.
   daemonDisabled = true;
-  daemonDisabledReason = "rejected";
-  await claude.pushNotification(systemMessage(
-    "system_bridge_replaced",
-    "⚠️ AgentBridge daemon rejected this session — another Claude Code session is already connected. Close the other session first, or run `agentbridge kill` to reset. AgentBridge 守护进程拒绝了此会话——另一个 Claude Code 会话已在连接中。请先关闭另一个会话，或运行 `agentbridge kill` 重置。",
-  ));
+  daemonDisabledReason = reason;
+  await claude.pushNotification(systemMessage(notificationId, notificationContent));
   await daemonClient.disconnect();
+  if (reason === "probe_in_progress") {
+    disabledRecoveryAttempts = 0;
+    startDisabledRecoveryPoller();
+  }
 });
 
 claude.on("ready", async () => {
@@ -267,23 +298,103 @@ async function pollDisabledRecovery() {
       return;
     }
 
-    log("Disabled-state recovery conditions met — attempting direct daemon reconnect");
-    try {
-      await daemonClient.connect();
-      daemonClient.attachClaude();
-      daemonDisabled = false;
-      daemonDisabledReason = null;
-      stopDisabledRecoveryPoller();
-      void claude.pushNotification(systemMessage(
-        "system_bridge_recovered",
-        "✅ AgentBridge recovered after the killed sentinel was cleared. Daemon reconnected.",
-      ));
-    } catch (err: any) {
-      log(`Disabled-state direct reconnect failed: ${err.message}`);
-      daemonDisabled = false;
-      daemonDisabledReason = null;
-      stopDisabledRecoveryPoller();
-      void reconnectToDaemon();
+    const recoveredFrom = daemonDisabledReason;
+    switch (recoveredFrom) {
+      case "probe_in_progress": {
+        if (disabledRecoveryAttempts >= DISABLED_RECOVERY_MAX_ATTEMPTS) {
+          log(
+            `Disabled-state auto-recovery gave up after ${DISABLED_RECOVERY_MAX_ATTEMPTS} attempts ` +
+            "— switching to auto_recovery_exhausted terminal state",
+          );
+          daemonDisabledReason = "auto_recovery_exhausted";
+          disabledRecoveryAttempts = 0;
+          stopDisabledRecoveryPoller();
+          void claude.pushNotification(systemMessage(
+            "system_bridge_auto_recovery_gave_up",
+            "⚠️ AgentBridge auto-recovery gave up after exhausting its retry budget for the in-flight liveness probe contention. Retry manually with `agentbridge claude`. AgentBridge 自动恢复已放弃——存活探测争用的重试预算已用尽。请使用 `agentbridge claude` 手动重试。",
+          ));
+          return;
+        }
+
+        disabledRecoveryAttempts += 1;
+        log(
+          `Disabled-state recovery attempt ${disabledRecoveryAttempts}/${DISABLED_RECOVERY_MAX_ATTEMPTS} ` +
+          "for probe_in_progress — attempting direct daemon reconnect",
+        );
+
+        try {
+          await daemonClient.connect();
+          const attached = await daemonClient.attachClaudeAndWaitForStatus(
+            DISABLED_RECOVERY_CONFIRM_TIMEOUT_MS,
+          );
+          if (!attached) {
+            log(
+              `Disabled-state probe_in_progress recovery attempt ${disabledRecoveryAttempts} did not confirm readiness`,
+            );
+            await daemonClient.disconnect();
+            return;
+          }
+
+          daemonDisabled = false;
+          daemonDisabledReason = null;
+          disabledRecoveryAttempts = 0;
+          stopDisabledRecoveryPoller();
+          // We're inside the `probe_in_progress` case branch — TS has narrowed
+          // recoveredFrom to that single value, so use the matching message
+          // directly. The outer switch (with its `never` exhaustive default)
+          // is what enforces compile-time coverage of every BridgeDisabledReason.
+          void claude.pushNotification(systemMessage(
+            "system_bridge_recovered",
+            "✅ AgentBridge recovered after the liveness probe completed. Daemon reconnected.",
+          ));
+        } catch (err: any) {
+          log(`Disabled-state probe_in_progress recovery attempt failed: ${err.message}`);
+          await daemonClient.disconnect();
+        }
+        return;
+      }
+      case "killed": {
+        log("Disabled-state recovery conditions met — attempting direct daemon reconnect");
+        try {
+          await daemonClient.connect();
+          const attached = await daemonClient.attachClaudeAndWaitForStatus(
+            DISABLED_RECOVERY_CONFIRM_TIMEOUT_MS,
+          );
+          if (!attached) {
+            throw new Error("daemon did not confirm reconnect");
+          }
+
+          daemonDisabled = false;
+          daemonDisabledReason = null;
+          disabledRecoveryAttempts = 0;
+          stopDisabledRecoveryPoller();
+          void claude.pushNotification(systemMessage(
+            "system_bridge_recovered",
+            "✅ AgentBridge recovered after the killed sentinel was cleared. Daemon reconnected.",
+          ));
+        } catch (err: any) {
+          log(`Disabled-state direct reconnect failed: ${err.message}`);
+          daemonDisabled = false;
+          daemonDisabledReason = null;
+          disabledRecoveryAttempts = 0;
+          stopDisabledRecoveryPoller();
+          void reconnectToDaemon();
+        }
+        return;
+      }
+      case "evicted":
+      case "rejected":
+      case "auto_recovery_exhausted":
+      case null:
+        log(
+          `Disabled-state recovery poller encountered terminal/unexpected reason ${recoveredFrom ?? "null"} — stopping`,
+        );
+        stopDisabledRecoveryPoller();
+        return;
+      default: {
+        const exhaustive: never = recoveredFrom;
+        return exhaustive;
+      }
     }
   } finally {
     disabledRecoveryInFlight = false;

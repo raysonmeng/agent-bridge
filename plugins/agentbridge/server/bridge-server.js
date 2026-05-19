@@ -13994,6 +13994,8 @@ import { EventEmitter as EventEmitter2 } from "events";
 
 // src/control-protocol.ts
 var CLOSE_CODE_REPLACED = 4001;
+var CLOSE_CODE_EVICTED_STALE = 4002;
+var CLOSE_CODE_PROBE_IN_PROGRESS = 4003;
 
 // src/daemon-client.ts
 var nextSocketId = 0;
@@ -14049,6 +14051,45 @@ class DaemonClient extends EventEmitter2 {
   }
   attachClaude() {
     this.send({ type: "claude_connect" });
+  }
+  async attachClaudeAndWaitForStatus(timeoutMs = 1000) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return false;
+    }
+    return await new Promise((resolve) => {
+      let settled = false;
+      let timer = null;
+      const cleanup = () => {
+        if (settled)
+          return;
+        settled = true;
+        if (timer) {
+          clearTimeout(timer);
+          timer = null;
+        }
+        this.off("status", onStatus);
+        this.off("rejected", onRejected);
+        this.off("disconnect", onDisconnect);
+      };
+      const finish = (value) => {
+        cleanup();
+        resolve(value);
+      };
+      const onStatus = () => finish(true);
+      const onRejected = () => finish(false);
+      const onDisconnect = () => finish(false);
+      this.on("status", onStatus);
+      this.on("rejected", onRejected);
+      this.on("disconnect", onDisconnect);
+      timer = setTimeout(() => {
+        finish(false);
+      }, timeoutMs);
+      try {
+        this.attachClaude();
+      } catch {
+        finish(false);
+      }
+    });
   }
   async disconnect() {
     if (!this.ws)
@@ -14114,8 +14155,8 @@ class DaemonClient extends EventEmitter2 {
       if (isCurrent) {
         this.ws = null;
         this.rejectPendingReplies("AgentBridge daemon disconnected.");
-        if (event.code === CLOSE_CODE_REPLACED) {
-          this.emit("rejected");
+        if (event.code === CLOSE_CODE_REPLACED || event.code === CLOSE_CODE_EVICTED_STALE || event.code === CLOSE_CODE_PROBE_IN_PROGRESS) {
+          this.emit("rejected", event.code);
         } else {
           this.emit("disconnect");
         }
@@ -14503,6 +14544,12 @@ function disabledReplyError(reason) {
   switch (reason) {
     case "rejected":
       return "AgentBridge rejected this session \u2014 another Claude Code session is already connected. Close the other session first, or run `agentbridge kill` to reset.";
+    case "evicted":
+      return "AgentBridge evicted this session because it stopped responding to liveness probes \u2014 a newer Claude Code session has taken over. Close this session and start a new one with `agentbridge claude`.";
+    case "probe_in_progress":
+      return "AgentBridge rejected this session \u2014 a liveness probe is currently checking the incumbent Claude session. Retry in a few seconds with `agentbridge claude`.";
+    case "auto_recovery_exhausted":
+      return "AgentBridge auto-recovery gave up after exhausting its retry budget for the in-flight liveness probe contention. Retry manually with `agentbridge claude`.";
     case "killed":
       return "AgentBridge is disabled by `agentbridge kill`. Restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to reconnect.";
   }
@@ -14529,6 +14576,9 @@ var lastDisconnectNotifyTs = 0;
 var lastReconnectNotifyTs = 0;
 var disabledRecoveryTimer = null;
 var disabledRecoveryInFlight = false;
+var disabledRecoveryAttempts = 0;
+var DISABLED_RECOVERY_MAX_ATTEMPTS = 6;
+var DISABLED_RECOVERY_CONFIRM_TIMEOUT_MS = 1000;
 claude.setReplySender(async (msg, requireReply) => {
   if (msg.source !== "claude") {
     return { success: false, error: "Invalid message source" };
@@ -14573,14 +14623,38 @@ daemonClient.on("disconnect", () => {
   }
   reconnectToDaemon();
 });
-daemonClient.on("rejected", async () => {
+daemonClient.on("rejected", async (code) => {
   if (shuttingDown || daemonDisabled)
     return;
-  log("Daemon rejected this session (close code 4001) \u2014 another Claude session is already connected");
+  let reason;
+  let notificationId;
+  let notificationContent;
+  switch (code) {
+    case CLOSE_CODE_EVICTED_STALE:
+      reason = "evicted";
+      notificationId = "system_bridge_evicted";
+      notificationContent = "\u26A0\uFE0F AgentBridge evicted this session because it stopped responding to liveness probes \u2014 a newer Claude Code session has taken over. Close this session and start a new one with `agentbridge claude` if you want to reconnect. AgentBridge \u56E0\u6B64\u4F1A\u8BDD\u672A\u54CD\u5E94\u5B58\u6D3B\u63A2\u6D4B\u800C\u5C06\u5176\u9A71\u9010\u2014\u2014\u66F4\u65B0\u7684 Claude Code \u4F1A\u8BDD\u5DF2\u63A5\u7BA1\u3002\u5982\u9700\u91CD\u8FDE\uFF0C\u8BF7\u5173\u95ED\u6B64\u4F1A\u8BDD\u5E76\u8FD0\u884C `agentbridge claude` \u542F\u52A8\u65B0\u4F1A\u8BDD\u3002";
+      break;
+    case CLOSE_CODE_PROBE_IN_PROGRESS:
+      reason = "probe_in_progress";
+      notificationId = "system_bridge_probe_in_progress";
+      notificationContent = "\u26A0\uFE0F AgentBridge rejected this session \u2014 a liveness probe is currently checking whether the incumbent Claude session is still alive. Retry in a few seconds with `agentbridge claude`. AgentBridge \u62D2\u7EDD\u4E86\u6B64\u4F1A\u8BDD\u2014\u2014\u6B63\u5728\u901A\u8FC7\u5B58\u6D3B\u63A2\u6D4B\u68C0\u67E5\u73B0\u6709 Claude \u4F1A\u8BDD\u662F\u5426\u4ECD\u7136\u5728\u7EBF\u3002\u8BF7\u7A0D\u540E\u7528 `agentbridge claude` \u91CD\u8BD5\u3002";
+      break;
+    default:
+      reason = "rejected";
+      notificationId = "system_bridge_replaced";
+      notificationContent = "\u26A0\uFE0F AgentBridge daemon rejected this session \u2014 another Claude Code session is already connected. Close the other session first, or run `agentbridge kill` to reset. AgentBridge \u5B88\u62A4\u8FDB\u7A0B\u62D2\u7EDD\u4E86\u6B64\u4F1A\u8BDD\u2014\u2014\u53E6\u4E00\u4E2A Claude Code \u4F1A\u8BDD\u5DF2\u5728\u8FDE\u63A5\u4E2D\u3002\u8BF7\u5148\u5173\u95ED\u53E6\u4E00\u4E2A\u4F1A\u8BDD\uFF0C\u6216\u8FD0\u884C `agentbridge kill` \u91CD\u7F6E\u3002";
+      break;
+  }
+  log(`Daemon rejected this session (close code ${code}, reason=${reason})`);
   daemonDisabled = true;
-  daemonDisabledReason = "rejected";
-  await claude.pushNotification(systemMessage("system_bridge_replaced", "\u26A0\uFE0F AgentBridge daemon rejected this session \u2014 another Claude Code session is already connected. Close the other session first, or run `agentbridge kill` to reset. AgentBridge \u5B88\u62A4\u8FDB\u7A0B\u62D2\u7EDD\u4E86\u6B64\u4F1A\u8BDD\u2014\u2014\u53E6\u4E00\u4E2A Claude Code \u4F1A\u8BDD\u5DF2\u5728\u8FDE\u63A5\u4E2D\u3002\u8BF7\u5148\u5173\u95ED\u53E6\u4E00\u4E2A\u4F1A\u8BDD\uFF0C\u6216\u8FD0\u884C `agentbridge kill` \u91CD\u7F6E\u3002"));
+  daemonDisabledReason = reason;
+  await claude.pushNotification(systemMessage(notificationId, notificationContent));
   await daemonClient.disconnect();
+  if (reason === "probe_in_progress") {
+    disabledRecoveryAttempts = 0;
+    startDisabledRecoveryPoller();
+  }
 });
 claude.on("ready", async () => {
   log(`MCP server ready (delivery mode: ${claude.getDeliveryMode()}) \u2014 ensuring AgentBridge daemon...`);
@@ -14697,20 +14771,72 @@ async function pollDisabledRecovery() {
     if (!healthy) {
       return;
     }
-    log("Disabled-state recovery conditions met \u2014 attempting direct daemon reconnect");
-    try {
-      await daemonClient.connect();
-      daemonClient.attachClaude();
-      daemonDisabled = false;
-      daemonDisabledReason = null;
-      stopDisabledRecoveryPoller();
-      claude.pushNotification(systemMessage("system_bridge_recovered", "\u2705 AgentBridge recovered after the killed sentinel was cleared. Daemon reconnected."));
-    } catch (err) {
-      log(`Disabled-state direct reconnect failed: ${err.message}`);
-      daemonDisabled = false;
-      daemonDisabledReason = null;
-      stopDisabledRecoveryPoller();
-      reconnectToDaemon();
+    const recoveredFrom = daemonDisabledReason;
+    switch (recoveredFrom) {
+      case "probe_in_progress": {
+        if (disabledRecoveryAttempts >= DISABLED_RECOVERY_MAX_ATTEMPTS) {
+          log(`Disabled-state auto-recovery gave up after ${DISABLED_RECOVERY_MAX_ATTEMPTS} attempts ` + "\u2014 switching to auto_recovery_exhausted terminal state");
+          daemonDisabledReason = "auto_recovery_exhausted";
+          disabledRecoveryAttempts = 0;
+          stopDisabledRecoveryPoller();
+          claude.pushNotification(systemMessage("system_bridge_auto_recovery_gave_up", "\u26A0\uFE0F AgentBridge auto-recovery gave up after exhausting its retry budget for the in-flight liveness probe contention. Retry manually with `agentbridge claude`. AgentBridge \u81EA\u52A8\u6062\u590D\u5DF2\u653E\u5F03\u2014\u2014\u5B58\u6D3B\u63A2\u6D4B\u4E89\u7528\u7684\u91CD\u8BD5\u9884\u7B97\u5DF2\u7528\u5C3D\u3002\u8BF7\u4F7F\u7528 `agentbridge claude` \u624B\u52A8\u91CD\u8BD5\u3002"));
+          return;
+        }
+        disabledRecoveryAttempts += 1;
+        log(`Disabled-state recovery attempt ${disabledRecoveryAttempts}/${DISABLED_RECOVERY_MAX_ATTEMPTS} ` + "for probe_in_progress \u2014 attempting direct daemon reconnect");
+        try {
+          await daemonClient.connect();
+          const attached = await daemonClient.attachClaudeAndWaitForStatus(DISABLED_RECOVERY_CONFIRM_TIMEOUT_MS);
+          if (!attached) {
+            log(`Disabled-state probe_in_progress recovery attempt ${disabledRecoveryAttempts} did not confirm readiness`);
+            await daemonClient.disconnect();
+            return;
+          }
+          daemonDisabled = false;
+          daemonDisabledReason = null;
+          disabledRecoveryAttempts = 0;
+          stopDisabledRecoveryPoller();
+          claude.pushNotification(systemMessage("system_bridge_recovered", "\u2705 AgentBridge recovered after the liveness probe completed. Daemon reconnected."));
+        } catch (err) {
+          log(`Disabled-state probe_in_progress recovery attempt failed: ${err.message}`);
+          await daemonClient.disconnect();
+        }
+        return;
+      }
+      case "killed": {
+        log("Disabled-state recovery conditions met \u2014 attempting direct daemon reconnect");
+        try {
+          await daemonClient.connect();
+          const attached = await daemonClient.attachClaudeAndWaitForStatus(DISABLED_RECOVERY_CONFIRM_TIMEOUT_MS);
+          if (!attached) {
+            throw new Error("daemon did not confirm reconnect");
+          }
+          daemonDisabled = false;
+          daemonDisabledReason = null;
+          disabledRecoveryAttempts = 0;
+          stopDisabledRecoveryPoller();
+          claude.pushNotification(systemMessage("system_bridge_recovered", "\u2705 AgentBridge recovered after the killed sentinel was cleared. Daemon reconnected."));
+        } catch (err) {
+          log(`Disabled-state direct reconnect failed: ${err.message}`);
+          daemonDisabled = false;
+          daemonDisabledReason = null;
+          disabledRecoveryAttempts = 0;
+          stopDisabledRecoveryPoller();
+          reconnectToDaemon();
+        }
+        return;
+      }
+      case "evicted":
+      case "rejected":
+      case "auto_recovery_exhausted":
+      case null:
+        log(`Disabled-state recovery poller encountered terminal/unexpected reason ${recoveredFrom ?? "null"} \u2014 stopping`);
+        stopDisabledRecoveryPoller();
+        return;
+      default: {
+        const exhaustive = recoveredFrom;
+        return exhaustive;
+      }
     }
   } finally {
     disabledRecoveryInFlight = false;
