@@ -29,6 +29,18 @@ import {
   type AppServerTrackedRequestMethod,
   type TurnStartParams,
 } from "./app-server-protocol";
+import {
+  CODEX_TRANSPORT_ENV,
+  TcpToUnixRelay,
+  type CodexTransport,
+  codexListenArg,
+  codexSocketPath,
+  ensureSocketDir,
+  parseTransportMode,
+  removeSocketFile,
+  resolveCodexTransport,
+  waitForUnixWsReady,
+} from "./codex-transport";
 
 interface TuiSocketData {
   connId: number;
@@ -75,6 +87,12 @@ export class CodexAdapter extends EventEmitter {
   private appServerWs: WebSocket | null = null;
   private tuiWs: ServerWebSocket<TuiSocketData> | null = null;
   private proxyServer: ReturnType<typeof Bun.serve> | null = null;
+  // #85 transport: how Codex app-server is reached. In "unix" mode the adapter
+  // still connects to ws://127.0.0.1:appPort, but a TcpToUnixRelay bridges that
+  // TCP port to Codex's unix socket (Codex builds may drop ws:// listen support).
+  private transport: CodexTransport = "ws";
+  private socketPath: string | null = null;
+  private relay: TcpToUnixRelay | null = null;
   private threadId: string | null = null;
   // Reserve negative ids for bridge-originated requests so they never collide
   // with proxy-rewritten TUI request ids.
@@ -169,9 +187,19 @@ export class CodexAdapter extends EventEmitter {
 
   async start() {
     this.intentionalDisconnect = false;
+    // #85: pick the Codex transport. checkPorts still applies in both modes —
+    // in unix mode the relay (not Codex) binds appPort, but the port must still
+    // be free for the relay to bind it; proxyPort is always ours.
     await this.checkPorts();
-    this.log(`Spawning codex app-server on ${this.appServerUrl}`);
-    this.proc = spawn("codex", ["app-server", "--listen", this.appServerUrl], {
+    this.resolveTransport();
+
+    const listen = codexListenArg(this.transport, this.appPort, this.socketPath ?? "");
+    if (this.transport === "unix" && this.socketPath) {
+      ensureSocketDir(this.socketPath);
+      removeSocketFile(this.socketPath); // clear any stale socket from a prior run
+    }
+    this.log(`Spawning codex app-server (transport=${this.transport}) --listen ${listen}`);
+    this.proc = spawn("codex", ["app-server", "--listen", listen], {
       stdio: ["pipe", "pipe", "pipe"],
     });
 
@@ -183,13 +211,31 @@ export class CodexAdapter extends EventEmitter {
     const stdoutRl = createInterface({ input: this.proc.stdout! });
     stdoutRl.on("line", (l) => this.log(`[codex-stdout] ${l}`));
 
-    await this.waitForHealthy();
+    if (this.transport === "unix" && this.socketPath) {
+      // Codex's unix listener does NOT serve HTTP /healthz — probe readiness via
+      // a WS upgrade against the socket, then stand up the TCP↔unix relay so the
+      // adapter's unchanged `new WebSocket(ws://127.0.0.1:appPort)` reaches it.
+      await waitForUnixWsReady(this.socketPath);
+      this.relay = new TcpToUnixRelay("127.0.0.1", this.appPort, this.socketPath, (m) => this.log(`[relay] ${m}`));
+      await this.relay.start();
+      this.log(`Transport relay ready: ws://127.0.0.1:${this.appPort} → unix://${this.socketPath}`);
+    } else {
+      await this.waitForHealthy();
+    }
 
     // Connect to app-server once, keep it alive permanently
     await this.connectToAppServer();
 
     this.startProxy();
     this.log(`Proxy ready on ${this.proxyUrl}`);
+  }
+
+  /** #85: resolve the transport (env-driven, `auto` probes ws support) and the unix socket path. */
+  private resolveTransport() {
+    const mode = parseTransportMode(process.env[CODEX_TRANSPORT_ENV]);
+    this.transport = resolveCodexTransport(mode);
+    this.socketPath = this.transport === "unix" ? codexSocketPath(this.appPort) : null;
+    this.log(`Codex transport mode=${mode} resolved=${this.transport}`);
   }
 
   /** Disconnect the bridge (proxy + app-server WS) without killing the Codex process. */
@@ -215,6 +261,12 @@ export class CodexAdapter extends EventEmitter {
     }
     this.proxyServer?.stop();
     this.proxyServer = null;
+    // #85: tear down the transport relay and remove the unix socket file.
+    if (this.relay) {
+      this.relay.stop();
+      this.relay = null;
+    }
+    if (this.socketPath) removeSocketFile(this.socketPath);
     this.clearResponseTrackingState();
     // #69: an intentional disconnect must synchronously drop turn state +
     // watchdog timers. We cannot rely on handleAppServerClose for this: we set

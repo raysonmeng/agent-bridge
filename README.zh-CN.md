@@ -248,6 +248,7 @@ agent_bridge/
 | `AGENTBRIDGE_CONTROL_PORT` | `4502` | bridge.ts 与 daemon.ts 之间的控制端口 |
 | `AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS` | `3000` | 等待在位 Claude pong 的最长时间，超时后在争用时驱逐（issue #68） |
 | `AGENTBRIDGE_TURN_WATCHDOG_MS` | `300000` | 单 turn 非活动看门狗：app-server 静默超过该毫秒数后强制完成该 turn，避免丢失 `turn/completed` 永久锁死注入（issue #69） |
+| `AGENTBRIDGE_CODEX_TRANSPORT` | `auto` | daemon 连接 Codex app-server 的方式：`auto`（探测 `codex app-server --help`，支持 `ws://` 则用 ws，否则经透明中继回退到 `unix://` socket）、`ws`（强制 ws）、`unix`（强制 unix socket + 中继）。用于去掉 `ws://` listen 支持的 Codex 版本（issue #85） |
 | `AGENTBRIDGE_STATE_DIR` | 平台默认 | 状态目录（pid、status、日志）。macOS: `~/Library/Application Support/agentbridge/`，Linux: `$XDG_STATE_HOME/agentbridge/` |
 | `AGENTBRIDGE_MODE` | `push` | 消息投递模式（`push` 用于 channel，`pull` 用于 API key 模式） |
 | `AGENTBRIDGE_DAEMON_ENTRY` | `./daemon.ts` | 覆盖 daemon 入口（插件包使用） |

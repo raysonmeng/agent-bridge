@@ -24,6 +24,7 @@
     "prepublishOnly": "bun run build:cli && bun run build:plugin",
     "validate:plugin": "claude plugin validate plugins/agentbridge && claude plugin validate .claude-plugin/marketplace.json",
     "test": "bun test src",
+    "e2e:transport": "bun scripts/e2e-codex-transport.mjs",
     "typecheck": "tsc --noEmit",
     "validate:plugin-versions": "bun scripts/check-plugin-versions.js",
     "check": "tsc --noEmit && bun test src && bun run verify:plugin-sync && bun scripts/check-plugin-versions.js"
