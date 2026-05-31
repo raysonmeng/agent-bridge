@@ -249,6 +249,8 @@ agent_bridge/
 | `CODEX_PROXY_PORT` | `4501` | Bridge proxy port for the Codex TUI |
 | `AGENTBRIDGE_CONTROL_PORT` | `4502` | Control port between bridge.ts and daemon.ts |
 | `AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS` | `3000` | Maximum wait for incumbent Claude pong before evicting on contention (issue #68) |
+| `AGENTBRIDGE_TURN_WATCHDOG_MS` | `300000` | Per-turn inactivity watchdog: force-completes a turn after this many ms of app-server silence so a lost `turn/completed` can't lock injection forever (issue #69) |
+| `AGENTBRIDGE_CODEX_TRANSPORT` | `auto` | How the daemon reaches the Codex app-server: `auto` (probe `codex app-server --help`, use `ws://` if supported else fall back to a `unix://` socket via a transparent relay), `ws` (force ws), or `unix` (force unix socket + relay). For builds that drop `ws://` listen support (issue #85) |
 | `AGENTBRIDGE_STATE_DIR` | Platform default | State directory for pid, status, logs (macOS: `~/Library/Application Support/agentbridge/`, Linux: `$XDG_STATE_HOME/agentbridge/`) |
 | `AGENTBRIDGE_MODE` | `push` | Message delivery mode (`push` for channels, `pull` for API key mode) |
 | `AGENTBRIDGE_DAEMON_ENTRY` | `./daemon.ts` | Override daemon entry point (used by plugin bundles) |

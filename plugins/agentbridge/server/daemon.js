@@ -105,6 +105,232 @@ function isAppServerResponseMessage(value) {
   return (typeof value.id === "number" || typeof value.id === "string") && value.method === undefined && (("result" in value) || ("error" in value));
 }
 
+// src/codex-transport.ts
+import { createServer, connect } from "net";
+import { spawnSync } from "child_process";
+import { mkdirSync as mkdirSync2, rmSync, chmodSync } from "fs";
+import { join as join2 } from "path";
+import { tmpdir } from "os";
+var CODEX_TRANSPORT_ENV = "AGENTBRIDGE_CODEX_TRANSPORT";
+var HEADER_SEP = `\r
+\r
+`;
+var EXTENSIONS_HEADER_RE = /^sec-websocket-extensions:/i;
+var MAX_UPGRADE_HEADER_BYTES = 64 * 1024;
+function parseTransportMode(raw) {
+  switch ((raw ?? "").trim().toLowerCase()) {
+    case "ws":
+      return "ws";
+    case "unix":
+      return "unix";
+    case "auto":
+    case "":
+      return "auto";
+    default:
+      return "auto";
+  }
+}
+function probeCodexWsSupport(runHelp = defaultRunCodexAppServerHelp) {
+  const help = runHelp();
+  if (help === null)
+    return true;
+  return help.includes("ws://");
+}
+function defaultRunCodexAppServerHelp() {
+  try {
+    const res = spawnSync("codex", ["app-server", "--help"], {
+      encoding: "utf-8",
+      timeout: 5000
+    });
+    if (res.error || typeof res.stdout !== "string")
+      return null;
+    return res.stdout + (res.stderr ?? "");
+  } catch {
+    return null;
+  }
+}
+function resolveCodexTransport(mode, runHelp = defaultRunCodexAppServerHelp) {
+  if (mode === "ws")
+    return "ws";
+  if (mode === "unix")
+    return "unix";
+  return probeCodexWsSupport(runHelp) ? "ws" : "unix";
+}
+function codexSocketPath(appPort, baseTmpDir = tmpdir()) {
+  const uid = typeof process.getuid === "function" ? process.getuid() : 0;
+  const dir = join2(baseTmpDir, `agentbridge-${uid}`);
+  const path = join2(dir, `codex-${appPort}.sock`);
+  if (path.length >= 104) {
+    throw new Error(`Codex unix socket path is too long for the platform (${path.length} >= 104): ${path}. ` + `Set a shorter TMPDIR or use ${CODEX_TRANSPORT_ENV}=ws.`);
+  }
+  return path;
+}
+function ensureSocketDir(socketPath) {
+  const dir = socketPath.slice(0, socketPath.lastIndexOf("/"));
+  if (!dir)
+    return;
+  mkdirSync2(dir, { recursive: true, mode: 448 });
+  try {
+    chmodSync(dir, 448);
+  } catch (err) {
+    throw new Error(`Refusing to use Codex socket dir ${dir}: cannot enforce 0700 perms ` + `(${err.message}). Remove it or set a private TMPDIR.`);
+  }
+}
+function removeSocketFile(socketPath) {
+  try {
+    rmSync(socketPath, { force: true });
+  } catch {}
+}
+function codexListenArg(transport, appPort, socketPath) {
+  return transport === "unix" ? `unix://${socketPath}` : `ws://127.0.0.1:${appPort}`;
+}
+function stripWebSocketExtensions(headerBlock) {
+  return headerBlock.split(`\r
+`).filter((line) => !EXTENSIONS_HEADER_RE.test(line)).join(`\r
+`);
+}
+
+class TcpToUnixRelay {
+  tcpHost;
+  tcpPort;
+  unixPath;
+  log;
+  server = null;
+  pairs = new Set;
+  constructor(tcpHost, tcpPort, unixPath, log = () => {}) {
+    this.tcpHost = tcpHost;
+    this.tcpPort = tcpPort;
+    this.unixPath = unixPath;
+    this.log = log;
+  }
+  start() {
+    return new Promise((resolve, reject) => {
+      const server = createServer((tcp) => this.handleConnection(tcp));
+      const onListenError = (err) => {
+        server.removeListener("listening", onListening);
+        reject(err);
+      };
+      const onListening = () => {
+        server.removeListener("error", onListenError);
+        server.on("error", (err) => this.log(`relay server error: ${err.message}`));
+        this.server = server;
+        resolve();
+      };
+      server.once("error", onListenError);
+      server.once("listening", onListening);
+      server.listen(this.tcpPort, this.tcpHost);
+    });
+  }
+  handleConnection(tcp) {
+    const unix = connect(this.unixPath);
+    const pair = { tcp, unix };
+    this.pairs.add(pair);
+    let closed = false;
+    const teardown = () => {
+      if (closed)
+        return;
+      closed = true;
+      this.pairs.delete(pair);
+      tcp.destroy();
+      unix.destroy();
+    };
+    let head = Buffer.alloc(0);
+    const onData = (chunk) => {
+      head = Buffer.concat([head, chunk]);
+      const sep = head.indexOf(HEADER_SEP);
+      if (sep === -1) {
+        if (head.length > MAX_UPGRADE_HEADER_BYTES) {
+          tcp.removeListener("data", onData);
+          unix.write(head);
+          head = Buffer.alloc(0);
+          tcp.pipe(unix);
+        }
+        return;
+      }
+      tcp.removeListener("data", onData);
+      const headers = head.subarray(0, sep).toString("utf8");
+      const rest = head.subarray(sep + HEADER_SEP.length);
+      unix.write(stripWebSocketExtensions(headers) + HEADER_SEP);
+      head = Buffer.alloc(0);
+      if (rest.length)
+        tcp.unshift(rest);
+      tcp.pipe(unix);
+    };
+    tcp.on("data", onData);
+    unix.pipe(tcp);
+    tcp.on("error", (e) => {
+      this.log(`relay tcp error: ${e.message}`);
+      teardown();
+    });
+    unix.on("error", (e) => {
+      this.log(`relay unix error: ${e.message}`);
+      teardown();
+    });
+    tcp.on("close", teardown);
+    unix.on("close", teardown);
+  }
+  get connectionCount() {
+    return this.pairs.size;
+  }
+  get port() {
+    const addr = this.server?.address();
+    return addr && typeof addr === "object" ? addr.port : this.tcpPort;
+  }
+  stop() {
+    if (this.server) {
+      this.server.close();
+      this.server = null;
+    }
+    for (const { tcp, unix } of this.pairs) {
+      tcp.destroy();
+      unix.destroy();
+    }
+    this.pairs.clear();
+  }
+}
+async function waitForUnixWsReady(socketPath, maxRetries = 40, delayMs = 250) {
+  for (let i = 0;i < maxRetries; i++) {
+    if (await attemptUnixWsUpgrade(socketPath))
+      return;
+    await new Promise((r) => setTimeout(r, delayMs));
+  }
+  throw new Error(`Codex unix app-server at ${socketPath} did not become ready`);
+}
+function attemptUnixWsUpgrade(socketPath) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const done = (ok) => {
+      if (settled)
+        return;
+      settled = true;
+      try {
+        socket.destroy();
+      } catch {}
+      resolve(ok);
+    };
+    const socket = connect(socketPath, () => {
+      socket.write(`GET / HTTP/1.1\r
+Host: localhost\r
+Upgrade: websocket\r
+Connection: Upgrade\r
+` + `Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r
+Sec-WebSocket-Version: 13\r
+\r
+`);
+    });
+    let buf = "";
+    socket.on("data", (d) => {
+      buf += d.toString("utf8");
+      if (buf.includes(`\r
+`))
+        done(buf.startsWith("HTTP/1.1 101"));
+    });
+    socket.on("error", () => done(false));
+    socket.on("close", () => done(false));
+    setTimeout(() => done(false), 1500);
+  });
+}
+
 // src/codex-adapter.ts
 class CodexAdapter extends EventEmitter {
   static RESPONSE_TRACKING_TTL_MS = 30000;
@@ -112,6 +338,9 @@ class CodexAdapter extends EventEmitter {
   appServerWs = null;
   tuiWs = null;
   proxyServer = null;
+  transport = "ws";
+  socketPath = null;
+  relay = null;
   threadId = null;
   nextInjectionId = -1;
   appPort;
@@ -124,6 +353,8 @@ class CodexAdapter extends EventEmitter {
   pendingRequests = new Map;
   activeTurnIds = new Set;
   turnInProgress = false;
+  turnWatchdogs = new Map;
+  threadSwitchSeq = 0;
   nextProxyId = 1e5;
   upstreamToClient = new Map;
   serverRequestToProxy = new Map;
@@ -163,8 +394,14 @@ class CodexAdapter extends EventEmitter {
   async start() {
     this.intentionalDisconnect = false;
     await this.checkPorts();
-    this.log(`Spawning codex app-server on ${this.appServerUrl}`);
-    this.proc = spawn("codex", ["app-server", "--listen", this.appServerUrl], {
+    this.resolveTransport();
+    const listen = codexListenArg(this.transport, this.appPort, this.socketPath ?? "");
+    if (this.transport === "unix" && this.socketPath) {
+      ensureSocketDir(this.socketPath);
+      removeSocketFile(this.socketPath);
+    }
+    this.log(`Spawning codex app-server (transport=${this.transport}) --listen ${listen}`);
+    this.proc = spawn("codex", ["app-server", "--listen", listen], {
       stdio: ["pipe", "pipe", "pipe"]
     });
     this.proc.on("error", (err) => this.emit("error", err));
@@ -173,10 +410,23 @@ class CodexAdapter extends EventEmitter {
     stderrRl.on("line", (l) => this.log(`[codex-server] ${l}`));
     const stdoutRl = createInterface({ input: this.proc.stdout });
     stdoutRl.on("line", (l) => this.log(`[codex-stdout] ${l}`));
-    await this.waitForHealthy();
+    if (this.transport === "unix" && this.socketPath) {
+      await waitForUnixWsReady(this.socketPath);
+      this.relay = new TcpToUnixRelay("127.0.0.1", this.appPort, this.socketPath, (m) => this.log(`[relay] ${m}`));
+      await this.relay.start();
+      this.log(`Transport relay ready: ws://127.0.0.1:${this.appPort} \u2192 unix://${this.socketPath}`);
+    } else {
+      await this.waitForHealthy();
+    }
     await this.connectToAppServer();
     this.startProxy();
     this.log(`Proxy ready on ${this.proxyUrl}`);
+  }
+  resolveTransport() {
+    const mode = parseTransportMode(process.env[CODEX_TRANSPORT_ENV]);
+    this.transport = resolveCodexTransport(mode);
+    this.socketPath = this.transport === "unix" ? codexSocketPath(this.appPort) : null;
+    this.log(`Codex transport mode=${mode} resolved=${this.transport}`);
   }
   disconnect() {
     this.intentionalDisconnect = true;
@@ -196,7 +446,14 @@ class CodexAdapter extends EventEmitter {
     }
     this.proxyServer?.stop();
     this.proxyServer = null;
+    if (this.relay) {
+      this.relay.stop();
+      this.relay = null;
+    }
+    if (this.socketPath)
+      removeSocketFile(this.socketPath);
     this.clearResponseTrackingState();
+    this.resetTurnState("adapter disconnect");
   }
   stop() {
     this.intentionalDisconnect = true;
@@ -323,8 +580,7 @@ class CodexAdapter extends EventEmitter {
       } catch {}
     }
     this.clearResponseTrackingStateForAppServerReconnect();
-    this.activeTurnIds.clear();
-    this.turnInProgress = false;
+    this.resetTurnState("app-server reconnect for new TUI session");
     try {
       await this.connectToAppServer(false);
       this.log("App-server reconnected for new TUI session \u2014 replaying buffered messages");
@@ -378,8 +634,7 @@ class CodexAdapter extends EventEmitter {
     this.log(`App-server connection closed (intentional=${intentional}, tuiConnected=${tuiConnected}, turnInProgress=${this.turnInProgress})`);
     this.appServerWs = null;
     this.clearResponseTrackingState();
-    this.activeTurnIds.clear();
-    this.turnInProgress = false;
+    this.resetTurnState("app-server connection closed");
     if (!intentional) {
       this.scheduleReconnect();
     }
@@ -811,6 +1066,9 @@ class CodexAdapter extends EventEmitter {
   handleAppServerPayload(raw) {
     try {
       const parsed = JSON.parse(raw);
+      if (typeof parsed === "object" && parsed !== null) {
+        this.refreshTurnWatchdogs();
+      }
       if (typeof parsed === "object" && parsed !== null && "id" in parsed) {
         if (this.tryConsumeReplayResponse(parsed)) {
           return null;
@@ -1039,6 +1297,9 @@ class CodexAdapter extends EventEmitter {
         pending.threadId = threadId;
       }
     }
+    if (method === "thread/start" || method === "thread/resume") {
+      pending.threadSwitchSeq = ++this.threadSwitchSeq;
+    }
     if (this.pendingRequests.has(key)) {
       this.log(`WARNING: overwriting pending request for key ${key}`);
     }
@@ -1062,6 +1323,10 @@ class CodexAdapter extends EventEmitter {
     }
     switch (pending.method) {
       case "thread/start": {
+        if (!this.isLatestThreadSwitch(pending)) {
+          this.log(`Ignoring stale thread/start response ${key} (seq=${pending.threadSwitchSeq} < latest=${this.threadSwitchSeq})`);
+          break;
+        }
         const threadId = message?.result?.thread?.id;
         if (typeof threadId === "string" && threadId.length > 0) {
           this.setActiveThreadId(threadId, `thread/start response ${key}`);
@@ -1070,6 +1335,10 @@ class CodexAdapter extends EventEmitter {
         break;
       }
       case "thread/resume": {
+        if (!this.isLatestThreadSwitch(pending)) {
+          this.log(`Ignoring stale thread/resume response ${key} (seq=${pending.threadSwitchSeq} < latest=${this.threadSwitchSeq})`);
+          break;
+        }
         const threadId = message?.result?.thread?.id;
         if (typeof threadId === "string" && threadId.length > 0) {
           this.setActiveThreadId(threadId, `thread/resume response ${key}`);
@@ -1082,10 +1351,17 @@ class CodexAdapter extends EventEmitter {
       }
       case "turn/start":
         if (pending.threadId) {
-          this.setActiveThreadId(pending.threadId, `turn/start response ${key}`);
+          if (this.threadId === null || this.threadId === pending.threadId) {
+            this.setActiveThreadId(pending.threadId, `turn/start response ${key}`);
+          } else {
+            this.log(`Ignoring turn/start response ${key} threadId=${pending.threadId} (active thread is ${this.threadId})`);
+          }
         }
         break;
     }
+  }
+  isLatestThreadSwitch(pending) {
+    return pending.threadSwitchSeq === this.threadSwitchSeq;
   }
   setActiveThreadId(threadId, reason) {
     if (this.threadId === threadId)
@@ -1101,11 +1377,9 @@ class CodexAdapter extends EventEmitter {
   }
   markTurnStarted(turnId) {
     const wasInProgress = this.turnInProgress;
-    if (typeof turnId === "string" && turnId.length > 0) {
-      this.activeTurnIds.add(turnId);
-    } else {
-      this.activeTurnIds.add(`unknown:${Date.now()}`);
-    }
+    const turnKey = typeof turnId === "string" && turnId.length > 0 ? turnId : `unknown:${Date.now()}`;
+    this.activeTurnIds.add(turnKey);
+    this.scheduleTurnWatchdog(turnKey);
     this.turnInProgress = this.activeTurnIds.size > 0;
     if (!wasInProgress && this.turnInProgress) {
       this.emit("turnStarted");
@@ -1114,10 +1388,67 @@ class CodexAdapter extends EventEmitter {
   markTurnCompleted(turnId) {
     if (typeof turnId === "string" && turnId.length > 0) {
       this.activeTurnIds.delete(turnId);
+      this.clearTurnWatchdog(turnId);
     } else {
       this.activeTurnIds.clear();
+      this.clearAllTurnWatchdogs();
     }
     this.turnInProgress = this.activeTurnIds.size > 0;
+  }
+  turnWatchdogMs() {
+    const v = Number(process.env.AGENTBRIDGE_TURN_WATCHDOG_MS);
+    return Number.isFinite(v) && v > 0 ? v : 300000;
+  }
+  scheduleTurnWatchdog(turnKey) {
+    this.clearTurnWatchdog(turnKey);
+    const timer = setTimeout(() => {
+      if (!this.activeTurnIds.has(turnKey))
+        return;
+      this.log(`WARNING: turn ${turnKey} watchdog fired after ${this.turnWatchdogMs()}ms of inactivity \u2014 ` + `assuming a lost turn/completed; force-completing to unblock injection`);
+      this.forceCompleteTurn(turnKey);
+    }, this.turnWatchdogMs());
+    timer.unref?.();
+    this.turnWatchdogs.set(turnKey, timer);
+  }
+  clearTurnWatchdog(turnKey) {
+    const timer = this.turnWatchdogs.get(turnKey);
+    if (timer) {
+      clearTimeout(timer);
+      this.turnWatchdogs.delete(turnKey);
+    }
+  }
+  clearAllTurnWatchdogs() {
+    for (const timer of this.turnWatchdogs.values())
+      clearTimeout(timer);
+    this.turnWatchdogs.clear();
+  }
+  refreshTurnWatchdogs() {
+    if (this.turnWatchdogs.size === 0)
+      return;
+    for (const turnKey of [...this.turnWatchdogs.keys()]) {
+      this.scheduleTurnWatchdog(turnKey);
+    }
+  }
+  forceCompleteTurn(turnKey) {
+    const wasInProgress = this.turnInProgress;
+    this.activeTurnIds.delete(turnKey);
+    this.clearTurnWatchdog(turnKey);
+    this.turnInProgress = this.activeTurnIds.size > 0;
+    if (wasInProgress && !this.turnInProgress) {
+      this.emit("turnCompleted");
+    }
+  }
+  resetTurnState(reason, emitCompleted = false) {
+    const wasInProgress = this.turnInProgress;
+    this.activeTurnIds.clear();
+    this.clearAllTurnWatchdogs();
+    this.turnInProgress = false;
+    if (emitCompleted && wasInProgress) {
+      this.emit("turnCompleted");
+    }
+    if (wasInProgress) {
+      this.log(`Turn state reset (${reason})`);
+    }
   }
   requestKey(id) {
     if (typeof id === "number" || typeof id === "string")
@@ -1746,8 +2077,8 @@ function isProcessAlive(pid) {
 }
 
 // src/config-service.ts
-import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync3 } from "fs";
-import { join as join2 } from "path";
+import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync3, existsSync as existsSync3 } from "fs";
+import { join as join3 } from "path";
 var DEFAULT_CONFIG = {
   version: "1.0",
   codex: {
@@ -1799,8 +2130,8 @@ class ConfigService {
   configPath;
   constructor(projectRoot) {
     const root = projectRoot ?? process.cwd();
-    this.configDir = join2(root, CONFIG_DIR);
-    this.configPath = join2(this.configDir, CONFIG_FILE);
+    this.configDir = join3(root, CONFIG_DIR);
+    this.configPath = join3(this.configDir, CONFIG_FILE);
   }
   hasConfig() {
     return existsSync3(this.configPath);
@@ -1835,7 +2166,7 @@ class ConfigService {
   }
   ensureConfigDir() {
     if (!existsSync3(this.configDir)) {
-      mkdirSync2(this.configDir, { recursive: true });
+      mkdirSync3(this.configDir, { recursive: true });
     }
   }
 }
