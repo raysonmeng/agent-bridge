@@ -135,6 +135,13 @@ class CliE2EHarness {
     const env: NodeJS.ProcessEnv = {
       ...process.env,
       PATH: `${binDir}:${process.env.PATH ?? ""}`,
+      // Strip any pair env leaked from a real `abg claude` session in the parent
+      // shell. computeBaseDir() prefers AGENTBRIDGE_BASE_DIR, so a leaked value
+      // would make the CLI read the developer's REAL registry instead of this
+      // test's tmp stateDir, breaking pair/kill isolation (undefined → omitted).
+      AGENTBRIDGE_BASE_DIR: undefined,
+      AGENTBRIDGE_PAIR_ID: undefined,
+      AGENTBRIDGE_PAIR_NAME: undefined,
       AGENTBRIDGE_STATE_DIR: stateDir,
       AGENTBRIDGE_CONTROL_PORT: String(controlPort),
       AGENTBRIDGE_DAEMON_ENTRY: fakeDaemonPath,
@@ -595,7 +602,7 @@ describe("E2E: CLI surface", () => {
 
         expect(result.code).toBe(0);
         expect(result.stdout).toContain("AgentBridge stopped.");
-        expect(result.stdout).toContain("Please restart Claude Code (`agentbridge claude --pair work`)");
+        expect(result.stdout).toContain("Please restart Claude Code (`agentbridge --pair work claude`)");
         expect(result.stdout).not.toContain("Please restart Claude Code (`agentbridge claude`)");
       } finally {
         await stopProcess(trackedDaemon);
@@ -613,7 +620,7 @@ describe("E2E: CLI surface", () => {
 
       expect(result.code).toBe(0);
       expect(result.stdout).toContain("Usage: abg kill");
-      expect(result.stdout).toContain("--pair <id>");
+      expect(result.stdout).toContain("--pair <name|id>");
       expect(pid && isProcessAlive(pid)).toBe(true);
       expect(existsSync(join(harness.stateDir, "killed"))).toBe(false);
     });

@@ -16,12 +16,22 @@ export type ControlClientMessage =
   | { type: "claude_connect" }
   | { type: "claude_disconnect" }
   | { type: "claude_to_codex"; requestId: string; message: BridgeMessage; requireReply?: boolean }
-  | { type: "status" };
+  | { type: "status" }
+  // Non-attaching probe: ask the daemon whether it already has a LIVE Claude
+  // frontend attached, WITHOUT contesting/attaching this socket. Used by the
+  // `abg claude` CLI conflict guard so a second session in the same pair errors
+  // out up front instead of evicting a live incumbent (issue #68 admission still
+  // arbitrates the authoritative live/stale decision at actual attach time).
+  | { type: "probe_incumbent" };
 
 export type ControlServerMessage =
   | { type: "codex_to_claude"; message: BridgeMessage }
   | { type: "claude_to_codex_result"; requestId: string; success: boolean; error?: string }
-  | { type: "status"; status: DaemonStatus };
+  | { type: "status"; status: DaemonStatus }
+  // Reply to `probe_incumbent`. `connected` = a Claude frontend socket is
+  // currently attached; `alive` = it responded to a liveness ping (a half-open
+  // dead incumbent reports connected:true, alive:false → safe to take over).
+  | { type: "incumbent_status"; connected: boolean; alive: boolean };
 
 /** WebSocket close code sent by the daemon when a newer Claude session replaces the current one. */
 export const CLOSE_CODE_REPLACED = 4001;

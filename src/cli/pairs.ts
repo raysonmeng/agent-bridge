@@ -3,7 +3,7 @@ import { DaemonLifecycle } from "../daemon-lifecycle";
 import { detectLegacyRootDaemon, type PairEntry, type PairPorts } from "../pair-registry";
 import {
   computeBaseDir,
-  findPair,
+  findPairForFlag,
   listPairs,
   portsForEntry,
   removePair,
@@ -13,6 +13,7 @@ import { stopPairEntry } from "./kill";
 
 interface PairRow {
   pairId: string;
+  name: string;
   slot: number | null;
   ports: PairPorts;
   source: PairEntry["source"] | "legacy";
@@ -31,7 +32,7 @@ export async function runPairs(args: string[] = []) {
 
   if (command && command !== "list" && command !== "--json") {
     console.error(`Unknown pairs command: ${command}`);
-    console.error("Usage: abg pairs [--json] | abg pairs rm <id>");
+    console.error("Usage: abg pairs [--json] | abg pairs rm <name|id>");
     process.exit(1);
   }
 
@@ -45,16 +46,24 @@ export async function runPairs(args: string[] = []) {
 }
 
 async function runRemove(args: string[]) {
-  const pairId = args[0];
-  if (!pairId) {
-    console.error("Error: `abg pairs rm <id>` requires a pair id.");
+  const flag = args[0];
+  if (!flag) {
+    console.error("Error: `abg pairs rm <name|id>` requires a pair name or id.");
     process.exit(1);
   }
 
   const base = computeBaseDir();
-  const pair = findPair(base, pairId);
+  // Accept a cwd-scoped friendly name (e.g. "work") OR a raw composite id copied
+  // from `abg pairs` — same resolution kill uses, for consistency.
+  let pair: PairEntry | null;
+  try {
+    pair = findPairForFlag(base, process.cwd(), flag);
+  } catch (err) {
+    console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+    process.exit(1);
+  }
   if (!pair) {
-    console.log(`No such pair: ${pairId}`);
+    console.log(`No such pair: "${flag}" in ${process.cwd()}`);
     printKnownPairs(base);
     return;
   }
@@ -75,6 +84,7 @@ async function collectRows(): Promise<PairRow[]> {
   if (legacy) {
     rows.push({
       pairId: "(legacy-root)",
+      name: "-",
       slot: null,
       ports: { appPort: 4500, proxyPort: 4501, controlPort: legacy.controlPort },
       source: "legacy",
@@ -101,6 +111,7 @@ async function rowForPair(base: string, pair: PairEntry): Promise<PairRow> {
 
   return {
     pairId: pair.pairId,
+    name: pair.name ?? "-",
     slot: pair.slot,
     ports,
     source: pair.source,
@@ -117,6 +128,7 @@ function printTable(rows: PairRow[]) {
   }
 
   const data = rows.map((row) => ({
+    name: row.name,
     pairId: row.pairId,
     slot: row.slot === null ? "-" : String(row.slot),
     ports: `${row.ports.appPort}/${row.ports.proxyPort}/${row.ports.controlPort}`,
@@ -127,6 +139,7 @@ function printTable(rows: PairRow[]) {
   }));
 
   const headers = {
+    name: "name",
     pairId: "pairId",
     slot: "slot",
     ports: "app/proxy/control",
@@ -147,6 +160,7 @@ function printTable(rows: PairRow[]) {
 
   const line = (row: Record<keyof typeof headers, string>) =>
     [
+      row.name.padEnd(widths.name),
       row.pairId.padEnd(widths.pairId),
       row.slot.padEnd(widths.slot),
       row.ports.padEnd(widths.ports),
@@ -159,6 +173,7 @@ function printTable(rows: PairRow[]) {
   console.log(line(headers));
   console.log(
     [
+      "-".repeat(widths.name),
       "-".repeat(widths.pairId),
       "-".repeat(widths.slot),
       "-".repeat(widths.ports),

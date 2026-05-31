@@ -12,6 +12,7 @@ interface DaemonClientEvents {
   disconnect: [];
   rejected: [number];
   status: [DaemonStatus];
+  incumbentStatus: [{ connected: boolean; alive: boolean }];
 }
 
 let nextSocketId = 0;
@@ -125,6 +126,52 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     });
   }
 
+  /**
+   * Ask the daemon whether it already has a LIVE Claude frontend attached,
+   * WITHOUT attaching this socket (so it never contests the incumbent).
+   *
+   * Fail-OPEN: on timeout, a closed socket, or an older daemon that doesn't
+   * understand `probe_incumbent` (it stays silent), this resolves to
+   * `{ connected:false, alive:false }` so the conflict guard never blocks a
+   * legitimate launch on a probe failure — admission (#68) is the backstop.
+   */
+  async probeIncumbent(timeoutMs = 3000): Promise<{ connected: boolean; alive: boolean }> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return { connected: false, alive: false };
+    }
+
+    return await new Promise((resolve) => {
+      let settled = false;
+      let timer: ReturnType<typeof setTimeout> | null = null;
+
+      const finish = (value: { connected: boolean; alive: boolean }) => {
+        if (settled) return;
+        settled = true;
+        if (timer) clearTimeout(timer);
+        this.off("incumbentStatus", onStatus);
+        this.off("disconnect", onDisconnect);
+        this.off("rejected", onRejected);
+        resolve(value);
+      };
+
+      const onStatus = (s: { connected: boolean; alive: boolean }) => finish(s);
+      const onDisconnect = () => finish({ connected: false, alive: false });
+      const onRejected = () => finish({ connected: false, alive: false });
+
+      this.on("incumbentStatus", onStatus);
+      this.on("disconnect", onDisconnect);
+      this.on("rejected", onRejected);
+
+      timer = setTimeout(() => finish({ connected: false, alive: false }), timeoutMs);
+
+      try {
+        this.send({ type: "probe_incumbent" });
+      } catch {
+        finish({ connected: false, alive: false });
+      }
+    });
+  }
+
   async disconnect() {
     if (!this.ws) return;
 
@@ -187,6 +234,9 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
         }
         case "status":
           this.emit("status", message.status);
+          return;
+        case "incumbent_status":
+          this.emit("incumbentStatus", { connected: message.connected, alive: message.alive });
           return;
       }
     };

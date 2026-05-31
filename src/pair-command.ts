@@ -17,8 +17,9 @@
 export function pairScopedCommand(cmd: string): string {
   const pairId = process.env.AGENTBRIDGE_PAIR_ID;
   if (!pairId) return `agentbridge ${cmd}`;
-  // Insert `--pair <id>` right after the subcommand so it precedes any extra args.
-  const [sub, ...rest] = cmd.split(" ");
-  const tail = rest.length > 0 ? ` ${rest.join(" ")}` : "";
-  return `agentbridge ${sub} --pair ${pairId}${tail}`;
+  // Prefer the friendly, cwd-scoped name (e.g. "main") when available; it is what
+  // the user types. The hint is meant to be run from the same project directory.
+  const selector = process.env.AGENTBRIDGE_PAIR_NAME || pairId;
+  // `--pair <name>` goes BEFORE the subcommand (the supported position).
+  return `agentbridge --pair ${selector} ${cmd}`;
 }

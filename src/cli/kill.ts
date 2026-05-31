@@ -5,7 +5,7 @@ import { DaemonLifecycle, isProcessAlive } from "../daemon-lifecycle";
 import { PairError, detectLegacyRootDaemon, type PairEntry, type PairPorts } from "../pair-registry";
 import {
   computeBaseDir,
-  findPair,
+  findPairForFlag,
   listPairs,
   parseKillArgs,
   portsForEntry,
@@ -46,13 +46,22 @@ export async function runKill(args: string[] = []) {
   const results: StopResult[] = [];
   let restartCommand = "agentbridge claude";
   if (parsed.pairFlag !== undefined) {
-    const pair = findPair(base, parsed.pairFlag);
+    // The friendly name is scoped to the current directory (same name elsewhere
+    // is a different pair); findPairForFlag composes it with the cwd, falling
+    // back to a raw pairId match for ids copied from `abg pairs`.
+    let pair: PairEntry | null;
+    try {
+      pair = findPairForFlag(base, process.cwd(), parsed.pairFlag);
+    } catch (err) {
+      console.error(`Error: ${err instanceof Error ? err.message : String(err)}`);
+      process.exit(1);
+    }
     if (!pair) {
-      console.log(`No such pair: ${parsed.pairFlag}`);
+      console.log(`No such pair: "${parsed.pairFlag}" in ${process.cwd()}`);
       printKnownPairs(base);
       return;
     }
-    restartCommand = `agentbridge claude --pair ${parsed.pairFlag}`;
+    restartCommand = `agentbridge --pair ${pair.name ?? parsed.pairFlag} claude`;
     results.push(await stopPairEntry(base, pair));
   } else {
     for (const pair of listPairs(base)) {
@@ -98,14 +107,15 @@ function validateKillArgs(args: string[]): string | "help" | null {
 function printKillUsage() {
   console.log(`
 Usage: abg kill [--all]
-       abg kill --pair <id>
+       abg [--pair <name|id>] kill
 
 Stops AgentBridge daemon/TUI processes.
 
 Options:
-  --pair <id>   Stop only one registered pair.
-  --all         Stop all registered pairs and any legacy-root daemon.
-  --help, -h    Show this help message.
+  --pair <name|id>  Stop only one pair — a cwd-scoped name (e.g. "main") or a
+                    full pair id from "abg pairs".
+  --all             Stop all registered pairs and any legacy-root daemon.
+  --help, -h        Show this help message.
 
 No arguments are equivalent to --all.
 `.trim());
@@ -179,7 +189,7 @@ function printSummary(results: StopResult[], restartCommand: string) {
   if (failed > 0) {
     console.log(`${failed} target${failed === 1 ? "" : "s"} reported errors; see log lines above.`);
   }
-  console.log("Registry entries were preserved. Use `abg pairs rm <id>` to stop and release a slot.");
+  console.log("Registry entries were preserved. Use `abg pairs rm <name|id>` to stop and release a slot.");
 }
 
 async function killManagedCodexTui(

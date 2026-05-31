@@ -1,7 +1,25 @@
-import { describe, expect, test } from "bun:test";
+import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { disabledReplyError } from "../bridge-disabled-state";
 
 describe("bridge disabled-state messaging", () => {
+  // These assert the bare `agentbridge claude` / `agentbridge kill` hint
+  // substrings, i.e. manual/no-pair mode. Clear any pair env that may have
+  // leaked from another test so pairScopedCommand renders the bare command.
+  let savedId: string | undefined;
+  let savedName: string | undefined;
+  beforeEach(() => {
+    savedId = process.env.AGENTBRIDGE_PAIR_ID;
+    savedName = process.env.AGENTBRIDGE_PAIR_NAME;
+    delete process.env.AGENTBRIDGE_PAIR_ID;
+    delete process.env.AGENTBRIDGE_PAIR_NAME;
+  });
+  afterEach(() => {
+    if (savedId === undefined) delete process.env.AGENTBRIDGE_PAIR_ID;
+    else process.env.AGENTBRIDGE_PAIR_ID = savedId;
+    if (savedName === undefined) delete process.env.AGENTBRIDGE_PAIR_NAME;
+    else process.env.AGENTBRIDGE_PAIR_NAME = savedName;
+  });
+
   test("kill-disabled sessions explain how to reconnect", () => {
     expect(disabledReplyError("killed")).toContain("disabled by `agentbridge kill`");
     expect(disabledReplyError("killed")).toContain("/resume");

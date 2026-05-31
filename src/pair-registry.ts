@@ -37,6 +37,8 @@ import { basename, join } from "node:path";
 export const PAIR_BASE_PORT = 4500;
 export const PAIR_SLOT_STRIDE = 10;
 export const PAIR_ID_REGEX = /^[A-Za-z0-9._-]{1,64}$/;
+/** Friendly pair name used when no `--pair <name>` is given. Scoped to the cwd. */
+export const DEFAULT_PAIR_NAME = "main";
 
 const LOCK_FILE_NAME = ".registry.lock";
 const REGISTRY_FILE_NAME = "registry.json";
@@ -61,6 +63,12 @@ export interface PairEntry {
   pairId: string;
   slot: number;
   cwd: string;
+  /**
+   * Friendly, cwd-scoped name the user typed (or {@link DEFAULT_PAIR_NAME} when
+   * none was given). Display-only — the `pairId` remains the canonical key.
+   * Optional so registries written before this field shipped still read cleanly.
+   */
+  name?: string;
   source: "flag" | "cwd";
   createdAt: string;
 }
@@ -75,6 +83,8 @@ export interface ResolvedPair {
   slot: number;
   ports: PairPorts;
   stateDir: string;
+  /** Friendly, cwd-scoped name ({@link DEFAULT_PAIR_NAME} when no `--pair` given). */
+  name: string;
   entry: PairEntry;
 }
 
@@ -169,6 +179,47 @@ export function derivePairIdFromCwd(cwd: string): string {
   const id = slug ? `${slug}-${hash}` : hash;
   // Guaranteed to satisfy validatePairId by construction.
   return id;
+}
+
+/**
+ * Derive a stable, fs-safe pairId for a NAMED pair scoped to a directory.
+ *
+ * The id is `<name-slug>-<8-char hash of realpath(cwd)>`. Scoping the hash to the
+ * cwd is the whole point: the SAME friendly name (e.g. "main") in two different
+ * directories resolves to two DISTINCT pairs, so they never collide on a slot /
+ * daemon / set of ports. Two different names in the SAME directory also stay
+ * distinct (different slug prefix, same hash suffix).
+ *
+ * `name` must already be validated via {@link validatePairId} (or be
+ * {@link DEFAULT_PAIR_NAME}). The slug is re-sanitised + length-capped defensively
+ * so the composite always satisfies {@link PAIR_ID_REGEX} (≤ 41 chars).
+ */
+export function derivePairId(cwd: string, name: string): string {
+  let real: string;
+  try {
+    real = realpathSync(cwd);
+  } catch {
+    real = cwd;
+  }
+  // Hash BOTH the cwd AND the (already validated) name. Hashing the name is what
+  // makes two distinct names in the same directory provably distinct even when
+  // their cosmetic slug sanitises to the same string — e.g. "main" vs "-main-"
+  // both slug to "main", and "---" slugs to empty. Without the name in the hash
+  // those would collide on one slot/daemon. The NUL separator stops (cwd, name)
+  // pairs from aliasing across the boundary.
+  // Lowercase the name in the hash so casing variants ("Foo" vs "foo") map to
+  // the SAME pair (the registry canonicalises by lowercased pairId). The slug
+  // below keeps the original case purely for display.
+  const hash = createHash("sha256").update(real).update("\0").update(name.toLowerCase()).digest("hex").slice(0, 8);
+  const slug =
+    name
+      .replace(/[^A-Za-z0-9._-]+/g, "-")
+      .replace(/^-+|-+$/g, "")
+      .slice(0, 32) || "pair";
+  // The hex hash suffix guarantees the id never ends in a dot and is never
+  // a pure "." / "..", so the only invariant left to the slug is the charset.
+  // The slug is purely cosmetic now; the hash alone guarantees uniqueness.
+  return `${slug}-${hash}`;
 }
 
 /**
@@ -587,13 +638,27 @@ export interface ResolvePairOptions {
  * releasing it (probing is slow and must not serialize all CLI starts). Re-running
  * for the same pair is idempotent — the slot is reused and a healthy daemon on the
  * control port is treated as "already running", not a conflict.
+ *
+ * UPGRADE NOTE: the pairId scheme changed to the cwd-scoped `<name>-<hash>` form.
+ * Entries written by an older build (verbatim `--pair` ids, or a different
+ * cwd-derivation) will NOT be matched here, so a launch allocates a fresh slot
+ * rather than reusing the legacy one. The legacy entry remains visible in
+ * `abg pairs` and is reclaimable with `abg pairs rm <id>` or `abg kill`
+ * (kill-all stops every registered pair regardless of id shape). We intentionally
+ * do not auto-migrate: the old id format is ambiguous and this is pre-v1.
  */
 export async function resolvePair(base: string, opts: ResolvePairOptions): Promise<ResolvedPair> {
   // `pairFlag != null` (rather than truthiness) so an explicit-but-empty `--pair`
   // (a missing value) surfaces a clear PAIR_ID_INVALID instead of silently
-  // falling back to cwd derivation.
+  // falling back to the default name.
+  //
+  // The friendly NAME is always scoped to the cwd: with a flag it is the
+  // validated `--pair <name>`; without one it is DEFAULT_PAIR_NAME ("main").
+  // The canonical pairId composes the name with a hash of the cwd, so the same
+  // name in two directories is two distinct pairs (see derivePairId).
   const hasFlag = opts.pairFlag != null;
-  const pairId = hasFlag ? validatePairId(opts.pairFlag as string) : derivePairIdFromCwd(opts.cwd);
+  const name = hasFlag ? validatePairId(opts.pairFlag as string) : DEFAULT_PAIR_NAME;
+  const pairId = derivePairId(opts.cwd, name);
   const source: PairEntry["source"] = hasFlag ? "flag" : "cwd";
   const lower = pairId.toLowerCase();
 
@@ -622,6 +687,7 @@ export async function resolvePair(base: string, opts: ResolvePairOptions): Promi
       pairId,
       slot: newSlot,
       cwd: opts.cwd,
+      name,
       source,
       createdAt: new Date().toISOString(),
     };
@@ -657,7 +723,15 @@ export async function resolvePair(base: string, opts: ResolvePairOptions): Promi
   // Use the registry's canonical pairId (case preserved from first registration),
   // NOT the caller's casing — otherwise `--pair Foo` then `--pair foo` would split
   // one logical pair across two state dirs on a case-sensitive filesystem.
-  return { pairId: entry.pairId, slot, ports, stateDir: join(pairsDir(base), entry.pairId), entry };
+  // `entry.name` is backfilled for entries written before the `name` field shipped.
+  return {
+    pairId: entry.pairId,
+    slot,
+    ports,
+    stateDir: join(pairsDir(base), entry.pairId),
+    name: entry.name ?? name,
+    entry,
+  };
 }
 
 /** Remove a pair entry from the registry (frees its slot). Returns the removed entry or null. */

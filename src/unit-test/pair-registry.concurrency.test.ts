@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 
-import { readRegistry, resolvePair } from "../pair-registry";
+import { derivePairId, readRegistry, resolvePair } from "../pair-registry";
 
 // Absolute path to the module under test, so the throwaway child script can
 // import it regardless of where the OS drops the temp dir.
@@ -256,12 +256,13 @@ describe("pair-registry concurrency", () => {
 
     const resolved = await resolvePair(base, { pairFlag: "x", cwd, probePorts: false });
 
-    expect(resolved.pairId).toBe("x");
+    const expectedId = derivePairId(cwd, "x");
+    expect(resolved.pairId).toBe(expectedId);
     expect(resolved.slot).toBe(0);
     expect(resolved.ports.appPort).toBe(4500);
     // The lock must be released after the call returns.
     expect(existsSync(lockFile)).toBe(false);
-    expect(readRegistry(base).pairs.map((p) => p.pairId)).toContain("x");
+    expect(readRegistry(base).pairs.map((p) => p.pairId)).toContain(expectedId);
   });
 
   // A corrupt lock with pid:0 must be treated as dead (process.kill(0,0) targets
@@ -276,7 +277,7 @@ describe("pair-registry concurrency", () => {
     mkdirSync(cwd, { recursive: true });
 
     const resolved = await resolvePair(base, { pairFlag: "y", cwd, probePorts: false });
-    expect(resolved.pairId).toBe("y");
+    expect(resolved.pairId).toBe(derivePairId(cwd, "y"));
     expect(existsSync(join(pairsDir, ".registry.lock"))).toBe(false);
   });
 

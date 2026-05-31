@@ -3,11 +3,12 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { writeRegistry, type PairEntry } from "../pair-registry";
+import { derivePairId, writeRegistry, type PairEntry } from "../pair-registry";
 import {
   applyPairEnv,
   computeBaseDir,
   findPair,
+  findPairForFlag,
   listPairs,
   parseKillArgs,
   parsePairFlag,
@@ -23,6 +24,7 @@ const ENV_KEYS = [
   "AGENTBRIDGE_STATE_DIR",
   "AGENTBRIDGE_CONTROL_PORT",
   "AGENTBRIDGE_PAIR_ID",
+  "AGENTBRIDGE_PAIR_NAME",
   "CODEX_WS_PORT",
   "CODEX_PROXY_PORT",
 ] as const;
@@ -140,24 +142,31 @@ describe("applyPairEnv — pair mode env injection", () => {
   test("an existing pair injects its slot's ports + state dir + pair id (no port probe)", async () => {
     const base = makeBase();
     process.env.AGENTBRIDGE_STATE_DIR = base;
-    // Seed the pair as already-registered at slot 3 so resolvePair takes the
-    // existing branch (no port probe → deterministic regardless of host ports).
-    writeRegistry(base, { version: 1, pairs: [entry("work", 3)] });
+    // The friendly name "work" is scoped to the cwd; seed the composite id that
+    // applyPairEnv (cwd = process.cwd()) will derive, at slot 3, so resolvePair
+    // takes the existing branch (no port probe → deterministic regardless of host).
+    const pairId = derivePairId(process.cwd(), "work");
+    writeRegistry(base, {
+      version: 1,
+      pairs: [{ pairId, slot: 3, cwd: process.cwd(), name: "work", source: "flag", createdAt: "2026-01-01T00:00:00.000Z" }],
+    });
 
     const res = await applyPairEnv({ pairFlag: "work" });
 
     expect(res.manual).toBe(false);
-    expect(res.pairId).toBe("work");
+    expect(res.pairId).toBe(pairId);
+    expect(res.name).toBe("work");
     expect(res.slot).toBe(3);
     expect(res.ports).toEqual({ appPort: 4530, proxyPort: 4531, controlPort: 4532 });
 
-    // The env vars + pair id are injected for downstream / spawned children.
-    expect(process.env.AGENTBRIDGE_PAIR_ID).toBe("work");
+    // The env vars + pair id/name are injected for downstream / spawned children.
+    expect(process.env.AGENTBRIDGE_PAIR_ID).toBe(pairId);
+    expect(process.env.AGENTBRIDGE_PAIR_NAME).toBe("work");
     expect(process.env.AGENTBRIDGE_CONTROL_PORT).toBe("4532");
     expect(process.env.CODEX_WS_PORT).toBe("4530");
     expect(process.env.CODEX_PROXY_PORT).toBe("4531");
-    expect(process.env.AGENTBRIDGE_STATE_DIR).toBe(join(base, "pairs", "work"));
-    expect(res.stateDir.dir).toBe(join(base, "pairs", "work"));
+    expect(process.env.AGENTBRIDGE_STATE_DIR).toBe(join(base, "pairs", pairId));
+    expect(res.stateDir.dir).toBe(join(base, "pairs", pairId));
     // BASE_DIR is pinned to the registry base (NOT the per-pair state dir) so a
     // child `abg pairs`/`abg kill` resolves the same registry.
     expect(process.env.AGENTBRIDGE_BASE_DIR).toBe(base);
@@ -204,5 +213,49 @@ describe("registry helpers", () => {
     const removed = await removePair(base, "a");
     expect(removed?.pairId).toBe("a");
     expect(listPairs(base).map((p) => p.pairId)).toEqual(["b"]);
+  });
+});
+
+describe("findPairForFlag — cwd-scoped name resolution (used by kill / pairs rm)", () => {
+  function seed(base: string, cwd: string, name: string, slot = 0) {
+    const pairId = derivePairId(cwd, name);
+    writeRegistry(base, {
+      version: 1,
+      pairs: [{ pairId, slot, cwd, name, source: "flag", createdAt: "2026-01-01T00:00:00.000Z" }],
+    });
+    return pairId;
+  }
+
+  test("matches a friendly name scoped to the cwd", () => {
+    const base = makeBase();
+    const cwd = "/tmp/projX";
+    const pairId = seed(base, cwd, "work");
+    expect(findPairForFlag(base, cwd, "work")?.pairId).toBe(pairId);
+  });
+
+  test("the same name from a DIFFERENT cwd does not match (different pair)", () => {
+    const base = makeBase();
+    const cwd = "/tmp/projX";
+    seed(base, cwd, "work");
+    expect(findPairForFlag(base, "/tmp/projY", "work")).toBeNull();
+  });
+
+  test("falls back to a raw composite pairId regardless of cwd", () => {
+    const base = makeBase();
+    const cwd = "/tmp/projX";
+    const pairId = seed(base, cwd, "work");
+    // From an unrelated cwd the friendly name won't resolve, but the raw id does.
+    expect(findPairForFlag(base, "/tmp/unrelated", pairId)?.pairId).toBe(pairId);
+  });
+
+  test("reaches an OLD verbatim-id entry (no name field) via the raw fallback", () => {
+    const base = makeBase();
+    writeRegistry(base, { version: 1, pairs: [entry("work", 0)] }); // legacy shape
+    expect(findPairForFlag(base, "/tmp/anything", "work")?.pairId).toBe("work");
+  });
+
+  test("throws PAIR_ID_INVALID for a malformed flag", () => {
+    const base = makeBase();
+    expect(() => findPairForFlag(base, "/tmp/x", "../escape")).toThrow();
   });
 });

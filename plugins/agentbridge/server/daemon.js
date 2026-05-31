@@ -2087,6 +2087,11 @@ function handleControlMessage(ws, raw) {
     case "status":
       sendStatus(ws);
       return;
+    case "probe_incumbent":
+      handleProbeIncumbent(ws).catch((err) => {
+        log(`handleProbeIncumbent threw for #${ws.data.clientId}: ${err?.message ?? err}`);
+      });
+      return;
     case "claude_to_codex": {
       if (message.message.source !== "claude") {
         sendProtocolMessage(ws, {
@@ -2206,6 +2211,24 @@ function detachClaude(ws, reason) {
   log(`Claude frontend detached (#${ws.data.clientId}, ${reason})`);
   scheduleClaudeDisconnectNotification(ws.data.clientId);
   scheduleIdleShutdown();
+}
+async function handleProbeIncumbent(ws) {
+  const occupant = attachedClaude;
+  if (!occupant || occupant === ws || occupant.readyState !== WebSocket.OPEN) {
+    sendProtocolMessage(ws, { type: "incumbent_status", connected: false, alive: false });
+    return;
+  }
+  if (challengeInProgress) {
+    sendProtocolMessage(ws, { type: "incumbent_status", connected: true, alive: true });
+    return;
+  }
+  const alive = await probeLiveness2(occupant, LIVENESS_PROBE_TIMEOUT_MS);
+  const stillConnected = attachedClaude === occupant && occupant.readyState === WebSocket.OPEN;
+  sendProtocolMessage(ws, {
+    type: "incumbent_status",
+    connected: stillConnected,
+    alive: stillConnected && alive
+  });
 }
 async function probeLiveness2(ws, timeoutMs) {
   return probeLiveness({

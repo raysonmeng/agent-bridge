@@ -13,6 +13,8 @@ import { createServer, type Server } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  DEFAULT_PAIR_NAME,
+  derivePairId,
   derivePairIdFromCwd,
   detectLegacyRootDaemon,
   MAX_PAIR_SLOT,
@@ -322,10 +324,11 @@ describe("resolvePair", () => {
     }
   }
 
-  test("fresh base + cwd -> slot 0, ports 4500/4501/4502, stateDir ends with pairId, 1 entry", async () => {
+  test("fresh base + cwd -> slot 0, default name 'main', stateDir ends with pairId, 1 entry", async () => {
     const tmpA = mkdtempSync(join(tmpdir(), "abg-pair-cwd-A-"));
     try {
-      const expectedId = derivePairIdFromCwd(tmpA);
+      // No flag → default name "main", scoped to this cwd.
+      const expectedId = derivePairId(tmpA, DEFAULT_PAIR_NAME);
       const r = await resolveTolerant(tmpA);
 
       // Allocation must have happened regardless of probe result.
@@ -333,11 +336,13 @@ describe("resolvePair", () => {
       expect(reg.pairs).toHaveLength(1);
       expect(reg.pairs[0]!.slot).toBe(0);
       expect(reg.pairs[0]!.pairId).toBe(expectedId);
+      expect(reg.pairs[0]!.name).toBe(DEFAULT_PAIR_NAME);
       expect(reg.pairs[0]!.source).toBe("cwd");
 
       if (r.ok) {
         expect(r.resolved.slot).toBe(0);
         expect(r.resolved.pairId).toBe(expectedId);
+        expect(r.resolved.name).toBe(DEFAULT_PAIR_NAME);
         expect(r.resolved.ports).toEqual({ appPort: 4500, proxyPort: 4501, controlPort: 4502 });
         expect(r.resolved.stateDir.endsWith(expectedId)).toBe(true);
       } else {
@@ -352,7 +357,7 @@ describe("resolvePair", () => {
   test("calling again with the SAME cwd is idempotent (same pairId/slot, still 1 entry)", async () => {
     const tmpA = mkdtempSync(join(tmpdir(), "abg-pair-cwd-A-"));
     try {
-      const expectedId = derivePairIdFromCwd(tmpA);
+      const expectedId = derivePairId(tmpA, DEFAULT_PAIR_NAME);
       await resolveTolerant(tmpA);
       await resolveTolerant(tmpA);
 
@@ -365,12 +370,14 @@ describe("resolvePair", () => {
     }
   });
 
-  test("a second distinct cwd allocates slot 1", async () => {
+  test("a second distinct cwd allocates slot 1 (same default name, different dir = different pair)", async () => {
     const tmpA = mkdtempSync(join(tmpdir(), "abg-pair-cwd-A-"));
     const tmpB = mkdtempSync(join(tmpdir(), "abg-pair-cwd-B-"));
     try {
-      const idA = derivePairIdFromCwd(tmpA);
-      const idB = derivePairIdFromCwd(tmpB);
+      const idA = derivePairId(tmpA, DEFAULT_PAIR_NAME);
+      const idB = derivePairId(tmpB, DEFAULT_PAIR_NAME);
+      // Same friendly name "main", different directories → distinct ids.
+      expect(idA).not.toBe(idB);
       await resolveTolerant(tmpA);
       const rB = await resolveTolerant(tmpB);
 
@@ -395,19 +402,39 @@ describe("resolvePair", () => {
     }
   });
 
-  test("explicit pairFlag uses that name verbatim", async () => {
+  test("explicit pairFlag scopes the name to the cwd (id = name + cwd hash)", async () => {
     const tmpA = mkdtempSync(join(tmpdir(), "abg-pair-cwd-A-"));
     try {
+      const expectedId = derivePairId(tmpA, "myname");
       const r = await resolveTolerant(tmpA, "myname");
       const reg = readRegistry(base);
       expect(reg.pairs).toHaveLength(1);
-      expect(reg.pairs[0]!.pairId).toBe("myname");
+      expect(reg.pairs[0]!.pairId).toBe(expectedId);
+      expect(reg.pairs[0]!.name).toBe("myname");
       expect(reg.pairs[0]!.source).toBe("flag");
       if (r.ok) {
-        expect(r.resolved.pairId).toBe("myname");
+        expect(r.resolved.pairId).toBe(expectedId);
+        expect(r.resolved.name).toBe("myname");
       }
     } finally {
       rmSync(tmpA, { recursive: true, force: true });
+    }
+  });
+
+  test("the same name in two directories resolves to two distinct pairs", async () => {
+    const tmpA = mkdtempSync(join(tmpdir(), "abg-pair-same-A-"));
+    const tmpB = mkdtempSync(join(tmpdir(), "abg-pair-same-B-"));
+    try {
+      await resolveTolerant(tmpA, "work");
+      await resolveTolerant(tmpB, "work");
+      const reg = readRegistry(base);
+      expect(reg.pairs).toHaveLength(2);
+      expect(reg.pairs[0]!.pairId).not.toBe(reg.pairs[1]!.pairId);
+      // Both carry the same friendly name though.
+      expect(reg.pairs.every((p) => p.name === "work")).toBe(true);
+    } finally {
+      rmSync(tmpA, { recursive: true, force: true });
+      rmSync(tmpB, { recursive: true, force: true });
     }
   });
 });
@@ -471,12 +498,16 @@ describe("cross-review regression fixes", () => {
 
   test("#3 case-insensitive match returns the registry's canonical pairId/state dir", async () => {
     const base = tmpBase();
-    writeRegistry(base, { version: 1, pairs: [entry(0, "Foo")] });
-    // Resolve with different casing — must canonicalize to "Foo", not "foo".
+    // The composite id is name-scoped to the cwd; seed the canonical (mixed-case)
+    // id for name "Foo" in /tmp/x, then resolve --pair foo from the SAME cwd.
+    const canonicalId = derivePairId("/tmp/x", "Foo");
+    writeRegistry(base, { version: 1, pairs: [entry(0, canonicalId)] });
+    // Resolve with different casing — must canonicalize to the seeded id, not the
+    // lowercased "foo-<hash>" variant.
     const r = await resolvePair(base, { pairFlag: "foo", cwd: "/tmp/x", probePorts: false });
-    expect(r.pairId).toBe("Foo");
+    expect(r.pairId).toBe(canonicalId);
     expect(r.slot).toBe(0);
-    expect(r.stateDir).toBe(join(base, "pairs", "Foo"));
+    expect(r.stateDir).toBe(join(base, "pairs", canonicalId));
   });
 
   test("#5 slot exhaustion throws WITHOUT persisting an invalid entry", async () => {

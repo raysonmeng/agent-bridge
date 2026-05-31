@@ -2,10 +2,12 @@ import { StateDirResolver } from "./state-dir";
 import {
   type PairEntry,
   type PairPorts,
+  derivePairId,
   portsForSlot,
   readRegistry,
   removePairEntry,
   resolvePair,
+  validatePairId,
 } from "./pair-registry";
 
 /**
@@ -25,6 +27,8 @@ export interface PairResolution {
   slot: number | null;
   ports: PairPorts;
   stateDir: StateDirResolver;
+  /** Friendly, cwd-scoped name ("main" by default; "(manual)" in legacy mode). */
+  name: string;
   /** True when running in legacy/manual single-pair mode (env pinned, no --pair). */
   manual: boolean;
 }
@@ -131,6 +135,7 @@ export async function applyPairEnv(opts: { pairFlag?: string }): Promise<PairRes
       slot: null,
       ports: { appPort, proxyPort, controlPort },
       stateDir,
+      name: "(manual)",
       manual: true,
     };
   }
@@ -143,6 +148,7 @@ export async function applyPairEnv(opts: { pairFlag?: string }): Promise<PairRes
   // to the per-pair dir.
   process.env.AGENTBRIDGE_BASE_DIR = base;
   process.env.AGENTBRIDGE_PAIR_ID = resolved.pairId;
+  process.env.AGENTBRIDGE_PAIR_NAME = resolved.name;
   process.env.AGENTBRIDGE_STATE_DIR = resolved.stateDir;
   process.env.AGENTBRIDGE_CONTROL_PORT = String(resolved.ports.controlPort);
   process.env.CODEX_WS_PORT = String(resolved.ports.appPort);
@@ -153,6 +159,7 @@ export async function applyPairEnv(opts: { pairFlag?: string }): Promise<PairRes
     slot: resolved.slot,
     ports: resolved.ports,
     stateDir: new StateDirResolver(resolved.stateDir),
+    name: resolved.name,
     manual: false,
   };
 }
@@ -166,6 +173,22 @@ export function listPairs(base: string): PairEntry[] {
 export function findPair(base: string, pairId: string): PairEntry | null {
   const lower = pairId.toLowerCase();
   return readRegistry(base).pairs.find((p) => p.pairId.toLowerCase() === lower) ?? null;
+}
+
+/**
+ * Resolve `--pair <flag>` to a registry entry the way a launch would.
+ *
+ * The friendly name is scoped to `cwd` (same name in another directory is a
+ * different pair), so kill/pairs must compose it with the cwd hash first. Falls
+ * back to a raw pairId match so an explicit composite id copied from `abg pairs`
+ * (which is cwd-independent) also resolves regardless of where it is run.
+ *
+ * Throws PAIR_ID_INVALID (via validatePairId) for a malformed flag.
+ */
+export function findPairForFlag(base: string, cwd: string, flag: string): PairEntry | null {
+  const name = validatePairId(flag);
+  const scopedId = derivePairId(cwd, name);
+  return findPair(base, scopedId) ?? findPair(base, flag);
 }
 
 /** Ports for a pair entry (convenience for kill/pairs). */

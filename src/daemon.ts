@@ -308,6 +308,11 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
     case "status":
       sendStatus(ws);
       return;
+    case "probe_incumbent":
+      handleProbeIncumbent(ws).catch((err) => {
+        log(`handleProbeIncumbent threw for #${ws.data.clientId}: ${err?.message ?? err}`);
+      });
+      return;
     case "claude_to_codex": {
       if (message.message.source !== "claude") {
         sendProtocolMessage(ws, {
@@ -465,6 +470,46 @@ function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
   scheduleClaudeDisconnectNotification(ws.data.clientId);
 
   scheduleIdleShutdown();
+}
+
+/**
+ * Answer a non-attaching `probe_incumbent` request: does this daemon currently
+ * have a LIVE Claude frontend attached? The asking socket (`ws`) is the CLI's
+ * throwaway control connection — it never attaches, so it can never be the
+ * occupant and probing it has no side effect on admission.
+ *
+ * Semantics mirror the challenge-on-contest path (issue #68):
+ *   - no occupant / closed occupant            → { connected:false, alive:false }
+ *   - a real contest probe already in flight    → { connected:true,  alive:true } (defer)
+ *   - otherwise actively ping the incumbent      → alive = pong observed in time
+ * A half-open dead incumbent reports connected:true, alive:false, telling the CLI
+ * it is safe to launch and let admission evict the stale frontend.
+ */
+async function handleProbeIncumbent(ws: ServerWebSocket<ControlSocketData>) {
+  const occupant = attachedClaude;
+  if (!occupant || occupant === ws || occupant.readyState !== WebSocket.OPEN) {
+    sendProtocolMessage(ws, { type: "incumbent_status", connected: false, alive: false });
+    return;
+  }
+  // A real challenge-on-contest decision is already running — defer to it (report
+  // live so the CLI guard errs on the safe side and does not race the admission).
+  if (challengeInProgress) {
+    sendProtocolMessage(ws, { type: "incumbent_status", connected: true, alive: true });
+    return;
+  }
+  // Deliberately do NOT set challengeInProgress here: this is a read-only probe,
+  // not a contest. Setting it would make a genuine concurrent claude_connect get
+  // bounced with CLOSE_CODE_PROBE_IN_PROGRESS (a ~3s reconnect delay) even though
+  // the probing socket never intends to attach. A real contest that races this
+  // probe just runs its own ping concurrently — harmless (ping is idempotent).
+  const alive = await probeLiveness(occupant, LIVENESS_PROBE_TIMEOUT_MS);
+  // The probe awaited; re-read state in case the incumbent closed meanwhile.
+  const stillConnected = attachedClaude === occupant && occupant.readyState === WebSocket.OPEN;
+  sendProtocolMessage(ws, {
+    type: "incumbent_status",
+    connected: stillConnected,
+    alive: stillConnected && alive,
+  });
 }
 
 async function probeLiveness(

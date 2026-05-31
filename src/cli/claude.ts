@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
+import { DaemonClient } from "../daemon-client";
 import { DaemonLifecycle } from "../daemon-lifecycle";
 import { applyPairEnv, parsePairFlag, type PairResolution } from "../pair-resolver";
 
@@ -39,6 +40,14 @@ export async function runClaude(args: string[]) {
     );
   }
 
+  // Conflict guard: refuse to launch a SECOND Claude frontend into a pair that
+  // already has a LIVE one (the confirmed "smart" behaviour: live → error here,
+  // stale/none → fall through and let admission take over). Skipped in manual
+  // mode (power-user single-pair). Fail-open on any probe error.
+  if (!pair.manual) {
+    await assertPairNotLive(lifecycle, pair);
+  }
+
   lifecycle.clearKilled();
 
   // Channel entry format: "server:<mcp-server-name>" for MCP-based channels,
@@ -73,6 +82,54 @@ export async function runClaude(args: string[]) {
     console.error(`Error starting Claude Code: ${err.message}`);
     process.exit(1);
   });
+}
+
+/**
+ * Refuse to start a second Claude session in a pair that already has a LIVE one.
+ *
+ * Probes the pair's running daemon (if any) WITHOUT attaching, so it never
+ * contests the incumbent. If a live frontend is found, prints a clear conflict
+ * message and exits — the user picks another `--pair` name or stops the live one.
+ * If there is no daemon, no incumbent, or only a stale (half-open dead) one, it
+ * returns so the launch proceeds; the daemon's admission logic then takes over
+ * the stale slot cleanly. Any probe error fails open (launch proceeds).
+ */
+async function assertPairNotLive(lifecycle: DaemonLifecycle, pair: PairResolution): Promise<void> {
+  let healthy = false;
+  try {
+    healthy = await lifecycle.isHealthy();
+  } catch {
+    return; // can't tell → don't block
+  }
+  if (!healthy) return; // no daemon yet → fresh start, no conflict
+
+  const client = new DaemonClient(lifecycle.controlWsUrl);
+  let incumbent: { connected: boolean; alive: boolean };
+  try {
+    await client.connect();
+    incumbent = await client.probeIncumbent();
+  } catch {
+    return; // probe failed → fail open
+  } finally {
+    try {
+      await client.disconnect();
+    } catch {}
+  }
+
+  if (incumbent.connected && incumbent.alive) {
+    const name = pair.name;
+    console.error(
+      `[agentbridge] Pair "${name}" in ${process.cwd()} already has an active Claude session.`,
+    );
+    console.error(`[agentbridge] Refusing to open a second one in the same pair.`);
+    console.error(`[agentbridge]`);
+    console.error(`[agentbridge]   • Use that existing session, or`);
+    console.error(`[agentbridge]   • Start a different pair:  abg --pair <other-name> claude`);
+    console.error(
+      `[agentbridge]   • If that session is actually dead, take it over with:  abg --pair ${name} kill`,
+    );
+    process.exit(1);
+  }
 }
 
 /**
