@@ -60,6 +60,9 @@ class StateDirResolver {
   get killedFile() {
     return join(this.stateDir, "killed");
   }
+  get updateCheckFile() {
+    return join(this.stateDir, "update-check.json");
+  }
 }
 
 // src/app-server-protocol.ts
@@ -2177,8 +2180,8 @@ var CLOSE_CODE_EVICTED_STALE = 4002;
 var CLOSE_CODE_PROBE_IN_PROGRESS = 4003;
 
 // src/env-utils.ts
-function parsePositiveIntEnv(name, fallback, log = () => {}) {
-  const raw = process.env[name];
+function parsePositiveIntEnv(name, fallback, log = () => {}, env = process.env) {
+  const raw = env[name];
   if (raw == null || raw === "")
     return fallback;
   const parsed = Number(raw);

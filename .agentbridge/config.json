@@ -1,0 +1,26 @@
+{
+  "version": "1.0",
+  "daemon": {
+    "port": 4500,
+    "proxyPort": 4501
+  },
+  "agents": {
+    "claude": {
+      "role": "Reviewer, Planner",
+      "mode": "push"
+    },
+    "codex": {
+      "role": "Implementer, Executor"
+    }
+  },
+  "markers": [
+    "IMPORTANT",
+    "STATUS",
+    "FYI"
+  ],
+  "turnCoordination": {
+    "attentionWindowSeconds": 15,
+    "busyGuard": true
+  },
+  "idleShutdownSeconds": 30
+}

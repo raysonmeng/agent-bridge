@@ -1,0 +1,134 @@
+name: Release on merge
+
+# Auto-publish cadence (user-chosen): every code merge to master is gated by the
+# full `bun run check` and, if green, bumps the patch version (synced across
+# package.json / plugin.json / marketplace.json). That version-bump commit then
+# drives the existing auto-release.yml -> publish.yml chain to publish to npm.
+#
+# IMPORTANT — requires a push token that re-triggers workflows:
+#   Pushes made with the default GITHUB_TOKEN do NOT trigger other workflows
+#   (GitHub's recursion guard), so the bump commit would never reach
+#   auto-release.yml. Set a repo secret RELEASE_PAT (a fine-grained PAT with
+#   `contents: write`) so the bump push fires auto-release -> publish. Without it
+#   the push still succeeds but the publish chain will not run.
+#   The same PAT must be allowed to push to master if branch protection is on.
+#
+# Loop/double-publish guards:
+#   - skip the bot's own `chore(release):` bump commit and any `[skip release]`
+#     commit (docs/chore), and pushes by github-actions[bot];
+#   - skip if the triggering push ALREADY changed the version (a manual bump or
+#     the existing release flow) — let that flow publish instead of double-bumping.
+
+on:
+  push:
+    branches: [master]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-on-merge
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    if: >-
+      !startsWith(github.event.head_commit.message, 'chore(release):') &&
+      !contains(github.event.head_commit.message, '[skip release]') &&
+      github.actor != 'github-actions[bot]'
+    steps:
+      # Fail loudly if RELEASE_PAT is missing. A GITHUB_TOKEN fallback would push
+      # a bump commit that never triggers auto-release -> publish (GitHub
+      # recursion guard), stranding an un-published version bump. Better to stop
+      # before bumping with a clear message.
+      - name: Require RELEASE_PAT
+        env:
+          RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
+        run: |
+          if [ -z "$RELEASE_PAT" ]; then
+            echo "::error::RELEASE_PAT secret is required for auto-publish-on-merge."
+            echo "::error::Pushes/releases made with GITHUB_TOKEN do not trigger the auto-release -> publish chain, so a bump would never reach npm. Add a fine-grained PAT with contents:write as the RELEASE_PAT secret. See docs/RELEASING.md."
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # PAT (required above) so the bump push re-triggers auto-release.yml.
+          token: ${{ secrets.RELEASE_PAT }}
+
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.3.11"
+
+      - name: Install dependencies
+        run: bun install --frozen-lockfile
+
+      - name: Skip if this push already bumped the version
+        id: guard
+        env:
+          BEFORE_SHA: ${{ github.event.before }}
+        run: |
+          CUR=$(node -p "require('./package.json').version")
+          # Compare against the branch tip BEFORE this push (github.event.before),
+          # not HEAD^ — covers multi-commit / rebase pushes where the version
+          # change may not be the immediately-preceding commit.
+          PREV=$(git show "$BEFORE_SHA:package.json" 2>/dev/null | node -p "try{JSON.parse(require('fs').readFileSync(0,'utf-8')).version}catch{''}" 2>/dev/null || echo "")
+          if [ -n "$PREV" ] && [ "$PREV" != "$CUR" ]; then
+            echo "Version already changed in this push ($PREV -> $CUR); the existing release flow will publish. Skipping auto-bump."
+            echo "bump=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "bump=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Gate, bump, commit, and push the release (race-safe)
+        if: steps.guard.outputs.bump == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Version this run STARTED from (the triggering commit's version).
+          INITIAL_VERSION="$(node -p "require('./package.json').version")"
+          # A concurrent human merge can either (a) edit package.json near the
+          # version line (so a rebase of our bump would CONFLICT) or (b) land
+          # between our fetch and push (non-fast-forward). On any push failure we
+          # discard our local bump, hard-reset to the latest origin/master, and
+          # retry from that new tip.
+          #
+          # CRITICAL: the integrity gate (bun install + bun run check) runs INSIDE
+          # the loop, on whatever tip we are about to bump+publish — never on a
+          # stale pre-reset tip. Otherwise a broken merge that landed during this
+          # job could be reset onto, bumped, and tagged/released before publish.yml
+          # rejects it, stranding a GitHub release/tag with no npm publish. Gating
+          # the candidate tip here guarantees we only ever tag a build that passes.
+          # (Once #90's release-form smoke lands, add smoke:built/smoke:pack here.)
+          for attempt in 1 2 3; do
+            # If the tip's version already differs from this run's starting
+            # version, another run (auto-bump OR a manual version bump with any
+            # commit message) already advanced and published past our base — our
+            # code is in that release. Exit cleanly instead of bumping a
+            # content-less version. (Version-compare, not commit-message match,
+            # so it also catches manual bumps. The bump only ever increases the
+            # version, so any difference means "already advanced".)
+            TIP_VERSION="$(node -p "require('./package.json').version")"
+            if [ "$TIP_VERSION" != "$INITIAL_VERSION" ]; then
+              echo "Version already advanced (${INITIAL_VERSION} -> ${TIP_VERSION}) since this run started; nothing to publish."
+              exit 0
+            fi
+            bun install --frozen-lockfile
+            bun run check
+            NEW="$(node scripts/bump-version.mjs patch)"
+            git add package.json \
+              plugins/agentbridge/.claude-plugin/plugin.json \
+              .claude-plugin/marketplace.json
+            git commit -m "chore(release): v${NEW}"
+            if git push origin HEAD:master; then
+              echo "Released v${NEW} (attempt ${attempt})"
+              exit 0
+            fi
+            echo "push rejected (attempt ${attempt}); syncing to latest origin/master and retrying"
+            git fetch origin master
+            git reset --hard origin/master
+          done
+          echo "::error::release-on-merge could not push the version bump after 3 attempts"
+          exit 1

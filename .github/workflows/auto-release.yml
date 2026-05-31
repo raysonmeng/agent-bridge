@@ -11,9 +11,22 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # Fail loudly if RELEASE_PAT is missing: a release created with GITHUB_TOKEN
+      # does NOT trigger publish.yml (GitHub recursion guard), which would strand
+      # a GitHub release with no npm publish. Better to stop with a clear message.
+      - name: Require RELEASE_PAT
+        env:
+          RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
+        run: |
+          if [ -z "$RELEASE_PAT" ]; then
+            echo "::error::RELEASE_PAT secret is required: releases created with GITHUB_TOKEN do not trigger publish.yml, so npm publish would never run. Add a fine-grained PAT with contents:write as RELEASE_PAT. See docs/RELEASING.md."
+            exit 1
+          fi
+
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
+          token: ${{ secrets.RELEASE_PAT }}
 
       - name: Read version from package.json
         id: version
@@ -22,10 +35,17 @@ jobs:
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
           echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
 
-      - name: Check if tag already exists
+      - name: Check if the RELEASE already exists
         id: check
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
         run: |
-          if git rev-parse "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
+          # Gate on the GitHub RELEASE, not just the tag. publish.yml fires on
+          # `release: published`, so a tag without a release means npm was never
+          # published. If a prior run pushed the tag but failed before creating
+          # the release, we MUST be able to recover on re-run — which only works
+          # if "exists" reflects the release, not the tag.
+          if gh release view "v${{ steps.version.outputs.version }}" >/dev/null 2>&1; then
             echo "exists=true" >> "$GITHUB_OUTPUT"
           else
             echo "exists=false" >> "$GITHUB_OUTPUT"
@@ -34,11 +54,29 @@ jobs:
       - name: Create tag and release
         if: steps.check.outputs.exists == 'false'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # PAT (required above) so the published release TRIGGERS publish.yml.
+          # Releases created with GITHUB_TOKEN do not start new workflow runs
+          # (GitHub recursion guard), which would strand the release without an
+          # npm publish. See docs/RELEASING.md.
+          GH_TOKEN: ${{ secrets.RELEASE_PAT }}
         run: |
           TAG="v${{ steps.version.outputs.version }}"
-          git tag "$TAG"
-          git push origin "$TAG"
+          # Idempotent + safe. The tag may already exist from a prior partial run
+          # that pushed it but failed before creating the release. Reuse it ONLY
+          # if it points at THIS commit — a tag on a different commit would make
+          # `gh release create` (and then publish.yml) ship the WRONG code. Fail
+          # loudly on a mismatch instead of publishing the wrong commit.
+          if git rev-parse "$TAG" >/dev/null 2>&1; then
+            TAG_SHA="$(git rev-parse "${TAG}^{commit}")"
+            HEAD_SHA="$(git rev-parse HEAD)"
+            if [ "$TAG_SHA" != "$HEAD_SHA" ]; then
+              echo "::error::Tag ${TAG} already exists at ${TAG_SHA} but this release is for ${HEAD_SHA}; refusing to publish a mismatched commit. Delete the stray tag or bump to a new version."
+              exit 1
+            fi
+          else
+            git tag "$TAG"
+            git push origin "$TAG"
+          fi
 
           # Generate changelog from commits since last tag
           PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || echo "")

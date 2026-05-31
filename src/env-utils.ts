@@ -2,8 +2,9 @@ export function parsePositiveIntEnv(
   name: string,
   fallback: number,
   log: (message: string) => void = () => {},
+  env: NodeJS.ProcessEnv = process.env,
 ): number {
-  const raw = process.env[name];
+  const raw = env[name];
   if (raw == null || raw === "") return fallback;
 
   // Use Number() (not parseInt) so values like "1.5" and "10abc" fail validation

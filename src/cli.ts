@@ -19,7 +19,22 @@ const restArgs = args.slice(1);
 export const MARKETPLACE_NAME = "agentbridge";
 export const PLUGIN_NAME = "agentbridge";
 
+/** Commands that print an update notice. claude/codex also trigger the daily refresh. */
+const REFRESH_COMMANDS = new Set(["claude", "codex"]);
+const NOTIFY_COMMANDS = new Set(["claude", "codex", "init", "dev"]);
+
 async function main() {
+  // Best-effort, non-blocking update notice. Fully guarded — never blocks,
+  // delays, or fails the command (see src/update-notifier.ts).
+  if (command && NOTIFY_COMMANDS.has(command)) {
+    try {
+      const { maybeNotifyUpdate } = await import("./update-notifier");
+      maybeNotifyUpdate({ refresh: REFRESH_COMMANDS.has(command) });
+    } catch {
+      // ignore — the notifier must never affect the command
+    }
+  }
+
   switch (command) {
     case "init":
       const { runInit } = await import("./cli/init");

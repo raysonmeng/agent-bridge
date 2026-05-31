@@ -18,11 +18,12 @@ jobs:
       - name: Install dependencies
         run: bun install --frozen-lockfile
 
-      - name: Type check
-        run: bun run typecheck
-
-      - name: Run tests
-        run: bun test src
+      # Final integrity gate before publishing: typecheck + full test suite +
+      # plugin-bundle sync + version alignment. Never publish a build that can't
+      # pass `bun run check`. (When #90's release-form smoke lands, add
+      # `bun run smoke:built` + `bun run smoke:pack` here too.)
+      - name: Check (typecheck + tests + plugin sync + version align)
+        run: bun run check
 
       - name: Build
         run: bun run prepublishOnly

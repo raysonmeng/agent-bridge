@@ -5,6 +5,7 @@ import { ConfigService } from "../config-service";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
 import { findPackageRoot, registerMarketplace } from "./pkg-root";
 import { upsertMarkedSection } from "../marker-section";
+import { compareVersions } from "../version-utils";
 import {
   MARKER_ID,
   CLAUDE_MD_SECTION,
@@ -113,19 +114,6 @@ function checkCodex() {
     console.error("  Install Codex: https://github.com/openai/codex");
     process.exit(1);
   }
-}
-
-/** Compare semver strings. Returns -1, 0, or 1. */
-function compareVersions(a: string, b: string): number {
-  const pa = a.split(".").map(Number);
-  const pb = b.split(".").map(Number);
-  for (let i = 0; i < 3; i++) {
-    const va = pa[i] ?? 0;
-    const vb = pb[i] ?? 0;
-    if (va < vb) return -1;
-    if (va > vb) return 1;
-  }
-  return 0;
 }
 
 /**

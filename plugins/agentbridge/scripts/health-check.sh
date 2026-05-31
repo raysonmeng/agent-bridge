@@ -37,6 +37,15 @@ fi
 
 printf '%s' "$now" >"$stamp_file" 2>/dev/null || true
 
+# In-session plugin-update reminder: compare the INSTALLED plugin version against
+# the latest npm version cached by the CLI notifier (src/update-notifier.ts). This
+# is how a user who updated the npm CLI but not the plugin learns of the mismatch
+# from inside Claude Code. Best-effort + silent: never blocks the hook.
+plugin_notice=""
+if command -v bun >/dev/null 2>&1 && [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
+  plugin_notice="$(bun "${CLAUDE_PLUGIN_ROOT}/scripts/plugin-update-notice.mjs" "${CLAUDE_PLUGIN_ROOT}/.claude-plugin/plugin.json" 2>/dev/null || true)"
+fi
+
 health_json="$(curl -fsS --max-time 1 "http://127.0.0.1:${port}/healthz" 2>/dev/null || true)"
 
 if [ -n "$health_json" ]; then
@@ -47,15 +56,15 @@ if [ -n "$health_json" ]; then
 
   if [ "$tui_connected" = "true" ]; then
     cat <<EOF
-{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"AgentBridge is running. Daemon healthy, Codex TUI connected. Bridge is ready for communication."}}
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"AgentBridge is running. Daemon healthy, Codex TUI connected. Bridge is ready for communication.${plugin_notice:+ $plugin_notice}"}}
 EOF
   else
     cat <<EOF
-{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"AgentBridge daemon is running but Codex TUI is not connected yet. Start Codex in another terminal with: agentbridge codex${pair_arg}"}}
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"AgentBridge daemon is running but Codex TUI is not connected yet. Start Codex in another terminal with: agentbridge codex${pair_arg}${plugin_notice:+ $plugin_notice}"}}
 EOF
   fi
 else
   cat <<EOF
-{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"AgentBridge daemon is not reachable on http://127.0.0.1:${port}/healthz yet. Start the bridge with: agentbridge claude${pair_arg} (this terminal) + agentbridge codex${pair_arg} (another terminal). If you're already using agentbridge claude${pair_arg}, the daemon may still be starting up."}}
+{"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"AgentBridge daemon is not reachable on http://127.0.0.1:${port}/healthz yet. Start the bridge with: agentbridge claude${pair_arg} (this terminal) + agentbridge codex${pair_arg} (another terminal). If you're already using agentbridge claude${pair_arg}, the daemon may still be starting up.${plugin_notice:+ $plugin_notice}"}}
 EOF
 fi

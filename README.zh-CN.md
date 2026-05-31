@@ -252,6 +252,21 @@ agent_bridge/
 | `AGENTBRIDGE_STATE_DIR` | 平台默认 | 状态目录（pid、status、日志）。macOS: `~/Library/Application Support/agentbridge/`，Linux: `$XDG_STATE_HOME/agentbridge/` |
 | `AGENTBRIDGE_MODE` | `push` | 消息投递模式（`push` 用于 channel，`pull` 用于 API key 模式） |
 | `AGENTBRIDGE_DAEMON_ENTRY` | `./daemon.ts` | 覆盖 daemon 入口（插件包使用） |
+| `NO_UPDATE_NOTIFIER` | 未设置 | 设为任意值即关闭「有新版本」提示（生态通用 opt-out） |
+| `AGENTBRIDGE_NO_UPDATE_NOTIFIER` | 未设置 | 命名空间化的关闭开关（效果同 `NO_UPDATE_NOTIFIER`） |
+| `AGENTBRIDGE_UPDATE_CHECK_INTERVAL_MS` | `86400000` | `abg claude`/`abg codex` 多久查一次 npm 新版本（默认每天一次）。其余时候只读缓存打印，大多数调用零网络 |
+
+### 更新提示
+
+`abg claude` 和 `abg codex` 在 npm 上有更新的**稳定**版本时,会向 stderr 打印一行提示,例如:
+
+```
+⚠ AgentBridge update available: 0.1.6 → 0.1.7
+  CLI:    npm install -g @raysonmeng/agentbridge@latest
+  Plugin: /plugin marketplace update agentbridge   (then /reload-plugins)
+```
+
+该检查是 best-effort,绝不阻塞/拖慢/弄坏你的命令:提示从缓存打印,npm 检查每天最多在后台跑一次,任何网络/registry 失败都静默忽略。非交互(管道)输出和 CI 下自动抑制,可用 `NO_UPDATE_NOTIFIER=1` 关闭。notifier 永远不会自动安装任何东西——只告诉你升级命令。
 
 ### 状态目录
 

@@ -88,4 +88,13 @@ export class StateDirResolver {
   get killedFile(): string {
     return join(this.stateDir, "killed");
   }
+
+  /**
+   * Cache for the update-notifier: `{ lastCheckMs, latest }`. Machine/user-global
+   * (not per-project) so the daily npm check runs once per machine, not once per
+   * project — see src/update-notifier.ts.
+   */
+  get updateCheckFile(): string {
+    return join(this.stateDir, "update-check.json");
+  }
 }

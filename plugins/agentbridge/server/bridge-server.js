@@ -13714,6 +13714,9 @@ class StateDirResolver {
   get killedFile() {
     return join(this.stateDir, "killed");
   }
+  get updateCheckFile() {
+    return join(this.stateDir, "update-check.json");
+  }
 }
 
 // src/claude-adapter.ts

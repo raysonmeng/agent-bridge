@@ -28,6 +28,7 @@ describe("StateDirResolver", () => {
     expect(resolver.statusFile).toBe(join(tempDir, "status.json"));
     expect(resolver.portsFile).toBe(join(tempDir, "ports.json"));
     expect(resolver.logFile).toBe(join(tempDir, "agentbridge.log"));
+    expect(resolver.updateCheckFile).toBe(join(tempDir, "update-check.json"));
   });
 
   test("ensure() creates directory if it does not exist", () => {
