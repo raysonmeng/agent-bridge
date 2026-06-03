@@ -41,6 +41,10 @@ import {
   resolveCodexTransport,
   waitForUnixWsReady,
 } from "./codex-transport";
+import {
+  ADAPTER_DISCONNECT_REASON,
+  APP_SERVER_RECONNECT_NEW_TUI_REASON,
+} from "./turn-notices";
 
 interface TuiSocketData {
   connId: number;
@@ -84,6 +88,8 @@ export class CodexAdapter extends EventEmitter {
   private static readonly RESPONSE_TRACKING_TTL_MS = 30000;
 
   private proc: ChildProcess | null = null;
+  /** pid of the spawned `codex app-server` child; survives `stop()` nulling `proc`. */
+  private appServerPid: number | null = null;
   private appServerWs: WebSocket | null = null;
   private tuiWs: ServerWebSocket<TuiSocketData> | null = null;
   private proxyServer: ReturnType<typeof Bun.serve> | null = null;
@@ -212,9 +218,17 @@ export class CodexAdapter extends EventEmitter {
     this.proc = spawn("codex", ["app-server", "--listen", listen], {
       stdio: ["pipe", "pipe", "pipe"],
     });
+    // Retain the pid independently of `this.proc` (which stop() nulls): the
+    // daemon's process.on("exit") last gasp uses it to guarantee the app-server
+    // is killed even when process.exit() races ahead of stop()'s async SIGKILL
+    // timer. Cleared only when the child truly exits.
+    this.appServerPid = this.proc.pid ?? null;
 
     this.proc.on("error", (err) => this.emit("error", err));
-    this.proc.on("exit", (code) => this.emit("exit", code));
+    this.proc.on("exit", (code) => {
+      this.appServerPid = null;
+      this.emit("exit", code);
+    });
 
     const stderrRl = createInterface({ input: this.proc.stderr! });
     stderrRl.on("line", (l) => this.log(`[codex-server] ${l}`));
@@ -285,7 +299,7 @@ export class CodexAdapter extends EventEmitter {
     // turnInProgress flag and a pending watchdog timer leak past disconnect().
     // emitCompleted stays false — an intentional teardown is not a real turn
     // completion and must not signal "Codex finished" downstream.
-    this.resetTurnState("adapter disconnect");
+    this.resetTurnState(ADAPTER_DISCONNECT_REASON);
   }
 
   /** Fully stop: disconnect bridge AND kill the Codex process. */
@@ -297,11 +311,33 @@ export class CodexAdapter extends EventEmitter {
       const proc = this.proc;
       this.proc = null;
       proc.kill("SIGTERM");
-      // SIGKILL fallback if SIGTERM doesn't work within 2s
+      // SIGKILL fallback if SIGTERM doesn't work within 2s. NOTE: this async
+      // timer only fires if the daemon keeps running; when shutdown() calls
+      // process.exit() right after stop(), the timer is destroyed before it
+      // fires — that path is covered by forceKillAppServerSync() in the
+      // daemon's process.on("exit") handler.
       const killTimer = setTimeout(() => {
         try { proc.kill("SIGKILL"); } catch {}
       }, 2000);
       proc.on("exit", () => clearTimeout(killTimer));
+    }
+  }
+
+  /**
+   * Synchronously force-kill the spawned app-server child if still alive.
+   * Best-effort and NON-blocking — intended for the daemon's process.on("exit")
+   * last gasp. `process.exit()` destroys stop()'s async SIGKILL fallback timer,
+   * so without this an app-server that ignores or is slow to handle SIGTERM
+   * would survive as an orphan holding the pair's port. A zombie left behind is
+   * reaped by init/launchd once the daemon process fully exits.
+   */
+  forceKillAppServerSync(): void {
+    const pid = this.appServerPid;
+    if (pid === null) return;
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {
+      // already gone — nothing to do
     }
   }
 
@@ -434,7 +470,7 @@ export class CodexAdapter extends EventEmitter {
     // pendingServerRequests — those must survive the intentional reconnect
     // so they can be replayed after the TUI completes thread/resume.
     this.clearResponseTrackingStateForAppServerReconnect();
-    this.resetTurnState("app-server reconnect for new TUI session");
+    this.resetTurnState(APP_SERVER_RECONNECT_NEW_TUI_REASON);
 
     try {
       await this.connectToAppServer(false);

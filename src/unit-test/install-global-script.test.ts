@@ -1,6 +1,7 @@
 import { describe, expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { installPrefixFromBinPath, resolveInstallPrefix } from "../../scripts/install-global.mjs";
 
 const SCRIPT = join(process.cwd(), "scripts/install-global.mjs");
 const PACKAGE_NAME = "@raysonmeng/agentbridge";
@@ -159,5 +160,45 @@ describe("scripts/postinstall.cjs shouldStopRunningDaemons", () => {
         env: { AGENTBRIDGE_POSTINSTALL_STOP: "0", npm_config_global: "true" },
       }),
     ).toBe(false);
+  });
+});
+
+describe("scripts/install-global.mjs prefix resolution", () => {
+  // The install must target the prefix where the user's `agentbridge` actually
+  // resolves on PATH — npm's default global prefix is not always the same dir
+  // (e.g. nvm bin on PATH but npm prefix elsewhere), which silently installs the
+  // upgrade where it never takes effect.
+  test("installPrefixFromBinPath derives <prefix> from <prefix>/bin/<name>", () => {
+    expect(installPrefixFromBinPath("/Users/x/.nvm/versions/node/v22.20.0/bin/agentbridge")).toBe(
+      "/Users/x/.nvm/versions/node/v22.20.0",
+    );
+    expect(installPrefixFromBinPath("/usr/local/bin/abg")).toBe("/usr/local");
+    expect(installPrefixFromBinPath("  /opt/n/bin/agentbridge  ")).toBe("/opt/n");
+  });
+
+  test("installPrefixFromBinPath returns null when not under a bin/ dir or empty", () => {
+    expect(installPrefixFromBinPath("/weird/path/agentbridge")).toBeNull();
+    expect(installPrefixFromBinPath("")).toBeNull();
+    expect(installPrefixFromBinPath(undefined)).toBeNull();
+  });
+
+  test("resolveInstallPrefix uses the first resolvable bin (agentbridge before abg)", () => {
+    const which = (bin: string) =>
+      bin === "agentbridge"
+        ? { status: 0, stdout: "/opt/node/bin/agentbridge\n" }
+        : { status: 1, stdout: "" };
+    expect(resolveInstallPrefix(which)).toBe("/opt/node");
+  });
+
+  test("resolveInstallPrefix falls back to abg when agentbridge is absent", () => {
+    const which = (bin: string) =>
+      bin === "abg"
+        ? { status: 0, stdout: "/home/u/.local/bin/abg\n" }
+        : { status: 1, stdout: "" };
+    expect(resolveInstallPrefix(which)).toBe("/home/u/.local");
+  });
+
+  test("resolveInstallPrefix returns null when nothing is on PATH (first install)", () => {
+    expect(resolveInstallPrefix(() => ({ status: 1, stdout: "" }))).toBeNull();
   });
 });

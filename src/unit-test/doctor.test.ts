@@ -87,10 +87,15 @@ describe("doctor command", () => {
         "daemon readiness",
         "build drift",
         "current thread",
+        "codex tui (this pair)",
+        "codex tui (other pairs)",
         "daemon log",
         "codex wrapper log",
       ]);
       expect(report.checks.some((check: { name: string }) => check.name === "agent backend")).toBe(false);
+      // Cross-pair scan fields are always present (arrays, possibly empty).
+      expect(Array.isArray(report.tui.attachedHere)).toBe(true);
+      expect(Array.isArray(report.tui.attachedElsewhere)).toBe(true);
     } finally {
       rmSync(root, { recursive: true, force: true });
       rmSync(base, { recursive: true, force: true });

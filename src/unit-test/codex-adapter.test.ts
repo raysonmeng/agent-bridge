@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import { createServer, Socket, type AddressInfo, type Server } from "node:net";
 import { CodexAdapter } from "../codex-adapter";
 
@@ -2159,5 +2159,47 @@ describe("CodexAdapter thread/closed diagnostic sniffer", () => {
 
     const diag = logs.filter((l) => l.startsWith("DIAGNOSTIC:"));
     expect(diag.length).toBe(0);
+  });
+});
+
+describe("CodexAdapter.forceKillAppServerSync", () => {
+  test("synchronously SIGKILLs the retained app-server pid", async () => {
+    const adapter = createAdapter();
+    // Stand-in for the spawned `codex app-server` child: a real, harmless,
+    // long-lived process. We assert via the `exit` event (which fires once the
+    // OS delivers the signal AND the child is reaped) rather than polling
+    // kill(pid,0) — the latter would see a not-yet-reaped zombie as "alive".
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1 << 30)"], {
+      stdio: "ignore",
+    });
+    const exited = new Promise<{ signal: NodeJS.Signals | null }>((resolve) => {
+      child.on("exit", (_code, signal) => resolve({ signal }));
+    });
+    // Let the child come up so it has a live pid to kill.
+    await sleep(100);
+    expect(typeof child.pid).toBe("number");
+
+    adapter.appServerPid = child.pid;
+    adapter.forceKillAppServerSync();
+
+    const result = await Promise.race([
+      exited,
+      sleep(3000).then(() => ({ signal: "TIMEOUT" as unknown as NodeJS.Signals })),
+    ]);
+    expect(result.signal).toBe("SIGKILL");
+  });
+
+  test("is a no-op (no throw) when no app-server pid is retained", () => {
+    const adapter = createAdapter();
+    adapter.appServerPid = null;
+    expect(() => adapter.forceKillAppServerSync()).not.toThrow();
+  });
+
+  test("swallows ESRCH when the retained pid is already gone", () => {
+    const adapter = createAdapter();
+    // A pid that is overwhelmingly unlikely to exist; process.kill would throw
+    // ESRCH, which forceKillAppServerSync must swallow.
+    adapter.appServerPid = 2147483646;
+    expect(() => adapter.forceKillAppServerSync()).not.toThrow();
   });
 });

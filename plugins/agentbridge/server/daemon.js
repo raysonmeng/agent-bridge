@@ -15,7 +15,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.6", "0.0.0-source"),
-  commit: defineString("6c24127", "source"),
+  commit: defineString("3f6efff", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, 1)
 });
@@ -399,10 +399,25 @@ Sec-WebSocket-Version: 13\r
   });
 }
 
+// src/turn-notices.ts
+var ADAPTER_DISCONNECT_REASON = "adapter disconnect";
+var APP_SERVER_RECONNECT_NEW_TUI_REASON = "app-server reconnect for new TUI session";
+var SILENT_ABORT_REASONS = new Set([
+  ADAPTER_DISCONNECT_REASON,
+  APP_SERVER_RECONNECT_NEW_TUI_REASON
+]);
+function buildTurnAbortedNotice(reason, replyWasRequired) {
+  if (SILENT_ABORT_REASONS.has(reason))
+    return null;
+  const tail = replyWasRequired ? " A reply you were waiting on will NOT arrive \u2014 retry your last message, or wait for the Codex TUI to reconnect." : " If you were waiting on a reply it will not arrive; retry, or wait for the Codex TUI to reconnect.";
+  return `\u26A0\uFE0F Codex's current turn ended without completing (${reason}). ` + "This usually means Codex hit an error (e.g. a rate limit / 429), the app-server connection dropped, or the turn was interrupted." + tail;
+}
+
 // src/codex-adapter.ts
 class CodexAdapter extends EventEmitter {
   static RESPONSE_TRACKING_TTL_MS = 30000;
   proc = null;
+  appServerPid = null;
   appServerWs = null;
   tuiWs = null;
   proxyServer = null;
@@ -473,8 +488,12 @@ class CodexAdapter extends EventEmitter {
     this.proc = spawn("codex", ["app-server", "--listen", listen], {
       stdio: ["pipe", "pipe", "pipe"]
     });
+    this.appServerPid = this.proc.pid ?? null;
     this.proc.on("error", (err) => this.emit("error", err));
-    this.proc.on("exit", (code) => this.emit("exit", code));
+    this.proc.on("exit", (code) => {
+      this.appServerPid = null;
+      this.emit("exit", code);
+    });
     const stderrRl = createInterface({ input: this.proc.stderr });
     stderrRl.on("line", (l) => this.log(`[codex-server] ${l}`));
     const stdoutRl = createInterface({ input: this.proc.stdout });
@@ -522,7 +541,7 @@ class CodexAdapter extends EventEmitter {
     if (this.socketPath)
       removeSocketFile(this.socketPath);
     this.clearResponseTrackingState();
-    this.resetTurnState("adapter disconnect");
+    this.resetTurnState(ADAPTER_DISCONNECT_REASON);
   }
   stop() {
     this.intentionalDisconnect = true;
@@ -538,6 +557,14 @@ class CodexAdapter extends EventEmitter {
       }, 2000);
       proc.on("exit", () => clearTimeout(killTimer));
     }
+  }
+  forceKillAppServerSync() {
+    const pid = this.appServerPid;
+    if (pid === null)
+      return;
+    try {
+      process.kill(pid, "SIGKILL");
+    } catch {}
   }
   injectMessage(text) {
     if (!this.threadId) {
@@ -649,7 +676,7 @@ class CodexAdapter extends EventEmitter {
       } catch {}
     }
     this.clearResponseTrackingStateForAppServerReconnect();
-    this.resetTurnState("app-server reconnect for new TUI session");
+    this.resetTurnState(APP_SERVER_RECONNECT_NEW_TUI_REASON);
     try {
       await this.connectToAppServer(false);
       this.log("App-server reconnected for new TUI session \u2014 replaying buffered messages");
@@ -2582,6 +2609,27 @@ async function persistCurrentThreadWithRolloutRetry(identity, threadId, reason, 
   return readRawCurrentThread(identity.stateDir) ?? writePendingCurrentThread(identity, threadId, reason);
 }
 
+// src/waiting-message.ts
+function formatWaitingForCodexTuiMessage(options) {
+  const pairName = options.pairName ?? "unknown";
+  const pairId = options.pairId ?? "manual";
+  const slot = options.slot === null || options.slot === undefined ? "manual" : String(options.slot);
+  return [
+    "\u23F3 Waiting for Codex TUI to connect.",
+    `Current pair: cwd=${options.cwd} pair=${pairName} pairId=${pairId} slot=${slot} proxy=${options.proxyUrl}`,
+    "If Codex was started from a different cwd, it belongs to another pair and will not attach here.",
+    "Run in another terminal:",
+    options.attachCmd,
+    "For diagnostics: abg doctor"
+  ].join(`
+`);
+}
+
+// src/pair-registry.ts
+var PAIR_BASE_PORT = 4500;
+var PAIR_SLOT_STRIDE = 10;
+var MAX_PAIR_SLOT = Math.floor((65535 - 2 - PAIR_BASE_PORT) / PAIR_SLOT_STRIDE);
+
 // src/liveness-probe.ts
 var OPEN = 1;
 async function probeLiveness(target, options) {
@@ -2712,7 +2760,12 @@ codex.on("turnCompleted", () => {
 });
 codex.on("turnAborted", (reason) => {
   log(`Codex turn aborted (${reason}) \u2014 clearing reply-required state`);
+  const replyWasRequired = replyTracker.isArmed;
   replyTracker.reset();
+  const notice = buildTurnAbortedNotice(reason, replyWasRequired);
+  if (notice) {
+    emitToClaude(systemMessage("system_turn_aborted", notice));
+  }
 });
 codex.on("turnStalled", (event) => {
   log(`Codex turn stalled (${event.turnId}, inactivity ${event.inactivityMs}ms)`);
@@ -3140,8 +3193,17 @@ function currentStatus() {
   };
 }
 function currentWaitingMessage() {
-  return `\u23F3 Waiting for Codex TUI to connect. Run in another terminal:
-${attachCmd}`;
+  const pairId = process.env.AGENTBRIDGE_PAIR_ID ?? null;
+  const offset = CODEX_PROXY_PORT - PAIR_BASE_PORT - 1;
+  const slot = pairId !== null && offset >= 0 && offset % PAIR_SLOT_STRIDE === 0 ? offset / PAIR_SLOT_STRIDE : null;
+  return formatWaitingForCodexTuiMessage({
+    attachCmd,
+    cwd: process.cwd(),
+    pairId,
+    pairName: process.env.AGENTBRIDGE_PAIR_NAME ?? null,
+    slot,
+    proxyUrl: codex.proxyUrl
+  });
 }
 function currentReadyMessage() {
   return `\u2705 Codex TUI connected (${codex.activeThreadId}). Bridge ready.`;
@@ -3245,6 +3307,7 @@ function shutdown(reason, exitCode = 0) {
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
 process.on("exit", () => {
+  codex.forceKillAppServerSync();
   removePidFile();
   removeStatusFile();
 });

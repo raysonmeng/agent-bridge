@@ -1,5 +1,4 @@
 import { spawn, execSync } from "node:child_process";
-import { execFileSync } from "node:child_process";
 import {
   openSync,
   writeSync,
@@ -25,6 +24,12 @@ import {
   type CurrentThreadState,
 } from "../thread-state";
 import { appendTraceEvent, pickRelevantEnv, redactArgv } from "../trace-log";
+import {
+  commandForPid,
+  commandMatchesManagedCodexTui,
+  findManagedCodexTuiProcesses,
+  isProcessAlive,
+} from "../process-lifecycle";
 import { checkOwnedFlagConflicts } from "./claude";
 
 /**
@@ -279,7 +284,8 @@ export async function runCodex(args: string[]) {
 
   const stateDir = pair.stateDir;
   const controlPort = pair.ports.controlPort;
-  guardNoLiveManagedTui(stateDir);
+  const pairProxyUrl = `ws://127.0.0.1:${pair.ports.proxyPort}`;
+  guardNoLiveManagedTui(stateDir, pairProxyUrl);
 
   const lifecycle = new DaemonLifecycle({
     stateDir,
@@ -429,6 +435,9 @@ export async function runCodex(args: string[]) {
   }
 
   let cleanedTuiPid = false;
+  let childExited = false;
+  let wrapperShuttingDown = false;
+  let signalExitCode: number | null = null;
   function cleanupTuiPidFile() {
     if (cleanedTuiPid) return;
     cleanedTuiPid = true;
@@ -437,11 +446,72 @@ export async function runCodex(args: string[]) {
     } catch {}
   }
 
-  process.on("exit", () => { restoreTerminal(); cleanupTuiPidFile(); });
-  process.on("SIGINT", () => { restoreTerminal(); cleanupTuiPidFile(); process.exit(130); });
-  process.on("SIGTERM", () => { restoreTerminal(); cleanupTuiPidFile(); process.exit(143); });
+  /**
+   * Ask the child to stop, escalating to SIGKILL, WITHOUT blocking the event
+   * loop. A synchronous wait here would prevent Node from reaping the child, so
+   * the killed pid would linger as an unreaped zombie that still answers
+   * `kill(pid, 0)` — and the wrapper would wait out every timeout for nothing.
+   * We signal asynchronously and let `child.on("exit")` (which fires only once
+   * the child is reaped) drive the actual shutdown.
+   */
+  function requestChildTermination(reason: string) {
+    if (childExited) return;
+    const pid = child.pid;
+    if (typeof pid !== "number") return;
+    appendWrapperLog(wrapperLogPath, `terminating child pid=${pid} reason=${reason}`);
+    try {
+      child.kill("SIGTERM");
+    } catch {}
+    const killTimer = setTimeout(() => {
+      if (childExited) return;
+      appendWrapperLog(wrapperLogPath, `child pid=${pid} still alive after SIGTERM; sending SIGKILL`);
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+    }, 1500);
+    killTimer.unref();
+  }
+
+  function shutdownWrapper(reason: string, exitCode: number) {
+    if (wrapperShuttingDown) return;
+    wrapperShuttingDown = true;
+    signalExitCode = exitCode;
+    restoreTerminal();
+    requestChildTermination(reason);
+
+    if (childExited) {
+      cleanupTuiPidFile();
+      process.exit(exitCode);
+      return;
+    }
+
+    // `child.on("exit")` exits the wrapper once the child is reaped. Hard
+    // fallback in case the signal can never be delivered to the child.
+    const forceTimer = setTimeout(() => {
+      cleanupTuiPidFile();
+      process.exit(exitCode);
+    }, 3000);
+    forceTimer.unref();
+  }
+
+  process.on("exit", () => {
+    // Last-resort SYNCHRONOUS cleanup only — never block. A best-effort SIGKILL
+    // is enough: once the wrapper exits the child is reparented to init/launchd
+    // and reaped there. Blocking to wait would defeat that reaping.
+    restoreTerminal();
+    if (!childExited && typeof child.pid === "number") {
+      try {
+        child.kill("SIGKILL");
+      } catch {}
+    }
+    cleanupTuiPidFile();
+  });
+  process.on("SIGHUP", () => shutdownWrapper("SIGHUP", 129));
+  process.on("SIGINT", () => shutdownWrapper("SIGINT", 130));
+  process.on("SIGTERM", () => shutdownWrapper("SIGTERM", 143));
 
   child.on("exit", (code, signal) => {
+    childExited = true;
     cleanupTuiPidFile();
 
     const runtimeMs = Date.now() - startedAt;
@@ -478,7 +548,9 @@ export async function runCodex(args: string[]) {
       ].join("\n"),
     );
 
-    process.exit(code ?? 0);
+    // When a signal initiated the shutdown, exit with the conventional
+    // 128+signal code (the child was reaped with signal=SIG*, code=null).
+    process.exit(signalExitCode ?? code ?? 0);
   });
 
   child.on("error", (err) => {
@@ -526,20 +598,25 @@ function traceCliStart(
   }
 }
 
-function guardNoLiveManagedTui(stateDir: PairResolution["stateDir"]) {
+function guardNoLiveManagedTui(stateDir: PairResolution["stateDir"], proxyUrl: string) {
   const pid = readTuiPid(stateDir);
-  if (!pid) return;
-  if (!isProcessAlive(pid)) {
-    try { unlinkSync(stateDir.tuiPidFile); } catch {}
-    return;
-  }
-  if (!isManagedCodexTuiProcess(pid)) {
-    appendWrapperLog(stateDir.codexWrapperLogFile, `stale tui pid file pointed at unmanaged live pid=${pid}; removing`);
-    try { unlinkSync(stateDir.tuiPidFile); } catch {}
-    return;
+  if (pid) {
+    if (!isProcessAlive(pid)) {
+      try { unlinkSync(stateDir.tuiPidFile); } catch {}
+    } else if (!isManagedCodexTuiProcess(pid, proxyUrl)) {
+      appendWrapperLog(stateDir.codexWrapperLogFile, `stale tui pid file pointed at unmanaged live pid=${pid}; removing`);
+      try { unlinkSync(stateDir.tuiPidFile); } catch {}
+    } else {
+      console.error(`[agentbridge] This pair already has a managed Codex TUI running (pid ${pid}).`);
+      console.error(`[agentbridge] Use that terminal, or stop it with: ${pairScopedCommand("kill")}`);
+      process.exit(1);
+    }
   }
 
-  console.error(`[agentbridge] This pair already has a managed Codex TUI running (pid ${pid}).`);
+  const orphan = findManagedCodexTuiProcesses(proxyUrl)[0];
+  if (!orphan) return;
+
+  console.error(`[agentbridge] This pair already has a managed Codex TUI running (pid ${orphan.pid}).`);
   console.error(`[agentbridge] Use that terminal, or stop it with: ${pairScopedCommand("kill")}`);
   process.exit(1);
 }
@@ -555,27 +632,9 @@ function readTuiPid(stateDir: PairResolution["stateDir"]): number | null {
   }
 }
 
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
-function isManagedCodexTuiProcess(pid: number): boolean {
-  try {
-    const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
-    return (
-      cmd.includes("codex") &&
-      cmd.includes("--enable") &&
-      cmd.includes("tui_app_server") &&
-      cmd.includes("--remote")
-    );
-  } catch {
-    return false;
-  }
+function isManagedCodexTuiProcess(pid: number, proxyUrl: string): boolean {
+  const cmd = commandForPid(pid);
+  return cmd !== null && commandMatchesManagedCodexTui(cmd, proxyUrl);
 }
 
 function proxyHealthUrl(proxyUrl: string): string {

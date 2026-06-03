@@ -1,7 +1,6 @@
-import { execFileSync } from "node:child_process";
 import { readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
-import { DaemonLifecycle, isProcessAlive } from "../daemon-lifecycle";
+import { DaemonLifecycle } from "../daemon-lifecycle";
 import { PairError, detectLegacyRootDaemon, type PairEntry, type PairPorts } from "../pair-registry";
 import {
   computeBaseDir,
@@ -10,6 +9,13 @@ import {
   parseKillArgs,
   portsForEntry,
 } from "../pair-resolver";
+import {
+  commandForPid,
+  commandMatchesManagedCodexTui,
+  findManagedCodexTuiProcesses,
+  isProcessAlive,
+  terminateProcessSync,
+} from "../process-lifecycle";
 import { StateDirResolver } from "../state-dir";
 
 type LogFn = (msg: string) => void;
@@ -140,7 +146,18 @@ async function stopStateDir(label: string, stateDir: StateDirResolver, ports: Pa
     });
 
     lifecycle.markKilled();
-    const tuiKilled = await killManagedCodexTui(stateDir, log);
+    // Prefer the daemon's own status.json proxyUrl over the slot's computed port:
+    // the legacy/manual kill path resolves ports heuristically (e.g. the legacy
+    // root daemon is reported as 4501) and a custom CODEX_PROXY_PORT would not
+    // match the slot default. The TUI connected to whatever proxyUrl the daemon
+    // advertised, so that is the URL the orphan scan must match. Read it BEFORE
+    // killing the daemon (kill() deletes status.json). Fall back to the slot port.
+    const status = lifecycle.readStatus();
+    const proxyUrl =
+      typeof status?.proxyUrl === "string" && status.proxyUrl.length > 0
+        ? status.proxyUrl
+        : `ws://127.0.0.1:${ports.proxyPort}`;
+    const tuiKilled = await killManagedCodexTui(stateDir, proxyUrl, log);
     const daemonKilled = await lifecycle.kill();
     return { label, daemonKilled, tuiKilled };
   } catch (error) {
@@ -194,53 +211,38 @@ function printSummary(results: StopResult[], restartCommand: string) {
 
 async function killManagedCodexTui(
   stateDir: StateDirResolver,
+  proxyUrl: string,
   log: LogFn,
   gracefulTimeoutMs = 3000,
 ): Promise<boolean> {
   const pid = readTuiPid(stateDir);
+  let killed = false;
   if (!pid) {
     log("No Codex TUI pid file found");
     removeTuiPidFile(stateDir);
-    return false;
-  }
-
-  if (!isProcessAlive(pid)) {
+  } else if (!isProcessAlive(pid)) {
     log(`Codex TUI pid ${pid} is not alive, cleaning up stale pid file`);
     removeTuiPidFile(stateDir);
-    return false;
-  }
-
-  if (!isManagedCodexTuiProcess(pid)) {
+  } else if (!isManagedCodexTuiProcess(pid, proxyUrl)) {
     log(`Pid ${pid} is alive but is NOT a managed AgentBridge Codex TUI — refusing to kill. Cleaning up stale pid file.`);
     removeTuiPidFile(stateDir);
-    return false;
-  }
-
-  log(`Sending SIGTERM to Codex TUI pid ${pid}`);
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch {
+  } else {
+    log(`Stopping Codex TUI pid ${pid}`);
+    terminateProcessSync(pid, { gracefulTimeoutMs, log });
     removeTuiPidFile(stateDir);
-    return false;
+    killed = true;
   }
 
-  const deadline = Date.now() + gracefulTimeoutMs;
-  while (Date.now() < deadline) {
-    if (!isProcessAlive(pid)) {
-      log(`Codex TUI pid ${pid} stopped gracefully`);
-      removeTuiPidFile(stateDir);
-      return true;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 200));
+  const orphanCandidates = findManagedCodexTuiProcesses(proxyUrl)
+    .filter((entry) => entry.pid !== pid);
+  for (const candidate of orphanCandidates) {
+    log(`Stopping orphan Codex TUI pid ${candidate.pid} attached to ${proxyUrl}`);
+    terminateProcessSync(candidate.pid, { gracefulTimeoutMs, log });
+    killed = true;
   }
-
-  log(`Codex TUI pid ${pid} did not stop gracefully, sending SIGKILL`);
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {}
 
   removeTuiPidFile(stateDir);
-  return true;
+  return killed;
 }
 
 function readTuiPid(stateDir: StateDirResolver): number | null {
@@ -260,16 +262,7 @@ function removeTuiPidFile(stateDir: StateDirResolver) {
   } catch {}
 }
 
-function isManagedCodexTuiProcess(pid: number): boolean {
-  try {
-    const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
-    return (
-      cmd.includes("codex") &&
-      cmd.includes("--enable") &&
-      cmd.includes("tui_app_server") &&
-      cmd.includes("--remote")
-    );
-  } catch {
-    return false;
-  }
+function isManagedCodexTuiProcess(pid: number, proxyUrl: string): boolean {
+  const cmd = commandForPid(pid);
+  return cmd !== null && commandMatchesManagedCodexTui(cmd, proxyUrl);
 }

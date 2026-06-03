@@ -23,6 +23,9 @@ import { parsePositiveIntEnv } from "./env-utils";
 import { ReplyRequiredTracker } from "./reply-required-tracker";
 import { persistCurrentThreadWithRolloutRetry } from "./thread-state";
 import { appendRotatingLog } from "./rotating-log";
+import { buildTurnAbortedNotice } from "./turn-notices";
+import { formatWaitingForCodexTuiMessage } from "./waiting-message";
+import { PAIR_BASE_PORT, PAIR_SLOT_STRIDE } from "./pair-registry";
 import type {
   ControlClientIdentity,
   ControlClientMessage,
@@ -213,7 +216,16 @@ codex.on("turnAborted", (reason: string) => {
   // stop). Clear the require_reply tracker so its armed state cannot be inherited
   // by a later, unrelated turn (force-forward leak + misattributed warning).
   log(`Codex turn aborted (${reason}) — clearing reply-required state`);
+  const replyWasRequired = replyTracker.isArmed;
   replyTracker.reset();
+
+  // Surface the abnormal ending to Claude so a turn that emitted "⏳ Codex is
+  // working" always gets a matching close signal (symmetric with the
+  // turn-completed / turn-stalled notices). Stays silent on intentional teardown.
+  const notice = buildTurnAbortedNotice(reason, replyWasRequired);
+  if (notice) {
+    emitToClaude(systemMessage("system_turn_aborted", notice));
+  }
 });
 
 codex.on("turnStalled", (event: { turnId: string; inactivityMs: number }) => {
@@ -792,7 +804,23 @@ function currentStatus(): DaemonStatus {
 }
 
 function currentWaitingMessage() {
-  return `⏳ Waiting for Codex TUI to connect. Run in another terminal:\n${attachCmd}`;
+  // Surface the pair identity so a user whose Codex is attached elsewhere can
+  // see WHY it isn't connecting here: a Codex started from a different cwd is a
+  // different pair and will never attach to this daemon (the #1 pairing pitfall).
+  const pairId = process.env.AGENTBRIDGE_PAIR_ID ?? null;
+  const offset = CODEX_PROXY_PORT - PAIR_BASE_PORT - 1;
+  const slot =
+    pairId !== null && offset >= 0 && offset % PAIR_SLOT_STRIDE === 0
+      ? offset / PAIR_SLOT_STRIDE
+      : null;
+  return formatWaitingForCodexTuiMessage({
+    attachCmd,
+    cwd: process.cwd(),
+    pairId,
+    pairName: process.env.AGENTBRIDGE_PAIR_NAME ?? null,
+    slot,
+    proxyUrl: codex.proxyUrl,
+  });
 }
 
 function currentReadyMessage() {
@@ -928,7 +956,16 @@ function shutdown(reason: string, exitCode = 0) {
 
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
-process.on("exit", () => { removePidFile(); removeStatusFile(); });
+process.on("exit", () => {
+  // Guarantee the app-server child cannot outlive the daemon: shutdown() calls
+  // process.exit() immediately after codex.stop(), which destroys stop()'s async
+  // SIGKILL fallback timer before it can fire. This synchronous last gasp kills
+  // the app-server even if it ignored/was slow on SIGTERM — preventing an orphan
+  // that holds the pair's port and blocks the next launch.
+  codex.forceKillAppServerSync();
+  removePidFile();
+  removeStatusFile();
+});
 process.on("uncaughtException", (err) => {
   log(`UNCAUGHT EXCEPTION: ${err.stack ?? err.message}`);
 });

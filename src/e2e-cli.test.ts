@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { spawn, type ChildProcess } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, rmSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer } from "node:net";
@@ -582,6 +582,51 @@ describe("E2E: CLI surface", () => {
       expect(existsSync(join(harness.stateDir, "codex-tui.pid"))).toBe(false);
       expect(existsSync(join(harness.stateDir, "status.json"))).toBe(false);
       expect(existsSync(join(harness.stateDir, "killed"))).toBe(true);
+    });
+  }, 20000);
+
+  test("agentbridge kill reaps a managed Codex TUI even when its pid file is missing", async () => {
+    await withHarness(async (harness) => {
+      const codexProc = await harness.spawnCli(
+        ["codex"],
+        { AGENTBRIDGE_CODEX_SHIM_HOLD_MS: "30000" },
+      );
+      await harness.waitForHealth();
+      await waitFor(() => harness.readTuiPid() !== null, 80, 50);
+
+      const tuiPid = harness.readTuiPid();
+      expect(tuiPid).not.toBeNull();
+      expect(tuiPid && isProcessAlive(tuiPid)).toBe(true);
+
+      unlinkSync(join(harness.stateDir, "codex-tui.pid"));
+
+      const result = await harness.runCli(["kill"]);
+
+      expect(result.code).toBe(0);
+      await waitFor(() => (tuiPid ? !isProcessAlive(tuiPid) : true), 80, 50);
+      await waitFor(() => codexProc.child.exitCode !== null, 80, 50);
+      expect(existsSync(join(harness.stateDir, "codex-tui.pid"))).toBe(false);
+    });
+  }, 20000);
+
+  test("agentbridge codex kills its child before exiting on SIGTERM", async () => {
+    await withHarness(async (harness) => {
+      const codexProc = await harness.spawnCli(
+        ["codex"],
+        { AGENTBRIDGE_CODEX_SHIM_HOLD_MS: "30000" },
+      );
+      await harness.waitForHealth();
+      await waitFor(() => harness.readTuiPid() !== null, 80, 50);
+
+      const tuiPid = harness.readTuiPid();
+      expect(tuiPid).not.toBeNull();
+      expect(tuiPid && isProcessAlive(tuiPid)).toBe(true);
+
+      codexProc.child.kill("SIGTERM");
+
+      await waitFor(() => codexProc.child.exitCode !== null, 80, 50);
+      await waitFor(() => (tuiPid ? !isProcessAlive(tuiPid) : true), 80, 50);
+      expect(existsSync(join(harness.stateDir, "codex-tui.pid"))).toBe(false);
     });
   }, 20000);
 

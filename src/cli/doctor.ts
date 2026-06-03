@@ -4,6 +4,11 @@ import { inspectAgentBridgeEnv } from "../env-guard";
 import { applyPairEnv, parsePairFlag, type PairResolution } from "../pair-resolver";
 import { readRawCurrentThread, readUsableCurrentThread } from "../thread-state";
 import { scanResumePollution } from "../resume-pollution";
+import {
+  commandMatchesManagedCodexTui,
+  listManagedCodexTuiProcesses,
+  type ManagedCodexTuiProcess,
+} from "../process-lifecycle";
 import type { DaemonStatus } from "../control-protocol";
 
 type CheckStatus = "ok" | "warn" | "fail";
@@ -29,6 +34,12 @@ interface DoctorReport {
     health: DaemonStatus | null;
     ready: DaemonStatus | null;
     buildDrift: boolean | null;
+  };
+  tui: {
+    /** Managed Codex TUIs attached to THIS pair's proxy. */
+    attachedHere: Array<{ pid: number; remoteUrl: string | null }>;
+    /** Managed Codex TUIs attached to a DIFFERENT pair/proxy (likely another cwd). */
+    attachedElsewhere: Array<{ pid: number; remoteUrl: string | null }>;
   };
   checks: DoctorCheck[];
 }
@@ -166,6 +177,41 @@ async function buildDoctorReport(pair: PairResolution): Promise<DoctorReport> {
         : "no current-thread.json for this pair",
   });
 
+  // Cross-pair Codex TUI scan: this is the half of the waiting-state diagnosis
+  // that `formatWaitingForCodexTuiMessage` points users to ("For diagnostics:
+  // abg doctor"). A Codex TUI started from a different cwd belongs to a
+  // different pair (a different proxy port) and will NEVER bridge here — the #1
+  // pairing pitfall. Surface both "attached here" and "attached elsewhere".
+  const pairProxyUrl = `ws://127.0.0.1:${pair.ports.proxyPort}`;
+  const managedTuis = listManagedCodexTuiProcesses();
+  const attachedHere: ManagedCodexTuiProcess[] = [];
+  const attachedElsewhere: ManagedCodexTuiProcess[] = [];
+  for (const tui of managedTuis) {
+    if (commandMatchesManagedCodexTui(tui.command, pairProxyUrl)) {
+      attachedHere.push(tui);
+    } else {
+      attachedElsewhere.push(tui);
+    }
+  }
+
+  checks.push({
+    name: "codex tui (this pair)",
+    status: attachedHere.length > 0 ? "ok" : "warn",
+    detail:
+      attachedHere.length > 0
+        ? `${attachedHere.length} attached to ${pairProxyUrl} (pid ${attachedHere.map((t) => t.pid).join(", ")})`
+        : `no managed Codex TUI attached to this pair's proxy ${pairProxyUrl}`,
+  });
+  checks.push({
+    name: "codex tui (other pairs)",
+    status: attachedElsewhere.length > 0 ? "warn" : "ok",
+    detail:
+      attachedElsewhere.length > 0
+        ? `${attachedElsewhere.length} managed Codex TUI(s) attached to a DIFFERENT pair/proxy — likely started from another cwd, will not bridge here: ` +
+          attachedElsewhere.map((t) => `pid ${t.pid}→${t.remoteUrl ?? "?"}`).join(", ")
+        : "no managed Codex TUI attached to another pair",
+  });
+
   for (const [name, path] of [
     ["daemon log", pair.stateDir.logFile],
     ["codex wrapper log", pair.stateDir.codexWrapperLogFile],
@@ -185,6 +231,10 @@ async function buildDoctorReport(pair: PairResolution): Promise<DoctorReport> {
     },
     env,
     daemon: { health, ready, buildDrift },
+    tui: {
+      attachedHere: attachedHere.map((t) => ({ pid: t.pid, remoteUrl: t.remoteUrl })),
+      attachedElsewhere: attachedElsewhere.map((t) => ({ pid: t.pid, remoteUrl: t.remoteUrl })),
+    },
     checks,
   };
 }
