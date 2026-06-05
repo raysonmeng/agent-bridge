@@ -10,7 +10,7 @@ import { disabledReplyError, type BridgeDisabledReason } from "./bridge-disabled
 import { guardAgentBridgeEnv, normalizeEnvGuardMode } from "./env-guard";
 import { pairScopedCommand } from "./pair-command";
 import { appendTraceEvent, pickRelevantEnv } from "./trace-log";
-import { appendRotatingLog } from "./rotating-log";
+import { createProcessLogger } from "./process-log";
 import {
   CLOSE_CODE_EVICTED_STALE,
   CLOSE_CODE_PROBE_IN_PROGRESS,
@@ -19,12 +19,13 @@ import type { ControlClientIdentity } from "./control-protocol";
 import type { BridgeMessage } from "./types";
 
 const originalEnv = { ...process.env };
+const bootstrapLogger = createProcessLogger({ component: "AgentBridgeFrontend" });
 const envGuardResult = guardAgentBridgeEnv({
   cwd: process.cwd(),
   env: process.env,
   mode: normalizeEnvGuardMode(process.env.AGENTBRIDGE_ENV_GUARD),
   allowStrict: false,
-  log: (msg) => process.stderr.write(`${msg}\n`),
+  log: bootstrapLogger.log,
 });
 
 const stateDir = new StateDirResolver();
@@ -33,6 +34,7 @@ const configService = new ConfigService();
 const config = configService.loadOrDefault();
 
 const CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
+const processLogger = createProcessLogger({ component: "AgentBridgeFrontend", logFile: stateDir.logFile });
 const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 const CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 
@@ -511,18 +513,14 @@ process.on("exit", () => {
   void daemonClient.disconnect();
 });
 process.on("uncaughtException", (err) => {
-  log(`UNCAUGHT EXCEPTION: ${err.stack ?? err.message}`);
+  processLogger.fatal("UNCAUGHT EXCEPTION", err);
 });
 process.on("unhandledRejection", (reason: any) => {
-  log(`UNHANDLED REJECTION: ${reason?.stack ?? reason}`);
+  processLogger.fatal("UNHANDLED REJECTION", reason);
 });
 
 function log(msg: string) {
-  const line = `[${new Date().toISOString()}] [AgentBridgeFrontend] ${msg}\n`;
-  process.stderr.write(line);
-  try {
-    appendRotatingLog(stateDir.logFile, line);
-  } catch {}
+  processLogger.log(msg);
 }
 
 log(`Starting AgentBridge frontend (daemon ws ${CONTROL_WS_URL})`);

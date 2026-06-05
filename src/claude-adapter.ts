@@ -20,7 +20,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
-import { appendRotatingLog } from "./rotating-log";
+import { createProcessLogger, type ProcessLogger } from "./process-log";
 import { StateDirResolver } from "./state-dir";
 import type { BridgeMessage } from "./types";
 
@@ -69,6 +69,7 @@ export class ClaudeAdapter extends EventEmitter {
   private readonly instanceId: string;
   private replySender: ReplySender | null = null;
   private readonly logFile: string;
+  private readonly logger: ProcessLogger;
 
   // Dual-mode transport
   private readonly configuredMode: DeliveryMode;
@@ -80,6 +81,7 @@ export class ClaudeAdapter extends EventEmitter {
   constructor(logFile = new StateDirResolver().logFile) {
     super();
     this.logFile = logFile;
+    this.logger = createProcessLogger({ component: "ClaudeAdapter", logFile: this.logFile });
     this.instanceId = randomUUID().slice(0, 8);
     this.sessionId = `codex_${Date.now()}`;
     this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 12);
@@ -341,10 +343,6 @@ export class ClaudeAdapter extends EventEmitter {
   }
 
   private log(msg: string) {
-    const line = `[${new Date().toISOString()}] [ClaudeAdapter] ${msg}\n`;
-    process.stderr.write(line);
-    try {
-      appendRotatingLog(this.logFile, line);
-    } catch {}
+    this.logger.log(msg);
   }
 }

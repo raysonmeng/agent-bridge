@@ -9,11 +9,18 @@ export function appendRotatingLog(
   content: string,
   options: { maxBytes?: number; keep?: number } = {},
 ): void {
-  const maxBytes = options.maxBytes ?? Number(process.env.AGENTBRIDGE_LOG_MAX_BYTES || DEFAULT_MAX_BYTES);
-  const keep = options.keep ?? Number(process.env.AGENTBRIDGE_LOG_ROTATE_KEEP || DEFAULT_KEEP);
+  const maxBytes = options.maxBytes ?? positiveIntFromEnv("AGENTBRIDGE_LOG_MAX_BYTES", DEFAULT_MAX_BYTES);
+  const keep = options.keep ?? positiveIntFromEnv("AGENTBRIDGE_LOG_ROTATE_KEEP", DEFAULT_KEEP);
   mkdirSync(dirname(path), { recursive: true });
   rotateIfNeeded(path, Buffer.byteLength(content), maxBytes, keep);
   appendFileSync(path, content, "utf-8");
+}
+
+function positiveIntFromEnv(name: string, fallback: number): number {
+  const value = process.env[name];
+  if (!value) return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
 
 function rotateIfNeeded(path: string, incomingBytes: number, maxBytes: number, keep: number): void {

@@ -13,6 +13,8 @@ import type { DaemonStatus } from "../control-protocol";
 
 type CheckStatus = "ok" | "warn" | "fail";
 
+const LARGE_LOG_WARN_BYTES = 100 * 1024 * 1024;
+
 interface DoctorCheck {
   name: string;
   status: CheckStatus;
@@ -244,6 +246,14 @@ function logCheck(name: string, path: string): DoctorCheck {
     return { name, status: "warn", detail: `missing: ${path}` };
   }
   const stat = statSync(path);
+  if (stat.size > LARGE_LOG_WARN_BYTES) {
+    return {
+      name,
+      status: "warn",
+      detail:
+        `${path} (${stat.size} bytes, oversized; stop the pair, rebuild/reinstall, then rotate or remove this log)`,
+    };
+  }
   return { name, status: "ok", detail: `${path} (${stat.size} bytes)` };
 }
 

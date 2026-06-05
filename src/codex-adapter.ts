@@ -13,7 +13,7 @@ import { spawn, execSync, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { EventEmitter } from "node:events";
 import { StateDirResolver } from "./state-dir";
-import { appendRotatingLog } from "./rotating-log";
+import { createProcessLogger, type ProcessLogger } from "./process-log";
 import type { BridgeMessage } from "./types";
 import type { ServerWebSocket } from "bun";
 import {
@@ -106,6 +106,7 @@ export class CodexAdapter extends EventEmitter {
   private appPort: number;
   private proxyPort: number;
   private readonly logFile: string;
+  private readonly logger: ProcessLogger;
   private tuiConnId = 0; // tracks which TUI connection is "current" (primary)
   private connIdCounter = 0; // monotonically increasing counter for unique conn IDs
   // Secondary (picker) connections: each gets its own dedicated app-server WS
@@ -193,6 +194,7 @@ export class CodexAdapter extends EventEmitter {
     this.appPort = appPort;
     this.proxyPort = proxyPort;
     this.logFile = logFile;
+    this.logger = createProcessLogger({ component: "CodexAdapter", logFile: this.logFile });
   }
 
   get appServerUrl() { return `ws://127.0.0.1:${this.appPort}`; }
@@ -1975,8 +1977,6 @@ export class CodexAdapter extends EventEmitter {
   }
 
   private log(msg: string) {
-    const line = `[${new Date().toISOString()}] [CodexAdapter] ${msg}\n`;
-    process.stderr.write(line);
-    try { appendRotatingLog(this.logFile, line); } catch {}
+    this.logger.log(msg);
   }
 }

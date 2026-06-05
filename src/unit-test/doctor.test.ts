@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { runDoctor } from "../cli/doctor";
 import { derivePairId, writeRegistry } from "../pair-registry";
 
@@ -118,6 +118,29 @@ describe("doctor command", () => {
         status: "warn",
         detail: "--agent is reserved for read-only delegated analysis; static diagnostics were run locally in this build.",
       });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("warns when the daemon log is oversized", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agentbridge-doctor-"));
+    const base = mkdtempSync(join(tmpdir(), "agentbridge-doctor-base-"));
+    try {
+      process.chdir(root);
+      process.env.AGENTBRIDGE_BASE_DIR = base;
+      const pairId = seedPair(root, base);
+      const logPath = join(base, "pairs", pairId, "agentbridge.log");
+      mkdirSync(dirname(logPath), { recursive: true });
+      writeFileSync(logPath, "", "utf-8");
+      truncateSync(logPath, 101 * 1024 * 1024);
+
+      const report = await runDoctorJson(["--pair", "main"]);
+      const daemonLog = report.checks.find((check: { name: string }) => check.name === "daemon log");
+
+      expect(daemonLog.status).toBe("warn");
+      expect(daemonLog.detail).toContain("oversized");
     } finally {
       rmSync(root, { recursive: true, force: true });
       rmSync(base, { recursive: true, force: true });

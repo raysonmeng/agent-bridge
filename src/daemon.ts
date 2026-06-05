@@ -22,7 +22,7 @@ import {
 import { parsePositiveIntEnv } from "./env-utils";
 import { ReplyRequiredTracker } from "./reply-required-tracker";
 import { persistCurrentThreadWithRolloutRetry } from "./thread-state";
-import { appendRotatingLog } from "./rotating-log";
+import { createProcessLogger } from "./process-log";
 import { buildTurnAbortedNotice } from "./turn-notices";
 import { formatWaitingForCodexTuiMessage } from "./waiting-message";
 import { PAIR_BASE_PORT, PAIR_SLOT_STRIDE } from "./pair-registry";
@@ -49,6 +49,7 @@ const stateDir = new StateDirResolver();
 stateDir.ensure();
 const configService = new ConfigService();
 const config = configService.loadOrDefault();
+const processLogger = createProcessLogger({ component: "AgentBridgeDaemon", logFile: stateDir.logFile });
 
 const CODEX_APP_PORT = parseInt(process.env.CODEX_WS_PORT ?? String(config.codex.appPort), 10);
 const CODEX_PROXY_PORT = parseInt(process.env.CODEX_PROXY_PORT ?? String(config.codex.proxyPort), 10);
@@ -967,18 +968,14 @@ process.on("exit", () => {
   removeStatusFile();
 });
 process.on("uncaughtException", (err) => {
-  log(`UNCAUGHT EXCEPTION: ${err.stack ?? err.message}`);
+  processLogger.fatal("UNCAUGHT EXCEPTION", err);
 });
 process.on("unhandledRejection", (reason: any) => {
-  log(`UNHANDLED REJECTION: ${reason?.stack ?? reason}`);
+  processLogger.fatal("UNHANDLED REJECTION", reason);
 });
 
 function log(msg: string) {
-  const line = `[${new Date().toISOString()}] [AgentBridgeDaemon] ${msg}\n`;
-  process.stderr.write(line);
-  try {
-    appendRotatingLog(stateDir.logFile, line);
-  } catch {}
+  processLogger.log(msg);
 }
 
 // Refuse to start if user intentionally killed the daemon.

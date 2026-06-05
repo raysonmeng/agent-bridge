@@ -15,7 +15,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.6", "0.0.0-source"),
-  commit: defineString("32c0201", "source"),
+  commit: defineString("33d46d8", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, 1)
 });
@@ -102,11 +102,18 @@ import { dirname } from "path";
 var DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
 var DEFAULT_KEEP = 3;
 function appendRotatingLog(path, content, options = {}) {
-  const maxBytes = options.maxBytes ?? Number(process.env.AGENTBRIDGE_LOG_MAX_BYTES || DEFAULT_MAX_BYTES);
-  const keep = options.keep ?? Number(process.env.AGENTBRIDGE_LOG_ROTATE_KEEP || DEFAULT_KEEP);
+  const maxBytes = options.maxBytes ?? positiveIntFromEnv("AGENTBRIDGE_LOG_MAX_BYTES", DEFAULT_MAX_BYTES);
+  const keep = options.keep ?? positiveIntFromEnv("AGENTBRIDGE_LOG_ROTATE_KEEP", DEFAULT_KEEP);
   mkdirSync2(dirname(path), { recursive: true });
   rotateIfNeeded(path, Buffer.byteLength(content), maxBytes, keep);
   appendFileSync(path, content, "utf-8");
+}
+function positiveIntFromEnv(name, fallback) {
+  const value = process.env[name];
+  if (!value)
+    return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
 function rotateIfNeeded(path, incomingBytes, maxBytes, keep) {
   if (!Number.isFinite(maxBytes) || maxBytes <= 0 || keep <= 0)
@@ -128,6 +135,79 @@ function rotateIfNeeded(path, incomingBytes, maxBytes, keep) {
     }
   }
   renameSync(path, `${path}.1`);
+}
+
+// src/process-log.ts
+var stderrStates = new WeakMap;
+function createProcessLogger(options) {
+  let fatalInProgress = false;
+  const stderr = options.stderr ?? process.stderr;
+  const stderrState = stateForStderr(stderr);
+  const write = (message) => {
+    const line = `[${new Date().toISOString()}] [${options.component}] ${message}
+`;
+    if (options.logFile) {
+      try {
+        appendRotatingLog(options.logFile, line);
+      } catch {}
+    }
+    if (!stderrState.enabled)
+      return;
+    try {
+      stderr.write(line);
+    } catch (error) {
+      if (error?.code === "EPIPE")
+        stderrState.enabled = false;
+    }
+  };
+  return {
+    log: write,
+    fatal(label, error) {
+      if (fatalInProgress)
+        return;
+      fatalInProgress = true;
+      try {
+        write(`${label}: ${safeFormatError(error)}`);
+      } finally {
+        fatalInProgress = false;
+      }
+    }
+  };
+}
+function stateForStderr(stderr) {
+  const key = stderr;
+  let state = stderrStates.get(key);
+  if (state)
+    return state;
+  state = { enabled: true };
+  stderrStates.set(key, state);
+  if (typeof stderr.on === "function") {
+    stderr.on("error", (error) => {
+      if (error?.code === "EPIPE") {
+        state.enabled = false;
+        return;
+      }
+      setTimeout(() => {
+        throw error;
+      }, 0);
+    });
+  }
+  return state;
+}
+function safeFormatError(error) {
+  try {
+    return formatError(error);
+  } catch {
+    return "<failed to format error>";
+  }
+}
+function formatError(error) {
+  if (error instanceof Error)
+    return error.stack ?? error.message;
+  if (typeof error === "object" && error !== null && "stack" in error) {
+    return String(error.stack);
+  }
+  return String(error);
 }
 
 // src/app-server-protocol.ts
@@ -429,6 +509,7 @@ class CodexAdapter extends EventEmitter {
   appPort;
   proxyPort;
   logFile;
+  logger;
   tuiConnId = 0;
   connIdCounter = 0;
   secondaryConnections = new Map;
@@ -465,6 +546,7 @@ class CodexAdapter extends EventEmitter {
     this.appPort = appPort;
     this.proxyPort = proxyPort;
     this.logFile = logFile;
+    this.logger = createProcessLogger({ component: "CodexAdapter", logFile: this.logFile });
   }
   get appServerUrl() {
     return `ws://127.0.0.1:${this.appPort}`;
@@ -1749,12 +1831,7 @@ class CodexAdapter extends EventEmitter {
     }
   }
   log(msg) {
-    const line = `[${new Date().toISOString()}] [CodexAdapter] ${msg}
-`;
-    process.stderr.write(line);
-    try {
-      appendRotatingLog(this.logFile, line);
-    } catch {}
+    this.logger.log(msg);
   }
 }
 
@@ -2663,6 +2740,7 @@ var stateDir = new StateDirResolver;
 stateDir.ensure();
 var configService = new ConfigService;
 var config = configService.loadOrDefault();
+var processLogger = createProcessLogger({ component: "AgentBridgeDaemon", logFile: stateDir.logFile });
 var CODEX_APP_PORT = parseInt(process.env.CODEX_WS_PORT ?? String(config.codex.appPort), 10);
 var CODEX_PROXY_PORT = parseInt(process.env.CODEX_PROXY_PORT ?? String(config.codex.proxyPort), 10);
 var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
@@ -3312,18 +3390,13 @@ process.on("exit", () => {
   removeStatusFile();
 });
 process.on("uncaughtException", (err) => {
-  log(`UNCAUGHT EXCEPTION: ${err.stack ?? err.message}`);
+  processLogger.fatal("UNCAUGHT EXCEPTION", err);
 });
 process.on("unhandledRejection", (reason) => {
-  log(`UNHANDLED REJECTION: ${reason?.stack ?? reason}`);
+  processLogger.fatal("UNHANDLED REJECTION", reason);
 });
 function log(msg) {
-  const line = `[${new Date().toISOString()}] [AgentBridgeDaemon] ${msg}
-`;
-  process.stderr.write(line);
-  try {
-    appendRotatingLog(stateDir.logFile, line);
-  } catch {}
+  processLogger.log(msg);
 }
 if (daemonLifecycle.wasKilled()) {
   log("Killed sentinel found \u2014 daemon was intentionally stopped. Exiting immediately.");

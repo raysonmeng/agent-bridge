@@ -13666,11 +13666,18 @@ import { dirname } from "path";
 var DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
 var DEFAULT_KEEP = 3;
 function appendRotatingLog(path, content, options = {}) {
-  const maxBytes = options.maxBytes ?? Number(process.env.AGENTBRIDGE_LOG_MAX_BYTES || DEFAULT_MAX_BYTES);
-  const keep = options.keep ?? Number(process.env.AGENTBRIDGE_LOG_ROTATE_KEEP || DEFAULT_KEEP);
+  const maxBytes = options.maxBytes ?? positiveIntFromEnv("AGENTBRIDGE_LOG_MAX_BYTES", DEFAULT_MAX_BYTES);
+  const keep = options.keep ?? positiveIntFromEnv("AGENTBRIDGE_LOG_ROTATE_KEEP", DEFAULT_KEEP);
   mkdirSync(dirname(path), { recursive: true });
   rotateIfNeeded(path, Buffer.byteLength(content), maxBytes, keep);
   appendFileSync(path, content, "utf-8");
+}
+function positiveIntFromEnv(name, fallback) {
+  const value = process.env[name];
+  if (!value)
+    return fallback;
+  const parsed = Number(value);
+  return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
 function rotateIfNeeded(path, incomingBytes, maxBytes, keep) {
   if (!Number.isFinite(maxBytes) || maxBytes <= 0 || keep <= 0)
@@ -13692,6 +13699,79 @@ function rotateIfNeeded(path, incomingBytes, maxBytes, keep) {
     }
   }
   renameSync(path, `${path}.1`);
+}
+
+// src/process-log.ts
+var stderrStates = new WeakMap;
+function createProcessLogger(options) {
+  let fatalInProgress = false;
+  const stderr = options.stderr ?? process.stderr;
+  const stderrState = stateForStderr(stderr);
+  const write = (message) => {
+    const line = `[${new Date().toISOString()}] [${options.component}] ${message}
+`;
+    if (options.logFile) {
+      try {
+        appendRotatingLog(options.logFile, line);
+      } catch {}
+    }
+    if (!stderrState.enabled)
+      return;
+    try {
+      stderr.write(line);
+    } catch (error2) {
+      if (error2?.code === "EPIPE")
+        stderrState.enabled = false;
+    }
+  };
+  return {
+    log: write,
+    fatal(label, error2) {
+      if (fatalInProgress)
+        return;
+      fatalInProgress = true;
+      try {
+        write(`${label}: ${safeFormatError(error2)}`);
+      } finally {
+        fatalInProgress = false;
+      }
+    }
+  };
+}
+function stateForStderr(stderr) {
+  const key = stderr;
+  let state = stderrStates.get(key);
+  if (state)
+    return state;
+  state = { enabled: true };
+  stderrStates.set(key, state);
+  if (typeof stderr.on === "function") {
+    stderr.on("error", (error2) => {
+      if (error2?.code === "EPIPE") {
+        state.enabled = false;
+        return;
+      }
+      setTimeout(() => {
+        throw error2;
+      }, 0);
+    });
+  }
+  return state;
+}
+function safeFormatError(error2) {
+  try {
+    return formatError2(error2);
+  } catch {
+    return "<failed to format error>";
+  }
+}
+function formatError2(error2) {
+  if (error2 instanceof Error)
+    return error2.stack ?? error2.message;
+  if (typeof error2 === "object" && error2 !== null && "stack" in error2) {
+    return String(error2.stack);
+  }
+  return String(error2);
 }
 
 // src/state-dir.ts
@@ -13796,6 +13876,7 @@ class ClaudeAdapter extends EventEmitter {
   instanceId;
   replySender = null;
   logFile;
+  logger;
   configuredMode;
   resolvedMode = null;
   pendingMessages = [];
@@ -13804,6 +13885,7 @@ class ClaudeAdapter extends EventEmitter {
   constructor(logFile = new StateDirResolver().logFile) {
     super();
     this.logFile = logFile;
+    this.logger = createProcessLogger({ component: "ClaudeAdapter", logFile: this.logFile });
     this.instanceId = randomUUID().slice(0, 8);
     this.sessionId = `codex_${Date.now()}`;
     this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 12);
@@ -14016,12 +14098,7 @@ ${formatted}`
     };
   }
   log(msg) {
-    const line = `[${new Date().toISOString()}] [ClaudeAdapter] ${msg}
-`;
-    process.stderr.write(line);
-    try {
-      appendRotatingLog(this.logFile, line);
-    } catch {}
+    this.logger.log(msg);
   }
 }
 
@@ -14039,7 +14116,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.6", "0.0.0-source"),
-  commit: defineString("32c0201", "source"),
+  commit: defineString("33d46d8", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, 1)
 });
@@ -14781,17 +14858,20 @@ import {
   existsSync as existsSync5,
   fsyncSync,
   linkSync,
+  lstatSync,
   mkdirSync as mkdirSync4,
   openSync as openSync2,
+  readdirSync,
   readFileSync as readFileSync3,
   realpathSync,
   renameSync as renameSync2,
+  rmSync,
   statSync as statSync2,
   unlinkSync as unlinkSync3,
   writeFileSync as writeFileSync3
 } from "fs";
 import { createHash, randomUUID as randomUUID2 } from "crypto";
-import { basename, join as join3 } from "path";
+import { basename, join as join3, resolve, sep } from "path";
 var PAIR_BASE_PORT = 4500;
 var PAIR_SLOT_STRIDE = 10;
 var PAIR_ID_REGEX = /^[A-Za-z0-9._-]{1,64}$/;
@@ -15065,19 +15145,20 @@ function redactData(value, key = "") {
 
 // src/bridge.ts
 var originalEnv = { ...process.env };
+var bootstrapLogger = createProcessLogger({ component: "AgentBridgeFrontend" });
 var envGuardResult = guardAgentBridgeEnv({
   cwd: process.cwd(),
   env: process.env,
   mode: normalizeEnvGuardMode(process.env.AGENTBRIDGE_ENV_GUARD),
   allowStrict: false,
-  log: (msg) => process.stderr.write(`${msg}
-`)
+  log: bootstrapLogger.log
 });
 var stateDir = new StateDirResolver;
 stateDir.ensure();
 var configService = new ConfigService;
 var config2 = configService.loadOrDefault();
 var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
+var processLogger = createProcessLogger({ component: "AgentBridgeFrontend", logFile: stateDir.logFile });
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 var CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 var claude = new ClaudeAdapter(stateDir.logFile);
@@ -15275,7 +15356,7 @@ function reconnectToDaemon() {
         if (attempt > 0) {
           log(`Reconnect attempt ${attempt + 1}, waiting ${delayMs}ms...`);
         }
-        await new Promise((resolve) => setTimeout(resolve, delayMs));
+        await new Promise((resolve2) => setTimeout(resolve2, delayMs));
         if (shuttingDown)
           return;
         if (await notifyIfDaemonKilled("Daemon was intentionally killed during reconnect backoff \u2014 not reconnecting")) {
@@ -15443,18 +15524,13 @@ process.on("exit", () => {
   daemonClient.disconnect();
 });
 process.on("uncaughtException", (err) => {
-  log(`UNCAUGHT EXCEPTION: ${err.stack ?? err.message}`);
+  processLogger.fatal("UNCAUGHT EXCEPTION", err);
 });
 process.on("unhandledRejection", (reason) => {
-  log(`UNHANDLED REJECTION: ${reason?.stack ?? reason}`);
+  processLogger.fatal("UNHANDLED REJECTION", reason);
 });
 function log(msg) {
-  const line = `[${new Date().toISOString()}] [AgentBridgeFrontend] ${msg}
-`;
-  process.stderr.write(line);
-  try {
-    appendRotatingLog(stateDir.logFile, line);
-  } catch {}
+  processLogger.log(msg);
 }
 log(`Starting AgentBridge frontend (daemon ws ${CONTROL_WS_URL})`);
 (async () => {
