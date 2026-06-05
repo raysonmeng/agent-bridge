@@ -4,11 +4,14 @@ import {
   existsSync,
   fsyncSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   openSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   renameSync,
+  rmSync,
   statSync,
   unlinkSync,
   writeFileSync,
@@ -16,7 +19,7 @@ import {
 import { createServer } from "node:net";
 import { createHash, randomUUID } from "node:crypto";
 import { hostname, userInfo } from "node:os";
-import { basename, join } from "node:path";
+import { basename, join, resolve, sep } from "node:path";
 
 /**
  * Pair registry — the single shared resource of the multi-pair feature.
@@ -827,5 +830,183 @@ export async function removePairEntry(base: string, pairId: string): Promise<Pai
     if (!found) return null;
     writeRegistry(base, { version: 1, pairs: reg.pairs.filter((p) => p.pairId.toLowerCase() !== lower) });
     return found;
+  });
+}
+
+/** Absolute path to the registry's `pairs/` root (the dir that holds per-pair state dirs). */
+export function pairsRootDir(base: string): string {
+  return pairsDir(base);
+}
+
+/**
+ * Absolute path to a single pair's on-disk state directory.
+ *
+ * Validates `pairId` first (rejects "." / ".." / path separators / reserved
+ * names) so the result can never escape `<base>/pairs`. Throws PAIR_ID_INVALID
+ * on a malformed id.
+ */
+export function pairDirPath(base: string, pairId: string): string {
+  const id = validatePairId(pairId);
+  return join(pairsDir(base), id);
+}
+
+/**
+ * Remove a pair's on-disk state directory. Does NOT touch the registry — callers
+ * remove the registry entry (removePairEntry) separately so registry truth and
+ * filesystem cleanup stay independently testable.
+ *
+ * Path-safe in depth: `validatePairId` already rejects traversal, but we also
+ * assert the resolved path is strictly inside the canonical `<base>/pairs` root
+ * before any `rmSync`, so a crafted id can never delete outside the registry.
+ * Returns true if a directory was actually removed.
+ */
+export function removePairDir(base: string, pairId: string): boolean {
+  const id = validatePairId(pairId);
+  const root = pairsDir(base);
+  const dir = join(root, id);
+  const canonicalRoot = resolve(root);
+  const canonicalDir = resolve(dir);
+  if (canonicalDir === canonicalRoot || !canonicalDir.startsWith(canonicalRoot + sep)) {
+    throw new PairError(
+      "PAIR_ID_INVALID",
+      `Refusing to remove a pair dir outside ${canonicalRoot}: ${canonicalDir}`,
+      { pairId },
+    );
+  }
+  // The lexical containment above passes even if `<base>/pairs` is itself a
+  // symlink to an external directory; `rmSync` would then follow it and delete
+  // the external target's child. Refuse to operate through a symlinked root.
+  // (We deliberately check ONLY the `pairs` segment, not the whole path via
+  // realpath — base components are legitimately symlinked, e.g. macOS /var.)
+  assertPairsRootNotSymlinked(root);
+  if (!existsSync(canonicalDir)) return false;
+  rmSync(canonicalDir, { recursive: true, force: true });
+  return true;
+}
+
+/** Throws if `<base>/pairs` exists and is a symlink (a delete/list traversal hazard). */
+function assertPairsRootNotSymlinked(root: string): void {
+  let stat: ReturnType<typeof lstatSync>;
+  try {
+    stat = lstatSync(root);
+  } catch {
+    return; // absent root — nothing to traverse
+  }
+  if (stat.isSymbolicLink()) {
+    throw new PairError(
+      "PAIR_ID_INVALID",
+      `Refusing to operate through a symlinked pairs root: ${root}`,
+      { root },
+    );
+  }
+}
+
+/**
+ * List the pair-id subdirectories under `<base>/pairs` (directories only — the
+ * registry file and any stray files are skipped). Used by `abg pairs prune` to
+ * find orphan state dirs left behind by older builds that removed the registry
+ * entry without deleting the dir. Returns raw dir names (callers validate).
+ */
+export function listPairDirs(base: string): string[] {
+  const root = pairsDir(base);
+  if (!existsSync(root)) return [];
+  // A symlinked pairs root is a traversal hazard (see removePairDir) — never
+  // enumerate through it.
+  if (lstatSync(root).isSymbolicLink()) return [];
+  return readdirSync(root, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name);
+}
+
+/**
+ * Conservative liveness probe for a pair dir: returns true if EITHER `daemon.pid`
+ * OR `status.json`'s pid points at a living process. Conservative on purpose —
+ * any sign of life keeps the dir, because wrongly deleting a live pair's state is
+ * far worse than skipping an orphan we are unsure about. Shared by the prune
+ * pre-filter and the in-lock delete gate so both agree on EPERM (= alive).
+ *
+ * Note: it does NOT confirm the pid is actually an AgentBridge daemon (no
+ * isDaemonProcess/ps check), so a stale pid OS-reused by an unrelated live
+ * process keeps an orphan dir un-pruned — a bounded disk leak. That is a
+ * deliberate trade-off: adding an identity check would risk a false-negative
+ * deleting a live pair, so reclaim hardening is left to the liveness follow-up.
+ */
+export function pairDirDaemonAlive(base: string, pairId: string): boolean {
+  const dir = join(pairsDir(base), pairId);
+  const pids: number[] = [];
+  try {
+    const pid = Number.parseInt(readFileSync(join(dir, "daemon.pid"), "utf-8").trim(), 10);
+    if (Number.isFinite(pid)) pids.push(pid);
+  } catch {
+    // no/unreadable daemon.pid
+  }
+  try {
+    const status = JSON.parse(readFileSync(join(dir, "status.json"), "utf-8")) as { pid?: unknown };
+    if (typeof status?.pid === "number") pids.push(status.pid);
+  } catch {
+    // no/unparseable status.json
+  }
+  return pids.some((pid) => pidLooksAlive(pid));
+}
+
+/**
+ * Atomically (under the registry lock) remove a pair's registry entry AND its
+ * state dir. Holding the lock across the delete closes the race where a
+ * concurrent `abg claude/codex` re-registers the same deterministic id — which
+ * also happens under this same lock in resolvePair — and would otherwise get its
+ * fresh state dir deleted out from under it. The dir is removed FIRST so a delete
+ * failure leaves the entry registered (retryable); a live daemon in the dir (a
+ * racing relaunch that registered + started before we acquired the lock) aborts
+ * the delete so a live pair's state is never destroyed.
+ *
+ * KNOWN LIMITATION (pre-existing, not closed here): this does NOT cover a
+ * launcher that already *reused* the existing registry entry via resolvePair
+ * BEFORE rm acquired the lock, but has not yet written its daemon.pid/status.json
+ * — rm/prune cannot observe such a pending launch, so concurrent `abg pairs rm X`
+ * + `abg claude --pair X` can still leave a live-but-unregistered state dir. The
+ * old `abg pairs rm` (entry-only removal) already had this window; B1 only adds
+ * the dir delete on top. A full fix needs a launch-side lease / registry
+ * tombstone / per-pair lock so the launcher revalidates membership before
+ * ensureRunning — see the reliability follow-up.
+ */
+export async function removePairEntryAndDir(
+  base: string,
+  pairId: string,
+): Promise<{ entry: PairEntry | null; dirRemoved: boolean; keptLive: boolean }> {
+  const lower = pairId.toLowerCase();
+  return withRegistryLock(base, () => {
+    const reg = readRegistry(base);
+    const found = reg.pairs.find((p) => p.pairId.toLowerCase() === lower) ?? null;
+    if (pairDirDaemonAlive(base, pairId)) {
+      return { entry: found, dirRemoved: false, keptLive: true };
+    }
+    const dirRemoved = removePairDir(base, pairId);
+    if (found) {
+      writeRegistry(base, { version: 1, pairs: reg.pairs.filter((p) => p.pairId.toLowerCase() !== lower) });
+    }
+    return { entry: found, dirRemoved, keptLive: false };
+  });
+}
+
+/**
+ * Atomically (under the registry lock) remove an ORPHAN pair dir — one with no
+ * registry entry and no live daemon. Used by `abg pairs prune`. The lock guards
+ * against deleting a dir whose id is (re)registered or whose daemon starts
+ * concurrently (both serialize on this lock).
+ */
+export async function removeUnregisteredPairDir(
+  base: string,
+  pairId: string,
+): Promise<{ removed: boolean; reason?: "registered" | "live" }> {
+  const lower = pairId.toLowerCase();
+  return withRegistryLock(base, () => {
+    const reg = readRegistry(base);
+    if (reg.pairs.some((p) => p.pairId.toLowerCase() === lower)) {
+      return { removed: false, reason: "registered" as const };
+    }
+    if (pairDirDaemonAlive(base, pairId)) {
+      return { removed: false, reason: "live" as const };
+    }
+    return { removed: removePairDir(base, pairId) };
   });
 }

@@ -17,13 +17,19 @@ import {
   derivePairId,
   derivePairIdFromCwd,
   detectLegacyRootDaemon,
+  listPairDirs,
   MAX_PAIR_SLOT,
+  pairDirPath,
+  pairsRootDir,
   PairError,
   pickLowestFreeSlot,
   portsForSlot,
   probePortFree,
   readRegistry,
+  removePairDir,
   removePairEntry,
+  removePairEntryAndDir,
+  removeUnregisteredPairDir,
   resolvePair,
   validatePairId,
   writeRegistry,
@@ -709,5 +715,126 @@ describe("cross-review regression fixes", () => {
     } finally {
       await closeServer(server);
     }
+  });
+});
+
+describe("removePairDir / listPairDirs / pairDirPath — pair state-dir cleanup (B1)", () => {
+  let base: string;
+
+  beforeEach(() => {
+    base = mkdtempSync(join(tmpdir(), "abg-pair-rmdir-"));
+  });
+  afterEach(() => {
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  test("removePairDir deletes an existing pair dir and returns true", () => {
+    const dir = join(base, "pairs", "main-deadbeef");
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "agentbridge.log"), "x", "utf-8");
+    expect(existsSync(dir)).toBe(true);
+
+    expect(removePairDir(base, "main-deadbeef")).toBe(true);
+    expect(existsSync(dir)).toBe(false);
+  });
+
+  test("removePairDir returns false when the dir does not exist", () => {
+    expect(removePairDir(base, "main-nope1234")).toBe(false);
+  });
+
+  test("removePairDir rejects path-traversal ids without deleting anything outside pairs/", () => {
+    // A sibling directory outside <base>/pairs that a traversal id could target.
+    const outside = join(base, "outside-secret");
+    mkdirSync(outside, { recursive: true });
+
+    for (const evil of ["..", "../..", "../outside-secret", "a/b", "."]) {
+      expect(() => removePairDir(base, evil)).toThrow(PairError);
+    }
+    // Nothing outside <base>/pairs was touched.
+    expect(existsSync(outside)).toBe(true);
+  });
+
+  test("pairDirPath validates the id and resolves inside <base>/pairs", () => {
+    expect(pairDirPath(base, "main-abcd1234")).toBe(join(pairsRootDir(base), "main-abcd1234"));
+    expect(() => pairDirPath(base, "..")).toThrow(PairError);
+  });
+
+  test("listPairDirs returns only subdirectories, excluding the registry file and stray files", () => {
+    const pairs = join(base, "pairs");
+    mkdirSync(join(pairs, "main-aaaa1111"), { recursive: true });
+    mkdirSync(join(pairs, "work-bbbb2222"), { recursive: true });
+    // writeRegistry drops pairs/registry.json (a FILE), which must NOT be listed.
+    writeRegistry(base, { version: 1, pairs: [] });
+    writeFileSync(join(pairs, "stray.txt"), "x", "utf-8");
+
+    expect(listPairDirs(base).sort()).toEqual(["main-aaaa1111", "work-bbbb2222"]);
+  });
+
+  test("listPairDirs returns [] when pairs/ is absent", () => {
+    const empty = mkdtempSync(join(tmpdir(), "abg-pair-empty-"));
+    try {
+      expect(listPairDirs(empty)).toEqual([]);
+    } finally {
+      rmSync(empty, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("removePairEntryAndDir / removeUnregisteredPairDir — locked atomic cleanup (B1)", () => {
+  let base: string;
+  beforeEach(() => {
+    base = mkdtempSync(join(tmpdir(), "abg-pair-lockrm-"));
+  });
+  afterEach(() => {
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  test("removePairEntryAndDir removes a dead pair's entry and dir", async () => {
+    const id = "main-deadbeef";
+    const dir = join(base, "pairs", id);
+    mkdirSync(dir, { recursive: true });
+    writeRegistry(base, { version: 1, pairs: [entry(0, id)] });
+
+    const res = await removePairEntryAndDir(base, id);
+    expect(res.keptLive).toBe(false);
+    expect(res.dirRemoved).toBe(true);
+    expect(res.entry?.pairId).toBe(id);
+    expect(existsSync(dir)).toBe(false);
+    expect(readRegistry(base).pairs.some((p) => p.pairId === id)).toBe(false);
+  });
+
+  test("removePairEntryAndDir keeps a LIVE pair's entry and dir (keptLive)", async () => {
+    const id = "main-livebeef";
+    const dir = join(base, "pairs", id);
+    mkdirSync(dir, { recursive: true });
+    // process.pid is alive → the in-lock liveness guard must refuse to delete.
+    writeFileSync(join(dir, "daemon.pid"), `${process.pid}\n`, "utf-8");
+    writeRegistry(base, { version: 1, pairs: [entry(0, id)] });
+
+    const res = await removePairEntryAndDir(base, id);
+    expect(res.keptLive).toBe(true);
+    expect(res.dirRemoved).toBe(false);
+    expect(existsSync(dir)).toBe(true);
+    expect(readRegistry(base).pairs.some((p) => p.pairId === id)).toBe(true);
+  });
+
+  test("removeUnregisteredPairDir removes an orphan but skips registered and live dirs", async () => {
+    const orphan = "main-orph0001";
+    const registered = "main-reg00002";
+    const live = "main-live0003";
+    for (const id of [orphan, registered, live]) {
+      mkdirSync(join(base, "pairs", id), { recursive: true });
+    }
+    writeFileSync(join(base, "pairs", live, "daemon.pid"), `${process.pid}\n`, "utf-8");
+    writeRegistry(base, { version: 1, pairs: [entry(0, registered)] });
+
+    expect(await removeUnregisteredPairDir(base, orphan)).toEqual({ removed: true });
+    expect(existsSync(join(base, "pairs", orphan))).toBe(false);
+
+    expect(await removeUnregisteredPairDir(base, registered)).toEqual({ removed: false, reason: "registered" });
+    expect(existsSync(join(base, "pairs", registered))).toBe(true);
+
+    expect(await removeUnregisteredPairDir(base, live)).toEqual({ removed: false, reason: "live" });
+    expect(existsSync(join(base, "pairs", live))).toBe(true);
   });
 });
