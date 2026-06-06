@@ -13863,7 +13863,7 @@ var PHASE_LABELS = {
   normal: "normal\uFF08\u6B63\u5E38\uFF09",
   balance: "balance\uFF08\u9700\u5747\u8861\uFF09",
   parallel: "parallel\uFF08\u5EFA\u8BAE\u5E76\u884C\u63D0\u901F\uFF09",
-  paused: "paused\uFF08\u8054\u5408\u6682\u505C\uFF09"
+  paused: "paused\uFF08\u9884\u7B97\u5E72\u9884\u4E2D\uFF09"
 };
 function renderBudgetSnapshot(snapshot) {
   const lines = [];
@@ -13881,8 +13881,15 @@ function renderBudgetSnapshot(snapshot) {
     }
   }
   if (snapshot.paused) {
-    const resume = snapshot.resumeAfterEpoch ? `\uFF1B\u9884\u8BA1\u6062\u590D\u4E0D\u65E9\u4E8E ${formatEpoch(snapshot.resumeAfterEpoch)}` : "";
-    lines.push(`\u6682\u505C\uFF1A\u662F \u2014 ${snapshot.pauseReason ?? "\u989D\u5EA6\u63A5\u8FD1\u8017\u5C3D"}${resume}`);
+    const resume = snapshot.resumeAfterEpoch ? `\uFF1B\u9884\u8BA1\u6062\u590D ${formatEpoch(snapshot.resumeAfterEpoch)}\uFF08\u4EE5\u5B9E\u6D4B\u4E3A\u51C6\uFF1B\u63D0\u524D\u5237\u65B0\u4F1A\u66F4\u65E9\u89E3\u9664\uFF09` : "";
+    const reason = snapshot.pauseReason ?? "\u989D\u5EA6\u63A5\u8FD1\u8017\u5C3D";
+    if (snapshot.pauseSide === "claude" && !snapshot.gateClosed) {
+      lines.push(`\u63A5\u529B\u4E2D\uFF1AClaude \u4FA7\u989D\u5EA6\u8017\u5C3D\uFF0C\u5DF2\u4EA4\u63A5 Codex \u7EE7\u7EED\u63A8\u8FDB\uFF08\u95F8\u95E8\u5F00\u653E\uFF09 \u2014 ${reason}${resume}`);
+    } else if (snapshot.pauseSide === "codex") {
+      lines.push(`\u6682\u505C\uFF1ACodex \u4FA7\u989D\u5EA6\u8017\u5C3D\uFF08\u95F8\u95E8\u5173\u95ED\uFF0CClaude \u53EF solo \u63A8\u8FDB\u72EC\u7ACB\u90E8\u5206\uFF09 \u2014 ${reason}${resume}`);
+    } else {
+      lines.push(`\u6682\u505C\uFF1A\u53CC\u4FA7\u8054\u5408\u6682\u505C\uFF08\u95F8\u95E8\u5173\u95ED\uFF09 \u2014 ${reason}${resume}`);
+    }
   } else {
     lines.push("\u6682\u505C\uFF1A\u5426");
   }
@@ -14212,7 +14219,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.6", "0.0.0-source"),
-  commit: defineString("6b54ee9", "source"),
+  commit: defineString("8e4ca6a", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, 1)
 });

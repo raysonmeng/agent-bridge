@@ -15,7 +15,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.6", "0.0.0-source"),
-  commit: defineString("6b54ee9", "source"),
+  commit: defineString("8e4ca6a", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, 1)
 });
@@ -2731,13 +2731,34 @@ function parallelState(claude, codex, cfg, now) {
     reason: `\u53CC\u65B9\u5269\u4F59\u989D\u5EA6\u5747\u9AD8\u4E8E ${pct(cfg.parallel.minRemainingPct)}\uFF0C\u6700\u8FD1 5h \u6876\u7EA6 ${minutes} \u5206\u949F\u540E\u91CD\u7F6E`
   };
 }
-function pauseDirective(claude, codex, triggers, resetEpochs, resumeEpoch, cfg) {
-  const sideText = triggers.length > 1 ? "\u53CC\u65B9" : AGENT_LABEL[triggers[0].agent];
+function renderBudgetInterventionDirective(claude, codex, side, reason, resumeEpoch, cfg) {
+  const resumeText = `\u9884\u8BA1\u6062\u590D\u65F6\u95F4\uFF08\u4EE5\u5B9E\u6D4B\u4E3A\u51C6\uFF1B\u63D0\u524D\u5237\u65B0\u4F1A\u66F4\u65E9\u89E3\u9664\uFF09\uFF1A${formatEpoch(resumeEpoch)}\u3002`;
+  if (side === "claude") {
+    return [
+      "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Claude \u4FA7\u989D\u5EA6\u7D27\u5F20\uFF0C\u8FDB\u5165\u63A5\u529B\u6A21\u5F0F\u3002",
+      `\u89E6\u53D1\u65B9\uFF1AClaude\uFF1B\u539F\u56E0\uFF1A${reason}\u3002`,
+      `${usageSummary("claude", claude)}\uFF1B${usageSummary("codex", codex)}\u3002`,
+      `\u6062\u590D\u53C2\u8003\uFF1AClaude gateUtil \u4F4E\u4E8E ${pct(cfg.resumeBelow)} \u4E14\u6CA1\u6709\u6709\u6548 rate_limit\uFF1B${resumeText}`,
+      "\u8BF7\u7ACB\u5373\u4EA4\u63A5\uFF1A\u628A\u5269\u4F59\u4EFB\u52A1\u6E05\u5355\u3001\u5173\u952E\u4E0A\u4E0B\u6587\u3001\u4EA7\u51FA\u4F4D\u7F6E\u3001\u9A8C\u6536\u6807\u51C6\u6253\u5305\u6210\u4E00\u6761 reply \u53D1\u7ED9 Codex\u3002",
+      "\u4EA4\u63A5\u540E Claude \u505C\u624B\uFF1B\u8981\u6C42 Codex \u5728\u5355 turn \u5185\u5C3D\u91CF\u5B8C\u6210\uFF0C\u5C3E\u5DF4\u5199 checkpoint\uFF0C\u6682\u505C\u671F\u4E0D\u8981\u671F\u5F85 Claude \u56DE\u590D\u3002"
+    ].join(`
+`);
+  }
+  if (side === "codex") {
+    return [
+      "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Codex \u4FA7\u989D\u5EA6\u7D27\u5F20\uFF0C\u6682\u505C\u59D4\u6D3E\u3002",
+      `\u89E6\u53D1\u65B9\uFF1ACodex\uFF1B\u539F\u56E0\uFF1A${reason}\u3002`,
+      `${usageSummary("claude", claude)}\uFF1B${usageSummary("codex", codex)}\u3002`,
+      `\u6062\u590D\u53C2\u8003\uFF1ACodex gateUtil \u4F4E\u4E8E ${pct(cfg.resumeBelow)} \u4E14\u6CA1\u6709\u6709\u6548 rate_limit\uFF1B${resumeText}`,
+      "\u8BF7 Claude \u5199 checkpoint\uFF0C\u5E76\u53EF solo \u63A8\u8FDB\u4E0D\u4F9D\u8D56 Codex \u7684\u72EC\u7ACB\u90E8\u5206\uFF1B\u4E0D\u8981\u7EE7\u7EED\u5411 Codex \u59D4\u6D3E\uFF0C\u6807\u6CE8\u6E05\u695A\u5206\u5DE5\u65AD\u70B9\u3002"
+    ].join(`
+`);
+  }
   return [
     "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011\u8FDB\u5165\u8054\u5408\u6682\u505C\u3002",
-    `\u89E6\u53D1\u65B9\uFF1A${sideText}\uFF1B\u539F\u56E0\uFF1A${triggers.map((trigger) => trigger.reason).join("\uFF1B")}\u3002`,
+    `\u89E6\u53D1\u65B9\uFF1A\u53CC\u65B9\uFF1B\u539F\u56E0\uFF1A${reason}\u3002`,
     `${usageSummary("claude", claude)}\uFF1B${usageSummary("codex", codex)}\u3002`,
-    `\u6062\u590D\u6761\u4EF6\uFF1AClaude \u4E0E Codex \u7684 gateUtil \u90FD\u4F4E\u4E8E ${pct(cfg.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002\u9884\u8BA1\u6062\u590D\u4E0D\u65E9\u4E8E ${formatEpoch(resumeEpoch)}\u3002`,
+    `\u6062\u590D\u6761\u4EF6\uFF1AClaude \u4E0E Codex \u7684 gateUtil \u90FD\u4F4E\u4E8E ${pct(cfg.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\uFF1B${resumeText}`,
     "\u8BF7\u6536\u5C3E\u5F53\u524D\u6B65\u3001\u5199 checkpoint\u3001\u505C\u6B62\u7EE7\u7EED\u59D4\u6D3E\uFF1Bpause \u671F\u95F4\u4E0D\u8981\u91CD\u8BD5\u5411 Codex \u53D1\u9001 reply\u3002"
   ].join(`
 `);
@@ -2801,7 +2822,7 @@ function computeBudgetState(claude, codex, cfg, now) {
   const pauseSide = !paused ? null : triggers.length > 1 ? "both" : triggers[0].agent;
   let directiveToClaude = null;
   if (phase === "paused") {
-    directiveToClaude = pauseDirective(claude, codex, triggers, resetEpochs, filteredResumeAfterEpoch, cfg);
+    directiveToClaude = renderBudgetInterventionDirective(claude, codex, pauseSide ?? "both", triggers.map((trigger) => trigger.reason).join("\uFF1B"), filteredResumeAfterEpoch, cfg);
   } else if (phase === "balance" && claude && codex) {
     directiveToClaude = balanceDirective(claude, codex, drift, parallel);
   } else if (phase === "parallel" && claude && codex) {
@@ -2861,7 +2882,7 @@ class BudgetCoordinator {
   log;
   timer = null;
   running = false;
-  paused = false;
+  activeSides = new Set;
   lastDirectiveFingerprint = null;
   latestSnapshot = null;
   pauseReason = null;
@@ -2895,7 +2916,10 @@ class BudgetCoordinator {
     }
   }
   isPaused() {
-    return this.paused;
+    return this.activeSides.size > 0;
+  }
+  isGateClosed() {
+    return this.activeSides.has("codex");
   }
   getSnapshot() {
     return this.latestSnapshot;
@@ -2935,7 +2959,7 @@ class BudgetCoordinator {
       return;
     }
     if (!usage) {
-      if (!this.paused)
+      if (!this.isPaused())
         this.latestSnapshot = null;
       return;
     }
@@ -2948,31 +2972,29 @@ class BudgetCoordinator {
     this.latestSnapshot = this.toSnapshot(state);
   }
   applyState(state) {
-    if (state.pause.active) {
-      this.pauseReason = state.pause.reason;
-      this.pauseResumeAfterEpoch = state.pause.resumeAfterEpoch;
-      const fingerprint2 = this.directiveFingerprint(state);
-      if (!this.paused) {
-        this.paused = true;
+    const previousSide = this.pauseSide();
+    this.updateActiveSides(state);
+    const currentSide = this.pauseSide();
+    if (currentSide) {
+      this.pauseReason = this.interventionReason(state);
+      const nextResumeAfterEpoch = this.resumeAfterEpoch(state);
+      this.pauseResumeAfterEpoch = previousSide === currentSide ? nextResumeAfterEpoch ?? this.pauseResumeAfterEpoch : nextResumeAfterEpoch;
+      const fingerprint2 = previousSide === currentSide && this.activeSideUsageMissing(state) && this.lastDirectiveFingerprint ? this.lastDirectiveFingerprint : this.directiveFingerprint(state, currentSide);
+      if (!previousSide) {
         this.onPauseChange(true);
-        this.emitDirective("system_budget_pause", state.directiveToClaude ?? this.pauseReason ?? "\u9884\u7B97\u534F\u8C03\u8FDB\u5165\u8054\u5408\u6682\u505C\u3002");
-      } else if (fingerprint2 !== this.lastDirectiveFingerprint) {
-        this.emitDirective("system_budget_pause", state.directiveToClaude ?? this.pauseReason ?? "\u9884\u7B97\u534F\u8C03\u8FDB\u5165\u8054\u5408\u6682\u505C\u3002");
+      }
+      if (!previousSide || previousSide !== currentSide || fingerprint2 !== this.lastDirectiveFingerprint) {
+        this.emitDirective(this.interventionPrefix(currentSide), this.interventionDirective(state, currentSide));
       }
       this.lastDirectiveFingerprint = fingerprint2;
       return;
     }
-    if (this.paused) {
-      if (!this.canResume(state)) {
-        this.pauseResumeAfterEpoch = this.resumeAfterEpoch(state) ?? this.pauseResumeAfterEpoch;
-        return;
-      }
-      this.paused = false;
+    if (previousSide) {
       this.pauseReason = null;
       this.pauseResumeAfterEpoch = null;
       this.lastDirectiveFingerprint = null;
       this.onPauseChange(false);
-      this.emitDirective("system_budget_resume", this.resumeDirective(state));
+      this.emitDirective(this.recoveryPrefix(previousSide), this.recoveryDirective(state, previousSide));
       return;
     }
     if (!state.directiveToClaude) {
@@ -2986,8 +3008,22 @@ class BudgetCoordinator {
       this.lastDirectiveFingerprint = fingerprint;
     }
   }
-  canResume(state) {
-    return this.canAgentResume(state.perAgent.claude, state.now) && this.canAgentResume(state.perAgent.codex, state.now);
+  updateActiveSides(state) {
+    for (const agent of ["claude", "codex"]) {
+      const usage = state.perAgent[agent];
+      if (this.shouldEnter(usage, state.now)) {
+        this.activeSides.add(agent);
+      } else if (this.activeSides.has(agent) && this.canAgentResume(usage, state.now)) {
+        this.activeSides.delete(agent);
+      }
+    }
+  }
+  shouldEnter(usage, now) {
+    if (!usage)
+      return false;
+    if (usage.rateLimitedUntil > now)
+      return true;
+    return usage.gateUtil >= this.config.pauseAt;
   }
   canAgentResume(usage, now) {
     if (!usage)
@@ -2997,10 +3033,7 @@ class BudgetCoordinator {
     return usage.gateUtil < this.config.resumeBelow;
   }
   resumeAfterEpoch(state) {
-    const epochs = [
-      this.resumeBlockingEpoch(state.perAgent.claude, state.now),
-      this.resumeBlockingEpoch(state.perAgent.codex, state.now)
-    ].filter((epoch) => epoch > 0);
+    const epochs = ["claude", "codex"].filter((agent) => this.activeSides.has(agent)).map((agent) => this.resumeBlockingEpoch(state.perAgent[agent], state.now)).filter((epoch) => epoch > 0);
     if (epochs.length === 0)
       return null;
     return Math.max(...epochs);
@@ -3047,10 +3080,16 @@ class BudgetCoordinator {
     this.pendingOverrideTier = tier;
     this.pendingOverrides = { ...overrides };
   }
-  directiveFingerprint(state) {
-    const side = state.phase === "balance" ? state.drift.lighter ?? "none" : state.pause.side ?? "none";
+  directiveFingerprint(state, activeSide) {
+    const side = activeSide ?? (state.phase === "balance" ? state.drift.lighter ?? "none" : state.pause.side ?? "none");
     let reset = 0;
-    if (state.phase === "balance" && state.drift.lighter) {
+    if (activeSide === "claude") {
+      reset = state.pause.resetEpochs.claude;
+    } else if (activeSide === "codex") {
+      reset = state.pause.resetEpochs.codex;
+    } else if (activeSide === "both") {
+      reset = Math.max(state.pause.resetEpochs.claude, state.pause.resetEpochs.codex);
+    } else if (state.phase === "balance" && state.drift.lighter) {
       reset = state.perAgent[state.drift.lighter]?.fiveHour?.resetEpoch ?? 0;
     } else if (side === "claude") {
       reset = state.pause.resetEpochs.claude;
@@ -3060,7 +3099,7 @@ class BudgetCoordinator {
       reset = Math.max(state.pause.resetEpochs.claude, state.pause.resetEpochs.codex);
     }
     return [
-      state.phase,
+      activeSide ? "paused" : state.phase,
       state.drift.heavier ?? "none",
       side,
       reset
@@ -3069,7 +3108,62 @@ class BudgetCoordinator {
   emitDirective(prefix, content) {
     this.emit(`${prefix}_${this.sequence++}`, content);
   }
-  resumeDirective(state) {
+  pauseSide() {
+    const claude = this.activeSides.has("claude");
+    const codex = this.activeSides.has("codex");
+    if (claude && codex)
+      return "both";
+    if (claude)
+      return "claude";
+    if (codex)
+      return "codex";
+    return null;
+  }
+  interventionPrefix(side) {
+    return side === "claude" ? "system_budget_handoff" : "system_budget_pause";
+  }
+  recoveryPrefix(previousSide) {
+    return previousSide === "claude" ? "system_budget_claude_recovered" : "system_budget_resume";
+  }
+  interventionDirective(state, side) {
+    return renderBudgetInterventionDirective(state.perAgent.claude, state.perAgent.codex, side, this.pauseReason ?? "\u9884\u7B97\u63A5\u8FD1\u8017\u5C3D", this.pauseResumeAfterEpoch, this.config);
+  }
+  interventionReason(state) {
+    return ["claude", "codex"].filter((agent) => this.activeSides.has(agent)).map((agent) => this.activeSideReason(agent, state.perAgent[agent], state.now)).join("\uFF1B");
+  }
+  activeSideUsageMissing(state) {
+    return ["claude", "codex"].some((agent) => this.activeSides.has(agent) && state.perAgent[agent] === null);
+  }
+  activeSideReason(agent, usage, now) {
+    if (!usage)
+      return `${AGENT_LABEL2[agent]} \u63A2\u6D4B\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u4FDD\u6301\u4E0A\u4E00\u8F6E\u9884\u7B97\u5E72\u9884`;
+    if (usage.rateLimitedUntil > now) {
+      return `${AGENT_LABEL2[agent]} \u63A2\u9488\u88AB\u9650\u6D41\u81F3 ${this.formatEpoch(usage.rateLimitedUntil)}`;
+    }
+    if (usage.gateUtil >= this.config.pauseAt) {
+      return `${AGENT_LABEL2[agent]} gateUtil ${pct2(usage.gateUtil)} \u2265 pauseAt ${pct2(this.config.pauseAt)}`;
+    }
+    return `${AGENT_LABEL2[agent]} gateUtil ${pct2(usage.gateUtil)} \u5C1A\u672A\u4F4E\u4E8E resumeBelow ${pct2(this.config.resumeBelow)}`;
+  }
+  recoveryDirective(state, previousSide) {
+    if (previousSide === "claude") {
+      return [
+        "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Claude \u4FA7\u9884\u7B97\u5DF2\u6062\u590D\u3002",
+        `${usageLine("claude", state.perAgent.claude)}\uFF1B${usageLine("codex", state.perAgent.codex)}\u3002`,
+        `Claude gateUtil \u5DF2\u4F4E\u4E8E ${pct2(this.config.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
+        "Claude \u53EF\u6062\u590D orchestrator \u89D2\u8272\uFF1B\u540E\u7EED\u5206\u914D\u524D\u8BF7\u91CD\u65B0\u67E5\u8BE2\u5B9E\u65F6\u989D\u5EA6\uFF0C\u4E0D\u8981\u4F9D\u8D56\u65E7\u6570\u5B57\u3002"
+      ].join(`
+`);
+    }
+    if (previousSide === "codex") {
+      return [
+        "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Codex \u4FA7\u9884\u7B97\u95F8\u95E8\u89E3\u9664\u3002",
+        `${usageLine("claude", state.perAgent.claude)}\uFF1B${usageLine("codex", state.perAgent.codex)}\u3002`,
+        `\u95F8\u95E8\u5DF2\u653E\u5F00\uFF1ACodex gateUtil \u4F4E\u4E8E ${pct2(this.config.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
+        "\u5EFA\u8BAE Claude \u7528 reply \u5E26\u4E0A\u5F53\u524D\u76EE\u6807\u3001checkpoint \u548C\u4E0B\u4E00\u6B65\uFF0C\u5524\u9192 Codex \u63A5\u7EED\u6267\u884C\u3002"
+      ].join(`
+`);
+    }
     return [
       "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011\u8054\u5408\u6682\u505C\u89E3\u9664\u3002",
       `${usageLine("claude", state.perAgent.claude)}\uFF1B${usageLine("codex", state.perAgent.codex)}\u3002`,
@@ -3078,8 +3172,11 @@ class BudgetCoordinator {
     ].join(`
 `);
   }
+  formatEpoch(epoch) {
+    return new Date(epoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
+  }
   toSnapshot(state) {
-    const paused = this.paused;
+    const paused = this.isPaused();
     return {
       phase: paused ? "paused" : state.phase,
       updatedAt: state.now,
@@ -3087,8 +3184,10 @@ class BudgetCoordinator {
       codex: state.perAgent.codex,
       driftPct: state.drift.pct,
       paused,
+      gateClosed: this.isGateClosed(),
+      pauseSide: this.pauseSide(),
       pauseReason: paused ? this.pauseReason ?? state.pause.reason : null,
-      resumeAfterEpoch: paused ? state.pause.resumeAfterEpoch ?? this.pauseResumeAfterEpoch : null,
+      resumeAfterEpoch: paused ? this.pauseResumeAfterEpoch ?? state.pause.resumeAfterEpoch : null,
       parallelRecommended: paused ? false : state.parallel.recommended,
       codexTier: state.effort.codexTier,
       claudeAdvice: state.effort.claudeAdvice
@@ -3596,7 +3695,7 @@ function ensureBudgetCoordinatorStarted() {
         queueMicrotask(() => broadcastStatus());
       },
       onPauseChange: (paused) => {
-        log(`Budget pause gate ${paused ? "CLOSED" : "OPEN"}`);
+        log(`Budget intervention ${paused ? "ACTIVE" : "CLEARED"} ` + `(gate ${budgetCoordinator?.isGateClosed() ? "CLOSED" : "OPEN"})`);
         queueMicrotask(() => broadcastStatus());
       },
       log
@@ -3617,9 +3716,10 @@ function stopBudgetCoordinator() {
 }
 function budgetPauseGateError() {
   const snapshot = budgetCoordinator?.getSnapshot() ?? null;
-  const reason = snapshot?.pauseReason ?? "\u989D\u5EA6\u63A5\u8FD1\u8017\u5C3D";
+  const reason = snapshot?.pauseReason ?? "Codex \u4FA7\u989D\u5EA6\u63A5\u8FD1\u8017\u5C3D";
   const resumeAt = snapshot?.resumeAfterEpoch ? new Date(snapshot.resumeAfterEpoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z") : null;
-  return `\u9884\u7B97\u8054\u5408\u6682\u505C\u4E2D\uFF0C\u5DF2\u62D2\u7EDD\u8F6C\u53D1\uFF1A${reason}\u3002` + `\u53CC\u65B9 gateUtil \u5747\u4F4E\u4E8E ${BUDGET_CONFIG.resumeBelow}% \u540E\u95F8\u95E8\u81EA\u52A8\u653E\u5F00` + (resumeAt ? `\uFF08\u9884\u8BA1\u6062\u590D\u4E0D\u65E9\u4E8E ${resumeAt}\uFF09` : "") + "\u3002\u6536\u5230 RESUME \u901A\u77E5\u524D\u8BF7\u52FF\u91CD\u8BD5\uFF1B\u8BF7\u5199 checkpoint \u5E76\u505C\u6B62\u59D4\u6D3E\u3002";
+  const sideHint = snapshot?.pauseSide === "both" ? "\u53CC\u4FA7\u989D\u5EA6\u5747\u5DF2\u8017\u5C3D\uFF0C\u8BF7\u5199 checkpoint \u7B49\u5F85\u5237\u65B0" : "\u4F60\u53EF\u7EE7\u7EED solo \u63A8\u8FDB\u53EF\u72EC\u7ACB\u90E8\u5206\uFF0C\u5E76\u5199 checkpoint \u6807\u6CE8\u5206\u5DE5\u65AD\u70B9";
+  return `\u9884\u7B97\u6682\u505C\uFF08\u95F8\u95E8\u5173\u95ED\uFF09\uFF0C\u5DF2\u62D2\u7EDD\u8F6C\u53D1\uFF1A${reason}\u3002` + `Codex \u4FA7 gateUtil \u4F4E\u4E8E ${BUDGET_CONFIG.resumeBelow}% \u540E\u95F8\u95E8\u81EA\u52A8\u653E\u5F00` + (resumeAt ? `\uFF08\u9884\u8BA1\u6062\u590D ${resumeAt}\uFF0C\u4EE5\u5B9E\u6D4B\u4E3A\u51C6\uFF1B\u63D0\u524D\u5237\u65B0\u4F1A\u66F4\u65E9\u89E3\u9664\uFF09` : "") + `\u3002\u6536\u5230 RESUME \u901A\u77E5\u524D\u8BF7\u52FF\u91CD\u8BD5\u5411 Codex \u53D1\u9001 reply\uFF1B${sideHint}\u3002`;
 }
 var tuiConnectionState = new TuiConnectionState({
   disconnectGraceMs: TUI_DISCONNECT_GRACE_MS,
@@ -3840,7 +3940,7 @@ function handleControlMessage(ws, raw) {
         });
         return;
       }
-      if (budgetCoordinator?.isPaused()) {
+      if (budgetCoordinator?.isGateClosed()) {
         const reason = budgetPauseGateError();
         log(`Injection rejected by budget pause gate`);
         sendProtocolMessage(ws, {
