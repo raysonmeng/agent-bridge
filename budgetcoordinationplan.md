@@ -1,6 +1,6 @@
 # AgentBridge × AgentQuotaGuard 集成：预算感知的双 Agent 协调层（v2.4）
 
-> **版本说明**：v1 = 远端 ultraplan 产出。v2 = 三方汇总版。v2.1/v2.2 = 交叉 review 两轮修订（0 REAL 终版，进入实施）。v2.3 = P0 实施期实证修订（探针 per-agent 回退链）。**v2.4 = R4 暂停语义按触发侧分级（接力模式）**。v2.5 = 配置型 pull 模式删除。**v2.6 = 真机实证修订：探针限流（rate_limited_until）从「进入条件」降级为「仅阻断解除」**——真机运行 35 分钟即出现误触发（自家 60s 轮询 + 双侧 guard hooks 同打 usage 端点造成 429，与额度耗尽无因果；用量仅 26%/28% 时误发 handoff）。
+> **版本说明**：v1 = 远端 ultraplan 产出。v2 = 三方汇总版。v2.1/v2.2 = 交叉 review 两轮修订（0 REAL 终版，进入实施）。v2.3 = P0 实施期实证修订（探针 per-agent 回退链）。**v2.4 = R4 暂停语义按触发侧分级（接力模式）**。v2.5 = 配置型 pull 模式删除。**v2.6 = 真机实证修订：探针限流（rate_limited_until）从「进入条件」降级为「仅阻断解除」**——真机运行 35 分钟即出现误触发（自家 60s 轮询 + 双侧 guard hooks 同打 usage 端点造成 429，与额度耗尽无因果；用量仅 26%/28% 时误发 handoff）。**v2.6 补充（信息量门槛）**：usage API 会随机返回瞬时空响应（ok:true、util 0、无任何窗口——真机 45 分钟两次），归一化在窗口识别后增加门槛：5h 与周窗口都识别不出且无有效限流 → 返回 null（探针失联语义，维持现状），不再信任假 0%。
 >
 > **Round-1 修订摘要**：① R4 进入/解除统一用 `gateUtil`（resettable hard winner）② probe 双形状归一化（bash `hard_util` / node 无此字段）③ capability probe 措辞降级（turn/started 不含 model）④ probe 解析序收紧 ⑤ 新增 `pauseAt=90`（先于 per-agent 硬线 92）⑥ **取消 park 转达**（消除闸门时序洞 + 省一轮 Codex 额度）⑦ R4 自动唤醒声明依赖 push 模式 ⑧ `rate_limited_until > now` ⑨ start() 立即首轮 poll ⑩ balance/parallel 并发合并文案 ⑪ `budget` 进 PAIR_AWARE_COMMANDS ⑫ 无 attached Claude 的 paused 可见性验收 ⑬ 重启重推导（容忍单次重复 STOP）。
 
