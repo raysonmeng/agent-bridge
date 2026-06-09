@@ -1,10 +1,18 @@
 import { describe, expect, test } from "bun:test";
 import { execSync, spawn } from "node:child_process";
+import { mkdtempSync } from "node:fs";
 import { createServer, Socket, type AddressInfo, type Server } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { CodexAdapter } from "../codex-adapter";
 
+// Hermetic log sink: the constructor's default logFile resolves the REAL pair
+// state dir — these tests were appending into (and could rotate!) a live
+// daemon's agentbridge.log, corrupting incident forensics.
+const TEST_LOG_FILE = join(mkdtempSync(join(tmpdir(), "abg-codex-adapter-test-")), "test.log");
+
 function createAdapter() {
-  return new CodexAdapter(4510, 4511) as any;
+  return new CodexAdapter(4510, 4511, TEST_LOG_FILE) as any;
 }
 
 function sleep(ms: number) {
@@ -1380,7 +1388,7 @@ describe("CodexAdapter server-to-client request passthrough", () => {
       },
     });
 
-    const adapter = new CodexAdapter(server.port, 4511) as any;
+    const adapter = new CodexAdapter(server.port, 4511, TEST_LOG_FILE) as any;
     adapter.log = () => {};
     adapter.connIdCounter = 1;
     adapter.tuiConnId = 1;
@@ -1815,6 +1823,9 @@ describe("CodexAdapter TUI outage recovery", () => {
   test("closes TUI with 1011 when outage timer fires", async () => {
     const { adapter, ws, logs } = setupAdapterWithTui();
     // Shrink timeout for the test via monkey-patching the static value.
+    // Capture the REAL value for restore — a hardcoded restore went stale when
+    // the production constant changed, silently poisoning later tests.
+    const originalOutageTimeout = (adapter.constructor as any).OUTAGE_TIMEOUT_MS;
     (adapter.constructor as any).OUTAGE_TIMEOUT_MS = 20;
 
     adapter.onTuiMessage(ws, JSON.stringify({ jsonrpc: "2.0", id: 1, method: "x", params: {} }));
@@ -1830,7 +1841,7 @@ describe("CodexAdapter TUI outage recovery", () => {
     expect(logs.some((l) => l.includes("did not return within"))).toBe(true);
 
     // Restore default.
-    (adapter.constructor as any).OUTAGE_TIMEOUT_MS = 5000;
+    (adapter.constructor as any).OUTAGE_TIMEOUT_MS = originalOutageTimeout;
   });
 
   test("drops non-primary outage sends with WARNING log (no close)", () => {

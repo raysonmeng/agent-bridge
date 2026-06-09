@@ -18,7 +18,7 @@ function formatWindow(window: { util: number; resetEpoch: number } | null, label
   return `${label} ${window.util}%（重置 ${formatEpoch(window.resetEpoch)}）`;
 }
 
-function formatAgent(name: string, usage: AgentUsage | null): string {
+function formatAgent(name: string, usage: AgentUsage | null, snapshotAt: number): string {
   if (!usage) return `${name}：未知（探测不可用）`;
   const parts = [
     formatWindow(usage.fiveHour, "5h"),
@@ -29,7 +29,14 @@ function formatAgent(name: string, usage: AgentUsage | null): string {
   if (usage.rateLimitedUntil > 0) {
     parts.push(`限流至 ${formatEpoch(usage.rateLimitedUntil)}`);
   }
-  if (usage.stale) parts.push("（缓存数据）");
+  // Data age, not poll age: a stale probe cache served at poll time carries a
+  // fresh-looking snapshot timestamp over hours-old numbers.
+  const ageSec = usage.fetchedAt > 0 ? snapshotAt - usage.fetchedAt : 0;
+  if (ageSec > 300) {
+    parts.push(`⚠️ 数据采集于 ${Math.round(ageSec / 60)} 分钟前`);
+  } else if (usage.stale) {
+    parts.push("（缓存数据）");
+  }
   return `${name}：${parts.join(" · ")}`;
 }
 
@@ -45,8 +52,8 @@ const PHASE_LABELS: Record<BudgetSnapshot["phase"], string> = {
 export function renderBudgetSnapshot(snapshot: BudgetSnapshot): string {
   const lines: string[] = [];
   lines.push(`【预算快照 · 账号级】阶段：${PHASE_LABELS[snapshot.phase]} · 更新于 ${formatEpoch(snapshot.updatedAt)}`);
-  lines.push(formatAgent("Claude", snapshot.claude));
-  lines.push(formatAgent("Codex", snapshot.codex));
+  lines.push(formatAgent("Claude", snapshot.claude, snapshot.updatedAt));
+  lines.push(formatAgent("Codex", snapshot.codex, snapshot.updatedAt));
 
   if (snapshot.claude && snapshot.codex) {
     const abs = Math.abs(snapshot.driftPct);

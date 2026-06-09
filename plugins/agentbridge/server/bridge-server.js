@@ -6517,6 +6517,9 @@ var require_dist = __commonJS((exports, module) => {
   exports.default = formatsPlugin;
 });
 
+// src/bridge.ts
+import { existsSync as existsSync6 } from "fs";
+
 // node_modules/zod/v4/core/core.js
 var NEVER = Object.freeze({
   status: "aborted"
@@ -13661,14 +13664,15 @@ import { EventEmitter } from "events";
 import { randomUUID } from "crypto";
 
 // src/rotating-log.ts
-import { appendFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "fs";
+import { appendFileSync, existsSync, renameSync, statSync, unlinkSync } from "fs";
 import { dirname } from "path";
 var DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
 var DEFAULT_KEEP = 3;
 function appendRotatingLog(path, content, options = {}) {
   const maxBytes = options.maxBytes ?? positiveIntFromEnv("AGENTBRIDGE_LOG_MAX_BYTES", DEFAULT_MAX_BYTES);
   const keep = options.keep ?? positiveIntFromEnv("AGENTBRIDGE_LOG_ROTATE_KEEP", DEFAULT_KEEP);
-  mkdirSync(dirname(path), { recursive: true });
+  if (!existsSync(dirname(path)))
+    return;
   rotateIfNeeded(path, Buffer.byteLength(content), maxBytes, keep);
   appendFileSync(path, content, "utf-8");
 }
@@ -13775,7 +13779,7 @@ function formatError2(error2) {
 }
 
 // src/state-dir.ts
-import { mkdirSync as mkdirSync2, existsSync as existsSync2 } from "fs";
+import { mkdirSync, existsSync as existsSync2 } from "fs";
 import { join } from "path";
 import { homedir, platform } from "os";
 
@@ -13794,7 +13798,7 @@ class StateDirResolver {
   }
   ensure() {
     if (!existsSync2(this.stateDir)) {
-      mkdirSync2(this.stateDir, { recursive: true });
+      mkdirSync(this.stateDir, { recursive: true });
     }
   }
   get dir() {
@@ -13843,7 +13847,7 @@ function formatWindow(window, label) {
     return `${label} \u672A\u77E5`;
   return `${label} ${window.util}%\uFF08\u91CD\u7F6E ${formatEpoch(window.resetEpoch)}\uFF09`;
 }
-function formatAgent(name, usage) {
+function formatAgent(name, usage, snapshotAt) {
   if (!usage)
     return `${name}\uFF1A\u672A\u77E5\uFF08\u63A2\u6D4B\u4E0D\u53EF\u7528\uFF09`;
   const parts = [
@@ -13855,8 +13859,12 @@ function formatAgent(name, usage) {
   if (usage.rateLimitedUntil > 0) {
     parts.push(`\u9650\u6D41\u81F3 ${formatEpoch(usage.rateLimitedUntil)}`);
   }
-  if (usage.stale)
+  const ageSec = usage.fetchedAt > 0 ? snapshotAt - usage.fetchedAt : 0;
+  if (ageSec > 300) {
+    parts.push(`\u26A0\uFE0F \u6570\u636E\u91C7\u96C6\u4E8E ${Math.round(ageSec / 60)} \u5206\u949F\u524D`);
+  } else if (usage.stale) {
     parts.push("\uFF08\u7F13\u5B58\u6570\u636E\uFF09");
+  }
   return `${name}\uFF1A${parts.join(" \xB7 ")}`;
 }
 var PHASE_LABELS = {
@@ -13868,8 +13876,8 @@ var PHASE_LABELS = {
 function renderBudgetSnapshot(snapshot) {
   const lines = [];
   lines.push(`\u3010\u9884\u7B97\u5FEB\u7167 \xB7 \u8D26\u53F7\u7EA7\u3011\u9636\u6BB5\uFF1A${PHASE_LABELS[snapshot.phase]} \xB7 \u66F4\u65B0\u4E8E ${formatEpoch(snapshot.updatedAt)}`);
-  lines.push(formatAgent("Claude", snapshot.claude));
-  lines.push(formatAgent("Codex", snapshot.codex));
+  lines.push(formatAgent("Claude", snapshot.claude, snapshot.updatedAt));
+  lines.push(formatAgent("Codex", snapshot.codex, snapshot.updatedAt));
   if (snapshot.claude && snapshot.codex) {
     const abs = Math.abs(snapshot.driftPct);
     if (abs > 0) {
@@ -14198,7 +14206,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.6", "0.0.0-source"),
-  commit: defineString("71ff4f3", "source"),
+  commit: defineString("2079374", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, 1)
 });
@@ -14206,6 +14214,11 @@ function sameRuntimeContract(a, b) {
   if (!a || !b)
     return false;
   return a.version === b.version && a.commit === b.commit && a.contractVersion === b.contractVersion;
+}
+function compatibleContractVersion(a, b) {
+  if (!a || !b)
+    return false;
+  return a.contractVersion === b.contractVersion;
 }
 function formatBuildInfo(build) {
   if (!build)
@@ -14450,7 +14463,7 @@ class DaemonClient extends EventEmitter2 {
 
 // src/daemon-lifecycle.ts
 import { spawn, execFileSync } from "child_process";
-import { existsSync as existsSync3, readFileSync, unlinkSync as unlinkSync2, writeFileSync, openSync, closeSync, constants } from "fs";
+import { existsSync as existsSync3, readFileSync, statSync as statSync2, unlinkSync as unlinkSync2, writeFileSync, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
 
 // src/env-utils.ts
@@ -14473,6 +14486,7 @@ var DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
 var REUSE_READY_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_REUSE_READY_RETRIES", 12);
 var REUSE_READY_DELAY_MS = 250;
 var HEALTH_FETCH_TIMEOUT_MS = 500;
+var LOCK_IDENTITY_GRACE_MS = parsePositiveIntEnv("AGENTBRIDGE_LOCK_IDENTITY_GRACE_MS", 120000);
 
 class DaemonLifecycle {
   stateDir;
@@ -14516,6 +14530,9 @@ class DaemonLifecycle {
       return true;
     return reported !== expected;
   }
+  isRegisteredPairDaemonInManualMode(status) {
+    return !this.expectedPairId && status?.pairId != null;
+  }
   isBuildDrifted(status) {
     if (process.env.AGENTBRIDGE_ALLOW_BUILD_DRIFT === "1")
       return false;
@@ -14524,18 +14541,30 @@ class DaemonLifecycle {
       return true;
     return !sameRuntimeContract(runtime, BUILD_INFO);
   }
+  canReuseDespiteDrift(status) {
+    if (!compatibleContractVersion(status?.build, BUILD_INFO))
+      return false;
+    return status?.tuiConnected === true;
+  }
   async ensureRunning() {
     if (await this.isHealthy()) {
       const status = await this.fetchStatus();
+      if (this.isRegisteredPairDaemonInManualMode(status)) {
+        throw new Error(`Control port ${this.controlPort} is owned by registered pair ${status?.pairId}. ` + `This session has no pair identity (manual mode) and will not reuse or replace it \u2014 ` + `start with \`agentbridge claude\` from that pair's directory, or set AGENTBRIDGE_CONTROL_PORT to a free port.`);
+      }
       if (this.isForeignDaemon(status)) {
         this.log(`Control port ${this.controlPort} held by a daemon for pair ${status?.pairId ?? "<none>"}, ` + `but this pair is ${this.expectedPairId} \u2014 replacing foreign daemon`);
         await this.replaceUnhealthyDaemon(status?.pid);
         return;
       }
       if (this.isBuildDrifted(status)) {
-        this.log(`Daemon on control port ${this.controlPort} is running build ${formatBuildInfo(status?.build)} ` + `but launcher is ${formatBuildInfo(BUILD_INFO)} \u2014 replacing drifted daemon`);
-        await this.replaceUnhealthyDaemon(status?.pid);
-        return;
+        if (this.canReuseDespiteDrift(status)) {
+          this.log(`Daemon on control port ${this.controlPort} is running build ${formatBuildInfo(status?.build)} ` + `(launcher ${formatBuildInfo(BUILD_INFO)}) but a live Codex TUI is attached \u2014 reusing instead of ` + `replacing; the new build is picked up at the next restart (abg kill, then relaunch)`);
+        } else {
+          this.log(`Daemon on control port ${this.controlPort} is running build ${formatBuildInfo(status?.build)} ` + `but launcher is ${formatBuildInfo(BUILD_INFO)} \u2014 replacing drifted daemon`);
+          await this.replaceUnhealthyDaemon(status?.pid);
+          return;
+        }
       }
       try {
         await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
@@ -14571,7 +14600,7 @@ class DaemonLifecycle {
       }
       if (await this.isHealthy()) {
         const status = await this.fetchStatus();
-        if (this.isForeignDaemon(status) || this.isBuildDrifted(status)) {
+        if (this.isForeignDaemon(status) || this.isBuildDrifted(status) && !this.canReuseDespiteDrift(status)) {
           this.log(`Daemon on control port ${this.controlPort} is not reusable under startup lock ` + `(pair=${status?.pairId ?? "<none>"}, build=${formatBuildInfo(status?.build)}) \u2014 replacing`);
           await this.kill(3000, status?.pid);
         } else {
@@ -14624,8 +14653,9 @@ class DaemonLifecycle {
     for (let attempt = 0;attempt < maxRetries; attempt++) {
       if (await this.isReady()) {
         const status = await this.fetchStatus();
-        if (!this.isForeignDaemon(status) && !this.isBuildDrifted(status))
+        if (!this.isForeignDaemon(status) && (!this.isBuildDrifted(status) || this.canReuseDespiteDrift(status))) {
           return;
+        }
       }
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
@@ -14711,7 +14741,7 @@ class DaemonLifecycle {
       }
       if (await this.isHealthy()) {
         const status = await this.fetchStatus();
-        if (!this.isForeignDaemon(status) && !this.isBuildDrifted(status)) {
+        if (!this.isForeignDaemon(status) && (!this.isBuildDrifted(status) || this.canReuseDespiteDrift(status))) {
           try {
             await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
             return;
@@ -14735,13 +14765,20 @@ class DaemonLifecycle {
   }
   acquireLockStrict(reclaimed = false) {
     this.stateDir.ensure();
+    let fd = null;
     try {
-      const fd = openSync(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
+      fd = openSync(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
       writeFileSync(fd, `${process.pid}
 `);
       closeSync(fd);
       return true;
     } catch (err) {
+      if (fd !== null && err.code !== "EEXIST") {
+        try {
+          closeSync(fd);
+        } catch {}
+        this.releaseLock();
+      }
       if (err.code === "EEXIST") {
         if (reclaimed)
           return false;
@@ -14752,12 +14789,32 @@ class DaemonLifecycle {
             this.releaseLock();
             return this.acquireLockStrict(true);
           }
+          if (Number.isFinite(holderPid) && this.lockAgeMs() > LOCK_IDENTITY_GRACE_MS && !this.isAgentBridgeProcess(holderPid)) {
+            this.log(`Startup lock is ${Math.round(this.lockAgeMs() / 1000)}s old and holder pid ${holderPid} ` + `is an unrelated process (pid recycled), reclaiming`);
+            this.releaseLock();
+            return this.acquireLockStrict(true);
+          }
         } catch {
           return false;
         }
         return false;
       }
       this.log(`Could not acquire strict startup lock: ${err.message}`);
+      return false;
+    }
+  }
+  lockAgeMs() {
+    try {
+      return Date.now() - statSync2(this.stateDir.lockFile).mtimeMs;
+    } catch {
+      return 0;
+    }
+  }
+  isAgentBridgeProcess(pid) {
+    try {
+      const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
+      return cmd.includes("agentbridge") || cmd.includes("agent_bridge");
+    } catch {
       return false;
     }
   }
@@ -14840,7 +14897,7 @@ function isProcessAlive(pid) {
 }
 
 // src/config-service.ts
-import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync3, existsSync as existsSync4 } from "fs";
+import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync4 } from "fs";
 import { join as join2 } from "path";
 var DEFAULT_BUDGET_CONFIG = {
   enabled: true,
@@ -15005,7 +15062,7 @@ class ConfigService {
   }
   ensureConfigDir() {
     if (!existsSync4(this.configDir)) {
-      mkdirSync3(this.configDir, { recursive: true });
+      mkdirSync2(this.configDir, { recursive: true });
     }
   }
 }
@@ -15017,14 +15074,14 @@ import {
   fsyncSync,
   linkSync,
   lstatSync,
-  mkdirSync as mkdirSync4,
+  mkdirSync as mkdirSync3,
   openSync as openSync2,
   readdirSync,
   readFileSync as readFileSync3,
   realpathSync,
   renameSync as renameSync2,
   rmSync,
-  statSync as statSync2,
+  statSync as statSync3,
   unlinkSync as unlinkSync3,
   writeFileSync as writeFileSync3
 } from "fs";
@@ -15217,7 +15274,7 @@ function nonEmpty(value) {
 }
 
 // src/trace-log.ts
-import { appendFileSync as appendFileSync2, mkdirSync as mkdirSync5 } from "fs";
+import { appendFileSync as appendFileSync2, mkdirSync as mkdirSync4 } from "fs";
 import { join as join4 } from "path";
 var SECRET_KEY_RE = /(token|secret|password|passwd|api[_-]?key|auth|cookie|session)/i;
 var SECRET_ARG_RE = /^--?(?:token|secret|password|passwd|apikey|api-key|api_key|auth|cookie|session)(?:=.*)?$/i;
@@ -15270,7 +15327,7 @@ function appendTraceEvent(input) {
     ...input.env ? { env: pickRelevantEnv(input.env) } : {},
     ...input.data ? { data: redactData(input.data) } : {}
   };
-  mkdirSync5(join4(input.cwd, ".agentbridge", "logs"), { recursive: true });
+  mkdirSync4(join4(input.cwd, ".agentbridge", "logs"), { recursive: true });
   appendFileSync2(path, JSON.stringify(event) + `
 `, "utf-8");
   return path;
@@ -15391,6 +15448,7 @@ daemonClient.on("status", (status) => {
 daemonClient.on("disconnect", () => {
   if (shuttingDown || daemonDisabled)
     return;
+  claude.setBudgetSnapshot(null);
   log("Daemon control connection closed \u2014 will attempt to reconnect");
   const now = Date.now();
   if (now - lastDisconnectNotifyTs >= RECONNECT_NOTIFY_COOLDOWN_MS) {
@@ -15418,6 +15476,11 @@ daemonClient.on("rejected", async (code) => {
       notificationId = "system_bridge_probe_in_progress";
       notificationContent = `\u26A0\uFE0F AgentBridge rejected this session \u2014 a liveness probe is currently checking whether the incumbent Claude session is still alive. Retry in a few seconds with \`${pairScopedCommand("claude")}\`. AgentBridge \u62D2\u7EDD\u4E86\u6B64\u4F1A\u8BDD\u2014\u2014\u6B63\u5728\u901A\u8FC7\u5B58\u6D3B\u63A2\u6D4B\u68C0\u67E5\u73B0\u6709 Claude \u4F1A\u8BDD\u662F\u5426\u4ECD\u7136\u5728\u7EBF\u3002\u8BF7\u7A0D\u540E\u7528 \`${pairScopedCommand("claude")}\` \u91CD\u8BD5\u3002`;
       break;
+    case CLOSE_CODE_PAIR_MISMATCH:
+      reason = "rejected";
+      notificationId = "system_bridge_pair_mismatch";
+      notificationContent = `\u26A0\uFE0F AgentBridge daemon rejected this session \u2014 pair/cwd identity mismatch (this daemon belongs to a different pair or directory). Do NOT kill it; start Claude Code from the pair's own directory, or pick another pair name with \`agentbridge --pair <name> claude\`. AgentBridge \u62D2\u7EDD\u4E86\u6B64\u4F1A\u8BDD\u2014\u2014pair/\u76EE\u5F55\u8EAB\u4EFD\u4E0D\u5339\u914D\uFF08\u8BE5 daemon \u5C5E\u4E8E\u5176\u4ED6 pair \u6216\u76EE\u5F55\uFF09\u3002\u65E0\u9700 kill\uFF1B\u8BF7\u5230\u5BF9\u5E94\u76EE\u5F55\u542F\u52A8\uFF0C\u6216\u6362\u4E00\u4E2A pair \u540D\uFF1A\`agentbridge --pair <\u540D\u5B57> claude\`\u3002`;
+      break;
     default:
       reason = "rejected";
       notificationId = "system_bridge_replaced";
@@ -15440,7 +15503,11 @@ claude.on("ready", async () => {
     await enterDisabledState("Killed sentinel found \u2014 bridge staying idle", `\u26D4 AgentBridge was stopped by \`agentbridge kill\`. Bridge is staying idle. Restart Claude Code (\`${pairScopedCommand("claude")}\`), switch to a new conversation, or run \`/resume\` to reconnect.`);
     return;
   }
-  await connectToDaemon();
+  try {
+    await connectToDaemon();
+  } catch {
+    reconnectToDaemon();
+  }
 });
 async function connectToDaemon(isReconnect = false) {
   if (daemonDisabled) {
@@ -15450,7 +15517,7 @@ async function connectToDaemon(isReconnect = false) {
   try {
     await daemonLifecycle.ensureRunning();
     await daemonClient.connect();
-    const status = await daemonClient.attachClaudeAndWaitForStatus(1500);
+    const status = await daemonClient.attachClaudeAndWaitForStatus(5000);
     if (!status) {
       throw new Error("Daemon did not confirm Claude attach.");
     }
@@ -15498,6 +15565,12 @@ async function notifyIfDaemonKilled(logMessage) {
   await enterDisabledState(logMessage, `\u26D4 AgentBridge was stopped by \`agentbridge kill\`. Bridge is staying idle. Restart Claude Code (\`${pairScopedCommand("claude")}\`), switch to a new conversation, or run \`/resume\` to reconnect.`);
   return true;
 }
+async function notifyIfPairRemoved(logMessage) {
+  if (existsSync6(stateDir.dir))
+    return false;
+  await enterDisabledState(logMessage, `\u26D4 This pair's state directory was removed (\`abg pairs rm\` / \`prune\`). Bridge is staying idle. Start fresh with \`${pairScopedCommand("claude")}\` if you still need this pair. \u8BE5 pair \u7684\u72B6\u6001\u76EE\u5F55\u5DF2\u88AB\u5220\u9664\uFF08pairs rm / prune\uFF09\uFF0C\u6865\u63A5\u4FDD\u6301\u5F85\u673A\uFF1B\u5982\u4ECD\u9700\u8981\u8BF7\u7528 \`${pairScopedCommand("claude")}\` \u91CD\u65B0\u542F\u52A8\u3002`);
+  return true;
+}
 function reconnectToDaemon() {
   if (shuttingDown || daemonDisabled)
     return Promise.resolve();
@@ -15509,6 +15582,9 @@ function reconnectToDaemon() {
     try {
       for (let attempt = 0;!shuttingDown; attempt += 1) {
         if (await notifyIfDaemonKilled("Daemon was intentionally killed by user (killed sentinel found) \u2014 not reconnecting")) {
+          return;
+        }
+        if (await notifyIfPairRemoved("Pair state directory removed \u2014 not reconnecting")) {
           return;
         }
         const delayMs = Math.min(1000 * 2 ** attempt, MAX_RECONNECT_DELAY_MS);

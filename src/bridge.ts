@@ -1,5 +1,6 @@
 #!/usr/bin/env bun
 
+import { existsSync } from "node:fs";
 import { ClaudeAdapter } from "./claude-adapter";
 import { BUILD_INFO } from "./build-info";
 import { DaemonClient } from "./daemon-client";
@@ -13,6 +14,7 @@ import { appendTraceEvent, pickRelevantEnv } from "./trace-log";
 import { createProcessLogger } from "./process-log";
 import {
   CLOSE_CODE_EVICTED_STALE,
+  CLOSE_CODE_PAIR_MISMATCH,
   CLOSE_CODE_PROBE_IN_PROGRESS,
 } from "./control-protocol";
 import type { ControlClientIdentity } from "./control-protocol";
@@ -136,6 +138,10 @@ daemonClient.on("status", (status) => {
 daemonClient.on("disconnect", () => {
   if (shuttingDown || daemonDisabled) return;
 
+  // A frozen budget snapshot from a dead daemon silently masquerades as live
+  // data in get_budget — clear it so the tool reports "unavailable" instead.
+  claude.setBudgetSnapshot(null);
+
   log("Daemon control connection closed — will attempt to reconnect");
 
   const now = Date.now();
@@ -167,6 +173,14 @@ daemonClient.on("rejected", async (code: number) => {
       reason = "probe_in_progress";
       notificationId = "system_bridge_probe_in_progress";
       notificationContent = `⚠️ AgentBridge rejected this session — a liveness probe is currently checking whether the incumbent Claude session is still alive. Retry in a few seconds with \`${pairScopedCommand("claude")}\`. AgentBridge 拒绝了此会话——正在通过存活探测检查现有 Claude 会话是否仍然在线。请稍后用 \`${pairScopedCommand("claude")}\` 重试。`;
+      break;
+    case CLOSE_CODE_PAIR_MISMATCH:
+      // Without this branch a pair/cwd mismatch fell into the default text
+      // ("another session is connected... run kill to reset"), sending users
+      // off to kill a perfectly healthy daemon that simply belongs elsewhere.
+      reason = "rejected";
+      notificationId = "system_bridge_pair_mismatch";
+      notificationContent = `⚠️ AgentBridge daemon rejected this session — pair/cwd identity mismatch (this daemon belongs to a different pair or directory). Do NOT kill it; start Claude Code from the pair's own directory, or pick another pair name with \`agentbridge --pair <name> claude\`. AgentBridge 拒绝了此会话——pair/目录身份不匹配（该 daemon 属于其他 pair 或目录）。无需 kill；请到对应目录启动，或换一个 pair 名：\`agentbridge --pair <名字> claude\`。`;
       break;
     default:
       reason = "rejected";
@@ -200,7 +214,15 @@ claude.on("ready", async () => {
     );
     return;
   }
-  await connectToDaemon();
+  try {
+    await connectToDaemon();
+  } catch {
+    // The initial attach has no retry of its own (unlike the disconnect path) —
+    // a transient failure here (e.g. attach contest, daemon mid-replace) used
+    // to strand the frontend until the user restarted Claude Code. Hand it to
+    // the same backoff loop the reconnect path uses.
+    void reconnectToDaemon();
+  }
 });
 
 async function connectToDaemon(isReconnect = false) {
@@ -212,7 +234,13 @@ async function connectToDaemon(isReconnect = false) {
   try {
     await daemonLifecycle.ensureRunning();
     await daemonClient.connect();
-    const status = await daemonClient.attachClaudeAndWaitForStatus(1500);
+    // Confirm window MUST exceed the daemon's liveness-probe timeout (3000ms
+    // default): when this attach contests a half-open dead incumbent, the
+    // daemon stays silent for the full probe before evicting it and admitting
+    // us. The old 1500ms lost that race every time — the legitimate new
+    // frontend reported "❌ daemon failed to start" while the daemon was about
+    // to accept it.
+    const status = await daemonClient.attachClaudeAndWaitForStatus(5000);
     if (!status) {
       throw new Error("Daemon did not confirm Claude attach.");
     }
@@ -279,6 +307,26 @@ async function notifyIfDaemonKilled(logMessage: string) {
   return true;
 }
 
+/**
+ * `abg pairs rm` / `prune` delete the pair's whole state dir — including the
+ * killed sentinel that normally stops this frontend from relaunching. Without
+ * this guard a surviving frontend would resurrect a full daemon for a pair the
+ * user explicitly removed, as an unregistered orphan no CLI command can stop.
+ */
+async function notifyIfPairRemoved(logMessage: string) {
+  // Trade-off: a transient fs error here (e.g. a network-volume hiccup) reads
+  // as "removed" and disables this frontend — accepted, because the recovery
+  // poller keeps checking and the alternative (resurrecting a deliberately
+  // removed pair as an unkillable orphan daemon) is strictly worse.
+  if (existsSync(stateDir.dir)) return false;
+
+  await enterDisabledState(
+    logMessage,
+    `⛔ This pair's state directory was removed (\`abg pairs rm\` / \`prune\`). Bridge is staying idle. Start fresh with \`${pairScopedCommand("claude")}\` if you still need this pair. 该 pair 的状态目录已被删除（pairs rm / prune），桥接保持待机；如仍需要请用 \`${pairScopedCommand("claude")}\` 重新启动。`,
+  );
+  return true;
+}
+
 function reconnectToDaemon(): Promise<void> {
   if (shuttingDown || daemonDisabled) return Promise.resolve();
 
@@ -291,6 +339,9 @@ function reconnectToDaemon(): Promise<void> {
     try {
       for (let attempt = 0; !shuttingDown; attempt += 1) {
         if (await notifyIfDaemonKilled("Daemon was intentionally killed by user (killed sentinel found) — not reconnecting")) {
+          return;
+        }
+        if (await notifyIfPairRemoved("Pair state directory removed — not reconnecting")) {
           return;
         }
 

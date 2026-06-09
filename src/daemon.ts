@@ -45,6 +45,14 @@ interface ControlSocketData {
   /** Monotonic pong counter — the liveness probe's source of truth (see liveness-probe.ts). */
   pongCount: number;
   identity?: ControlClientIdentity;
+  /**
+   * Bridge messages ws.send() returned -1 for: enqueued in Bun's socket buffer
+   * under backpressure, NOT yet on the wire. Bun discards that buffer if the
+   * socket closes before `drain` fires, so these are re-buffered at detach for
+   * redelivery on reconnect (at-least-once: a pre-close partial flush can
+   * produce a duplicate; silent loss cannot).
+   */
+  pendingBackpressure: BridgeMessage[];
 }
 
 const stateDir = new StateDirResolver();
@@ -331,10 +339,15 @@ codex.on("ready", (threadId: string) => {
   emitToClaude(
     systemMessage("system_ready", currentReadyMessage()),
   );
+  // A fresh codex (and its fresh thread) runs at its own defaults — stale
+  // delivered-tier bookkeeping would suppress the next legitimate override.
+  budgetCoordinator?.resetAppliedTier();
   ensureBudgetCoordinatorStarted();
 });
 
 codex.on("threadChanged", (event: { threadId: string; previousThreadId: string | null; reason: string }) => {
+  // Tier overrides are sticky PER THREAD — the new thread runs at defaults.
+  budgetCoordinator?.resetAppliedTier();
   broadcastStatus();
   void persistCurrentThreadWithRolloutRetry(
     {
@@ -385,7 +398,9 @@ codex.on("exit", (code: number | null) => {
   emitToClaude(
     systemMessage(
       "system_codex_exit",
-      `⚠️ Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running, but the Codex side needs to be restarted.`,
+      `⚠️ Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running. ` +
+        `Restart the Codex side (\`agentbridge codex\`); if it does not come back within ` +
+        `${Math.round(BOOTSTRAP_TIMEOUT_MS / 1000)}s the daemon will self-replace so the next launch starts clean.`,
     ),
   );
   broadcastStatus();
@@ -410,7 +425,7 @@ function startControlServer() {
         return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
       }
 
-      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now(), pongCount: 0 } })) {
+      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now(), pongCount: 0, pendingBackpressure: [] } })) {
         return undefined;
       }
 
@@ -422,6 +437,7 @@ function startControlServer() {
       open: (ws: ServerWebSocket<ControlSocketData>) => {
         ws.data.clientId = ++nextControlClientId;
         ws.data.lastPongAt = Date.now();
+        ws.data.pendingBackpressure = [];
         log(`Frontend socket opened (#${ws.data.clientId})`);
       },
       close: (ws: ServerWebSocket<ControlSocketData>, code: number, reason: string) => {
@@ -436,6 +452,25 @@ function startControlServer() {
       pong: (ws: ServerWebSocket<ControlSocketData>) => {
         ws.data.lastPongAt = Date.now();
         ws.data.pongCount++;
+      },
+      drain: (ws: ServerWebSocket<ControlSocketData>) => {
+        // Backpressure released. Confirm tracked messages as delivered only
+        // when the socket buffer is fully empty — after a partial drain the
+        // tail can still be lost on close, and a duplicate beats silent loss.
+        // No attachedClaude guard needed: only the attached socket ever
+        // accrues pendingBackpressure (every bridge-message send targets
+        // attachedClaude) and detachClaude drains the array synchronously,
+        // so a detached socket is always empty here. A drain with an empty
+        // OS buffer means the bytes reached the transport — the same
+        // delivery guarantee a plain successful send has.
+        if (ws.data.pendingBackpressure.length > 0 && ws.getBufferedAmount() === 0) {
+          ws.data.pendingBackpressure = [];
+        }
+        // Deliver anything that buffered while the socket was congested
+        // instead of waiting for the next reattach.
+        if (ws === attachedClaude && bufferedMessages.length > 0) {
+          flushBufferedMessages(ws);
+        }
       },
     },
   });
@@ -640,15 +675,20 @@ async function attachClaude(ws: ServerWebSocket<ControlSocketData>, identity?: C
     `Claude frontend attached (#${ws.data.clientId}, pair=${identity?.pairId ?? "<none>"}, cwd=${identity?.cwd ?? "<unknown>"})`,
   );
 
+  // Drain the older backlog BEFORE the status buffer's fresher summary — the
+  // reverse order delivered events out of timeline (summary first, then the
+  // pre-disconnect messages it summarizes).
+  const hadBacklog = bufferedMessages.length > 0;
+  if (hadBacklog) {
+    flushBufferedMessages(ws);
+  }
   statusBuffer.flush("claude reconnected");
   sendStatus(ws);
 
   const now = Date.now();
   const isRapidReattach = now - lastAttachStatusSentTs < ATTACH_STATUS_COOLDOWN_MS;
 
-  if (bufferedMessages.length > 0) {
-    flushBufferedMessages(ws);
-  } else if (!isRapidReattach) {
+  if (!hadBacklog && !isRapidReattach) {
     // Only send status messages if this is not a rapid reattach (avoid flooding Claude)
     if (tuiConnectionState.canReply()) {
       sendBridgeMessage(ws, systemMessage("system_ready", currentReadyMessage()));
@@ -666,6 +706,23 @@ function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
   attachedClaude = null;
   ws.data.attached = false;
   log(`Claude frontend detached (#${ws.data.clientId}, ${reason})`);
+
+  // Messages enqueued under backpressure never got a drain confirmation; Bun
+  // drops its socket buffer on close, so without this they would be lost.
+  // Prepend (they predate anything buffered after the send started failing)
+  // and re-apply the cap.
+  if (ws.data.pendingBackpressure.length > 0) {
+    bufferedMessages.unshift(...ws.data.pendingBackpressure);
+    log(
+      `Re-buffered ${ws.data.pendingBackpressure.length} backpressured message(s) for redelivery on reconnect`,
+    );
+    ws.data.pendingBackpressure = [];
+    if (bufferedMessages.length > MAX_BUFFERED_MESSAGES) {
+      const dropped = bufferedMessages.length - MAX_BUFFERED_MESSAGES;
+      bufferedMessages.splice(0, dropped);
+      log(`Message buffer overflow: dropped ${dropped} oldest message(s), ${MAX_BUFFERED_MESSAGES} remaining`);
+    }
+  }
 
   scheduleClaudeDisconnectNotification(ws.data.clientId);
 
@@ -849,9 +906,25 @@ function emitToClaude(message: BridgeMessage) {
 function trySendBridgeMessage(ws: ServerWebSocket<ControlSocketData>, message: BridgeMessage): boolean {
   try {
     const result = ws.send(JSON.stringify({ type: "codex_to_claude", message } satisfies ControlServerMessage));
-    if (typeof result === "number" && result <= 0) {
-      log(`Bridge message send returned ${result} (0=dropped, -1=backpressure)`);
+    // Bun semantics: -1 = backpressure, the message IS enqueued and will be
+    // delivered once the socket drains — treating it as failure re-buffered an
+    // already-queued message and delivered it twice. Only 0 (dropped) fails.
+    if (typeof result === "number" && result === 0) {
+      log("Bridge message send returned 0 (dropped)");
       return false;
+    }
+    if (typeof result === "number" && result === -1) {
+      // Enqueued but not on the wire: Bun owns the bytes until `drain`
+      // confirms delivery, and drops them if the socket closes first. Track
+      // the message so detachClaude can re-buffer it for the next attach.
+      // Same cap as bufferedMessages — a never-draining socket must not
+      // accumulate unboundedly (bounded, logged loss beats OOM).
+      ws.data.pendingBackpressure.push(message);
+      if (ws.data.pendingBackpressure.length > MAX_BUFFERED_MESSAGES) {
+        const dropped = ws.data.pendingBackpressure.length - MAX_BUFFERED_MESSAGES;
+        ws.data.pendingBackpressure.splice(0, dropped);
+        log(`Backpressure overflow: dropped ${dropped} oldest tracked message(s), ${MAX_BUFFERED_MESSAGES} remaining`);
+      }
     }
     return true;
   } catch (err: any) {
@@ -862,11 +935,12 @@ function trySendBridgeMessage(ws: ServerWebSocket<ControlSocketData>, message: B
 
 function flushBufferedMessages(ws: ServerWebSocket<ControlSocketData>) {
   const messages = bufferedMessages.splice(0, bufferedMessages.length);
-  for (const message of messages) {
-    if (!trySendBridgeMessage(ws, message)) {
-      // Re-buffer this and all remaining messages on failure
-      const failedIndex = messages.indexOf(message);
-      const remaining = messages.slice(failedIndex);
+  for (let i = 0; i < messages.length; i++) {
+    if (!trySendBridgeMessage(ws, messages[i]!)) {
+      // Re-buffer this and all remaining messages on failure. Positional index,
+      // not indexOf: identity lookup breaks the count if a message object is
+      // ever enqueued twice.
+      const remaining = messages.slice(i);
       bufferedMessages.unshift(...remaining);
       log(`Flush interrupted: re-buffered ${remaining.length} message(s) after send failure`);
       return;
@@ -995,6 +1069,17 @@ function armBootDeadline() {
     if (codexBootstrapped) return; // became ready in time — nothing to do
     if (tuiConnectionState.snapshot().tuiConnected) return; // a TUI is actively using it
     log(`Codex not ready within bootstrap deadline (${BOOTSTRAP_TIMEOUT_MS}ms) — self-exiting to release control port`);
+    // An attached Claude frontend deserves a why before the socket drops: without
+    // this notice the self-exit looks like a random daemon crash from its side
+    // (it only sees "control connection lost" + a reconnect loop).
+    if (attachedClaude) {
+      emitToClaude(
+        systemMessage(
+          "system_daemon_self_replace",
+          "⚠️ Codex did not become ready within the bootstrap deadline — the AgentBridge daemon is restarting itself to release a clean slot. The bridge will reconnect automatically.",
+        ),
+      );
+    }
     shutdown("codex not ready within bootstrap deadline", 1);
   }, BOOTSTRAP_TIMEOUT_MS);
   // Don't let the watchdog itself keep the event loop alive.
@@ -1022,6 +1107,12 @@ async function bootCodex() {
       writeStatusFile();
       emitToClaude(systemMessage("system_waiting", currentWaitingMessage()));
       broadcastStatus();
+      // Arm the idle countdown for the launched-but-never-used case: without
+      // this, a daemon whose launcher dies before any client attaches has no
+      // detach event to arm it and lives (with its codex app-server) forever.
+      // scheduleIdleShutdown returns early (arms nothing) if a client is
+      // already attached.
+      scheduleIdleShutdown();
       return;
     } catch (err: any) {
       const attemptsLeft = CODEX_BOOT_RETRIES - attempt;

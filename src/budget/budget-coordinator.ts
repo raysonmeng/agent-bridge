@@ -1,4 +1,4 @@
-import { computeBudgetState, renderBudgetInterventionDirective } from "./budget-state";
+import { computeBudgetState, isDecisionGrade, renderBudgetInterventionDirective } from "./budget-state";
 import type {
   AgentName,
   AgentUsage,
@@ -117,8 +117,24 @@ export class BudgetCoordinator {
     this.pendingOverrides = null;
   }
 
+  /**
+   * Forget the delivered-tier bookkeeping. turn/start overrides are sticky PER
+   * THREAD — after a thread switch or a codex restart the new thread runs at
+   * its own defaults, so a stale `lastAppliedTier` would suppress the next
+   * legitimate override ("already applied") or skip the explicit full-restore.
+   * The daemon calls this on codex `ready` and `threadChanged`.
+   */
+  resetAppliedTier(): void {
+    this.lastAppliedTier = "full";
+    this.pendingOverrideTier = null;
+    this.pendingOverrides = null;
+  }
+
   private scheduleNext(): void {
     if (!this.running) return;
+    // Defensive: never fork a second polling chain if a timer is already armed
+    // (e.g. a future stop()→start() reentry pattern).
+    if (this.timer) clearTimeout(this.timer);
     const delayMs = Math.max(0, this.config.pollSeconds * 1000);
     this.timer = setTimeout(() => {
       this.timer = null;
@@ -215,15 +231,28 @@ export class BudgetCoordinator {
     }
   }
 
+  // Only decision-grade records may CHANGE intervention state (enter or exit).
+  // Two real-machine failure shapes feed untrustworthy records into the
+  // decision loop:
+  //  - the probe serves a stale cache during an outage: hours-old utils with
+  //    resetEpochs already in the past would enter (and then freeze) a pause
+  //    whose "estimated resume" predates now;
+  //  - a windowless rate-limit-only record reads gateUtil=0, which must not
+  //    AUTHORIZE a resume the moment the throttle expires (the entry-side
+  //    information floor in quota-source has no resume-side counterpart).
+  // Untrustworthy data holds the current state — same semantics as a probe
+  // miss. The check itself is shared with the entry-side guard: see
+  // isDecisionGrade in budget-state.ts.
+
   private shouldEnter(usage: AgentUsage | null, now: number): boolean {
-    if (!usage) return false;
-    return usage.gateUtil >= this.config.pauseAt;
+    if (!isDecisionGrade(usage, now)) return false;
+    return usage!.gateUtil >= this.config.pauseAt;
   }
 
   private canAgentResume(usage: AgentUsage | null, now: number): boolean {
-    if (!usage) return false;
-    if (usage.rateLimitedUntil > now) return false;
-    return usage.gateUtil < this.config.resumeBelow;
+    if (!isDecisionGrade(usage, now)) return false;
+    if (usage!.rateLimitedUntil > now) return false;
+    return usage!.gateUtil < this.config.resumeBelow;
   }
 
   private resumeAfterEpoch(state: BudgetState): number | null {

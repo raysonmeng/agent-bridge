@@ -1,3 +1,4 @@
+import { STALE_MAX_AGE_SEC } from "./types";
 import type { AgentName, AgentUsage, BudgetConfig, BudgetState, CodexTier } from "./types";
 
 interface PauseTrigger {
@@ -63,8 +64,26 @@ function resumeAfterEpoch(
   return Math.max(...epochs);
 }
 
-function pauseTrigger(agent: AgentName, usage: AgentUsage | null, cfg: BudgetConfig): PauseTrigger | null {
+/**
+ * Decision-grade data check: a record whose every window has already reset,
+ * or that was fetched long ago (stale probe cache during an upstream outage),
+ * describes a PAST quota window — its utils must not trigger an intervention
+ * now, nor authorize a resume. Single source of truth for both the entry-side
+ * guard (here) and the coordinator's resume gate.
+ */
+export function isDecisionGrade(usage: AgentUsage | null, now: number): boolean {
+  if (!usage) return false;
+  const freshWindow =
+    (usage.fiveHour !== null && usage.fiveHour.resetEpoch > now) ||
+    (usage.weekly !== null && usage.weekly.resetEpoch > now);
+  if (!freshWindow) return false;
+  if (usage.fetchedAt > 0 && now - usage.fetchedAt > STALE_MAX_AGE_SEC) return false;
+  return true;
+}
+
+function pauseTrigger(agent: AgentName, usage: AgentUsage | null, cfg: BudgetConfig, now: number): PauseTrigger | null {
   if (!usage) return null;
+  if (!isDecisionGrade(usage, now)) return null;
   if (usage.gateUtil >= cfg.pauseAt) {
     return {
       agent,
@@ -204,8 +223,8 @@ export function computeBudgetState(
   now: number,
 ): BudgetState {
   const triggers = [
-    pauseTrigger("claude", claude, cfg),
-    pauseTrigger("codex", codex, cfg),
+    pauseTrigger("claude", claude, cfg, now),
+    pauseTrigger("codex", codex, cfg, now),
   ].filter((trigger): trigger is PauseTrigger => trigger !== null);
   const paused = triggers.length > 0;
   const drift = driftFor(claude, codex, cfg);

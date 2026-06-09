@@ -99,6 +99,32 @@ export function listManagedCodexTuiProcesses(): ManagedCodexTuiProcess[] {
   }
 }
 
+/**
+ * Claude Code plugin frontends (bridge-server.js processes). These are the
+ * processes that re-launch a pair's daemon as soon as the killed sentinel is
+ * cleared, and they keep OLD plugin code loaded until their Claude Code window
+ * is reopened — i.e. the two things `abg kill` users most need to know about
+ * but cannot see from the daemon list alone. Pure half for tests.
+ */
+export function listBridgeFrontendProcessesFromList(processes: ProcessListEntry[]): ProcessListEntry[] {
+  return processes.filter(
+    (entry) =>
+      /(?:^|[\s/\\])bridge-server\.js(?:\s|$)/.test(entry.command) &&
+      (entry.command.includes("agentbridge") || entry.command.includes("agent_bridge")),
+  );
+}
+
+export function listBridgeFrontendProcesses(): ProcessListEntry[] {
+  try {
+    const output = execFileSync("ps", ["-axo", "pid=,command="], { encoding: "utf-8" });
+    return listBridgeFrontendProcessesFromList(parsePsProcessList(output)).filter(
+      (entry) => entry.pid !== process.pid,
+    );
+  } catch {
+    return [];
+  }
+}
+
 export function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0);

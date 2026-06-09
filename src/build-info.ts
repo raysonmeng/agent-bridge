@@ -80,6 +80,22 @@ export function sameRuntimeContract(
   );
 }
 
+/**
+ * Protocol-level compatibility ONLY: can a frontend at build `a` talk to a daemon
+ * at build `b` at all? This is the weakest of the build comparisons — commit and
+ * version may differ (the daemon merely runs older code), but as long as the
+ * control-protocol contractVersion matches, every message still parses. Used to
+ * decide whether replacing a drifted daemon is MANDATORY (incompatible) or merely
+ * desirable (upgrade hygiene).
+ */
+export function compatibleContractVersion(
+  a: AgentBridgeBuildInfo | null | undefined,
+  b: AgentBridgeBuildInfo | null | undefined,
+): boolean {
+  if (!a || !b) return false;
+  return a.contractVersion === b.contractVersion;
+}
+
 export function formatBuildInfo(build: AgentBridgeBuildInfo | null | undefined): string {
   if (!build) return "<unknown>";
   return `${build.version}/${build.commit}/${build.bundle}/contract-v${build.contractVersion}`;

@@ -1,7 +1,7 @@
 import { spawn, execFileSync } from "node:child_process";
-import { existsSync, readFileSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "node:fs";
+import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
-import { BUILD_INFO, formatBuildInfo, sameRuntimeContract } from "./build-info";
+import { BUILD_INFO, compatibleContractVersion, formatBuildInfo, sameRuntimeContract } from "./build-info";
 import { StateDirResolver } from "./state-dir";
 import { parsePositiveIntEnv } from "./env-utils";
 import type { DaemonStatus } from "./control-protocol";
@@ -20,6 +20,10 @@ const DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
 const REUSE_READY_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_REUSE_READY_RETRIES", 12);
 const REUSE_READY_DELAY_MS = 250;
 const HEALTH_FETCH_TIMEOUT_MS = 500;
+// A legitimate startup-lock hold lasts seconds (launch + waitForReady, plus a
+// 3s graceful kill during a replace). Only locks far older than that get the
+// pid-recycling identity check — see acquireLockStrict.
+const LOCK_IDENTITY_GRACE_MS = parsePositiveIntEnv("AGENTBRIDGE_LOCK_IDENTITY_GRACE_MS", 120_000);
 
 export interface DaemonLifecycleOptions {
   stateDir: StateDirResolver;
@@ -87,6 +91,18 @@ export class DaemonLifecycle {
     return reported !== expected;
   }
 
+  /**
+   * A MANUAL-mode launcher (no AGENTBRIDGE_PAIR_ID) found a daemon that belongs
+   * to a REGISTERED pair on its control port. Manual mode waives the foreign
+   * check above, but adopting (or worse, drift-replacing) a registered pair's
+   * daemon is squatting: an unwrapped `claude` session defaults to the root
+   * control port, which aliases registered slot 0. Neither reuse nor replace is
+   * acceptable here — the caller must abort with guidance.
+   */
+  private isRegisteredPairDaemonInManualMode(status: DaemonStatus | null): boolean {
+    return !this.expectedPairId && status?.pairId != null;
+  }
+
   private isBuildDrifted(status: DaemonStatus | null): boolean {
     if (process.env.AGENTBRIDGE_ALLOW_BUILD_DRIFT === "1") return false;
     const runtime = status?.build;
@@ -98,6 +114,23 @@ export class DaemonLifecycle {
     return !sameRuntimeContract(runtime, BUILD_INFO);
   }
 
+  /**
+   * Can a build-drifted daemon be REUSED instead of replaced? Replacing a daemon
+   * is destructive: SIGTERM tears down the codex app-server proxy, which severs
+   * any attached Codex TUI mid-session (observed live: the TUI dies with
+   * "WebSocket protocol error: Connection reset without closing handshake").
+   * Commit/version drift alone is an upgrade-hygiene concern, never worth that:
+   *  - contractVersion mismatch → NOT reusable (the frontend cannot speak to it);
+   *  - same contract + live Codex TUI attached → reusable (warn; the new build is
+   *    picked up at the next natural restart instead of by killing live work);
+   *  - same contract + no TUI → not reusable (replace in the safe window, keeping
+   *    the auto-upgrade behavior when it costs nothing).
+   */
+  private canReuseDespiteDrift(status: DaemonStatus | null): boolean {
+    if (!compatibleContractVersion(status?.build, BUILD_INFO)) return false;
+    return status?.tuiConnected === true;
+  }
+
   /** Ensure daemon is running: reuse a healthy one, replace a bad/foreign one, else launch. */
   async ensureRunning(): Promise<void> {
     // Fast path: something answers /healthz on our control port. But healthz 200 only
@@ -105,6 +138,13 @@ export class DaemonLifecycle {
     // daemon belongs to THIS pair. Distinguish reuse-able from replace-able:
     if (await this.isHealthy()) {
       const status = await this.fetchStatus();
+      if (this.isRegisteredPairDaemonInManualMode(status)) {
+        throw new Error(
+          `Control port ${this.controlPort} is owned by registered pair ${status?.pairId}. ` +
+            `This session has no pair identity (manual mode) and will not reuse or replace it — ` +
+            `start with \`agentbridge claude\` from that pair's directory, or set AGENTBRIDGE_CONTROL_PORT to a free port.`,
+        );
+      }
       if (this.isForeignDaemon(status)) {
         this.log(
           `Control port ${this.controlPort} held by a daemon for pair ${status?.pairId ?? "<none>"}, ` +
@@ -114,12 +154,21 @@ export class DaemonLifecycle {
         return;
       }
       if (this.isBuildDrifted(status)) {
-        this.log(
-          `Daemon on control port ${this.controlPort} is running build ${formatBuildInfo(status?.build)} ` +
-            `but launcher is ${formatBuildInfo(BUILD_INFO)} — replacing drifted daemon`,
-        );
-        await this.replaceUnhealthyDaemon(status?.pid);
-        return;
+        if (this.canReuseDespiteDrift(status)) {
+          this.log(
+            `Daemon on control port ${this.controlPort} is running build ${formatBuildInfo(status?.build)} ` +
+              `(launcher ${formatBuildInfo(BUILD_INFO)}) but a live Codex TUI is attached — reusing instead of ` +
+              `replacing; the new build is picked up at the next restart (abg kill, then relaunch)`,
+          );
+          // fall through to the readiness check + reuse path below
+        } else {
+          this.log(
+            `Daemon on control port ${this.controlPort} is running build ${formatBuildInfo(status?.build)} ` +
+              `but launcher is ${formatBuildInfo(BUILD_INFO)} — replacing drifted daemon`,
+          );
+          await this.replaceUnhealthyDaemon(status?.pid);
+          return;
+        }
       }
       try {
         // Short window: a sane daemon (or a legit slow boot) reports ready within ~3s.
@@ -175,7 +224,7 @@ export class DaemonLifecycle {
       // Re-check under the lock: a concurrent launcher may have just started one.
       if (await this.isHealthy()) {
         const status = await this.fetchStatus();
-        if (this.isForeignDaemon(status) || this.isBuildDrifted(status)) {
+        if (this.isForeignDaemon(status) || (this.isBuildDrifted(status) && !this.canReuseDespiteDrift(status))) {
           this.log(
             `Daemon on control port ${this.controlPort} is not reusable under startup lock ` +
               `(pair=${status?.pairId ?? "<none>"}, build=${formatBuildInfo(status?.build)}) — replacing`,
@@ -247,7 +296,16 @@ export class DaemonLifecycle {
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       if (await this.isReady()) {
         const status = await this.fetchStatus();
-        if (!this.isForeignDaemon(status) && !this.isBuildDrifted(status)) return; // ready + ours + current build
+        // Accept ready + ours + (current build OR a drifted daemon that the reuse
+        // policy keeps alive — same contract with a live TUI). Without the latter,
+        // this loop spins to a 10s timeout against a perfectly usable daemon
+        // (observed live as "Timed out waiting for readiness+identity").
+        if (
+          !this.isForeignDaemon(status) &&
+          (!this.isBuildDrifted(status) || this.canReuseDespiteDrift(status))
+        ) {
+          return;
+        }
       }
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
@@ -368,7 +426,10 @@ export class DaemonLifecycle {
       // Re-check under the lock: the daemon may have readied or been replaced already.
       if (await this.isHealthy()) {
         const status = await this.fetchStatus();
-        if (!this.isForeignDaemon(status) && !this.isBuildDrifted(status)) {
+        if (
+          !this.isForeignDaemon(status) &&
+          (!this.isBuildDrifted(status) || this.canReuseDespiteDrift(status))
+        ) {
           try {
             await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
             return; // someone else already fixed it — don't kill
@@ -408,18 +469,47 @@ export class DaemonLifecycle {
    */
   private acquireLockStrict(reclaimed = false): boolean {
     this.stateDir.ensure();
+    let fd: number | null = null;
     try {
-      const fd = openSync(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
+      fd = openSync(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
       writeFileSync(fd, `${process.pid}\n`);
       closeSync(fd);
       return true;
     } catch (err: any) {
+      if (fd !== null && err.code !== "EEXIST") {
+        // O_EXCL create succeeded but the pid write/close failed (e.g. ENOSPC):
+        // without cleanup we'd leave an EMPTY lock file that parses to NaN and
+        // can never be reclaimed — a permanent wedge for this pair.
+        try {
+          closeSync(fd);
+        } catch {}
+        this.releaseLock();
+      }
       if (err.code === "EEXIST") {
         if (reclaimed) return false; // already retried once after reclaiming
         try {
           const holderPid = Number.parseInt(readFileSync(this.stateDir.lockFile, "utf-8").trim(), 10);
           if (Number.isFinite(holderPid) && !isProcessAlive(holderPid)) {
             this.log(`Stale startup lock from dead process ${holderPid}, reclaiming`);
+            this.releaseLock();
+            return this.acquireLockStrict(true);
+          }
+          // Alive pid but NOT an AgentBridge process — the lock holder died and
+          // the OS recycled its pid into something unrelated. Treating that as
+          // a live holder wedges the pair forever. Identity is only consulted
+          // for STALE locks: pid recycling takes far longer than any legitimate
+          // lock hold (seconds), and the command-line heuristic must not veto a
+          // fresh, genuinely-live holder (e.g. a test runner invoked with
+          // relative paths carries no agentbridge marker).
+          if (
+            Number.isFinite(holderPid) &&
+            this.lockAgeMs() > LOCK_IDENTITY_GRACE_MS &&
+            !this.isAgentBridgeProcess(holderPid)
+          ) {
+            this.log(
+              `Startup lock is ${Math.round(this.lockAgeMs() / 1000)}s old and holder pid ${holderPid} ` +
+                `is an unrelated process (pid recycled), reclaiming`,
+            );
             this.releaseLock();
             return this.acquireLockStrict(true);
           }
@@ -430,6 +520,30 @@ export class DaemonLifecycle {
         return false; // live holder — contended
       }
       this.log(`Could not acquire strict startup lock: ${err.message}`);
+      return false;
+    }
+  }
+
+  /** Age of the current lock file in ms (Infinity-safe: 0 when unreadable). */
+  private lockAgeMs(): number {
+    try {
+      return Date.now() - statSync(this.stateDir.lockFile).mtimeMs;
+    } catch {
+      return 0;
+    }
+  }
+
+  /**
+   * Loose identity check for lock holders: launchers (CLI / plugin frontend)
+   * and daemons all carry agentbridge markers in their command line. Used only
+   * to detect OS pid recycling — NOT for kill decisions (kill() keeps the
+   * stricter daemon-entry match).
+   */
+  private isAgentBridgeProcess(pid: number): boolean {
+    try {
+      const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
+      return cmd.includes("agentbridge") || cmd.includes("agent_bridge");
+    } catch {
       return false;
     }
   }

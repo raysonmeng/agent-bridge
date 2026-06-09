@@ -15,7 +15,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.6", "0.0.0-source"),
-  commit: defineString("71ff4f3", "source"),
+  commit: defineString("2079374", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, 1)
 });
@@ -26,6 +26,11 @@ function sameRuntimeContract(a, b) {
   if (!a || !b)
     return false;
   return a.version === b.version && a.commit === b.commit && a.contractVersion === b.contractVersion;
+}
+function compatibleContractVersion(a, b) {
+  if (!a || !b)
+    return false;
+  return a.contractVersion === b.contractVersion;
 }
 function formatBuildInfo(build) {
   if (!build)
@@ -97,14 +102,15 @@ class StateDirResolver {
 }
 
 // src/rotating-log.ts
-import { appendFileSync, existsSync as existsSync2, mkdirSync as mkdirSync2, renameSync, statSync, unlinkSync } from "fs";
+import { appendFileSync, existsSync as existsSync2, renameSync, statSync, unlinkSync } from "fs";
 import { dirname } from "path";
 var DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
 var DEFAULT_KEEP = 3;
 function appendRotatingLog(path, content, options = {}) {
   const maxBytes = options.maxBytes ?? positiveIntFromEnv("AGENTBRIDGE_LOG_MAX_BYTES", DEFAULT_MAX_BYTES);
   const keep = options.keep ?? positiveIntFromEnv("AGENTBRIDGE_LOG_ROTATE_KEEP", DEFAULT_KEEP);
-  mkdirSync2(dirname(path), { recursive: true });
+  if (!existsSync2(dirname(path)))
+    return;
   rotateIfNeeded(path, Buffer.byteLength(content), maxBytes, keep);
   appendFileSync(path, content, "utf-8");
 }
@@ -256,7 +262,7 @@ function isAppServerResponseMessage(value) {
 // src/codex-transport.ts
 import { createServer, connect } from "net";
 import { spawnSync } from "child_process";
-import { mkdirSync as mkdirSync3, rmSync, chmodSync } from "fs";
+import { mkdirSync as mkdirSync2, rmSync, chmodSync } from "fs";
 import { join as join2 } from "path";
 import { tmpdir } from "os";
 var CODEX_TRANSPORT_ENV = "AGENTBRIDGE_CODEX_TRANSPORT";
@@ -317,7 +323,7 @@ function ensureSocketDir(socketPath) {
   const dir = socketPath.slice(0, socketPath.lastIndexOf("/"));
   if (!dir)
     return;
-  mkdirSync3(dir, { recursive: true, mode: 448 });
+  mkdirSync2(dir, { recursive: true, mode: 448 });
   try {
     chmodSync(dir, 448);
   } catch (err) {
@@ -535,7 +541,7 @@ class CodexAdapter extends EventEmitter {
   outageQueue = [];
   outageTimer = null;
   static OUTAGE_QUEUE_MAX = 64;
-  static OUTAGE_TIMEOUT_MS = 5000;
+  static OUTAGE_TIMEOUT_MS = 1e4;
   lastInitializeRaw = null;
   lastInitializedRaw = null;
   sessionRestoreInProgress = false;
@@ -993,6 +999,10 @@ class CodexAdapter extends EventEmitter {
         const isUpgrade = req.headers.get("upgrade")?.toLowerCase() === "websocket";
         self.log(`HTTP ${req.method} ${url.pathname} (upgrade=${isUpgrade})`);
         if (url.pathname === "/healthz" || url.pathname === "/readyz") {
+          if (self.transport === "unix") {
+            const up = self.appServerWs?.readyState === WebSocket.OPEN;
+            return new Response(up ? "ok" : "upstream not connected", { status: up ? 200 : 503 });
+          }
           return fetch(`http://127.0.0.1:${self.appPort}${url.pathname}`);
         }
         if (server.upgrade(req, { data: { connId: 0 } }))
@@ -1371,7 +1381,7 @@ class CodexAdapter extends EventEmitter {
       timestamp: Date.now()
     });
     this.serverRequestToProxy.delete(proxyId);
-    this.log(`Buffered approval response until app-server reconnect (${reason}) (proxy id=${proxyId} \u2192 server id=${pending.serverId})`);
+    this.log(`Approval response could not reach the app-server (${reason}) \u2014 buffered best-effort, but it is ` + `likely lost (session-scoped id; reconnects clear this buffer). The TUI may need to re-approve. ` + `(proxy id=${proxyId} \u2192 server id=${pending.serverId})`);
   }
   flushPendingServerResponses() {
     if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN)
@@ -2055,7 +2065,7 @@ class TuiConnectionState {
 
 // src/daemon-lifecycle.ts
 import { spawn as spawn2, execFileSync } from "child_process";
-import { existsSync as existsSync3, readFileSync, unlinkSync as unlinkSync2, writeFileSync, openSync, closeSync, constants } from "fs";
+import { existsSync as existsSync3, readFileSync, statSync as statSync2, unlinkSync as unlinkSync2, writeFileSync, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
 
 // src/env-utils.ts
@@ -2078,6 +2088,7 @@ var DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
 var REUSE_READY_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_REUSE_READY_RETRIES", 12);
 var REUSE_READY_DELAY_MS = 250;
 var HEALTH_FETCH_TIMEOUT_MS = 500;
+var LOCK_IDENTITY_GRACE_MS = parsePositiveIntEnv("AGENTBRIDGE_LOCK_IDENTITY_GRACE_MS", 120000);
 
 class DaemonLifecycle {
   stateDir;
@@ -2121,6 +2132,9 @@ class DaemonLifecycle {
       return true;
     return reported !== expected;
   }
+  isRegisteredPairDaemonInManualMode(status) {
+    return !this.expectedPairId && status?.pairId != null;
+  }
   isBuildDrifted(status) {
     if (process.env.AGENTBRIDGE_ALLOW_BUILD_DRIFT === "1")
       return false;
@@ -2129,18 +2143,30 @@ class DaemonLifecycle {
       return true;
     return !sameRuntimeContract(runtime, BUILD_INFO);
   }
+  canReuseDespiteDrift(status) {
+    if (!compatibleContractVersion(status?.build, BUILD_INFO))
+      return false;
+    return status?.tuiConnected === true;
+  }
   async ensureRunning() {
     if (await this.isHealthy()) {
       const status = await this.fetchStatus();
+      if (this.isRegisteredPairDaemonInManualMode(status)) {
+        throw new Error(`Control port ${this.controlPort} is owned by registered pair ${status?.pairId}. ` + `This session has no pair identity (manual mode) and will not reuse or replace it \u2014 ` + `start with \`agentbridge claude\` from that pair's directory, or set AGENTBRIDGE_CONTROL_PORT to a free port.`);
+      }
       if (this.isForeignDaemon(status)) {
         this.log(`Control port ${this.controlPort} held by a daemon for pair ${status?.pairId ?? "<none>"}, ` + `but this pair is ${this.expectedPairId} \u2014 replacing foreign daemon`);
         await this.replaceUnhealthyDaemon(status?.pid);
         return;
       }
       if (this.isBuildDrifted(status)) {
-        this.log(`Daemon on control port ${this.controlPort} is running build ${formatBuildInfo(status?.build)} ` + `but launcher is ${formatBuildInfo(BUILD_INFO)} \u2014 replacing drifted daemon`);
-        await this.replaceUnhealthyDaemon(status?.pid);
-        return;
+        if (this.canReuseDespiteDrift(status)) {
+          this.log(`Daemon on control port ${this.controlPort} is running build ${formatBuildInfo(status?.build)} ` + `(launcher ${formatBuildInfo(BUILD_INFO)}) but a live Codex TUI is attached \u2014 reusing instead of ` + `replacing; the new build is picked up at the next restart (abg kill, then relaunch)`);
+        } else {
+          this.log(`Daemon on control port ${this.controlPort} is running build ${formatBuildInfo(status?.build)} ` + `but launcher is ${formatBuildInfo(BUILD_INFO)} \u2014 replacing drifted daemon`);
+          await this.replaceUnhealthyDaemon(status?.pid);
+          return;
+        }
       }
       try {
         await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
@@ -2176,7 +2202,7 @@ class DaemonLifecycle {
       }
       if (await this.isHealthy()) {
         const status = await this.fetchStatus();
-        if (this.isForeignDaemon(status) || this.isBuildDrifted(status)) {
+        if (this.isForeignDaemon(status) || this.isBuildDrifted(status) && !this.canReuseDespiteDrift(status)) {
           this.log(`Daemon on control port ${this.controlPort} is not reusable under startup lock ` + `(pair=${status?.pairId ?? "<none>"}, build=${formatBuildInfo(status?.build)}) \u2014 replacing`);
           await this.kill(3000, status?.pid);
         } else {
@@ -2229,8 +2255,9 @@ class DaemonLifecycle {
     for (let attempt = 0;attempt < maxRetries; attempt++) {
       if (await this.isReady()) {
         const status = await this.fetchStatus();
-        if (!this.isForeignDaemon(status) && !this.isBuildDrifted(status))
+        if (!this.isForeignDaemon(status) && (!this.isBuildDrifted(status) || this.canReuseDespiteDrift(status))) {
           return;
+        }
       }
       await new Promise((resolve) => setTimeout(resolve, delayMs));
     }
@@ -2316,7 +2343,7 @@ class DaemonLifecycle {
       }
       if (await this.isHealthy()) {
         const status = await this.fetchStatus();
-        if (!this.isForeignDaemon(status) && !this.isBuildDrifted(status)) {
+        if (!this.isForeignDaemon(status) && (!this.isBuildDrifted(status) || this.canReuseDespiteDrift(status))) {
           try {
             await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
             return;
@@ -2340,13 +2367,20 @@ class DaemonLifecycle {
   }
   acquireLockStrict(reclaimed = false) {
     this.stateDir.ensure();
+    let fd = null;
     try {
-      const fd = openSync(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
+      fd = openSync(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
       writeFileSync(fd, `${process.pid}
 `);
       closeSync(fd);
       return true;
     } catch (err) {
+      if (fd !== null && err.code !== "EEXIST") {
+        try {
+          closeSync(fd);
+        } catch {}
+        this.releaseLock();
+      }
       if (err.code === "EEXIST") {
         if (reclaimed)
           return false;
@@ -2357,12 +2391,32 @@ class DaemonLifecycle {
             this.releaseLock();
             return this.acquireLockStrict(true);
           }
+          if (Number.isFinite(holderPid) && this.lockAgeMs() > LOCK_IDENTITY_GRACE_MS && !this.isAgentBridgeProcess(holderPid)) {
+            this.log(`Startup lock is ${Math.round(this.lockAgeMs() / 1000)}s old and holder pid ${holderPid} ` + `is an unrelated process (pid recycled), reclaiming`);
+            this.releaseLock();
+            return this.acquireLockStrict(true);
+          }
         } catch {
           return false;
         }
         return false;
       }
       this.log(`Could not acquire strict startup lock: ${err.message}`);
+      return false;
+    }
+  }
+  lockAgeMs() {
+    try {
+      return Date.now() - statSync2(this.stateDir.lockFile).mtimeMs;
+    } catch {
+      return 0;
+    }
+  }
+  isAgentBridgeProcess(pid) {
+    try {
+      const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
+      return cmd.includes("agentbridge") || cmd.includes("agent_bridge");
+    } catch {
       return false;
     }
   }
@@ -2445,7 +2499,7 @@ function isProcessAlive(pid) {
 }
 
 // src/config-service.ts
-import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync4, existsSync as existsSync4 } from "fs";
+import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync3, existsSync as existsSync4 } from "fs";
 import { join as join3 } from "path";
 var DEFAULT_BUDGET_CONFIG = {
   enabled: true,
@@ -2626,10 +2680,13 @@ class ConfigService {
   }
   ensureConfigDir() {
     if (!existsSync4(this.configDir)) {
-      mkdirSync4(this.configDir, { recursive: true });
+      mkdirSync3(this.configDir, { recursive: true });
     }
   }
 }
+
+// src/budget/types.ts
+var STALE_MAX_AGE_SEC = 600;
 
 // src/budget/budget-state.ts
 var AGENT_LABEL = {
@@ -2680,8 +2737,20 @@ function resumeAfterEpoch(claude, codex, cfg, now) {
     return null;
   return Math.max(...epochs);
 }
-function pauseTrigger(agent, usage, cfg) {
+function isDecisionGrade(usage, now) {
   if (!usage)
+    return false;
+  const freshWindow = usage.fiveHour !== null && usage.fiveHour.resetEpoch > now || usage.weekly !== null && usage.weekly.resetEpoch > now;
+  if (!freshWindow)
+    return false;
+  if (usage.fetchedAt > 0 && now - usage.fetchedAt > STALE_MAX_AGE_SEC)
+    return false;
+  return true;
+}
+function pauseTrigger(agent, usage, cfg, now) {
+  if (!usage)
+    return null;
+  if (!isDecisionGrade(usage, now))
     return null;
   if (usage.gateUtil >= cfg.pauseAt) {
     return {
@@ -2793,8 +2862,8 @@ function claudeAdviceFor(claude) {
 }
 function computeBudgetState(claude, codex, cfg, now) {
   const triggers = [
-    pauseTrigger("claude", claude, cfg),
-    pauseTrigger("codex", codex, cfg)
+    pauseTrigger("claude", claude, cfg, now),
+    pauseTrigger("codex", codex, cfg, now)
   ].filter((trigger) => trigger !== null);
   const paused = triggers.length > 0;
   const drift = driftFor(claude, codex, cfg);
@@ -2926,9 +2995,16 @@ class BudgetCoordinator {
     this.pendingOverrideTier = null;
     this.pendingOverrides = null;
   }
+  resetAppliedTier() {
+    this.lastAppliedTier = "full";
+    this.pendingOverrideTier = null;
+    this.pendingOverrides = null;
+  }
   scheduleNext() {
     if (!this.running)
       return;
+    if (this.timer)
+      clearTimeout(this.timer);
     const delayMs = Math.max(0, this.config.pollSeconds * 1000);
     this.timer = setTimeout(() => {
       this.timer = null;
@@ -3009,12 +3085,12 @@ class BudgetCoordinator {
     }
   }
   shouldEnter(usage, now) {
-    if (!usage)
+    if (!isDecisionGrade(usage, now))
       return false;
     return usage.gateUtil >= this.config.pauseAt;
   }
   canAgentResume(usage, now) {
-    if (!usage)
+    if (!isDecisionGrade(usage, now))
       return false;
     if (usage.rateLimitedUntil > now)
       return false;
@@ -3460,7 +3536,7 @@ class ReplyRequiredTracker {
 // src/thread-state.ts
 import {
   existsSync as existsSync6,
-  mkdirSync as mkdirSync5,
+  mkdirSync as mkdirSync4,
   readdirSync,
   readFileSync as readFileSync3,
   renameSync as renameSync2,
@@ -3479,7 +3555,7 @@ function codexHome(env = process.env) {
   return env.CODEX_HOME && env.CODEX_HOME.length > 0 ? env.CODEX_HOME : join5(homedir3(), ".codex");
 }
 function atomicWriteJson(path, value) {
-  mkdirSync5(dirname2(path), { recursive: true });
+  mkdirSync4(dirname2(path), { recursive: true });
   const tmp = `${path}.tmp.${process.pid}.${Date.now()}`;
   writeFileSync3(tmp, JSON.stringify(value, null, 2) + `
 `, "utf-8");
@@ -3796,9 +3872,11 @@ codex.on("ready", (threadId) => {
   log(`Codex ready \u2014 thread ${threadId}`);
   log("Bridge fully operational");
   emitToClaude(systemMessage("system_ready", currentReadyMessage()));
+  budgetCoordinator?.resetAppliedTier();
   ensureBudgetCoordinatorStarted();
 });
 codex.on("threadChanged", (event) => {
+  budgetCoordinator?.resetAppliedTier();
   broadcastStatus();
   persistCurrentThreadWithRolloutRetry({
     stateDir,
@@ -3834,7 +3912,7 @@ codex.on("exit", (code) => {
   statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
   clearPendingClaudeDisconnect("Codex process exited");
-  emitToClaude(systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running, but the Codex side needs to be restarted.`));
+  emitToClaude(systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running. ` + `Restart the Codex side (\`agentbridge codex\`); if it does not come back within ` + `${Math.round(BOOTSTRAP_TIMEOUT_MS / 1000)}s the daemon will self-replace so the next launch starts clean.`));
   broadcastStatus();
   armBootDeadline();
 });
@@ -3850,7 +3928,7 @@ function startControlServer() {
       if (url.pathname === "/readyz") {
         return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
       }
-      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now(), pongCount: 0 } })) {
+      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now(), pongCount: 0, pendingBackpressure: [] } })) {
         return;
       }
       return new Response("AgentBridge daemon");
@@ -3861,6 +3939,7 @@ function startControlServer() {
       open: (ws) => {
         ws.data.clientId = ++nextControlClientId;
         ws.data.lastPongAt = Date.now();
+        ws.data.pendingBackpressure = [];
         log(`Frontend socket opened (#${ws.data.clientId})`);
       },
       close: (ws, code, reason) => {
@@ -3875,6 +3954,14 @@ function startControlServer() {
       pong: (ws) => {
         ws.data.lastPongAt = Date.now();
         ws.data.pongCount++;
+      },
+      drain: (ws) => {
+        if (ws.data.pendingBackpressure.length > 0 && ws.getBufferedAmount() === 0) {
+          ws.data.pendingBackpressure = [];
+        }
+        if (ws === attachedClaude && bufferedMessages.length > 0) {
+          flushBufferedMessages(ws);
+        }
       }
     }
   });
@@ -4024,13 +4111,15 @@ async function attachClaude(ws, identity) {
   ws.data.attached = true;
   cancelIdleShutdown();
   log(`Claude frontend attached (#${ws.data.clientId}, pair=${identity?.pairId ?? "<none>"}, cwd=${identity?.cwd ?? "<unknown>"})`);
+  const hadBacklog = bufferedMessages.length > 0;
+  if (hadBacklog) {
+    flushBufferedMessages(ws);
+  }
   statusBuffer.flush("claude reconnected");
   sendStatus(ws);
   const now = Date.now();
   const isRapidReattach = now - lastAttachStatusSentTs < ATTACH_STATUS_COOLDOWN_MS;
-  if (bufferedMessages.length > 0) {
-    flushBufferedMessages(ws);
-  } else if (!isRapidReattach) {
+  if (!hadBacklog && !isRapidReattach) {
     if (tuiConnectionState.canReply()) {
       sendBridgeMessage(ws, systemMessage("system_ready", currentReadyMessage()));
     } else if (codexBootstrapped) {
@@ -4045,6 +4134,16 @@ function detachClaude(ws, reason) {
   attachedClaude = null;
   ws.data.attached = false;
   log(`Claude frontend detached (#${ws.data.clientId}, ${reason})`);
+  if (ws.data.pendingBackpressure.length > 0) {
+    bufferedMessages.unshift(...ws.data.pendingBackpressure);
+    log(`Re-buffered ${ws.data.pendingBackpressure.length} backpressured message(s) for redelivery on reconnect`);
+    ws.data.pendingBackpressure = [];
+    if (bufferedMessages.length > MAX_BUFFERED_MESSAGES) {
+      const dropped = bufferedMessages.length - MAX_BUFFERED_MESSAGES;
+      bufferedMessages.splice(0, dropped);
+      log(`Message buffer overflow: dropped ${dropped} oldest message(s), ${MAX_BUFFERED_MESSAGES} remaining`);
+    }
+  }
   scheduleClaudeDisconnectNotification(ws.data.clientId);
   scheduleIdleShutdown();
 }
@@ -4172,9 +4271,17 @@ function emitToClaude(message) {
 function trySendBridgeMessage(ws, message) {
   try {
     const result = ws.send(JSON.stringify({ type: "codex_to_claude", message }));
-    if (typeof result === "number" && result <= 0) {
-      log(`Bridge message send returned ${result} (0=dropped, -1=backpressure)`);
+    if (typeof result === "number" && result === 0) {
+      log("Bridge message send returned 0 (dropped)");
       return false;
+    }
+    if (typeof result === "number" && result === -1) {
+      ws.data.pendingBackpressure.push(message);
+      if (ws.data.pendingBackpressure.length > MAX_BUFFERED_MESSAGES) {
+        const dropped = ws.data.pendingBackpressure.length - MAX_BUFFERED_MESSAGES;
+        ws.data.pendingBackpressure.splice(0, dropped);
+        log(`Backpressure overflow: dropped ${dropped} oldest tracked message(s), ${MAX_BUFFERED_MESSAGES} remaining`);
+      }
     }
     return true;
   } catch (err) {
@@ -4184,10 +4291,9 @@ function trySendBridgeMessage(ws, message) {
 }
 function flushBufferedMessages(ws) {
   const messages = bufferedMessages.splice(0, bufferedMessages.length);
-  for (const message of messages) {
-    if (!trySendBridgeMessage(ws, message)) {
-      const failedIndex = messages.indexOf(message);
-      const remaining = messages.slice(failedIndex);
+  for (let i = 0;i < messages.length; i++) {
+    if (!trySendBridgeMessage(ws, messages[i])) {
+      const remaining = messages.slice(i);
       bufferedMessages.unshift(...remaining);
       log(`Flush interrupted: re-buffered ${remaining.length} message(s) after send failure`);
       return;
@@ -4284,6 +4390,9 @@ function armBootDeadline() {
     if (tuiConnectionState.snapshot().tuiConnected)
       return;
     log(`Codex not ready within bootstrap deadline (${BOOTSTRAP_TIMEOUT_MS}ms) \u2014 self-exiting to release control port`);
+    if (attachedClaude) {
+      emitToClaude(systemMessage("system_daemon_self_replace", "\u26A0\uFE0F Codex did not become ready within the bootstrap deadline \u2014 the AgentBridge daemon is restarting itself to release a clean slot. The bridge will reconnect automatically."));
+    }
     shutdown("codex not ready within bootstrap deadline", 1);
   }, BOOTSTRAP_TIMEOUT_MS);
   bootDeadlineTimer.unref?.();
@@ -4307,6 +4416,7 @@ async function bootCodex() {
       writeStatusFile();
       emitToClaude(systemMessage("system_waiting", currentWaitingMessage()));
       broadcastStatus();
+      scheduleIdleShutdown();
       return;
     } catch (err) {
       const attemptsLeft = CODEX_BOOT_RETRIES - attempt;

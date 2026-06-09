@@ -1,4 +1,4 @@
-import { appendFileSync, existsSync, mkdirSync, renameSync, statSync, unlinkSync } from "node:fs";
+import { appendFileSync, existsSync, renameSync, statSync, unlinkSync } from "node:fs";
 import { dirname } from "node:path";
 
 const DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
@@ -11,7 +11,12 @@ export function appendRotatingLog(
 ): void {
   const maxBytes = options.maxBytes ?? positiveIntFromEnv("AGENTBRIDGE_LOG_MAX_BYTES", DEFAULT_MAX_BYTES);
   const keep = options.keep ?? positiveIntFromEnv("AGENTBRIDGE_LOG_ROTATE_KEEP", DEFAULT_KEEP);
-  mkdirSync(dirname(path), { recursive: true });
+  // Logging must NEVER recreate a deleted directory: every process owning a
+  // pair calls stateDir.ensure() at startup, so a missing parent here means
+  // the pair was removed (abg pairs rm / prune) while this process survived.
+  // The old unconditional mkdir resurrected removed pair dirs as unregistered
+  // orphans on every log line. Best-effort logging drops the line instead.
+  if (!existsSync(dirname(path))) return;
   rotateIfNeeded(path, Buffer.byteLength(content), maxBytes, keep);
   appendFileSync(path, content, "utf-8");
 }

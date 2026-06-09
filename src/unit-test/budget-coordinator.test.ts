@@ -528,3 +528,120 @@ describe("BudgetCoordinator", () => {
     expect(logs.filter((message) => message.includes("full restore mapping"))).toHaveLength(1);
   });
 });
+
+describe("decision-grade data guards (stale cache / expired windows)", () => {
+  test("expired-window stale cache does NOT enter intervention", async () => {
+    // Real-machine shape: probe serves an hours-old cache during an upstream
+    // outage — every window's resetEpoch is already in the past. Trusting it
+    // would open (and freeze) a pause whose "resume estimate" predates now.
+    const source = new FakeSource([
+      {
+        claude: usage(),
+        codex: usage({
+          gateUtil: 95,
+          fiveHour: { util: 95, resetEpoch: NOW - 5400 },
+          weekly: { util: 95, resetEpoch: NOW - 100 },
+          fetchedAt: NOW - 7200,
+        }),
+      },
+    ]);
+    const emitted: Array<{ id: string }> = [];
+    const coordinator = new BudgetCoordinator({
+      source: source as any,
+      config: CONFIG,
+      emit: (id) => emitted.push({ id }),
+      onPauseChange: () => {},
+      now: () => NOW,
+    });
+    await coordinator.start();
+    coordinator.stop();
+    expect(coordinator.isPaused()).toBe(false);
+    expect(coordinator.isGateClosed()).toBe(false);
+    expect(emitted.some((e) => e.id.startsWith("system_budget_pause"))).toBe(false);
+    expect(emitted.some((e) => e.id.startsWith("system_budget_handoff"))).toBe(false);
+  });
+
+  test("fresh-window but ancient fetchedAt does NOT enter intervention", async () => {
+    const source = new FakeSource([
+      {
+        claude: usage(),
+        codex: usage({ gateUtil: 95, fetchedAt: NOW - 3600 }),
+      },
+    ]);
+    const coordinator = new BudgetCoordinator({
+      source: source as any,
+      config: CONFIG,
+      emit: () => {},
+      onPauseChange: () => {},
+      now: () => NOW,
+    });
+    await coordinator.start();
+    coordinator.stop();
+    expect(coordinator.isPaused()).toBe(false);
+  });
+
+  test("windowless rate-limit record cannot AUTHORIZE resume at throttle expiry", async () => {
+    // Poll 1: codex genuinely over the gate → pause. Poll 2: a rate-limit-only
+    // record (no windows, util 0) whose throttle just expired — gateUtil=0 must
+    // NOT read as "recovered" (it is absence of information, not a measurement).
+    const source = new FakeSource([
+      { claude: usage(), codex: usage({ gateUtil: 95 }) },
+      {
+        claude: usage(),
+        codex: usage({
+          ok: false,
+          gateUtil: 0,
+          warnUtil: 0,
+          fiveHour: null,
+          weekly: null,
+          rateLimitedUntil: NOW - 1,
+        }),
+      },
+    ]);
+    const emitted: Array<{ id: string }> = [];
+    const coordinator = new BudgetCoordinator({
+      source: source as any,
+      config: CONFIG,
+      emit: (id) => emitted.push({ id }),
+      onPauseChange: () => {},
+      now: () => NOW,
+    });
+    await coordinator.start();
+    await (coordinator as any).pollOnce();
+    coordinator.stop();
+    expect(coordinator.isPaused()).toBe(true);
+    expect(coordinator.isGateClosed()).toBe(true);
+    expect(emitted.some((e) => e.id.startsWith("system_budget_resume"))).toBe(false);
+  });
+
+  test("resetAppliedTier re-arms the override after a thread switch", async () => {
+    const tierConfig: BudgetConfig = {
+      ...CONFIG,
+      codexTierControl: true,
+      codexTiers: { full: { effort: "high" }, balanced: { effort: "medium" }, eco: { effort: "low" } },
+    };
+    // codex warnUtil 85 → eco band on every poll.
+    const source = new FakeSource([
+      { claude: usage(), codex: usage({ gateUtil: 40, warnUtil: 85 }) },
+      { claude: usage(), codex: usage({ gateUtil: 40, warnUtil: 85 }) },
+    ]);
+    const coordinator = new BudgetCoordinator({
+      source: source as any,
+      config: tierConfig,
+      emit: () => {},
+      onPauseChange: () => {},
+      now: () => NOW,
+    });
+    await coordinator.start();
+    expect(coordinator.getCodexTurnOverrides()).toEqual({ effort: "low" });
+    coordinator.notifyOverridesDelivered();
+    expect(coordinator.getCodexTurnOverrides()).toBeNull(); // delivered — no requeue for same tier
+
+    // Thread switch: the new thread runs at its defaults; stale bookkeeping
+    // would keep suppressing the override forever.
+    coordinator.resetAppliedTier();
+    await (coordinator as any).pollOnce();
+    coordinator.stop();
+    expect(coordinator.getCodexTurnOverrides()).toEqual({ effort: "low" });
+  });
+});
