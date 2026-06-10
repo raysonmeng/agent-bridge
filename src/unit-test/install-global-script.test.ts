@@ -27,14 +27,16 @@ function dryRunCommands(mode: string, extraArgs: string[] = []): string[] {
 }
 
 describe("scripts/install-global.mjs", () => {
-  test("local mode builds, packs, replaces the global install, then syncs the plugin", () => {
+  test("local mode builds and VERIFIES before stopping anything, then installs and syncs the plugin", () => {
+    // Ordering contract: stop-running comes AFTER build verification — a red
+    // build must not cause a machine-wide daemon outage.
     const commands = dryRunCommands("local");
     expect(commands).toEqual([
-      "$ node scripts/install-safety.cjs stop-running --dry-run",
       "$ bun run prepublishOnly",
       "$ node scripts/install-safety.cjs verify-built",
       "$ npm pack --pack-destination <temp>",
       "$ node scripts/install-safety.cjs verify-tarball <packed-tarball>",
+      "$ node scripts/install-safety.cjs stop-running --dry-run  # after build verifies — red builds no longer cause an outage",
       `$ npm uninstall -g ${PACKAGE_NAME}  # ignored if not installed`,
       "$ npm install -g --force <packed-tarball>",
       "$ bun src/cli.ts dev --skip-build  # sync Claude Code plugin (skip with --skip-plugin)",

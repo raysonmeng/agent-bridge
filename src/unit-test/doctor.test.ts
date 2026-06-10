@@ -14,6 +14,11 @@ const ENV_KEYS = [
   "AGENTBRIDGE_PROXY_PORT",
   "AGENTBRIDGE_CONTROL_PORT",
   "AGENTBRIDGE_MANUAL",
+  // The CODEX port pair is part of the env-vs-cwd consistency check too. The
+  // old doctor masked leftovers by mutating env to match; the read-only doctor
+  // reports them honestly, so tests must actually isolate them.
+  "CODEX_WS_PORT",
+  "CODEX_PROXY_PORT",
 ];
 
 const savedEnv = new Map<string, string | undefined>();
@@ -82,10 +87,12 @@ describe("doctor command", () => {
       expect(report.pair.slot).toBe(1234);
       expect(report.env.ok).toBe(true);
       expect(report.checks.map((check: { name: string }) => check.name)).toEqual([
+        "pair registration",
         "env",
         "daemon health",
         "daemon readiness",
         "build drift",
+        "artifact alignment",
         "current thread",
         "codex tui (this pair)",
         "codex tui (other pairs)",

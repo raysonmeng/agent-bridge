@@ -145,11 +145,11 @@ function installLocal() {
   const prefix = dryRun ? resolveInstallPrefix() : null;
   if (dryRun) {
     reportPrefix(prefix);
-    printDry("node", ["scripts/install-safety.cjs", "stop-running", "--dry-run"]);
     printDry("bun", ["run", "prepublishOnly"]);
     printDry("node", ["scripts/install-safety.cjs", "verify-built"]);
     printDry("npm", ["pack", "--pack-destination", "<temp>"]);
     printDry("node", ["scripts/install-safety.cjs", "verify-tarball", "<packed-tarball>"]);
+    printDry("node", ["scripts/install-safety.cjs", "stop-running", "--dry-run"], "  # after build verifies — red builds no longer cause an outage");
     printDry("npm", ["uninstall", "-g", packageName], "  # ignored if not installed");
     printDry("npm", ["install", "-g", "--force", "<packed-tarball>"]);
     if (!skipPlugin) {
@@ -163,13 +163,17 @@ function installLocal() {
   const env = prefixEnv(target);
   let packDir = "";
   try {
-    run("node", ["scripts/install-safety.cjs", "stop-running"]);
+    // Build + verify FIRST, stop running daemons LAST: the old order killed
+    // every running pair before the build was even validated, so a red build
+    // meant a pointless machine-wide outage. Now the stop window shrinks to
+    // just the npm replacement.
     run("bun", ["run", "prepublishOnly"]);
     run("node", ["scripts/install-safety.cjs", "verify-built"]);
     packDir = mkdtempSync(join(tmpdir(), "agentbridge-pack-"));
     const packed = run("npm", ["pack", "--pack-destination", packDir], { captureStdout: true });
     const tarball = packedTarballFrom(packed.stdout ?? "", packDir);
     run("node", ["scripts/install-safety.cjs", "verify-tarball", tarball]);
+    run("node", ["scripts/install-safety.cjs", "stop-running"]);
     run("npm", ["uninstall", "-g", packageName], { allowFailure: true, envExtra: env });
     run("npm", ["install", "-g", "--force", tarball], { envExtra: env });
     process.stdout.write(`install-global: installed ${packageName} globally from local source\n`);
@@ -191,10 +195,42 @@ function installLocal() {
     }
   }
 
-  // Running daemons/sessions were stopped at the start of the install — make
+  // Running daemons/sessions were stopped before the npm replacement — make
   // the required restart explicit instead of leaving it implied.
   process.stdout.write(
     "# note: running AgentBridge sessions were stopped — start fresh with `agentbridge claude` / `agentbridge codex`\n",
+  );
+
+  warnAboutSurvivingFrontends();
+}
+
+/**
+ * Old Claude Code windows keep the PREVIOUS plugin loaded in memory; their
+ * sessions relaunch daemons at the old build, recreating the exact artifact
+ * split this installer just fixed. Surface them explicitly — the user cannot
+ * otherwise tell which windows are stale.
+ */
+function warnAboutSurvivingFrontends() {
+  let output = "";
+  try {
+    output = spawnSync("ps", ["-axo", "pid=,command="], { encoding: "utf-8" }).stdout ?? "";
+  } catch {
+    return;
+  }
+  const frontends = output
+    .split("\n")
+    .map((line) => line.match(/^\s*(\d+)\s+(.+)$/))
+    .filter(
+      (m) =>
+        m &&
+        /(?:^|[\s/\\])bridge-server\.js(?:\s|$)/.test(m[2]) &&
+        (m[2].includes("agentbridge") || m[2].includes("agent_bridge")),
+    )
+    .map((m) => Number(m[1]));
+  if (frontends.length === 0) return;
+  process.stdout.write(
+    `# ⚠️  检测到 ${frontends.length} 个仍在运行的 Claude Code 桥接前端 (pid ${frontends.join(", ")})：\n` +
+      "#     它们窗口内加载的仍是旧插件代码——请关闭并重开这些 Claude Code 窗口以使用新版本。\n",
   );
 }
 

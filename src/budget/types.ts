@@ -8,6 +8,14 @@
  * Keep this file dependency-free; it is bundled into the plugin daemon.
  */
 
+/**
+ * Max age (seconds since fetchedAt) for usage data to count as decision-grade.
+ * Shared by the entry-side guard (budget-state.ts) and the coordinator's
+ * resume gate (budget-coordinator.ts) — they must never diverge, or one side
+ * acts on data the other already rejected as stale.
+ */
+export const STALE_MAX_AGE_SEC = 600;
+
 /** One quota window (5h primary or weekly secondary). */
 export interface BudgetWindow {
   /** Utilization percent, 0-100. */

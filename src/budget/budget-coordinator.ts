@@ -1,4 +1,4 @@
-import { computeBudgetState, renderBudgetInterventionDirective } from "./budget-state";
+import { computeBudgetState, isDecisionGrade, renderBudgetInterventionDirective } from "./budget-state";
 import type {
   AgentName,
   AgentUsage,
@@ -12,6 +12,10 @@ import type { QuotaSource } from "./quota-source";
 
 type QuotaSourceLike = Pick<QuotaSource, "fetchBoth">;
 type PauseSide = BudgetSnapshot["pauseSide"];
+
+// Directive-fingerprint quantum for reset epochs. Must absorb probe jitter
+// (seconds) while still distinguishing a genuine window reset (hours).
+const RESET_FINGERPRINT_BUCKET_SEC = 600;
 
 export interface BudgetCoordinatorOptions {
   source: QuotaSourceLike;
@@ -117,8 +121,24 @@ export class BudgetCoordinator {
     this.pendingOverrides = null;
   }
 
+  /**
+   * Forget the delivered-tier bookkeeping. turn/start overrides are sticky PER
+   * THREAD — after a thread switch or a codex restart the new thread runs at
+   * its own defaults, so a stale `lastAppliedTier` would suppress the next
+   * legitimate override ("already applied") or skip the explicit full-restore.
+   * The daemon calls this on codex `ready` and `threadChanged`.
+   */
+  resetAppliedTier(): void {
+    this.lastAppliedTier = "full";
+    this.pendingOverrideTier = null;
+    this.pendingOverrides = null;
+  }
+
   private scheduleNext(): void {
     if (!this.running) return;
+    // Defensive: never fork a second polling chain if a timer is already armed
+    // (e.g. a future stop()→start() reentry pattern).
+    if (this.timer) clearTimeout(this.timer);
     const delayMs = Math.max(0, this.config.pollSeconds * 1000);
     this.timer = setTimeout(() => {
       this.timer = null;
@@ -191,6 +211,23 @@ export class BudgetCoordinator {
       return;
     }
 
+    // Drift/parallel advice compares the two sides — against a non-decision-
+    // grade record the comparison is a phantom. Observed live: a transient
+    // empty Claude probe record (gate=0%, no windows) inflated drift 54%→58%
+    // and emitted a directive on each side of the blip. Hold the previous
+    // directive state and KEEP the fingerprint — whether the phantom inflated
+    // drift (directive present) or deflated it away (directive null), the
+    // recovery to the same real state must re-emit nothing. This sits BEFORE
+    // the null-directive branch so a blip cannot reset the fingerprint.
+    // (Pause entry/exit above has its own decision-grade guards in
+    // shouldEnter/canAgentResume.)
+    if (
+      !isDecisionGrade(state.perAgent.claude, state.now) ||
+      !isDecisionGrade(state.perAgent.codex, state.now)
+    ) {
+      return;
+    }
+
     if (!state.directiveToClaude) {
       this.lastDirectiveFingerprint = null;
       return;
@@ -215,15 +252,28 @@ export class BudgetCoordinator {
     }
   }
 
+  // Only decision-grade records may CHANGE intervention state (enter or exit).
+  // Two real-machine failure shapes feed untrustworthy records into the
+  // decision loop:
+  //  - the probe serves a stale cache during an outage: hours-old utils with
+  //    resetEpochs already in the past would enter (and then freeze) a pause
+  //    whose "estimated resume" predates now;
+  //  - a windowless rate-limit-only record reads gateUtil=0, which must not
+  //    AUTHORIZE a resume the moment the throttle expires (the entry-side
+  //    information floor in quota-source has no resume-side counterpart).
+  // Untrustworthy data holds the current state — same semantics as a probe
+  // miss. The check itself is shared with the entry-side guard: see
+  // isDecisionGrade in budget-state.ts.
+
   private shouldEnter(usage: AgentUsage | null, now: number): boolean {
-    if (!usage) return false;
-    return usage.gateUtil >= this.config.pauseAt;
+    if (!isDecisionGrade(usage, now)) return false;
+    return usage!.gateUtil >= this.config.pauseAt;
   }
 
   private canAgentResume(usage: AgentUsage | null, now: number): boolean {
-    if (!usage) return false;
-    if (usage.rateLimitedUntil > now) return false;
-    return usage.gateUtil < this.config.resumeBelow;
+    if (!isDecisionGrade(usage, now)) return false;
+    if (usage!.rateLimitedUntil > now) return false;
+    return usage!.gateUtil < this.config.resumeBelow;
   }
 
   private resumeAfterEpoch(state: BudgetState): number | null {
@@ -303,7 +353,16 @@ export class BudgetCoordinator {
       activeSide ? "paused" : state.phase,
       state.drift.heavier ?? "none",
       side,
-      reset,
+      // Round-to-nearest bucket, not the raw epoch: the probe's reset_epoch
+      // jitters by ±1s between polls (observed live: 09:49:59 ⇄ 09:50:00),
+      // and a raw value re-emits the same directive every poll. Rounding —
+      // not floor — because real reset times sit ON round boundaries, so a
+      // floor bucket edge would keep flapping. A genuine window reset jumps
+      // hours and still lands in a different bucket.
+      // Domain assumption: jitter tolerance holds because reset epochs sit
+      // near bucket-aligned times. An ARBITRARY epoch at a half-bucket point
+      // (k*600+300) would still flap under ±1s — not a shape the probe emits.
+      Math.round(reset / RESET_FINGERPRINT_BUCKET_SEC),
     ].join("|");
   }
 

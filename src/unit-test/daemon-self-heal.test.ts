@@ -139,9 +139,11 @@ describe("DaemonLifecycle self-heal (zombie / foreign daemon replacement)", () =
     expect(killPid).toBe(99999); // targeted kill via the /healthz body pid, not the pid file
   });
 
-  test("replaces a drifted daemon even when pair identity matches", async () => {
-    process.env.AGENTBRIDGE_PAIR_ID = "mine-aaaa0000";
-    const port = await freePort();
+  // Drifted-daemon fixture: same pair, same contractVersion unless overridden.
+  function driftedDaemon(
+    port: number,
+    opts: { tuiConnected: boolean; contractVersion?: number },
+  ) {
     const s = Bun.serve({
       port,
       hostname: "127.0.0.1",
@@ -149,20 +151,31 @@ describe("DaemonLifecycle self-heal (zombie / foreign daemon replacement)", () =
         const u = new URL(req.url);
         const body = {
           bridgeReady: true,
-          tuiConnected: true,
-          threadId: "thread",
+          tuiConnected: opts.tuiConnected,
+          threadId: opts.tuiConnected ? "thread" : null,
           queuedMessageCount: 0,
           proxyUrl: "",
           appServerUrl: "",
           pid: 99999,
           pairId: "mine-aaaa0000",
-          build: { ...BUILD_INFO, commit: "old-build" },
+          build: {
+            ...BUILD_INFO,
+            commit: "old-build",
+            contractVersion: opts.contractVersion ?? BUILD_INFO.contractVersion,
+          },
         };
         if (u.pathname === "/healthz" || u.pathname === "/readyz") return Response.json(body);
         return new Response("ok");
       },
     });
     servers.push(s);
+    return s;
+  }
+
+  test("replaces a drifted daemon when NO Codex TUI is attached (safe upgrade window)", async () => {
+    process.env.AGENTBRIDGE_PAIR_ID = "mine-aaaa0000";
+    const port = await freePort();
+    driftedDaemon(port, { tuiConnected: false });
     const lc = lifecycle(port);
     let killed = false;
     let launched = false;
@@ -179,6 +192,92 @@ describe("DaemonLifecycle self-heal (zombie / foreign daemon replacement)", () =
     expect(killed).toBe(true);
     expect(launched).toBe(true);
     expect(killPid).toBe(99999);
+  });
+
+  test("REUSES a drifted daemon (same contract) when a live Codex TUI is attached", async () => {
+    // Replacing a live daemon severs the codex proxy and kills the user's TUI
+    // session ("Connection reset without closing handshake") — the proven failure
+    // mode behind "abg codex dies right after starting". Same-contract drift with
+    // a live TUI must reuse, never replace.
+    process.env.AGENTBRIDGE_PAIR_ID = "mine-aaaa0000";
+    const port = await freePort();
+    driftedDaemon(port, { tuiConnected: true });
+    const lc = lifecycle(port);
+    let killed = false;
+    let launched = false;
+    (lc as any).kill = async () => {
+      killed = true;
+      return true;
+    };
+    (lc as any).launch = () => {
+      launched = true;
+    };
+    await lc.ensureRunning();
+    expect(killed).toBe(false);
+    expect(launched).toBe(false);
+  });
+
+  test("replaces a contract-incompatible daemon even when a Codex TUI is attached", async () => {
+    // contractVersion mismatch means the frontend literally cannot speak to the
+    // daemon — reuse is impossible, so replacement is mandatory despite the cost.
+    process.env.AGENTBRIDGE_PAIR_ID = "mine-aaaa0000";
+    const port = await freePort();
+    driftedDaemon(port, { tuiConnected: true, contractVersion: BUILD_INFO.contractVersion + 1 });
+    const lc = lifecycle(port);
+    let killed = false;
+    let launched = false;
+    (lc as any).kill = async () => {
+      killed = true;
+      return true;
+    };
+    (lc as any).launch = () => {
+      launched = true;
+    };
+    await lc.ensureRunning();
+    expect(killed).toBe(true);
+    expect(launched).toBe(true);
+  });
+
+  test("manual mode refuses to adopt or replace a REGISTERED pair's daemon (no squatting)", async () => {
+    // No AGENTBRIDGE_PAIR_ID (manual/unwrapped session), but the daemon on the
+    // port belongs to a registered pair. Reusing would squat it; replacing
+    // would kill it. ensureRunning must abort with guidance instead.
+    delete process.env.AGENTBRIDGE_PAIR_ID;
+    const port = await freePort();
+    fakeDaemon(port, { readyzStatus: 200, pairId: "registered-cccc2222", pid: 99999 });
+    const lc = lifecycle(port);
+    let killed = false;
+    let launched = false;
+    (lc as any).kill = async () => {
+      killed = true;
+      return true;
+    };
+    (lc as any).launch = () => {
+      launched = true;
+    };
+    let error: Error | null = null;
+    try {
+      await lc.ensureRunning();
+    } catch (err) {
+      error = err as Error;
+    }
+    expect(error).not.toBeNull();
+    expect(error!.message).toContain("registered pair registered-cccc2222");
+    expect(killed).toBe(false);
+    expect(launched).toBe(false);
+  });
+
+  test("waitForReadyAndOurs accepts a drifted daemon kept alive by the TUI-reuse policy", async () => {
+    // The contended-lock wait must accept the same daemons the reuse policy keeps:
+    // before this rule, a frontend waiting on a drifted-but-live daemon spun to a
+    // 10s timeout ("Timed out waiting for readiness+identity") despite the daemon
+    // being perfectly usable.
+    process.env.AGENTBRIDGE_PAIR_ID = "mine-aaaa0000";
+    const port = await freePort();
+    driftedDaemon(port, { tuiConnected: true });
+    const lc = lifecycle(port);
+    // Small retry budget: success must come from acceptance, not retries.
+    await lc.waitForReadyAndOurs(3, 50);
   });
 
   test("does NOT replace a daemon that differs only by bundle kind (dist vs plugin)", async () => {

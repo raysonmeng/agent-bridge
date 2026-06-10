@@ -164,7 +164,10 @@ export class CodexAdapter extends EventEmitter {
   private outageQueue: Array<{ raw: string; connId: number }> = [];
   private outageTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly OUTAGE_QUEUE_MAX = 64;
-  private static readonly OUTAGE_TIMEOUT_MS = 5000;
+  // Must outlast the first reconnect attempts (base 1s exponential: 1+2+4 ≈ 7s
+  // before the third try) plus session restore — at 5s the fail-fast was firing
+  // BEFORE the reconnect it exists to bridge, killing recoverable TUIs.
+  private static readonly OUTAGE_TIMEOUT_MS = 10_000;
 
   // Session-state capture for unintentional-reconnect replay.
   //
@@ -833,6 +836,15 @@ export class CodexAdapter extends EventEmitter {
         const isUpgrade = req.headers.get("upgrade")?.toLowerCase() === "websocket";
         self.log(`HTTP ${req.method} ${url.pathname} (upgrade=${isUpgrade})`);
         if (url.pathname === "/healthz" || url.pathname === "/readyz") {
+          // unix transport: appPort is a raw byte relay into Codex's unix
+          // socket, which serves NO HTTP endpoints (verified fact in
+          // codex-transport.ts) — forwarding would hang/500 and `abg codex`
+          // would always die at waitForProxyReady. Answer from the adapter's
+          // own upstream-connection state instead.
+          if (self.transport === "unix") {
+            const up = self.appServerWs?.readyState === WebSocket.OPEN;
+            return new Response(up ? "ok" : "upstream not connected", { status: up ? 200 : 503 });
+          }
           return fetch(`http://127.0.0.1:${self.appPort}${url.pathname}`);
         }
         if (server.upgrade(req, { data: { connId: 0 } })) return undefined;
@@ -933,8 +945,11 @@ export class CodexAdapter extends EventEmitter {
    *
    * Entries are replayed when their threadId matches `resumedThreadId`, or
    * when they have no threadId (fallback: cannot attribute, so assume they
-   * belong to whatever the TUI is resuming). Non-matching entries stay in
-   * the buffer — they may match a subsequent resume.
+   * belong to whatever the TUI is resuming). Non-matching entries survive
+   * THIS function, but the thread/resume response handler then calls
+   * dropOrphanPendingRequests(resumedThreadId), which deletes them — they do
+   * NOT persist to a subsequent resume. (Their server ids would be stale on a
+   * later session anyway; see the new-TUI initialize handling.)
    */
   private replayPendingForThread(resumedThreadId: string, ws: ServerWebSocket<TuiSocketData>) {
     const remaining: BufferedServerRequest[] = [];
@@ -1366,7 +1381,15 @@ export class CodexAdapter extends EventEmitter {
       timestamp: Date.now(),
     });
     this.serverRequestToProxy.delete(proxyId);
-    this.log(`Buffered approval response until app-server reconnect (${reason}) (proxy id=${proxyId} → server id=${pending.serverId})`);
+    // Honest wording: reconnect paths clear this buffer before any flush can
+    // run, and server ids are session-scoped anyway — so this response is
+    // best-effort at most and usually LOST. The old text ("buffered until
+    // reconnect") sent incident debugging down a dead end.
+    this.log(
+      `Approval response could not reach the app-server (${reason}) — buffered best-effort, but it is ` +
+        `likely lost (session-scoped id; reconnects clear this buffer). The TUI may need to re-approve. ` +
+        `(proxy id=${proxyId} → server id=${pending.serverId})`,
+    );
   }
 
   private flushPendingServerResponses() {

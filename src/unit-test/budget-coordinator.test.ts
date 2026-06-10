@@ -125,6 +125,92 @@ describe("BudgetCoordinator", () => {
     expect(emitted[0].content).toContain("用量比例漂移");
   });
 
+  test("holds balance directive across a non-decision-grade blip (observed live: phantom 0% record flipped the heavier side)", async () => {
+    // A transient empty probe record (gate=0, no windows) must not flap the
+    // balance directive: during the blip the heavier side flips to a phantom,
+    // and on recovery the unchanged real state must re-emit nothing.
+    const drifted = {
+      claude: usage({ gateUtil: 35, warnUtil: 45 }),
+      codex: usage({ gateUtil: 20, warnUtil: 20 }),
+    };
+    const source = new FakeSource([
+      drifted,
+      {
+        claude: usage({ gateUtil: 0, warnUtil: 0, fiveHour: null, weekly: null }),
+        codex: usage({ gateUtil: 20, warnUtil: 20 }),
+      },
+      drifted,
+    ]);
+    const { coordinator, emitted } = makeCoordinator(source);
+
+    await coordinator.start();
+    await waitFor(() => source.calls >= 3);
+    coordinator.stop();
+
+    expect(
+      emitted.filter((event) => event.id.startsWith("system_budget_balance") || event.id.startsWith("system_budget_parallel")),
+    ).toHaveLength(1);
+  });
+
+  test("a blip that deflates drift below threshold must not reset the dedup fingerprint", async () => {
+    // Ordering regression guard: the decision-grade hold must run BEFORE the
+    // null-directive branch — a phantom that makes the drift directive
+    // disappear would otherwise clear the fingerprint and re-emit the same
+    // directive when the data recovers.
+    // Note the gate condition is the blip's fiveHour/weekly being null (no
+    // fresh window → not decision-grade), NOT the drift magnitude — a blip
+    // with valid windows would legitimately update the directive.
+    const drifted = {
+      claude: usage({ gateUtil: 15, warnUtil: 15 }),
+      codex: usage({ gateUtil: 2, warnUtil: 2 }),
+    };
+    const source = new FakeSource([
+      drifted,
+      {
+        claude: usage({ gateUtil: 0, warnUtil: 0, fiveHour: null, weekly: null }),
+        codex: usage({ gateUtil: 2, warnUtil: 2 }),
+      },
+      drifted,
+    ]);
+    const { coordinator, emitted } = makeCoordinator(source);
+
+    await coordinator.start();
+    await waitFor(() => source.calls >= 3);
+    coordinator.stop();
+
+    expect(
+      emitted.filter((event) => event.id.startsWith("system_budget_balance") || event.id.startsWith("system_budget_parallel")),
+    ).toHaveLength(1);
+  });
+
+  test("does not re-emit balance directive on probe reset-epoch jitter (observed live: ±1s per poll)", async () => {
+    // The probe's reset_epoch wobbles by a second between polls. A raw epoch
+    // in the directive fingerprint re-emitted the same balance directive
+    // every 60s poll — one spam notification per minute for as long as the
+    // drift persisted.
+    const source = new FakeSource([
+      {
+        claude: usage({ gateUtil: 35, warnUtil: 45 }),
+        codex: usage({ gateUtil: 20, warnUtil: 20, fiveHour: { util: 20, resetEpoch: NOW + 3600 } }),
+      },
+      {
+        claude: usage({ gateUtil: 35, warnUtil: 45 }),
+        codex: usage({ gateUtil: 20, warnUtil: 20, fiveHour: { util: 20, resetEpoch: NOW + 3601 } }),
+      },
+      {
+        claude: usage({ gateUtil: 35, warnUtil: 45 }),
+        codex: usage({ gateUtil: 20, warnUtil: 20, fiveHour: { util: 20, resetEpoch: NOW + 3599 } }),
+      },
+    ]);
+    const { coordinator, emitted } = makeCoordinator(source);
+
+    await coordinator.start();
+    await waitFor(() => source.calls >= 3);
+    coordinator.stop();
+
+    expect(emitted.filter((event) => event.id.startsWith("system_budget_balance"))).toHaveLength(1);
+  });
+
   test("re-emits balance directive when the lighter side enters a new five-hour window", async () => {
     const source = new FakeSource([
       {
@@ -526,5 +612,122 @@ describe("BudgetCoordinator", () => {
 
     expect(coordinator.getCodexTurnOverrides()).toBeNull();
     expect(logs.filter((message) => message.includes("full restore mapping"))).toHaveLength(1);
+  });
+});
+
+describe("decision-grade data guards (stale cache / expired windows)", () => {
+  test("expired-window stale cache does NOT enter intervention", async () => {
+    // Real-machine shape: probe serves an hours-old cache during an upstream
+    // outage — every window's resetEpoch is already in the past. Trusting it
+    // would open (and freeze) a pause whose "resume estimate" predates now.
+    const source = new FakeSource([
+      {
+        claude: usage(),
+        codex: usage({
+          gateUtil: 95,
+          fiveHour: { util: 95, resetEpoch: NOW - 5400 },
+          weekly: { util: 95, resetEpoch: NOW - 100 },
+          fetchedAt: NOW - 7200,
+        }),
+      },
+    ]);
+    const emitted: Array<{ id: string }> = [];
+    const coordinator = new BudgetCoordinator({
+      source: source as any,
+      config: CONFIG,
+      emit: (id) => emitted.push({ id }),
+      onPauseChange: () => {},
+      now: () => NOW,
+    });
+    await coordinator.start();
+    coordinator.stop();
+    expect(coordinator.isPaused()).toBe(false);
+    expect(coordinator.isGateClosed()).toBe(false);
+    expect(emitted.some((e) => e.id.startsWith("system_budget_pause"))).toBe(false);
+    expect(emitted.some((e) => e.id.startsWith("system_budget_handoff"))).toBe(false);
+  });
+
+  test("fresh-window but ancient fetchedAt does NOT enter intervention", async () => {
+    const source = new FakeSource([
+      {
+        claude: usage(),
+        codex: usage({ gateUtil: 95, fetchedAt: NOW - 3600 }),
+      },
+    ]);
+    const coordinator = new BudgetCoordinator({
+      source: source as any,
+      config: CONFIG,
+      emit: () => {},
+      onPauseChange: () => {},
+      now: () => NOW,
+    });
+    await coordinator.start();
+    coordinator.stop();
+    expect(coordinator.isPaused()).toBe(false);
+  });
+
+  test("windowless rate-limit record cannot AUTHORIZE resume at throttle expiry", async () => {
+    // Poll 1: codex genuinely over the gate → pause. Poll 2: a rate-limit-only
+    // record (no windows, util 0) whose throttle just expired — gateUtil=0 must
+    // NOT read as "recovered" (it is absence of information, not a measurement).
+    const source = new FakeSource([
+      { claude: usage(), codex: usage({ gateUtil: 95 }) },
+      {
+        claude: usage(),
+        codex: usage({
+          ok: false,
+          gateUtil: 0,
+          warnUtil: 0,
+          fiveHour: null,
+          weekly: null,
+          rateLimitedUntil: NOW - 1,
+        }),
+      },
+    ]);
+    const emitted: Array<{ id: string }> = [];
+    const coordinator = new BudgetCoordinator({
+      source: source as any,
+      config: CONFIG,
+      emit: (id) => emitted.push({ id }),
+      onPauseChange: () => {},
+      now: () => NOW,
+    });
+    await coordinator.start();
+    await (coordinator as any).pollOnce();
+    coordinator.stop();
+    expect(coordinator.isPaused()).toBe(true);
+    expect(coordinator.isGateClosed()).toBe(true);
+    expect(emitted.some((e) => e.id.startsWith("system_budget_resume"))).toBe(false);
+  });
+
+  test("resetAppliedTier re-arms the override after a thread switch", async () => {
+    const tierConfig: BudgetConfig = {
+      ...CONFIG,
+      codexTierControl: true,
+      codexTiers: { full: { effort: "high" }, balanced: { effort: "medium" }, eco: { effort: "low" } },
+    };
+    // codex warnUtil 85 → eco band on every poll.
+    const source = new FakeSource([
+      { claude: usage(), codex: usage({ gateUtil: 40, warnUtil: 85 }) },
+      { claude: usage(), codex: usage({ gateUtil: 40, warnUtil: 85 }) },
+    ]);
+    const coordinator = new BudgetCoordinator({
+      source: source as any,
+      config: tierConfig,
+      emit: () => {},
+      onPauseChange: () => {},
+      now: () => NOW,
+    });
+    await coordinator.start();
+    expect(coordinator.getCodexTurnOverrides()).toEqual({ effort: "low" });
+    coordinator.notifyOverridesDelivered();
+    expect(coordinator.getCodexTurnOverrides()).toBeNull(); // delivered — no requeue for same tier
+
+    // Thread switch: the new thread runs at its defaults; stale bookkeeping
+    // would keep suppressing the override forever.
+    coordinator.resetAppliedTier();
+    await (coordinator as any).pollOnce();
+    coordinator.stop();
+    expect(coordinator.getCodexTurnOverrides()).toEqual({ effort: "low" });
   });
 });

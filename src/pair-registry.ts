@@ -814,6 +814,13 @@ export async function resolvePair(base: string, opts: ResolvePairOptions): Promi
 
 async function removeAllocatedPairIfUnchanged(base: string, pairId: string, slot: number): Promise<void> {
   await withRegistryLock(base, () => {
+    // Rollback guard: this runs when OUR allocation probe failed, but a
+    // concurrent same-pair launcher may have already adopted the entry and
+    // started using it — its state dir exists or its daemon is alive. We are
+    // already under the registry lock, so these checks are race-safe; skipping
+    // the rollback merely leaves a registered entry that the other launcher is
+    // legitimately using.
+    if (existsSync(pairDirPath(base, pairId)) || pairDirDaemonAlive(base, pairId)) return;
     const reg = readRegistry(base);
     const nextPairs = reg.pairs.filter((pair) => !(pair.pairId === pairId && pair.slot === slot));
     if (nextPairs.length === reg.pairs.length) return;
