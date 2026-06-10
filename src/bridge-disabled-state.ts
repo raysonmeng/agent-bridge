@@ -22,6 +22,6 @@ export function disabledReplyError(reason: BridgeDisabledReason): string {
     case "auto_recovery_exhausted":
       return `AgentBridge auto-recovery gave up after exhausting its retry budget for the in-flight liveness probe contention. Retry manually with \`${claudeCmd}\`.`;
     case "killed":
-      return `AgentBridge is disabled by \`agentbridge kill\`. Restart Claude Code (\`${claudeCmd}\`), switch to a new conversation, or run \`/resume\` to reconnect.`;
+      return `AgentBridge is disabled by \`${pairScopedCommand("kill")}\`. Restart Claude Code (\`${claudeCmd}\`), switch to a new conversation, or run \`/resume\` to reconnect.`;
   }
 }

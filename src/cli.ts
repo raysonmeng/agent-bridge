@@ -11,6 +11,8 @@
  *   agentbridge kill        — Force kill all AgentBridge processes
  */
 
+import { cliInvocationName } from "./cli-invocation";
+
 // Marketplace name constant (shared with plugin)
 export const MARKETPLACE_NAME = "agentbridge";
 export const PLUGIN_NAME = "agentbridge";
@@ -133,6 +135,10 @@ async function main(command: string | undefined, restArgs: string[]) {
 }
 
 function printHelp() {
+  // The Usage block deliberately shows BOTH names (teaching that the binary is
+  // published twice). Everything action-oriented — the Examples below — echoes
+  // whichever name the user actually invoked, via cliInvocationName().
+  const cli = cliInvocationName();
   console.log(`
 AgentBridge — Multi-agent collaboration bridge
 
@@ -184,30 +190,30 @@ Multi-pair:
   contesting it — pick another --pair name (or kill the live one first).
 
 Examples:
-  abg init                     # First-time setup
-  abg claude                   # Start the "main" pair for this directory
-  abg codex                    # Connect Codex to this directory's "main" pair
-  abg resume                   # Print resume commands for both sides
-  abg resume claude            # Resume the last Claude Code session here
-  abg resume codex             # Resume this pair's current Codex thread
-  abg claude --safe            # One launch without the max-permission default
-  abg --pair work claude       # Start a named pair "work" (this directory)
-  abg --pair work codex        # Connect Codex to the "work" pair
-  abg --pair review claude     # A second, parallel pair
-  abg pairs                    # List all pairs and their ports/status
-  abg pairs --threads          # Include current thread mapping
-  abg doctor --json            # Emit a structured diagnostics report
-  abg logs                     # Tail the last 100 lines of this pair's daemon log
-  abg logs -f -n 200           # Follow the log, starting from the last 200 lines
-  abg logs --codex             # Tail the codex wrapper log instead
-  abg --pair work logs         # Tail the "work" pair's daemon log
-  abg pairs rm work            # Stop this directory's "work" pair and free its slot
-  abg pairs rm work-1a2b3c4d   # ...or by its full id (from that pair's directory)
-  abg pairs prune              # Preview reclaimable: orphan dirs + stranded entries (cwd-gone, dead, >1d)
-  abg pairs prune --apply      # ...actually delete the previewed dirs + entries
-  abg --pair work kill         # Stop only this directory's "work" pair
-  abg kill                     # Stop this directory's pairs (+ any legacy-root daemon)
-  abg kill all                 # Stop every pair in every directory (+ legacy-root)
+  ${cli} init                     # First-time setup
+  ${cli} claude                   # Start the "main" pair for this directory
+  ${cli} codex                    # Connect Codex to this directory's "main" pair
+  ${cli} resume                   # Print resume commands for both sides
+  ${cli} resume claude            # Resume the last Claude Code session here
+  ${cli} resume codex             # Resume this pair's current Codex thread
+  ${cli} claude --safe            # One launch without the max-permission default
+  ${cli} --pair work claude       # Start a named pair "work" (this directory)
+  ${cli} --pair work codex        # Connect Codex to the "work" pair
+  ${cli} --pair review claude     # A second, parallel pair
+  ${cli} pairs                    # List all pairs and their ports/status
+  ${cli} pairs --threads          # Include current thread mapping
+  ${cli} doctor --json            # Emit a structured diagnostics report
+  ${cli} logs                     # Tail the last 100 lines of this pair's daemon log
+  ${cli} logs -f -n 200           # Follow the log, starting from the last 200 lines
+  ${cli} logs --codex             # Tail the codex wrapper log instead
+  ${cli} --pair work logs         # Tail the "work" pair's daemon log
+  ${cli} pairs rm work            # Stop this directory's "work" pair and free its slot
+  ${cli} pairs rm work-1a2b3c4d   # ...or by its full id (from that pair's directory)
+  ${cli} pairs prune              # Preview reclaimable: orphan dirs + stranded entries (cwd-gone, dead, >1d)
+  ${cli} pairs prune --apply      # ...actually delete the previewed dirs + entries
+  ${cli} --pair work kill         # Stop only this directory's "work" pair
+  ${cli} kill                     # Stop this directory's pairs (+ any legacy-root daemon)
+  ${cli} kill all                 # Stop every pair in every directory (+ legacy-root)
 `.trim());
 }
 

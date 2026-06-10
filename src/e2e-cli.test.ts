@@ -601,7 +601,10 @@ describe("E2E: CLI surface", () => {
 
       expect(result.code).toBe(0);
       expect(result.stdout).toContain("AgentBridge stopped.");
-      expect(result.stdout).toContain("Please restart Claude Code (`agentbridge claude`), switch to a new conversation, or run `/resume` to fully disconnect.");
+      // The restart hint echoes the invocation name (cliInvocationName); the
+      // harness launches via `bun run cli.ts`, so argv[1]'s basename is neither
+      // published name → the "abg" fallback.
+      expect(result.stdout).toContain("Please restart Claude Code (`abg claude`), switch to a new conversation, or run `/resume` to fully disconnect.");
       await waitFor(() => (pid ? !isProcessAlive(pid) : true), 60, 50);
       await waitFor(() => (tuiPid ? !isProcessAlive(tuiPid) : true), 60, 50);
       await waitFor(() => codexProc.child.exitCode !== null, 60, 50);
@@ -714,8 +717,10 @@ describe("E2E: CLI surface", () => {
 
         expect(result.code).toBe(0);
         expect(result.stdout).toContain("AgentBridge stopped.");
-        expect(result.stdout).toContain("Please restart Claude Code (`agentbridge --pair work claude`)");
-        expect(result.stdout).not.toContain("Please restart Claude Code (`agentbridge claude`)");
+        // Invocation name is the "abg" fallback here (launched via `bun run cli.ts`);
+        // the --pair scope must still ride along with it.
+        expect(result.stdout).toContain("Please restart Claude Code (`abg --pair work claude`)");
+        expect(result.stdout).not.toContain("Please restart Claude Code (`abg claude`)");
       } finally {
         await stopProcess(trackedDaemon);
       }

@@ -2,6 +2,7 @@ import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "n
 import { join } from "node:path";
 import { pluginCacheRoot } from "./plugin-cache";
 import { BUILD_INFO, formatBuildInfo, sameRuntimeContract } from "../build-info";
+import { cliInvocationName } from "../cli-invocation";
 import { ConfigService } from "../config-service";
 import { fetchDaemonStatus } from "../daemon-status";
 import { inspectAgentBridgeEnv } from "../env-guard";
@@ -157,6 +158,9 @@ function runResumePollution(args: string[]) {
 
 async function buildDoctorReport(pair: PairResolution, registered: boolean): Promise<DoctorReport> {
   const cwd = process.cwd();
+  // Echo whichever name the user invoked (abg | agentbridge) in every actionable
+  // hint, so doctor's guidance matches kill/budget — see cli-invocation.ts.
+  const cli = cliInvocationName();
   const env = inspectAgentBridgeEnv({ cwd, env: process.env });
   const [health, ready] = registered
     ? await Promise.all([
@@ -195,7 +199,7 @@ async function buildDoctorReport(pair: PairResolution, registered: boolean): Pro
       : `not registered yet — would be ${pair.pairId} (created on first launch)`,
     hint: registered
       ? undefined
-      : "该目录还没有注册过 pair：运行 `agentbridge claude` 即会创建。以下检查按未启动状态解读。",
+      : `该目录还没有注册过 pair：运行 \`${cli} claude\` 即会创建。以下检查按未启动状态解读。`,
   });
   checks.push({
     name: "env",
@@ -203,9 +207,9 @@ async function buildDoctorReport(pair: PairResolution, registered: boolean): Pro
     detail: env.ok ? "AgentBridge env matches cwd" : env.reasons.join("; "),
     hint: env.ok
       ? undefined
-      : "环境变量与当前目录不匹配：请在正确的项目目录里重新运行 `agentbridge claude`，不要复用其他目录的会话环境。",
+      : `环境变量与当前目录不匹配：请在正确的项目目录里重新运行 \`${cli} claude\`，不要复用其他目录的会话环境。`,
   });
-  checks.push(configParseabilityCheck(cwd));
+  checks.push(configParseabilityCheck(cwd, cli));
   checks.push({
     name: "daemon health",
     status: health ? "ok" : "warn",
@@ -214,7 +218,7 @@ async function buildDoctorReport(pair: PairResolution, registered: boolean): Pro
       : registered
         ? `no daemon reachable on :${pair.ports.controlPort}`
         : "n/a — pair not registered",
-    hint: health ? undefined : "daemon 未运行。运行 `agentbridge claude`（或 `agentbridge codex`）会自动启动它。",
+    hint: health ? undefined : `daemon 未运行。运行 \`${cli} claude\`（或 \`${cli} codex\`）会自动启动它。`,
   });
   // Daemon-dependent checks collapse to skip when the daemon is not running:
   // one root cause must not stack three WARNs.
@@ -262,7 +266,7 @@ async function buildDoctorReport(pair: PairResolution, registered: boolean): Pro
     hint:
       buildDrift === true
         ? "daemon 运行的是旧构建（通常由旧版 CLI 或未重开的 Claude Code 窗口启动）。" +
-          "没有进行中的 Codex 会话时，运行 `abg kill` 后重新 `agentbridge claude` 即可对齐；" +
+          `没有进行中的 Codex 会话时，运行 \`${cli} kill\` 后重新 \`${cli} claude\` 即可对齐；` +
           "有活跃会话则等收尾后再重启——版本差异不会强杀活跃会话，可以继续用。"
         : undefined,
   });
@@ -283,7 +287,7 @@ async function buildDoctorReport(pair: PairResolution, registered: boolean): Pro
       ? undefined
       : rawThread
         ? "通常无害：线程还没有产生首条回应、或 rollout 文件尚未落盘。" +
-          "仅当 `abg codex`（resume）失败时才需要处理：用 `abg codex --new` 开新线程。"
+          `仅当 \`${cli} codex\`（resume）失败时才需要处理：用 \`${cli} codex --new\` 开新线程。`
         : registered
           ? "尚无线程记录：连接 Codex 后建立首个线程时会自动写入，无需处理。"
           : undefined,
@@ -316,7 +320,7 @@ async function buildDoctorReport(pair: PairResolution, registered: boolean): Pro
     hint:
       attachedHere.length > 0
         ? undefined
-        : "另开一个终端、在同一目录运行 `agentbridge codex` 连接本 pair。",
+        : `另开一个终端、在同一目录运行 \`${cli} codex\` 连接本 pair。`,
   });
   checks.push({
     name: "codex tui (other pairs)",
@@ -328,7 +332,7 @@ async function buildDoctorReport(pair: PairResolution, registered: boolean): Pro
         : "no managed Codex TUI attached to another pair",
     hint:
       attachedElsewhere.length > 0
-        ? "这些 TUI 属于其他目录的 pair，不影响本 pair；它们不会桥接到这里。如不再需要，去对应目录运行 `abg kill`。"
+        ? `这些 TUI 属于其他目录的 pair，不影响本 pair；它们不会桥接到这里。如不再需要，去对应目录运行 \`${cli} kill\`。`
         : undefined,
   });
 
@@ -336,7 +340,7 @@ async function buildDoctorReport(pair: PairResolution, registered: boolean): Pro
     ["daemon log", pair.stateDir.logFile],
     ["codex wrapper log", pair.stateDir.codexWrapperLogFile],
   ] as const) {
-    checks.push(logCheck(name, path));
+    checks.push(logCheck(name, path, cli));
   }
 
   return {
@@ -431,7 +435,7 @@ function extractBundleCommit(path: string): string | null {
  * defaults at startup (P1); surface that loudly here so doctor — run by someone
  * already stuck — can see it instead of chasing why their thresholds "don't work".
  */
-function configParseabilityCheck(cwd: string): DoctorCheck {
+function configParseabilityCheck(cwd: string, cli: string): DoctorCheck {
   const desc = new ConfigService(cwd).describeConfig();
   if (desc.state === "absent") {
     return {
@@ -447,7 +451,7 @@ function configParseabilityCheck(cwd: string): DoctorCheck {
       detail: `unparseable at ${desc.path} (${desc.reason}) — custom thresholds NOT in effect, using defaults`,
       hint:
         "config.json 损坏或字段类型错误：bridge 已回退到默认阈值，你的自定义 budget/idle 设置未生效。" +
-        "修正该文件的 JSON 语法/字段类型后重启 `agentbridge claude` 即可重新生效。",
+        `修正该文件的 JSON 语法/字段类型后重启 \`${cli} claude\` 即可重新生效。`,
     };
   }
   return {
@@ -459,7 +463,7 @@ function configParseabilityCheck(cwd: string): DoctorCheck {
   };
 }
 
-function logCheck(name: string, path: string): DoctorCheck {
+function logCheck(name: string, path: string, cli: string): DoctorCheck {
   if (!existsSync(path)) {
     return {
       name,
@@ -475,7 +479,7 @@ function logCheck(name: string, path: string): DoctorCheck {
       status: "warn",
       detail:
         `${path} (${stat.size} bytes, oversized; stop the pair, rebuild/reinstall, then rotate or remove this log)`,
-      hint: "日志过大：`abg kill` 停止 pair 后删除该文件再重启即可。",
+      hint: `日志过大：\`${cli} kill\` 停止 pair 后删除该文件再重启即可。`,
     };
   }
   return { name, status: "ok", detail: `${path} (${stat.size} bytes)` };

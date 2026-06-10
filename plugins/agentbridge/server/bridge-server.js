@@ -14271,7 +14271,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("9195031", "source"),
+  commit: defineString("3f14d41", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -15290,6 +15290,21 @@ class ConfigService {
   }
 }
 
+// src/cli-invocation.ts
+import { basename } from "path";
+var CLI_NAMES = ["abg", "agentbridge"];
+var DEFAULT_CLI_NAME = "abg";
+function cliInvocationName(argv = process.argv) {
+  const raw = argv[1];
+  if (typeof raw !== "string" || raw.length === 0)
+    return DEFAULT_CLI_NAME;
+  const name = basename(raw).replace(/\.(ts|js|mjs|cjs)$/, "");
+  return isCliName(name) ? name : DEFAULT_CLI_NAME;
+}
+function isCliName(value) {
+  return CLI_NAMES.includes(value);
+}
+
 // src/pair-registry.ts
 import {
   closeSync as closeSync2,
@@ -15309,7 +15324,7 @@ import {
   writeFileSync as writeFileSync3
 } from "fs";
 import { createHash, randomUUID as randomUUID2 } from "crypto";
-import { basename, join as join3, resolve, sep } from "path";
+import { basename as basename2, join as join3, resolve, sep } from "path";
 var PAIR_BASE_PORT = 4500;
 var PAIR_SLOT_STRIDE = 10;
 var PAIR_ID_REGEX = /^[A-Za-z0-9._-]{1,64}$/;
@@ -15390,10 +15405,10 @@ function findPair(base, pairId) {
 }
 
 // src/pair-command.ts
-function pairScopedCommand(cmd) {
+function pairScopedCommand(cmd, name = cliInvocationName()) {
   const pairId = process.env.AGENTBRIDGE_PAIR_ID;
   if (!pairId)
-    return `agentbridge ${cmd}`;
+    return `${name} ${cmd}`;
   let selector = process.env.AGENTBRIDGE_PAIR_NAME;
   if (!selector) {
     try {
@@ -15402,7 +15417,7 @@ function pairScopedCommand(cmd) {
       selector = pairId;
     }
   }
-  return `agentbridge --pair ${selector} ${cmd}`;
+  return `${name} --pair ${selector} ${cmd}`;
 }
 
 // src/bridge-disabled-state.ts
@@ -15418,7 +15433,7 @@ function disabledReplyError(reason) {
     case "auto_recovery_exhausted":
       return `AgentBridge auto-recovery gave up after exhausting its retry budget for the in-flight liveness probe contention. Retry manually with \`${claudeCmd}\`.`;
     case "killed":
-      return `AgentBridge is disabled by \`agentbridge kill\`. Restart Claude Code (\`${claudeCmd}\`), switch to a new conversation, or run \`/resume\` to reconnect.`;
+      return `AgentBridge is disabled by \`${pairScopedCommand("kill")}\`. Restart Claude Code (\`${claudeCmd}\`), switch to a new conversation, or run \`/resume\` to reconnect.`;
   }
 }
 
@@ -15757,7 +15772,7 @@ daemonClient.on("rejected", async (code) => {
 claude.on("ready", async () => {
   log("MCP server ready (push delivery) \u2014 ensuring AgentBridge daemon...");
   if (daemonLifecycle.wasKilled()) {
-    await enterDisabledState("Killed sentinel found \u2014 bridge staying idle", `\u26D4 AgentBridge was stopped by \`agentbridge kill\`. Bridge is staying idle. Restart Claude Code (\`${pairScopedCommand("claude")}\`), switch to a new conversation, or run \`/resume\` to reconnect.`);
+    await enterDisabledState("Killed sentinel found \u2014 bridge staying idle", `\u26D4 AgentBridge was stopped by \`${pairScopedCommand("kill")}\`. Bridge is staying idle. Restart Claude Code (\`${pairScopedCommand("claude")}\`), switch to a new conversation, or run \`/resume\` to reconnect.`);
     return;
   }
   try {
@@ -15819,7 +15834,7 @@ var reconnectTask = null;
 async function notifyIfDaemonKilled(logMessage) {
   if (!daemonLifecycle.wasKilled())
     return false;
-  await enterDisabledState(logMessage, `\u26D4 AgentBridge was stopped by \`agentbridge kill\`. Bridge is staying idle. Restart Claude Code (\`${pairScopedCommand("claude")}\`), switch to a new conversation, or run \`/resume\` to reconnect.`);
+  await enterDisabledState(logMessage, `\u26D4 AgentBridge was stopped by \`${pairScopedCommand("kill")}\`. Bridge is staying idle. Restart Claude Code (\`${pairScopedCommand("claude")}\`), switch to a new conversation, or run \`/resume\` to reconnect.`);
   return true;
 }
 async function notifyIfPairRemoved(logMessage) {

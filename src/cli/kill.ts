@@ -1,5 +1,6 @@
 import { readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+import { cliInvocationName } from "../cli-invocation";
 import { DaemonLifecycle } from "../daemon-lifecycle";
 import { PairError, detectLegacyRootDaemon, listPairDirs, type PairEntry, type PairPorts } from "../pair-registry";
 import {
@@ -56,8 +57,11 @@ export async function runKill(args: string[] = []) {
   const base = computeBaseDir();
   console.log("AgentBridge Kill — stopping AgentBridge pair processes\n");
 
+  // Echo back whichever name the user invoked (abg | agentbridge) so the whole
+  // stop → restart journey reads consistently — see cli-invocation.ts.
+  const cli = cliInvocationName();
   const results: StopResult[] = [];
-  let restartCommand = "agentbridge claude";
+  let restartCommand = `${cli} claude`;
   if (parsed.pairFlag !== undefined) {
     // The friendly name is scoped to the current directory (same name elsewhere
     // is a different pair); findPairForFlag composes it with the cwd, falling
@@ -74,7 +78,7 @@ export async function runKill(args: string[] = []) {
       printKnownPairs(base);
       return;
     }
-    restartCommand = `agentbridge --pair ${pair.name ?? parsed.pairFlag} claude`;
+    restartCommand = `${cli} --pair ${pair.name ?? parsed.pairFlag} claude`;
     results.push(await stopPairEntry(base, pair));
   } else if (parsed.all) {
     // The registry is exactly the state that gets corrupted when things go
@@ -119,7 +123,7 @@ export async function runKill(args: string[] = []) {
       const message = error instanceof Error ? error.message : String(error);
       console.log(
         `⚠️  pair registry 不可读（${message}）——无法按目录定位 pair。` +
-          "运行 `abg kill --all` 可降级为全盘状态目录扫描，停止所有能找到的 pair。",
+          `运行 \`${cli} kill --all\` 可降级为全盘状态目录扫描，停止所有能找到的 pair。`,
       );
       process.exitCode = 2;
     }
@@ -136,7 +140,7 @@ export async function runKill(args: string[] = []) {
     }
     if (results.length === 0) {
       console.log(`No AgentBridge pairs registered for current directory: ${process.cwd()}`);
-      console.log("Use `abg kill all` or `abg kill --all` to stop pairs from every directory.");
+      console.log(`Use \`${cli} kill all\` or \`${cli} kill --all\` to stop pairs from every directory.`);
       return;
     }
   }
@@ -336,13 +340,17 @@ export function formatKillReport(
   lines.push("");
 
   if (stopped.length > 0) {
+    // Keep the sibling `codex` hint phrased in the SAME binary name the caller
+    // built restartCommand from (its leading token), so kill never mixes
+    // `abg claude` with `agentbridge codex`.
+    const cliName = restartCommand.split(" ")[0] ?? "abg";
     lines.push("AgentBridge stopped.");
     lines.push(
       `Please restart Claude Code (\`${restartCommand}\`), switch to a new conversation, or run \`/resume\` to fully disconnect.`,
     );
     lines.push(
       "ℹ️  已写入 killed 哨兵：被停止的 pair 不会被自动复活；" +
-        `下次 \`${restartCommand}\` / \`agentbridge codex\` 会清除哨兵并用当前安装版本启动全新 daemon。`,
+        `下次 \`${restartCommand}\` / \`${cliName} codex\` 会清除哨兵并用当前安装版本启动全新 daemon。`,
     );
   } else {
     lines.push("No running AgentBridge daemon or managed Codex TUI found.");

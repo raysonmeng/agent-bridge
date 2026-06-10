@@ -228,7 +228,7 @@ claude.on("ready", async () => {
   if (daemonLifecycle.wasKilled()) {
     await enterDisabledState(
       "Killed sentinel found — bridge staying idle",
-      `⛔ AgentBridge was stopped by \`agentbridge kill\`. Bridge is staying idle. Restart Claude Code (\`${pairScopedCommand("claude")}\`), switch to a new conversation, or run \`/resume\` to reconnect.`,
+      `⛔ AgentBridge was stopped by \`${pairScopedCommand("kill")}\`. Bridge is staying idle. Restart Claude Code (\`${pairScopedCommand("claude")}\`), switch to a new conversation, or run \`/resume\` to reconnect.`,
     );
     return;
   }
@@ -320,7 +320,7 @@ async function notifyIfDaemonKilled(logMessage: string) {
 
   await enterDisabledState(
     logMessage,
-    `⛔ AgentBridge was stopped by \`agentbridge kill\`. Bridge is staying idle. Restart Claude Code (\`${pairScopedCommand("claude")}\`), switch to a new conversation, or run \`/resume\` to reconnect.`,
+    `⛔ AgentBridge was stopped by \`${pairScopedCommand("kill")}\`. Bridge is staying idle. Restart Claude Code (\`${pairScopedCommand("claude")}\`), switch to a new conversation, or run \`/resume\` to reconnect.`,
   );
   return true;
 }

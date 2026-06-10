@@ -1,6 +1,7 @@
 import { execSync, execFileSync } from "node:child_process";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { cliInvocationName } from "../cli-invocation";
 import { ConfigService } from "../config-service";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
 import { findPackageRoot, registerMarketplace } from "./pkg-root";
@@ -15,14 +16,42 @@ import {
 
 const MIN_CLAUDE_VERSION = "2.1.80";
 
+/**
+ * Result of a single dependency probe. Mirrors doctor's DoctorCheck so the two
+ * surfaces read the same way (check line + ↳ hint) for the first-run journey.
+ *
+ * - "ok"   → present and acceptable
+ * - "warn" → absent but NOT fatal (the second agent can be installed later)
+ * - "fail" → absent/too-old and fatal (a hard prerequisite for init to succeed)
+ */
+export interface DepCheck {
+  name: string;
+  status: "ok" | "warn" | "fail";
+  detail: string;
+  /** Actionable next step for a non-OK check (install URL / upgrade command). */
+  hint?: string;
+}
+
 export async function runInit() {
   console.log("AgentBridge Init\n");
+  const cli = cliInvocationName();
 
-  // Step 1: Check dependencies
+  // Step 1: Check dependencies. Collect ALL results first, then report them
+  // together — the old flow exited on the FIRST missing dep, so a user missing
+  // both claude and codex only ever saw the claude error and fixed things one
+  // round-trip at a time. We now check all three, print a doctor-style summary,
+  // and only THEN decide whether to abort.
   console.log("Checking dependencies...");
-  checkBun();
-  checkClaude();
-  checkCodex();
+  const depChecks = [checkBun(), checkClaude(), checkCodex()];
+  for (const line of formatDepChecks(depChecks, cli)) {
+    console.log(line);
+  }
+  // bun/claude are hard prerequisites (runtime + plugin host); a missing codex
+  // is only a WARN — see checkCodex(). Abort only on a real FAIL, after the user
+  // has seen the full picture.
+  if (depChecks.some((check) => check.status === "fail")) {
+    process.exit(1);
+  }
   console.log("");
 
   // Step 2: Generate project config
@@ -66,7 +95,7 @@ export async function runInit() {
     // Detect context independently here so a findPackageRoot() failure above
     // (no package.json) is still treated as "not a repo" → marketplace steps.
     console.log("  Plugin install skipped (marketplace registration or install failed).");
-    for (const line of pluginInstallFallbackGuidance(detectRepoCheckout())) {
+    for (const line of pluginInstallFallbackGuidance(detectRepoCheckout(), cli)) {
       console.log(line);
     }
   }
@@ -82,8 +111,8 @@ export async function runInit() {
   }
   console.log("Next steps:");
   console.log("  1. If Claude Code is already running, execute /reload-plugins in your session");
-  console.log("  2. Start Claude Code:  agentbridge claude");
-  console.log("  3. Start Codex TUI:    agentbridge codex");
+  console.log(`  2. Start Claude Code:  ${cli} claude`);
+  console.log(`  3. Start Codex TUI:    ${cli} codex`);
 }
 
 /**
@@ -101,15 +130,20 @@ function detectRepoCheckout(): boolean {
 
 /**
  * Guidance lines printed when step-4 plugin install fails. Repo checkouts can
- * recover with `abg dev`; global npm installs cannot (the published package
+ * recover with `<cli> dev`; global npm installs cannot (the published package
  * ships no build scripts), so those users get the README marketplace steps.
  * Pure + exported for unit testing.
+ *
+ * @param cli the resolved invocation name; defaults to cliInvocationName().
  */
-export function pluginInstallFallbackGuidance(insideRepo: boolean): string[] {
+export function pluginInstallFallbackGuidance(
+  insideRepo: boolean,
+  cli: string = cliInvocationName(),
+): string[] {
   if (insideRepo) {
     return [
       "  You can install it later with:",
-      "    abg dev   # registers marketplace and installs plugin",
+      `    ${cli} dev   # registers marketplace and installs plugin`,
     ];
   }
   return [
@@ -118,49 +152,91 @@ export function pluginInstallFallbackGuidance(insideRepo: boolean): string[] {
   ];
 }
 
-function checkBun() {
+/**
+ * Render dependency checks in doctor's "check line + ↳ hint" style, then a
+ * closing line that links the first-run journey to diagnostics. Pure (no I/O)
+ * so the exact shape is unit-testable.
+ *
+ * Format matches formatDoctorReport: `STATUS name: detail`, with a `     ↳ hint`
+ * line under any non-OK check.
+ */
+export function formatDepChecks(checks: DepCheck[], cli: string): string[] {
+  const lines: string[] = [];
+  for (const check of checks) {
+    lines.push(`  ${check.status.toUpperCase().padEnd(4)} ${check.name}: ${check.detail}`);
+    if ((check.status === "warn" || check.status === "fail") && check.hint) {
+      lines.push(`       ↳ ${check.hint}`);
+    }
+  }
+  // Tie the first-run journey to ongoing diagnostics: after install, `doctor`
+  // is where the user verifies env/daemon/build health.
+  lines.push(`  验证安装: ${cli} doctor`);
+  return lines;
+}
+
+/** bun is the runtime — its absence is fatal. */
+function checkBun(): DepCheck {
   try {
     const version = execSync("bun --version", { encoding: "utf-8" }).trim();
-    console.log(`  bun: ${version}`);
+    return { name: "bun", status: "ok", detail: version };
   } catch {
-    console.error("  ERROR: bun not found in PATH.");
-    console.error("  Install Bun: https://bun.sh");
-    process.exit(1);
+    return {
+      name: "bun",
+      status: "fail",
+      detail: "not found in PATH",
+      hint: "Install Bun: https://bun.sh",
+    };
   }
 }
 
-function checkClaude() {
+/** claude hosts the plugin and is the primary agent — absence/too-old is fatal. */
+function checkClaude(): DepCheck {
+  let versionOutput: string;
   try {
-    const versionOutput = execSync("claude --version", { encoding: "utf-8" }).trim();
-    // Extract version number (may be in format "claude v2.1.80" or just "2.1.80")
-    const match = versionOutput.match(/(\d+\.\d+\.\d+)/);
-    if (match) {
-      const version = match[1];
-      console.log(`  claude: ${version}`);
-      if (compareVersions(version, MIN_CLAUDE_VERSION) < 0) {
-        console.error(`  ERROR: Claude Code version ${version} is too old.`);
-        console.error(`  Channels require >= ${MIN_CLAUDE_VERSION}.`);
-        console.error("  Update: npm update -g @anthropic-ai/claude-code");
-        process.exit(1);
-      }
-    } else {
-      console.log(`  claude: ${versionOutput} (version check skipped)`);
-    }
+    versionOutput = execSync("claude --version", { encoding: "utf-8" }).trim();
   } catch {
-    console.error("  ERROR: claude not found in PATH.");
-    console.error("  Install Claude Code: npm install -g @anthropic-ai/claude-code");
-    process.exit(1);
+    return {
+      name: "claude",
+      status: "fail",
+      detail: "not found in PATH",
+      hint: "Install Claude Code: npm install -g @anthropic-ai/claude-code",
+    };
   }
+  // Extract version number (may be in format "claude v2.1.80" or just "2.1.80").
+  const match = versionOutput.match(/(\d+\.\d+\.\d+)/);
+  if (!match) {
+    return { name: "claude", status: "ok", detail: `${versionOutput} (version check skipped)` };
+  }
+  const version = match[1]!;
+  if (compareVersions(version, MIN_CLAUDE_VERSION) < 0) {
+    return {
+      name: "claude",
+      status: "fail",
+      detail: `${version} is too old (channels require >= ${MIN_CLAUDE_VERSION})`,
+      hint: "Update: npm update -g @anthropic-ai/claude-code",
+    };
+  }
+  return { name: "claude", status: "ok", detail: version };
 }
 
-function checkCodex() {
+/**
+ * codex is the SECOND agent. A user may legitimately set up the Claude side
+ * first and install/connect Codex later, so a missing codex is a non-fatal
+ * WARN: init still installs the plugin, writes config, and completes. The old
+ * flow hard-exited here, which blocked the entire setup over an optional-at-init
+ * dependency — `agentbridge codex` will surface the same hint when actually used.
+ */
+function checkCodex(): DepCheck {
   try {
     const version = execSync("codex --version", { encoding: "utf-8" }).trim();
-    console.log(`  codex: ${version}`);
+    return { name: "codex", status: "ok", detail: version };
   } catch {
-    console.error("  ERROR: codex not found in PATH.");
-    console.error("  Install Codex: https://github.com/openai/codex");
-    process.exit(1);
+    return {
+      name: "codex",
+      status: "warn",
+      detail: "not found in PATH (the Codex side will be unavailable until installed)",
+      hint: "Install Codex when you want to pair: https://github.com/openai/codex",
+    };
   }
 }
 

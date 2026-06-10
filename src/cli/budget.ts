@@ -6,12 +6,16 @@
  * two surfaces to stay consistent).
  */
 
+import { cliInvocationName } from "../cli-invocation";
 import { fetchDaemonStatus } from "../daemon-status";
 import { parsePairFlag, type ReadOnlyPairResolution, resolvePairReadOnly } from "../pair-resolver";
 import { renderBudgetSnapshot, BUDGET_UNAVAILABLE_TEXT } from "../budget/render";
 
 export async function runBudget(args: string[]) {
   const json = args.includes("--json");
+  // Echo whichever name the user invoked (abg | agentbridge) in the "run X first"
+  // hints, so they match the kill/doctor guidance — see cli-invocation.ts.
+  const cli = cliInvocationName();
   const { pairFlag } = parsePairFlag(args.filter((arg) => arg !== "--json"));
   let resolution: ReadOnlyPairResolution;
   try {
@@ -32,7 +36,7 @@ export async function runBudget(args: string[]) {
     if (json) {
       console.log(JSON.stringify({ ok: false, error: "pair_not_registered" }));
     } else {
-      console.error("该目录尚无 pair，先运行 abg claude");
+      console.error(`该目录尚无 pair，先运行 ${cli} claude`);
     }
     process.exit(1);
     return;
@@ -45,7 +49,7 @@ export async function runBudget(args: string[]) {
     } else {
       console.error(
         `AgentBridge daemon 未运行（pair ${pair.pairId}，控制端口 ${pair.ports.controlPort}）。` +
-          "先运行 `abg claude` 启动会话。",
+          `先运行 \`${cli} claude\` 启动会话。`,
       );
     }
     process.exit(1);

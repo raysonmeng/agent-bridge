@@ -38,35 +38,51 @@ describe("pairScopedCommand", () => {
     rmSync(base, { recursive: true, force: true });
   });
 
-  test("legacy/manual mode (no AGENTBRIDGE_PAIR_ID) → bare command", () => {
-    expect(pairScopedCommand("codex")).toBe("agentbridge codex");
-    expect(pairScopedCommand("claude")).toBe("agentbridge claude");
-    expect(pairScopedCommand("kill")).toBe("agentbridge kill");
+  // The leading binary name now comes from cliInvocationName(); in the test
+  // runner argv[1] is a test path, so the live default resolves to "abg". The
+  // explicit-name overload is exercised separately below to prove either name
+  // flows through.
+  test("legacy/manual mode (no AGENTBRIDGE_PAIR_ID) → bare command (default name)", () => {
+    expect(pairScopedCommand("codex")).toBe("abg codex");
+    expect(pairScopedCommand("claude")).toBe("abg claude");
+    expect(pairScopedCommand("kill")).toBe("abg kill");
   });
 
   test("pair mode → puts --pair <selector> BEFORE the subcommand", () => {
     process.env.AGENTBRIDGE_PAIR_ID = "work-1a2b3c4d";
     process.env.AGENTBRIDGE_PAIR_NAME = "work";
-    expect(pairScopedCommand("codex")).toBe("agentbridge --pair work codex");
-    expect(pairScopedCommand("claude")).toBe("agentbridge --pair work claude");
-    expect(pairScopedCommand("kill")).toBe("agentbridge --pair work kill");
+    expect(pairScopedCommand("codex")).toBe("abg --pair work codex");
+    expect(pairScopedCommand("claude")).toBe("abg --pair work claude");
+    expect(pairScopedCommand("kill")).toBe("abg --pair work kill");
+  });
+
+  test("echoes the explicit invocation name (abg vs agentbridge)", () => {
+    process.env.AGENTBRIDGE_PAIR_ID = "work-1a2b3c4d";
+    process.env.AGENTBRIDGE_PAIR_NAME = "work";
+    expect(pairScopedCommand("codex", "agentbridge")).toBe("agentbridge --pair work codex");
+    expect(pairScopedCommand("codex", "abg")).toBe("abg --pair work codex");
+    // Bare (legacy) form also threads the name through.
+    delete process.env.AGENTBRIDGE_PAIR_ID;
+    delete process.env.AGENTBRIDGE_PAIR_NAME;
+    expect(pairScopedCommand("claude", "agentbridge")).toBe("agentbridge claude");
+    expect(pairScopedCommand("claude", "abg")).toBe("abg claude");
   });
 
   test("prefers the friendly name over the composite pairId", () => {
     process.env.AGENTBRIDGE_PAIR_ID = "main-deadbeef";
     process.env.AGENTBRIDGE_PAIR_NAME = "main";
-    expect(pairScopedCommand("codex")).toBe("agentbridge --pair main codex");
+    expect(pairScopedCommand("codex", "agentbridge")).toBe("agentbridge --pair main codex");
   });
 
   test("--pair precedes the subcommand's own extra args", () => {
     process.env.AGENTBRIDGE_PAIR_ID = "review-1a2b3c4d";
     process.env.AGENTBRIDGE_PAIR_NAME = "review";
-    expect(pairScopedCommand("claude --resume")).toBe("agentbridge --pair review claude --resume");
+    expect(pairScopedCommand("claude --resume", "agentbridge")).toBe("agentbridge --pair review claude --resume");
   });
 
   test("an empty-string AGENTBRIDGE_PAIR_ID is treated as unset (no --pair)", () => {
     process.env.AGENTBRIDGE_PAIR_ID = "";
-    expect(pairScopedCommand("codex")).toBe("agentbridge codex");
+    expect(pairScopedCommand("codex", "agentbridge")).toBe("agentbridge codex");
   });
 
   // Conservative C: when AGENTBRIDGE_PAIR_NAME is missing (e.g. an OLD bridge
@@ -80,13 +96,13 @@ describe("pairScopedCommand", () => {
         { pairId: "myproj-1a2b3c4d", slot: 3, cwd: "/some/dir", name: "myproj", source: "cwd", createdAt: "2026-01-01T00:00:00.000Z" },
       ],
     });
-    expect(pairScopedCommand("codex")).toBe("agentbridge --pair myproj codex");
+    expect(pairScopedCommand("codex", "agentbridge")).toBe("agentbridge --pair myproj codex");
   });
 
   test("falls back to the composite pairId when PAIR_NAME unset AND no registry match", () => {
     process.env.AGENTBRIDGE_PAIR_ID = "myproj-1a2b3c4d";
     writeRegistry(base, { version: 1, pairs: [] });
-    expect(pairScopedCommand("codex")).toBe("agentbridge --pair myproj-1a2b3c4d codex");
+    expect(pairScopedCommand("codex", "agentbridge")).toBe("agentbridge --pair myproj-1a2b3c4d codex");
   });
 
   // best-effort: a corrupt/unreadable registry must NOT throw while rendering a
@@ -96,7 +112,7 @@ describe("pairScopedCommand", () => {
     process.env.AGENTBRIDGE_PAIR_ID = "ghost-deadbeef";
     mkdirSync(join(base, "pairs"), { recursive: true });
     writeFileSync(join(base, "pairs", "registry.json"), "{ this is not valid json", "utf-8");
-    expect(() => pairScopedCommand("codex")).not.toThrow();
-    expect(pairScopedCommand("codex")).toBe("agentbridge --pair ghost-deadbeef codex");
+    expect(() => pairScopedCommand("codex", "agentbridge")).not.toThrow();
+    expect(pairScopedCommand("codex", "agentbridge")).toBe("agentbridge --pair ghost-deadbeef codex");
   });
 });
