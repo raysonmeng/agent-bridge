@@ -14271,7 +14271,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("3f14d41", "source"),
+  commit: defineString("ef0c291", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -14549,8 +14549,43 @@ class DaemonClient extends EventEmitter2 {
 
 // src/daemon-lifecycle.ts
 import { spawn } from "child_process";
-import { existsSync as existsSync3, readFileSync, statSync as statSync2, unlinkSync as unlinkSync2, writeFileSync, openSync, closeSync, constants } from "fs";
+import { existsSync as existsSync3, readFileSync, statSync as statSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2, openSync as openSync2, closeSync as closeSync2, constants } from "fs";
 import { fileURLToPath } from "url";
+
+// src/atomic-json.ts
+import * as fs from "fs";
+import { randomUUID as randomUUID2 } from "crypto";
+import { dirname as dirname2 } from "path";
+function tmpPathFor(targetPath) {
+  return `${targetPath}.tmp.${process.pid}.${randomUUID2()}`;
+}
+function atomicWriteText(path, content, options = {}) {
+  fs.mkdirSync(dirname2(path), { recursive: true });
+  const tmp = tmpPathFor(path);
+  let renamed = false;
+  const fd = fs.openSync(tmp, "w");
+  try {
+    try {
+      fs.writeFileSync(fd, content, "utf-8");
+      if (options.fsync)
+        fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmp, path);
+    renamed = true;
+  } finally {
+    if (!renamed) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {}
+    }
+  }
+}
+function atomicWriteJson(path, value, options = {}) {
+  atomicWriteText(path, JSON.stringify(value, null, 2) + `
+`, options);
+}
 
 // src/env-utils.ts
 function parsePositiveIntEnv(name, fallback, log = () => {}, env = process.env) {
@@ -14825,9 +14860,7 @@ class DaemonLifecycle {
     }
   }
   writeStatus(status) {
-    this.stateDir.ensure();
-    writeFileSync(this.stateDir.statusFile, JSON.stringify(status, null, 2) + `
-`, "utf-8");
+    atomicWriteJson(this.stateDir.statusFile, status);
   }
   readPid() {
     try {
@@ -14841,28 +14874,27 @@ class DaemonLifecycle {
     }
   }
   writePid(pid) {
-    this.stateDir.ensure();
-    writeFileSync(this.stateDir.pidFile, `${pid ?? process.pid}
-`, "utf-8");
+    atomicWriteText(this.stateDir.pidFile, `${pid ?? process.pid}
+`);
   }
   removePidFile() {
     try {
-      unlinkSync2(this.stateDir.pidFile);
+      unlinkSync3(this.stateDir.pidFile);
     } catch {}
   }
   removeStatusFile() {
     try {
-      unlinkSync2(this.stateDir.statusFile);
+      unlinkSync3(this.stateDir.statusFile);
     } catch {}
   }
   markKilled() {
     this.stateDir.ensure();
-    writeFileSync(this.stateDir.killedFile, `${Date.now()}
+    writeFileSync2(this.stateDir.killedFile, `${Date.now()}
 `, "utf-8");
   }
   clearKilled() {
     try {
-      unlinkSync2(this.stateDir.killedFile);
+      unlinkSync3(this.stateDir.killedFile);
     } catch {}
   }
   wasKilled() {
@@ -14929,15 +14961,15 @@ class DaemonLifecycle {
     this.stateDir.ensure();
     let fd = null;
     try {
-      fd = openSync(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
-      writeFileSync(fd, `${process.pid}
+      fd = openSync2(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
+      writeFileSync2(fd, `${process.pid}
 `);
-      closeSync(fd);
+      closeSync2(fd);
       return true;
     } catch (err) {
       if (fd !== null && err.code !== "EEXIST") {
         try {
-          closeSync(fd);
+          closeSync2(fd);
         } catch {}
         this.releaseLock();
       }
@@ -14974,7 +15006,7 @@ class DaemonLifecycle {
   }
   releaseLock() {
     try {
-      unlinkSync2(this.stateDir.lockFile);
+      unlinkSync3(this.stateDir.lockFile);
     } catch {}
   }
   async kill(gracefulTimeoutMs = 3000, pidOverride) {
@@ -15033,7 +15065,7 @@ async function fetchWithTimeout(url, timeoutMs = HEALTH_FETCH_TIMEOUT_MS) {
 }
 
 // src/config-service.ts
-import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync2, existsSync as existsSync4 } from "fs";
+import { readFileSync as readFileSync2, mkdirSync as mkdirSync3, existsSync as existsSync4 } from "fs";
 import { join as join2 } from "path";
 var DEFAULT_BUDGET_CONFIG = {
   enabled: true,
@@ -15267,9 +15299,7 @@ class ConfigService {
     };
   }
   save(config2) {
-    this.ensureConfigDir();
-    writeFileSync2(this.configPath, JSON.stringify(config2, null, 2) + `
-`, "utf-8");
+    atomicWriteJson(this.configPath, config2);
   }
   initDefaults() {
     this.ensureConfigDir();
@@ -15285,7 +15315,7 @@ class ConfigService {
   }
   ensureConfigDir() {
     if (!existsSync4(this.configDir)) {
-      mkdirSync2(this.configDir, { recursive: true });
+      mkdirSync3(this.configDir, { recursive: true });
     }
   }
 }
@@ -15307,23 +15337,19 @@ function isCliName(value) {
 
 // src/pair-registry.ts
 import {
-  closeSync as closeSync2,
   existsSync as existsSync5,
-  fsyncSync,
   linkSync,
   lstatSync,
-  mkdirSync as mkdirSync3,
-  openSync as openSync2,
+  mkdirSync as mkdirSync4,
   readdirSync,
   readFileSync as readFileSync3,
   realpathSync,
-  renameSync as renameSync2,
   rmSync,
   statSync as statSync3,
-  unlinkSync as unlinkSync3,
+  unlinkSync as unlinkSync4,
   writeFileSync as writeFileSync3
 } from "fs";
-import { createHash, randomUUID as randomUUID2 } from "crypto";
+import { createHash, randomUUID as randomUUID3 } from "crypto";
 import { basename as basename2, join as join3, resolve, sep } from "path";
 var PAIR_BASE_PORT = 4500;
 var PAIR_SLOT_STRIDE = 10;
@@ -15513,7 +15539,7 @@ function nonEmpty(value) {
 }
 
 // src/trace-log.ts
-import { appendFileSync as appendFileSync2, existsSync as existsSync6, mkdirSync as mkdirSync4, readdirSync as readdirSync2, statSync as statSync4, unlinkSync as unlinkSync4 } from "fs";
+import { appendFileSync as appendFileSync2, existsSync as existsSync6, mkdirSync as mkdirSync5, readdirSync as readdirSync2, statSync as statSync4, unlinkSync as unlinkSync5 } from "fs";
 import { join as join4 } from "path";
 var TRACE_RETENTION_DAYS = 7;
 var TRACE_FILE_RE = /^trace-\d{4}-\d{2}-\d{2}\.jsonl$/;
@@ -15570,7 +15596,7 @@ function appendTraceEvent(input) {
   };
   const logsDir = join4(input.cwd, ".agentbridge", "logs");
   const isNewDayFile = !existsSync6(path);
-  mkdirSync4(logsDir, { recursive: true });
+  mkdirSync5(logsDir, { recursive: true });
   if (isNewDayFile) {
     pruneOldTraceLogs(logsDir, path, Date.parse(timestamp));
   }
@@ -15596,7 +15622,7 @@ function pruneOldTraceLogs(logsDir, keepPath, nowMs) {
       continue;
     try {
       if (statSync4(filePath).mtimeMs < cutoff) {
-        unlinkSync4(filePath);
+        unlinkSync5(filePath);
       }
     } catch {}
   }

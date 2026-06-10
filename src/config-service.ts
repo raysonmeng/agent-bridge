@@ -1,5 +1,6 @@
-import { readFileSync, writeFileSync, mkdirSync, existsSync } from "node:fs";
+import { readFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
+import { atomicWriteJson } from "./atomic-json";
 import type { BudgetConfig, CodexTierMap, CodexTurnOverrides } from "./budget/types";
 
 /** Machine-readable project config schema. */
@@ -477,8 +478,7 @@ export class ConfigService {
 
   /** Save project config. */
   save(config: AgentBridgeConfig): void {
-    this.ensureConfigDir();
-    writeFileSync(this.configPath, JSON.stringify(config, null, 2) + "\n", "utf-8");
+    atomicWriteJson(this.configPath, config);
   }
 
   /** Generate default config files if they don't exist. Returns list of created files. */

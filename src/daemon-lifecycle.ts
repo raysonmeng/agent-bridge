@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
+import { atomicWriteJson, atomicWriteText } from "./atomic-json";
 import { BUILD_INFO, compatibleContractVersion, formatBuildInfo, sameRuntimeContract } from "./build-info";
 import { StateDirResolver } from "./state-dir";
 import { parsePositiveIntEnv } from "./env-utils";
@@ -351,8 +352,7 @@ export class DaemonLifecycle {
 
   /** Write daemon status to status.json. */
   writeStatus(status: Record<string, unknown>): void {
-    this.stateDir.ensure();
-    writeFileSync(this.stateDir.statusFile, JSON.stringify(status, null, 2) + "\n", "utf-8");
+    atomicWriteJson(this.stateDir.statusFile, status);
   }
 
   /** Read daemon PID from pid file. */
@@ -369,8 +369,7 @@ export class DaemonLifecycle {
 
   /** Write daemon PID to pid file. */
   writePid(pid?: number): void {
-    this.stateDir.ensure();
-    writeFileSync(this.stateDir.pidFile, `${pid ?? process.pid}\n`, "utf-8");
+    atomicWriteText(this.stateDir.pidFile, `${pid ?? process.pid}\n`);
   }
 
   /** Remove stale pid file. */

@@ -1,13 +1,11 @@
 import {
   existsSync,
-  mkdirSync,
   readdirSync,
   readFileSync,
-  renameSync,
-  writeFileSync,
 } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, join } from "node:path";
+import { atomicWriteJson } from "./atomic-json";
 import type { StateDirResolver } from "./state-dir";
 
 export type CurrentThreadStatus = "pending" | "current";
@@ -44,13 +42,6 @@ function threadTag(identity: ThreadIdentity): string {
 
 export function codexHome(env: NodeJS.ProcessEnv = process.env): string {
   return env.CODEX_HOME && env.CODEX_HOME.length > 0 ? env.CODEX_HOME : join(homedir(), ".codex");
-}
-
-function atomicWriteJson(path: string, value: unknown): void {
-  mkdirSync(dirname(path), { recursive: true });
-  const tmp = `${path}.tmp.${process.pid}.${Date.now()}`;
-  writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n", "utf-8");
-  renameSync(tmp, path);
 }
 
 export function readRawCurrentThread(stateDir: StateDirResolver): CurrentThreadState | null {

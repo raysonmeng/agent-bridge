@@ -1,4 +1,5 @@
-import { describe, expect, test, beforeEach, afterEach } from "bun:test";
+import { describe, expect, spyOn, test, beforeEach, afterEach } from "bun:test";
+import * as fs from "node:fs";
 import {
   existsSync,
   mkdirSync,
@@ -12,6 +13,7 @@ import {
 import { createServer, type Server } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { DaemonLifecycle } from "../daemon-lifecycle";
 import {
   classifyReclaimableEntries,
   DEFAULT_PAIR_NAME,
@@ -40,6 +42,7 @@ import {
   type PairEntry,
   type RegistryFile,
 } from "../pair-registry";
+import { StateDirResolver } from "../state-dir";
 
 // Helper: build a minimal PairEntry with a given slot (other fields are
 // irrelevant for slot-allocation logic).
@@ -840,6 +843,30 @@ describe("removePairEntryAndDir / removeUnregisteredPairDir — locked atomic cl
 
     expect(await removeUnregisteredPairDir(base, live)).toEqual({ removed: false, reason: "live" });
     expect(existsSync(join(base, "pairs", live))).toBe(true);
+  });
+
+  test("a failed status update cannot expose a torn status that lets prune delete a live pair", async () => {
+    const live = "main-live0004";
+    const dir = join(base, "pairs", live);
+    mkdirSync(dir, { recursive: true });
+    const lifecycle = new DaemonLifecycle({
+      stateDir: new StateDirResolver(dir),
+      controlPort: portsForSlot(0).controlPort,
+      log: () => {},
+    });
+    lifecycle.writeStatus({ pid: process.pid });
+
+    const renameSpy = spyOn(fs, "renameSync").mockImplementationOnce(() => {
+      throw new Error("rename failed");
+    });
+    try {
+      expect(() => lifecycle.writeStatus({ pid: 2147483646 })).toThrow("rename failed");
+    } finally {
+      renameSpy.mockRestore();
+    }
+
+    expect(await removeUnregisteredPairDir(base, live)).toEqual({ removed: false, reason: "live" });
+    expect(existsSync(dir)).toBe(true);
   });
 });
 

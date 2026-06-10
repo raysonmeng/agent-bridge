@@ -1,16 +1,12 @@
 import { execFileSync } from "node:child_process";
 import {
-  closeSync,
   existsSync,
-  fsyncSync,
   linkSync,
   lstatSync,
   mkdirSync,
-  openSync,
   readdirSync,
   readFileSync,
   realpathSync,
-  renameSync,
   rmSync,
   statSync,
   unlinkSync,
@@ -20,6 +16,7 @@ import { createServer } from "node:net";
 import { createHash, randomUUID } from "node:crypto";
 import { hostname, userInfo } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
+import { atomicWriteJson } from "./atomic-json";
 import { isAgentBridgeDaemon, pidLooksAlive } from "./process-lifecycle";
 
 /**
@@ -318,18 +315,7 @@ export function readRegistry(base: string): RegistryFile {
 
 /** Atomically replace the registry file (temp + fsync + rename). */
 export function writeRegistry(base: string, reg: RegistryFile): void {
-  mkdirSync(pairsDir(base), { recursive: true });
-  const target = registryPath(base);
-  const tmp = `${target}.tmp.${process.pid}`;
-  const data = JSON.stringify(reg, null, 2) + "\n";
-  const fd = openSync(tmp, "w");
-  try {
-    writeFileSync(fd, data);
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
-  renameSync(tmp, target);
+  atomicWriteJson(registryPath(base), reg, { fsync: true });
 }
 
 // ---------------------------------------------------------------------------

@@ -21,7 +21,8 @@
  * CLI (`npm i -g`) and plugin (`/plugin marketplace update`) upgrade paths.
  */
 
-import { readFileSync, writeFileSync } from "node:fs";
+import { readFileSync } from "node:fs";
+import { atomicWriteJson } from "./atomic-json";
 import { StateDirResolver } from "./state-dir";
 import { isStableUpgrade, isStableVersion } from "./version-utils";
 import { parsePositiveIntEnv } from "./env-utils";
@@ -91,8 +92,7 @@ function readCache(stateDir: StateDirResolver): UpdateCache | null {
 
 function writeCache(stateDir: StateDirResolver, cache: UpdateCache): void {
   try {
-    stateDir.ensure();
-    writeFileSync(stateDir.updateCheckFile, JSON.stringify(cache, null, 2) + "\n", "utf-8");
+    atomicWriteJson(stateDir.updateCheckFile, cache);
   } catch {
     // best-effort; a failed cache write just means we recheck next time
   }

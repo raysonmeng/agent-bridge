@@ -18,7 +18,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("3f14d41", "source"),
+  commit: defineString("ef0c291", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -2454,8 +2454,43 @@ class TuiConnectionState {
 
 // src/daemon-lifecycle.ts
 import { spawn as spawn2 } from "child_process";
-import { existsSync as existsSync3, readFileSync, statSync as statSync2, unlinkSync as unlinkSync2, writeFileSync, openSync, closeSync, constants } from "fs";
+import { existsSync as existsSync3, readFileSync, statSync as statSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2, openSync as openSync2, closeSync as closeSync2, constants } from "fs";
 import { fileURLToPath } from "url";
+
+// src/atomic-json.ts
+import * as fs from "fs";
+import { randomUUID } from "crypto";
+import { dirname as dirname2 } from "path";
+function tmpPathFor(targetPath) {
+  return `${targetPath}.tmp.${process.pid}.${randomUUID()}`;
+}
+function atomicWriteText(path, content, options = {}) {
+  fs.mkdirSync(dirname2(path), { recursive: true });
+  const tmp = tmpPathFor(path);
+  let renamed = false;
+  const fd = fs.openSync(tmp, "w");
+  try {
+    try {
+      fs.writeFileSync(fd, content, "utf-8");
+      if (options.fsync)
+        fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmp, path);
+    renamed = true;
+  } finally {
+    if (!renamed) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {}
+    }
+  }
+}
+function atomicWriteJson(path, value, options = {}) {
+  atomicWriteText(path, JSON.stringify(value, null, 2) + `
+`, options);
+}
 
 // src/process-lifecycle.ts
 import { execFileSync as execFileSync2 } from "child_process";
@@ -2717,9 +2752,7 @@ class DaemonLifecycle {
     }
   }
   writeStatus(status) {
-    this.stateDir.ensure();
-    writeFileSync(this.stateDir.statusFile, JSON.stringify(status, null, 2) + `
-`, "utf-8");
+    atomicWriteJson(this.stateDir.statusFile, status);
   }
   readPid() {
     try {
@@ -2733,28 +2766,27 @@ class DaemonLifecycle {
     }
   }
   writePid(pid) {
-    this.stateDir.ensure();
-    writeFileSync(this.stateDir.pidFile, `${pid ?? process.pid}
-`, "utf-8");
+    atomicWriteText(this.stateDir.pidFile, `${pid ?? process.pid}
+`);
   }
   removePidFile() {
     try {
-      unlinkSync2(this.stateDir.pidFile);
+      unlinkSync3(this.stateDir.pidFile);
     } catch {}
   }
   removeStatusFile() {
     try {
-      unlinkSync2(this.stateDir.statusFile);
+      unlinkSync3(this.stateDir.statusFile);
     } catch {}
   }
   markKilled() {
     this.stateDir.ensure();
-    writeFileSync(this.stateDir.killedFile, `${Date.now()}
+    writeFileSync2(this.stateDir.killedFile, `${Date.now()}
 `, "utf-8");
   }
   clearKilled() {
     try {
-      unlinkSync2(this.stateDir.killedFile);
+      unlinkSync3(this.stateDir.killedFile);
     } catch {}
   }
   wasKilled() {
@@ -2821,15 +2853,15 @@ class DaemonLifecycle {
     this.stateDir.ensure();
     let fd = null;
     try {
-      fd = openSync(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
-      writeFileSync(fd, `${process.pid}
+      fd = openSync2(this.stateDir.lockFile, constants.O_CREAT | constants.O_EXCL | constants.O_WRONLY);
+      writeFileSync2(fd, `${process.pid}
 `);
-      closeSync(fd);
+      closeSync2(fd);
       return true;
     } catch (err) {
       if (fd !== null && err.code !== "EEXIST") {
         try {
-          closeSync(fd);
+          closeSync2(fd);
         } catch {}
         this.releaseLock();
       }
@@ -2866,7 +2898,7 @@ class DaemonLifecycle {
   }
   releaseLock() {
     try {
-      unlinkSync2(this.stateDir.lockFile);
+      unlinkSync3(this.stateDir.lockFile);
     } catch {}
   }
   async kill(gracefulTimeoutMs = 3000, pidOverride) {
@@ -2925,7 +2957,7 @@ async function fetchWithTimeout(url, timeoutMs = HEALTH_FETCH_TIMEOUT_MS) {
 }
 
 // src/config-service.ts
-import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSync as mkdirSync3, existsSync as existsSync4 } from "fs";
+import { readFileSync as readFileSync2, mkdirSync as mkdirSync4, existsSync as existsSync4 } from "fs";
 import { join as join3 } from "path";
 var DEFAULT_BUDGET_CONFIG = {
   enabled: true,
@@ -3175,9 +3207,7 @@ class ConfigService {
     };
   }
   save(config) {
-    this.ensureConfigDir();
-    writeFileSync2(this.configPath, JSON.stringify(config, null, 2) + `
-`, "utf-8");
+    atomicWriteJson(this.configPath, config);
   }
   initDefaults() {
     this.ensureConfigDir();
@@ -3193,7 +3223,7 @@ class ConfigService {
   }
   ensureConfigDir() {
     if (!existsSync4(this.configDir)) {
-      mkdirSync3(this.configDir, { recursive: true });
+      mkdirSync4(this.configDir, { recursive: true });
     }
   }
 }
@@ -4332,14 +4362,11 @@ class ReplyRequiredTracker {
 // src/thread-state.ts
 import {
   existsSync as existsSync6,
-  mkdirSync as mkdirSync4,
   readdirSync,
-  readFileSync as readFileSync3,
-  renameSync as renameSync2,
-  writeFileSync as writeFileSync3
+  readFileSync as readFileSync3
 } from "fs";
 import { homedir as homedir3 } from "os";
-import { basename as basename2, dirname as dirname2, join as join5 } from "path";
+import { basename as basename2, join as join5 } from "path";
 function nowIso() {
   return new Date().toISOString();
 }
@@ -4349,13 +4376,6 @@ function threadTag(identity) {
 }
 function codexHome(env = process.env) {
   return env.CODEX_HOME && env.CODEX_HOME.length > 0 ? env.CODEX_HOME : join5(homedir3(), ".codex");
-}
-function atomicWriteJson(path, value) {
-  mkdirSync4(dirname2(path), { recursive: true });
-  const tmp = `${path}.tmp.${process.pid}.${Date.now()}`;
-  writeFileSync3(tmp, JSON.stringify(value, null, 2) + `
-`, "utf-8");
-  renameSync2(tmp, path);
 }
 function readRawCurrentThread(stateDir) {
   try {
