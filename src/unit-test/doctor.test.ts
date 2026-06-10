@@ -153,4 +153,64 @@ describe("doctor command", () => {
       rmSync(base, { recursive: true, force: true });
     }
   });
+
+  test("checks daemon health and readiness concurrently", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agentbridge-doctor-"));
+    const base = mkdtempSync(join(tmpdir(), "agentbridge-doctor-base-"));
+    const originalFetch = globalThis.fetch;
+    try {
+      process.chdir(root);
+      process.env.AGENTBRIDGE_BASE_DIR = base;
+      seedPair(root, base);
+
+      const paths: string[] = [];
+      let markReadyRequested: () => void = () => {};
+      const readyRequested = new Promise<void>((resolve) => {
+        markReadyRequested = resolve;
+      });
+      const statusPayload = (path: string) => ({
+        bridgeReady: true,
+        tuiConnected: false,
+        threadId: null,
+        queuedMessageCount: 0,
+        proxyUrl: "ws://127.0.0.1:16841",
+        appServerUrl: "ws://127.0.0.1:16840",
+        pid: 123,
+        pairId: path,
+      });
+
+      globalThis.fetch = ((input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
+        const path = new URL(String(input)).pathname;
+        paths.push(path);
+        if (path === "/healthz") {
+          return new Promise<Response>((resolve, reject) => {
+            const signal = init?.signal;
+            const onAbort = () => reject(new Error("aborted"));
+            signal?.addEventListener("abort", onAbort, { once: true });
+            readyRequested.then(() => {
+              signal?.removeEventListener("abort", onAbort);
+              resolve(Response.json(statusPayload(path)));
+            });
+          });
+        }
+        if (path === "/readyz") {
+          markReadyRequested();
+          return Promise.resolve(Response.json(statusPayload(path)));
+        }
+        return Promise.resolve(new Response("missing", { status: 404 }));
+      }) as unknown as typeof fetch;
+
+      const started = Date.now();
+      const report = await runDoctorJson(["--pair", "main"]);
+
+      expect(Date.now() - started).toBeLessThan(900);
+      expect(paths).toEqual(["/healthz", "/readyz"]);
+      expect(report.daemon.health?.pairId).toBe("/healthz");
+      expect(report.daemon.ready?.pairId).toBe("/readyz");
+    } finally {
+      globalThis.fetch = originalFetch;
+      rmSync(root, { recursive: true, force: true });
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
 });

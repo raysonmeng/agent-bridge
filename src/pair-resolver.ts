@@ -1,9 +1,10 @@
 import { realpathSync } from "node:fs";
-import { resolve } from "node:path";
+import { join, resolve } from "node:path";
 import { StateDirResolver } from "./state-dir";
 import {
   type PairEntry,
   type PairPorts,
+  PairError,
   derivePairId,
   portsForSlot,
   readRegistry,
@@ -35,6 +36,12 @@ export interface PairResolution {
   manual: boolean;
   /** Non-blocking advisory (cross-cwd raw match / pairId-looking new alloc); CLI prints to stderr. */
   warning?: string;
+}
+
+export interface ReadOnlyPairResolution {
+  pair: PairResolution;
+  /** False when no registry entry exists yet (pair would be created on first launch). */
+  registered: boolean;
 }
 
 /**
@@ -170,6 +177,69 @@ export async function applyPairEnv(opts: { pairFlag?: string }): Promise<PairRes
     name: resolved.name,
     manual: false,
     warning: resolved.warning,
+  };
+}
+
+export function resolvePairReadOnly(pairFlag: string | undefined): ReadOnlyPairResolution {
+  // Manual/legacy override: explicit env + AGENTBRIDGE_MANUAL=1 (mirror of
+  // applyPairEnv's manual branch — already read-only there).
+  const explicitEnv =
+    !!process.env.AGENTBRIDGE_STATE_DIR ||
+    !!process.env.AGENTBRIDGE_CONTROL_PORT ||
+    !!process.env.CODEX_WS_PORT ||
+    !!process.env.CODEX_PROXY_PORT;
+  if (pairFlag === undefined && explicitEnv && process.env.AGENTBRIDGE_MANUAL === "1") {
+    return {
+      registered: true,
+      pair: {
+        pairId: "(manual)",
+        slot: null,
+        ports: {
+          appPort: Number.parseInt(process.env.CODEX_WS_PORT ?? "4500", 10),
+          proxyPort: Number.parseInt(process.env.CODEX_PROXY_PORT ?? "4501", 10),
+          controlPort: Number.parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10),
+        },
+        stateDir: new StateDirResolver(),
+        name: "(manual)",
+        manual: true,
+      },
+    };
+  }
+
+  const base = computeBaseDir();
+  const cwd = process.cwd();
+  const name = pairFlag ?? "main";
+  let entry: PairEntry | null = null;
+  try {
+    entry = findPairForFlag(base, cwd, name);
+  } catch (err) {
+    if (err instanceof PairError && err.code === "PAIR_ID_INVALID") throw err;
+    // Corrupt/unreadable registry must not stop diagnosis — fall through to derived identity.
+  }
+  if (entry) {
+    return {
+      registered: true,
+      pair: {
+        pairId: entry.pairId,
+        slot: entry.slot,
+        ports: portsForEntry(entry),
+        stateDir: new StateDirResolver(join(base, "pairs", entry.pairId)),
+        name: entry.name ?? name,
+        manual: false,
+      },
+    };
+  }
+  const pairId = derivePairId(cwd, name);
+  return {
+    registered: false,
+    pair: {
+      pairId,
+      slot: null,
+      ports: { appPort: 0, proxyPort: 0, controlPort: 0 },
+      stateDir: new StateDirResolver(join(base, "pairs", pairId)),
+      name,
+      manual: false,
+    },
   };
 }
 

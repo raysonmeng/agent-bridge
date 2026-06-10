@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -15,6 +15,7 @@ import {
   parsePairFlag,
   portsForEntry,
   removePair,
+  resolvePairReadOnly,
 } from "../pair-resolver";
 
 // ---------------------------------------------------------------------------
@@ -32,9 +33,11 @@ const ENV_KEYS = [
 ] as const;
 
 let savedEnv: Record<string, string | undefined> = {};
+let previousCwd: string;
 const tempBases: string[] = [];
 
 beforeEach(() => {
+  previousCwd = process.cwd();
   savedEnv = {};
   for (const k of ENV_KEYS) {
     savedEnv[k] = process.env[k];
@@ -43,6 +46,7 @@ beforeEach(() => {
 });
 
 afterEach(() => {
+  process.chdir(previousCwd);
   for (const k of ENV_KEYS) {
     if (savedEnv[k] === undefined) delete process.env[k];
     else process.env[k] = savedEnv[k];
@@ -51,6 +55,82 @@ afterEach(() => {
     const base = tempBases.pop();
     if (base) rmSync(base, { recursive: true, force: true });
   }
+});
+
+describe("resolvePairReadOnly", () => {
+  test("returns an unregistered derived pair without allocating a registry entry", () => {
+    const base = makeBase();
+    process.env.AGENTBRIDGE_STATE_DIR = base;
+
+    const res = resolvePairReadOnly(undefined);
+
+    expect(res.registered).toBe(false);
+    expect(res.pair.pairId).toBe(derivePairId(process.cwd(), "main"));
+    expect(res.pair.slot).toBeNull();
+    expect(res.pair.ports).toEqual({ appPort: 0, proxyPort: 0, controlPort: 0 });
+    expect(res.pair.stateDir.dir).toBe(join(base, "pairs", res.pair.pairId));
+    expect(listPairs(base)).toEqual([]);
+    expect(process.env.AGENTBRIDGE_PAIR_ID).toBeUndefined();
+    expect(process.env.AGENTBRIDGE_CONTROL_PORT).toBeUndefined();
+  });
+
+  test("resolves an existing pair without injecting child env", () => {
+    const base = makeBase();
+    process.env.AGENTBRIDGE_STATE_DIR = base;
+    const pairId = derivePairId(process.cwd(), "work");
+    writeRegistry(base, {
+      version: 1,
+      pairs: [{ pairId, slot: 2, cwd: process.cwd(), name: "work", source: "flag", createdAt: "2026-01-01T00:00:00.000Z" }],
+    });
+
+    const res = resolvePairReadOnly("work");
+
+    expect(res.registered).toBe(true);
+    expect(res.pair.pairId).toBe(pairId);
+    expect(res.pair.slot).toBe(2);
+    expect(res.pair.ports).toEqual({ appPort: 4520, proxyPort: 4521, controlPort: 4522 });
+    expect(res.pair.stateDir.dir).toBe(join(base, "pairs", pairId));
+    expect(process.env.AGENTBRIDGE_PAIR_ID).toBeUndefined();
+    expect(process.env.AGENTBRIDGE_CONTROL_PORT).toBeUndefined();
+  });
+
+  test("preserves manual legacy mode semantics", () => {
+    const base = makeBase();
+    process.env.AGENTBRIDGE_MANUAL = "1";
+    process.env.AGENTBRIDGE_STATE_DIR = base;
+    process.env.AGENTBRIDGE_CONTROL_PORT = "5502";
+    process.env.CODEX_WS_PORT = "5500";
+    process.env.CODEX_PROXY_PORT = "5501";
+
+    const res = resolvePairReadOnly(undefined);
+
+    expect(res.registered).toBe(true);
+    expect(res.pair.manual).toBe(true);
+    expect(res.pair.pairId).toBe("(manual)");
+    expect(res.pair.ports).toEqual({ appPort: 5500, proxyPort: 5501, controlPort: 5502 });
+    expect(listPairs(base)).toEqual([]);
+  });
+
+  test("falls back to a derived identity when the registry is corrupt", () => {
+    const base = makeBase();
+    process.env.AGENTBRIDGE_STATE_DIR = base;
+    mkdirSync(join(base, "pairs"), { recursive: true });
+    writeFileSync(join(base, "pairs", "registry.json"), "{not-json", "utf-8");
+
+    const res = resolvePairReadOnly("main");
+
+    expect(res.registered).toBe(false);
+    expect(res.pair.pairId).toBe(derivePairId(process.cwd(), "main"));
+    expect(res.pair.ports).toEqual({ appPort: 0, proxyPort: 0, controlPort: 0 });
+  });
+
+  test("rejects invalid pair names instead of treating them as unregistered pairs", () => {
+    const base = makeBase();
+    process.env.AGENTBRIDGE_STATE_DIR = base;
+
+    expect(() => resolvePairReadOnly("../escape")).toThrow("Invalid --pair name");
+    expect(listPairs(base)).toEqual([]);
+  });
 });
 
 function makeBase(): string {

@@ -2,16 +2,14 @@ import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "n
 import { homedir } from "node:os";
 import { join } from "node:path";
 import { BUILD_INFO, formatBuildInfo, sameRuntimeContract } from "../build-info";
+import { fetchDaemonStatus } from "../daemon-status";
 import { inspectAgentBridgeEnv } from "../env-guard";
-import { derivePairId } from "../pair-registry";
 import {
-  computeBaseDir,
-  findPairForFlag,
   parsePairFlag,
-  portsForEntry,
   type PairResolution,
+  type ReadOnlyPairResolution,
+  resolvePairReadOnly,
 } from "../pair-resolver";
-import { StateDirResolver } from "../state-dir";
 import { readRawCurrentThread, readUsableCurrentThread } from "../thread-state";
 import { scanResumePollution } from "../resume-pollution";
 import {
@@ -115,74 +113,6 @@ export async function runDoctor(args: string[] = []) {
   printDoctorReport(report);
 }
 
-interface ReadOnlyPairResolution {
-  pair: PairResolution;
-  /** False when no registry entry exists yet (pair would be created on first launch). */
-  registered: boolean;
-}
-
-function resolvePairReadOnly(pairFlag: string | undefined): ReadOnlyPairResolution {
-  // Manual/legacy override: explicit env + AGENTBRIDGE_MANUAL=1 (mirror of
-  // applyPairEnv's manual branch — already read-only there).
-  const explicitEnv =
-    !!process.env.AGENTBRIDGE_STATE_DIR ||
-    !!process.env.AGENTBRIDGE_CONTROL_PORT ||
-    !!process.env.CODEX_WS_PORT ||
-    !!process.env.CODEX_PROXY_PORT;
-  if (pairFlag === undefined && explicitEnv && process.env.AGENTBRIDGE_MANUAL === "1") {
-    return {
-      registered: true,
-      pair: {
-        pairId: "(manual)",
-        slot: null,
-        ports: {
-          appPort: Number.parseInt(process.env.CODEX_WS_PORT ?? "4500", 10),
-          proxyPort: Number.parseInt(process.env.CODEX_PROXY_PORT ?? "4501", 10),
-          controlPort: Number.parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10),
-        },
-        stateDir: new StateDirResolver(),
-        name: "(manual)",
-        manual: true,
-      },
-    };
-  }
-
-  const base = computeBaseDir();
-  const cwd = process.cwd();
-  const name = pairFlag ?? "main";
-  let entry = null;
-  try {
-    entry = findPairForFlag(base, cwd, name);
-  } catch {
-    // Corrupt registry must not stop diagnosis — fall through to derived identity.
-  }
-  if (entry) {
-    return {
-      registered: true,
-      pair: {
-        pairId: entry.pairId,
-        slot: entry.slot,
-        ports: portsForEntry(entry),
-        stateDir: new StateDirResolver(join(base, "pairs", entry.pairId)),
-        name: entry.name ?? name,
-        manual: false,
-      },
-    };
-  }
-  const pairId = derivePairId(cwd, name);
-  return {
-    registered: false,
-    pair: {
-      pairId,
-      slot: null,
-      ports: { appPort: 0, proxyPort: 0, controlPort: 0 },
-      stateDir: new StateDirResolver(join(base, "pairs", pairId)),
-      name,
-      manual: false,
-    },
-  };
-}
-
 function runResumePollution(args: string[]) {
   const json = args.includes("--json");
   const apply = args.includes("--apply");
@@ -227,8 +157,12 @@ function runResumePollution(args: string[]) {
 async function buildDoctorReport(pair: PairResolution, registered: boolean): Promise<DoctorReport> {
   const cwd = process.cwd();
   const env = inspectAgentBridgeEnv({ cwd, env: process.env });
-  const health = registered ? await fetchDaemonStatus(pair.ports.controlPort, "/healthz") : null;
-  const ready = registered ? await fetchDaemonStatus(pair.ports.controlPort, "/readyz") : null;
+  const [health, ready] = registered
+    ? await Promise.all([
+        fetchDaemonStatus(pair.ports.controlPort, "/healthz"),
+        fetchDaemonStatus(pair.ports.controlPort, "/readyz"),
+      ])
+    : [null, null];
   // Drift keys on the runtime contract (version/commit/contractVersion), not the
   // bundle kind — a dist daemon vs a plugin launcher is not real drift.
   // A source-mode launcher (bun src/cli.ts …) is unstamped — "source" never
@@ -492,20 +426,6 @@ function logCheck(name: string, path: string): DoctorCheck {
     };
   }
   return { name, status: "ok", detail: `${path} (${stat.size} bytes)` };
-}
-
-async function fetchDaemonStatus(port: number, path: "/healthz" | "/readyz"): Promise<DaemonStatus | null> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), 500);
-  try {
-    const response = await fetch(`http://127.0.0.1:${port}${path}`, { signal: controller.signal });
-    if (!response.ok) return null;
-    return (await response.json()) as DaemonStatus;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
 }
 
 /** Render the doctor report. Pure (no I/O) so the exact shape is unit-testable. */

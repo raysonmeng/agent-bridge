@@ -6,16 +6,37 @@
  * two surfaces to stay consistent).
  */
 
-import { applyPairEnv, parsePairFlag } from "../pair-resolver";
-import type { DaemonStatus } from "../control-protocol";
+import { fetchDaemonStatus } from "../daemon-status";
+import { parsePairFlag, type ReadOnlyPairResolution, resolvePairReadOnly } from "../pair-resolver";
 import { renderBudgetSnapshot, BUDGET_UNAVAILABLE_TEXT } from "../budget/render";
-
-const STATUS_FETCH_TIMEOUT_MS = 1000;
 
 export async function runBudget(args: string[]) {
   const json = args.includes("--json");
   const { pairFlag } = parsePairFlag(args.filter((arg) => arg !== "--json"));
-  const pair = await applyPairEnv({ pairFlag });
+  let resolution: ReadOnlyPairResolution;
+  try {
+    resolution = resolvePairReadOnly(pairFlag);
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    if (json) {
+      console.log(JSON.stringify({ ok: false, error: message }));
+    } else {
+      console.error(`[agentbridge] ${message}`);
+    }
+    process.exit(1);
+    return;
+  }
+  const { pair } = resolution;
+
+  if (!resolution.registered) {
+    if (json) {
+      console.log(JSON.stringify({ ok: false, error: "pair_not_registered" }));
+    } else {
+      console.error("该目录尚无 pair，先运行 abg claude");
+    }
+    process.exit(1);
+    return;
+  }
 
   const status = await fetchDaemonStatus(pair.ports.controlPort);
   if (!status) {
@@ -43,18 +64,4 @@ export async function runBudget(args: string[]) {
 
   console.log(`pair: ${status.pairId ?? pair.pairId}`);
   console.log(status.budget ? renderBudgetSnapshot(status.budget) : BUDGET_UNAVAILABLE_TEXT);
-}
-
-async function fetchDaemonStatus(port: number): Promise<DaemonStatus | null> {
-  const controller = new AbortController();
-  const timer = setTimeout(() => controller.abort(), STATUS_FETCH_TIMEOUT_MS);
-  try {
-    const response = await fetch(`http://127.0.0.1:${port}/healthz`, { signal: controller.signal });
-    if (!response.ok) return null;
-    return (await response.json()) as DaemonStatus;
-  } catch {
-    return null;
-  } finally {
-    clearTimeout(timer);
-  }
 }
