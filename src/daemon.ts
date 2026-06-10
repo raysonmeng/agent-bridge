@@ -38,6 +38,7 @@ import type {
 } from "./control-protocol";
 import type { BridgeMessage } from "./types";
 import { probeLiveness as probeLivenessImpl } from "./liveness-probe";
+import { BoundedMessageBuffer } from "./delivery-buffer";
 
 interface ControlSocketData {
   clientId: number;
@@ -54,7 +55,7 @@ interface ControlSocketData {
    * redelivery on reconnect (at-least-once: a pre-close partial flush can
    * produce a duplicate; silent loss cannot).
    */
-  pendingBackpressure: BridgeMessage[];
+  pendingBackpressure: BoundedMessageBuffer;
 }
 
 const stateDir = new StateDirResolver();
@@ -147,7 +148,25 @@ const LIVENESS_PROBE_TIMEOUT_MS = parsePositiveIntEnv(
 const LIVENESS_PROBE_POLL_MS = 50;
 let challengeInProgress = false;
 
-const bufferedMessages: BridgeMessage[] = [];
+// Module-level delivery backlog: messages that could not be sent while Claude
+// was detached / a send failed, awaiting the next attach or drain.
+const bufferedMessages = new BoundedMessageBuffer({
+  cap: MAX_BUFFERED_MESSAGES,
+  overflowLabel: "Message buffer overflow",
+  log,
+});
+
+// Per-socket backpressure tracker (ws.send returned -1): bounded the same way
+// so a never-draining socket can't accumulate unboundedly. Distinct overflow
+// label/noun keeps the log line bit-exact with the prior inline code.
+function createPendingBackpressureBuffer(): BoundedMessageBuffer {
+  return new BoundedMessageBuffer({
+    cap: MAX_BUFFERED_MESSAGES,
+    overflowLabel: "Backpressure overflow",
+    overflowNoun: "tracked message(s)",
+    log,
+  });
+}
 
 // --- Budget coordination (plan v2.3 P1) ---
 // Constructed lazily on the first codex "ready" and kept for the daemon's lifetime.
@@ -596,7 +615,7 @@ function startControlServer() {
           log("Rejected WS upgrade on control port: Origin header present (possible CSWSH)");
           return wsOriginRejectedResponse();
         }
-        if (server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now(), pongCount: 0, pendingBackpressure: [] } })) {
+        if (server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now(), pongCount: 0, pendingBackpressure: createPendingBackpressureBuffer() } })) {
           return undefined;
         }
       }
@@ -609,7 +628,7 @@ function startControlServer() {
       open: (ws: ServerWebSocket<ControlSocketData>) => {
         ws.data.clientId = ++nextControlClientId;
         ws.data.lastPongAt = Date.now();
-        ws.data.pendingBackpressure = [];
+        ws.data.pendingBackpressure = createPendingBackpressureBuffer();
         log(`Frontend socket opened (#${ws.data.clientId})`);
       },
       close: (ws: ServerWebSocket<ControlSocketData>, code: number, reason: string) => {
@@ -636,7 +655,7 @@ function startControlServer() {
         // OS buffer means the bytes reached the transport — the same
         // delivery guarantee a plain successful send has.
         if (ws.data.pendingBackpressure.length > 0 && ws.getBufferedAmount() === 0) {
-          ws.data.pendingBackpressure = [];
+          ws.data.pendingBackpressure.clear();
         }
         // Deliver anything that buffered while the socket was congested
         // instead of waiting for the next reattach.
@@ -1150,16 +1169,11 @@ function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
   // Prepend (they predate anything buffered after the send started failing)
   // and re-apply the cap.
   if (ws.data.pendingBackpressure.length > 0) {
-    bufferedMessages.unshift(...ws.data.pendingBackpressure);
+    const reBuffered = ws.data.pendingBackpressure.drainAll();
     log(
-      `Re-buffered ${ws.data.pendingBackpressure.length} backpressured message(s) for redelivery on reconnect`,
+      `Re-buffered ${reBuffered.length} backpressured message(s) for redelivery on reconnect`,
     );
-    ws.data.pendingBackpressure = [];
-    if (bufferedMessages.length > MAX_BUFFERED_MESSAGES) {
-      const dropped = bufferedMessages.length - MAX_BUFFERED_MESSAGES;
-      bufferedMessages.splice(0, dropped);
-      log(`Message buffer overflow: dropped ${dropped} oldest message(s), ${MAX_BUFFERED_MESSAGES} remaining`);
-    }
+    bufferedMessages.unshiftMany(reBuffered);
   }
 
   scheduleClaudeDisconnectNotification(ws.data.clientId);
@@ -1337,11 +1351,6 @@ function emitToClaude(message: BridgeMessage) {
   }
 
   bufferedMessages.push(message);
-  if (bufferedMessages.length > MAX_BUFFERED_MESSAGES) {
-    const dropped = bufferedMessages.length - MAX_BUFFERED_MESSAGES;
-    bufferedMessages.splice(0, dropped);
-    log(`Message buffer overflow: dropped ${dropped} oldest message(s), ${MAX_BUFFERED_MESSAGES} remaining`);
-  }
 }
 
 function trySendBridgeMessage(ws: ServerWebSocket<ControlSocketData>, message: BridgeMessage): boolean {
@@ -1361,11 +1370,6 @@ function trySendBridgeMessage(ws: ServerWebSocket<ControlSocketData>, message: B
       // Same cap as bufferedMessages — a never-draining socket must not
       // accumulate unboundedly (bounded, logged loss beats OOM).
       ws.data.pendingBackpressure.push(message);
-      if (ws.data.pendingBackpressure.length > MAX_BUFFERED_MESSAGES) {
-        const dropped = ws.data.pendingBackpressure.length - MAX_BUFFERED_MESSAGES;
-        ws.data.pendingBackpressure.splice(0, dropped);
-        log(`Backpressure overflow: dropped ${dropped} oldest tracked message(s), ${MAX_BUFFERED_MESSAGES} remaining`);
-      }
     }
     return true;
   } catch (err: any) {
@@ -1375,14 +1379,16 @@ function trySendBridgeMessage(ws: ServerWebSocket<ControlSocketData>, message: B
 }
 
 function flushBufferedMessages(ws: ServerWebSocket<ControlSocketData>) {
-  const messages = bufferedMessages.splice(0, bufferedMessages.length);
+  const messages = bufferedMessages.drainAll();
   for (let i = 0; i < messages.length; i++) {
     if (!trySendBridgeMessage(ws, messages[i]!)) {
       // Re-buffer this and all remaining messages on failure. Positional index,
       // not indexOf: identity lookup breaks the count if a message object is
-      // ever enqueued twice.
+      // ever enqueued twice. The buffer is empty here (just drained, and
+      // trySend only touches pendingBackpressure), so re-applying the cap on
+      // prepend is a provable no-op — count is preserved bit-exactly.
       const remaining = messages.slice(i);
-      bufferedMessages.unshift(...remaining);
+      bufferedMessages.unshiftMany(remaining);
       log(`Flush interrupted: re-buffered ${remaining.length} message(s) after send failure`);
       return;
     }

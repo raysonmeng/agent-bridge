@@ -18,7 +18,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("20991c3", "source"),
+  commit: defineString("56a5f87", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -4540,6 +4540,47 @@ async function probeLiveness(target, options) {
   return target.pongCount > baseline;
 }
 
+// src/delivery-buffer.ts
+class BoundedMessageBuffer {
+  messages = [];
+  cap;
+  overflowLabel;
+  overflowNoun;
+  log;
+  constructor(options) {
+    this.cap = options.cap;
+    this.overflowLabel = options.overflowLabel;
+    this.overflowNoun = options.overflowNoun ?? "message(s)";
+    this.log = options.log;
+  }
+  get length() {
+    return this.messages.length;
+  }
+  push(message) {
+    this.messages.push(message);
+    this.enforceCap();
+  }
+  unshiftMany(messages) {
+    if (messages.length === 0)
+      return;
+    this.messages.unshift(...messages);
+    this.enforceCap();
+  }
+  drainAll() {
+    return this.messages.splice(0, this.messages.length);
+  }
+  clear() {
+    this.messages.length = 0;
+  }
+  enforceCap() {
+    if (this.messages.length > this.cap) {
+      const dropped = this.messages.length - this.cap;
+      this.messages.splice(0, dropped);
+      this.log(`${this.overflowLabel}: dropped ${dropped} oldest ${this.overflowNoun}, ${this.cap} remaining`);
+    }
+  }
+}
+
 // src/daemon.ts
 var stateDir = new StateDirResolver;
 stateDir.ensure();
@@ -4583,7 +4624,19 @@ var ATTACH_STATUS_COOLDOWN_MS = 30000;
 var LIVENESS_PROBE_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS", 3000, log);
 var LIVENESS_PROBE_POLL_MS = 50;
 var challengeInProgress = false;
-var bufferedMessages = [];
+var bufferedMessages = new BoundedMessageBuffer({
+  cap: MAX_BUFFERED_MESSAGES,
+  overflowLabel: "Message buffer overflow",
+  log
+});
+function createPendingBackpressureBuffer() {
+  return new BoundedMessageBuffer({
+    cap: MAX_BUFFERED_MESSAGES,
+    overflowLabel: "Backpressure overflow",
+    overflowNoun: "tracked message(s)",
+    log
+  });
+}
 var budgetCoordinator = null;
 function ensureBudgetCoordinatorStarted() {
   if (!BUDGET_CONFIG.enabled)
@@ -4836,7 +4889,7 @@ function startControlServer() {
           log("Rejected WS upgrade on control port: Origin header present (possible CSWSH)");
           return wsOriginRejectedResponse();
         }
-        if (server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now(), pongCount: 0, pendingBackpressure: [] } })) {
+        if (server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now(), pongCount: 0, pendingBackpressure: createPendingBackpressureBuffer() } })) {
           return;
         }
       }
@@ -4848,7 +4901,7 @@ function startControlServer() {
       open: (ws) => {
         ws.data.clientId = ++nextControlClientId;
         ws.data.lastPongAt = Date.now();
-        ws.data.pendingBackpressure = [];
+        ws.data.pendingBackpressure = createPendingBackpressureBuffer();
         log(`Frontend socket opened (#${ws.data.clientId})`);
       },
       close: (ws, code, reason) => {
@@ -4866,7 +4919,7 @@ function startControlServer() {
       },
       drain: (ws) => {
         if (ws.data.pendingBackpressure.length > 0 && ws.getBufferedAmount() === 0) {
-          ws.data.pendingBackpressure = [];
+          ws.data.pendingBackpressure.clear();
         }
         if (ws === attachedClaude && bufferedMessages.length > 0) {
           flushBufferedMessages(ws);
@@ -5191,14 +5244,9 @@ function detachClaude(ws, reason) {
   ws.data.attached = false;
   log(`Claude frontend detached (#${ws.data.clientId}, ${reason})`);
   if (ws.data.pendingBackpressure.length > 0) {
-    bufferedMessages.unshift(...ws.data.pendingBackpressure);
-    log(`Re-buffered ${ws.data.pendingBackpressure.length} backpressured message(s) for redelivery on reconnect`);
-    ws.data.pendingBackpressure = [];
-    if (bufferedMessages.length > MAX_BUFFERED_MESSAGES) {
-      const dropped = bufferedMessages.length - MAX_BUFFERED_MESSAGES;
-      bufferedMessages.splice(0, dropped);
-      log(`Message buffer overflow: dropped ${dropped} oldest message(s), ${MAX_BUFFERED_MESSAGES} remaining`);
-    }
+    const reBuffered = ws.data.pendingBackpressure.drainAll();
+    log(`Re-buffered ${reBuffered.length} backpressured message(s) for redelivery on reconnect`);
+    bufferedMessages.unshiftMany(reBuffered);
   }
   scheduleClaudeDisconnectNotification(ws.data.clientId);
   scheduleIdleShutdown();
@@ -5321,11 +5369,6 @@ function emitToClaude(message) {
     log("Send to Claude failed, buffering message for retry on reconnect");
   }
   bufferedMessages.push(message);
-  if (bufferedMessages.length > MAX_BUFFERED_MESSAGES) {
-    const dropped = bufferedMessages.length - MAX_BUFFERED_MESSAGES;
-    bufferedMessages.splice(0, dropped);
-    log(`Message buffer overflow: dropped ${dropped} oldest message(s), ${MAX_BUFFERED_MESSAGES} remaining`);
-  }
 }
 function trySendBridgeMessage(ws, message) {
   try {
@@ -5336,11 +5379,6 @@ function trySendBridgeMessage(ws, message) {
     }
     if (typeof result === "number" && result === -1) {
       ws.data.pendingBackpressure.push(message);
-      if (ws.data.pendingBackpressure.length > MAX_BUFFERED_MESSAGES) {
-        const dropped = ws.data.pendingBackpressure.length - MAX_BUFFERED_MESSAGES;
-        ws.data.pendingBackpressure.splice(0, dropped);
-        log(`Backpressure overflow: dropped ${dropped} oldest tracked message(s), ${MAX_BUFFERED_MESSAGES} remaining`);
-      }
     }
     return true;
   } catch (err) {
@@ -5349,11 +5387,11 @@ function trySendBridgeMessage(ws, message) {
   }
 }
 function flushBufferedMessages(ws) {
-  const messages = bufferedMessages.splice(0, bufferedMessages.length);
+  const messages = bufferedMessages.drainAll();
   for (let i = 0;i < messages.length; i++) {
     if (!trySendBridgeMessage(ws, messages[i])) {
       const remaining = messages.slice(i);
-      bufferedMessages.unshift(...remaining);
+      bufferedMessages.unshiftMany(remaining);
       log(`Flush interrupted: re-buffered ${remaining.length} message(s) after send failure`);
       return;
     }
