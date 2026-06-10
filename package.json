@@ -38,7 +38,8 @@
     "release:bump": "node scripts/bump-version.mjs",
     "typecheck": "tsc --noEmit",
     "validate:plugin-versions": "bun scripts/check-plugin-versions.js",
-    "check": "tsc --noEmit && bun test src && bun run verify:plugin-sync && bun scripts/check-plugin-versions.js"
+    "check": "tsc --noEmit && bun test src && bun run verify:plugin-sync && bun scripts/check-plugin-versions.js",
+    "ci:local": "bun run check && bun run smoke:built && bun run smoke:pack"
   },
   "repository": {
     "type": "git",
