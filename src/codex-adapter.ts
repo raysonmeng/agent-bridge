@@ -18,10 +18,14 @@ import { createProcessLogger, type ProcessLogger } from "./process-log";
 import type { BridgeMessage } from "./types";
 import type { ServerWebSocket } from "bun";
 import {
+  APP_SERVER_RATE_LIMIT_ERROR_CODES,
   isAppServerNotification,
   isAppServerRequestMessage,
   isAppServerResponseMessage,
   isTrackedAppServerRequestMethod,
+  parseAppServerVersion,
+  type AppServerInfo,
+  type AppServerInitializeResponse,
   type AppServerItem,
   type AppServerNotification,
   type AppServerRequest,
@@ -90,6 +94,34 @@ interface PendingRequest {
   threadSwitchSeq?: number;
 }
 
+/**
+ * ── Codex app-server PROTOCOL-VERSION-COUPLING CHECKLIST (P1 #5) ────────────
+ *
+ * The proxy intercepts and rewrites the Codex app-server protocol at a handful
+ * of points. Every one of them encodes assumptions about a SPECIFIC protocol
+ * snapshot — an upstream bump can silently break them. When bumping the
+ * supported codex version, re-verify EACH site against codex-rs:
+ *
+ *   1. initialize capture — captureAppServerInfo() / handleAppServerResponse.
+ *      Reads InitializeResponse.userAgent (codex-rs v1.rs:61-71). If the field
+ *      set changes, the captured AppServerInfo / drift WARNING must follow.
+ *   2. agentMessage aggregation — handleServerNotification (item/started +
+ *      item/agentMessage/delta + item/completed). Coupled to the item/* event
+ *      names and the `agentMessage` item type.
+ *   3. turn lifecycle — turn/started + turn/completed notifications drive
+ *      turnPhase, the inactivity watchdog, and busy-guard injection.
+ *   4. rate-limit patch — patchResponse(). Matches the `account/rateLimits/read`
+ *      error and hand-writes a GetAccountRateLimitsResponse-shaped mock
+ *      (rateLimits / rateLimitsByLimitId). Coupled to BOTH the error shape and
+ *      the success result shape (codex-rs v2/account.rs:254-258).
+ *   5. thread/closed sniff — handleAppServerPayload. String-matches the
+ *      `thread/closed` notification method to explain a silent TUI exit(0).
+ *
+ * The captured app-server version (exposed via `appServerInfo` →
+ * DaemonStatus → /healthz + `abg doctor`) lets an operator see, at a glance,
+ * whether the running server drifted from the version these sites were written
+ * against.
+ */
 export class CodexAdapter extends EventEmitter {
   private static readonly RESPONSE_TRACKING_TTL_MS = 30000;
 
@@ -212,6 +244,21 @@ export class CodexAdapter extends EventEmitter {
   // unintentional reconnect. See handleSessionRestoreAfterReconnect.
   private lastInitializeRaw: string | null = null;
   private lastInitializedRaw: string | null = null;
+  // P1 #5: protocol-version awareness. Proxy ids of in-flight `initialize`
+  // requests (TUI → app-server), so the matching RESPONSE can be recognized and
+  // its InitializeResponse captured at the handleAppServerResponse funnel.
+  private pendingInitializeProxyIds = new Set<number>();
+  // Captured app-server identity (version / platform) from the last initialize
+  // response. null until the first handshake completes. Surfaced on
+  // DaemonStatus.appServerInfo via the getter below.
+  private appServerInfo: AppServerInfo | null = null;
+  // Fire the "unknown app-server version" WARNING at most once per distinct
+  // captured version string, so a stable-but-unrecognized server does not spam
+  // the log on every reconnect/initialize.
+  private warnedAppServerVersions = new Set<string>();
+  // Fire the patchResponse fragile-text-match WARNING at most once per distinct
+  // error message, so a repeated legacy rate-limit error does not spam the log.
+  private warnedFragileRateLimitMessages = new Set<string>();
   private sessionRestoreInProgress = false;
   private replayPending = new Map<number | string, {
     method: string;
@@ -232,6 +279,13 @@ export class CodexAdapter extends EventEmitter {
   get appServerUrl() { return `ws://127.0.0.1:${this.appPort}`; }
   get proxyUrl() { return `ws://127.0.0.1:${this.proxyPort}`; }
   get activeThreadId() { return this.threadId; }
+  /**
+   * Captured Codex app-server identity (P1 #5). null until the first
+   * `initialize` handshake response is observed. Read by the daemon's status
+   * builder so /healthz + status.json + `abg doctor` can surface which
+   * app-server build the proxy is coupled to.
+   */
+  get capturedAppServerInfo(): AppServerInfo | null { return this.appServerInfo; }
 
   // ── Lifecycle ──────────────────────────────────────────────
 
@@ -1445,6 +1499,13 @@ export class CodexAdapter extends EventEmitter {
         const proxyId = this.nextProxyId++;
         this.upstreamToClient.set(proxyId, { connId, clientId: parsed.id });
         this.trackPendingRequest(parsed, connId, proxyId);
+        // P1 #5: remember initialize request proxy ids so the matching response
+        // can be recognized in handleAppServerResponse and its InitializeResponse
+        // captured (version / platform). Bounded: cleared on capture and on
+        // response-tracking resets.
+        if (parsed.method === "initialize") {
+          this.pendingInitializeProxyIds.add(proxyId);
+        }
         parsed.id = proxyId;
         forwarded = JSON.stringify(parsed);
       } else {
@@ -1674,6 +1735,14 @@ export class CodexAdapter extends EventEmitter {
     if (mapping) {
       this.upstreamToClient.delete(numericId);
 
+      // P1 #5: capture the initialize response (version / platform) BEFORE the
+      // staleness drop below — the server identity is connection-independent, so
+      // even a response to a now-superseded conn still tells us the truth about
+      // the app-server we're proxying. Always clears the pending-id bookkeeping.
+      if (!isNaN(numericId) && this.pendingInitializeProxyIds.delete(numericId)) {
+        this.captureAppServerInfo(parsed.result);
+      }
+
       if (mapping.connId !== this.tuiConnId) {
         this.log(`Dropping stale response (upstream id ${responseId}, from conn #${mapping.connId}, current #${this.tuiConnId})`);
         return null;
@@ -1760,11 +1829,71 @@ export class CodexAdapter extends EventEmitter {
     return null;
   }
 
+  /**
+   * P1 #5: capture the app-server identity from an `initialize` response result
+   * (version / platform) and expose it on the status getter. Logs the captured
+   * identity, and WARNs once-per-distinct-version when the userAgent is missing
+   * or its version is unparseable — a signal the app-server drifted from the
+   * shape these intercept points were written against (see the class-level
+   * version-coupling checklist).
+   *
+   * Behavior-preserving: capture-only, never mutates the forwarded payload.
+   */
+  private captureAppServerInfo(result: unknown): void {
+    const init = (typeof result === "object" && result !== null ? result : {}) as AppServerInitializeResponse;
+    const userAgent = typeof init.userAgent === "string" ? init.userAgent : null;
+    const version = parseAppServerVersion(userAgent);
+    const info: AppServerInfo = {
+      version,
+      userAgent,
+      platformFamily: typeof init.platformFamily === "string" ? init.platformFamily : null,
+      platformOs: typeof init.platformOs === "string" ? init.platformOs : null,
+    };
+    this.appServerInfo = info;
+    this.log(
+      `Captured app-server initialize: version=${version ?? "unknown"} ` +
+        `userAgent=${userAgent ?? "none"} platform=${info.platformOs ?? "?"}/${info.platformFamily ?? "?"}`,
+    );
+    if (version === null) {
+      // Key the at-most-once dedup on the raw userAgent (or a sentinel) so a
+      // stable-but-unparseable server warns once, not on every reconnect.
+      const dedupKey = userAgent ?? "<missing-userAgent>";
+      if (!this.warnedAppServerVersions.has(dedupKey)) {
+        this.warnedAppServerVersions.add(dedupKey);
+        this.log(
+          `WARNING: app-server initialize response carried no parseable version ` +
+            `(userAgent=${userAgent ?? "missing"}). The proxy's intercept points assume a ` +
+            `known protocol snapshot — verify the version-coupling checklist if Codex was upgraded.`,
+        );
+      }
+    }
+  }
+
   private patchResponse(parsed: AppServerNotification | AppServerResponse | Record<string, unknown>, raw: string): string {
     if (isAppServerResponseMessage(parsed) && parsed.error && parsed.id !== undefined) {
       const errMsg: string = parsed.error.message ?? "";
-      if (errMsg.includes("rate limits") || errMsg.includes("rateLimits")) {
-        this.log(`Patching rateLimits error → mock success (id: ${parsed.id})`);
+      const errCode = parsed.error.code;
+      const textMatchesRateLimit = errMsg.includes("rate limits") || errMsg.includes("rateLimits");
+      // P1 #5: structured-code-FIRST. The app-server's rate-limit read path uses
+      // GENERIC JSON-RPC error codes (no rate-limit-specific code exists —
+      // codex-rs error_code.rs + account_processor.rs:967-990), so the
+      // structured signal we DO have is "the error code is one of the recognized
+      // codes that path emits". When the code is recognized AND the text agrees,
+      // we patch via the structured path with NO fragile-match warning. When the
+      // code is absent/unrecognized but the legacy text still matches, we keep
+      // patching (behavior-preserving) but log a once-per-message 'fragile-match'
+      // warning so an upstream wording change becomes visible instead of silent.
+      const codeRecognized =
+        typeof errCode === "number" && APP_SERVER_RATE_LIMIT_ERROR_CODES.has(errCode);
+      const structuredMatch = codeRecognized && textMatchesRateLimit;
+
+      if (structuredMatch || textMatchesRateLimit) {
+        if (structuredMatch) {
+          this.log(`Patching rateLimits error → mock success via structured code ${errCode} (id: ${parsed.id})`);
+        } else {
+          this.warnFragileRateLimitMatch(errMsg, errCode);
+          this.log(`Patching rateLimits error → mock success via fragile text fallback (id: ${parsed.id})`);
+        }
         return JSON.stringify({
           id: parsed.id,
           result: {
@@ -1784,6 +1913,21 @@ export class CodexAdapter extends EventEmitter {
       // WS on each TUI `initialize` request, giving it a fresh connection scope.
     }
     return raw;
+  }
+
+  /**
+   * P1 #5: emit the 'fragile-match' warning at most once per distinct error
+   * message, so a repeated legacy rate-limit error does not spam the log.
+   */
+  private warnFragileRateLimitMatch(errMsg: string, errCode: number | undefined): void {
+    if (this.warnedFragileRateLimitMessages.has(errMsg)) return;
+    this.warnedFragileRateLimitMessages.add(errMsg);
+    this.log(
+      `WARNING: fragile-match — patched a rate-limit error by human-readable text ` +
+        `(code=${errCode ?? "none"} not in the recognized set). If Codex changed the ` +
+        `error wording or code, update patchResponse / APP_SERVER_RATE_LIMIT_ERROR_CODES. ` +
+        `Message: ${errMsg.slice(0, 120)}`,
+    );
   }
 
   // ── Server Message Interception (for Bridge) ───────────────
@@ -2286,6 +2430,11 @@ export class CodexAdapter extends EventEmitter {
   private clearTransientResponseTrackingState() {
     this.pendingRequests.clear();
     this.upstreamToClient.clear();
+    // P1 #5: pending initialize ids share upstreamToClient's lifecycle — a proxy
+    // id dropped from upstreamToClient can never match a response, so clear here
+    // to avoid an unbounded leak of orphaned ids. The captured appServerInfo
+    // itself PERSISTS (it is a fact about the server, not a transient mapping).
+    this.pendingInitializeProxyIds.clear();
 
     for (const timer of this.staleProxyIds.values()) {
       clearTimeout(timer);

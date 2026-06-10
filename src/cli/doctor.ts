@@ -231,6 +231,23 @@ async function buildDoctorReport(pair: PairResolution, registered: boolean): Pro
         ? "daemon 在运行但 codex app-server 尚未就绪；稍候片刻重试，持续不就绪请查看下方 daemon log。"
         : undefined,
   });
+  // P1 #5: surface the captured Codex app-server identity (version/platform).
+  // null until the first initialize handshake — informational, never a failure.
+  const appServerInfo = health?.appServerInfo ?? null;
+  checks.push({
+    name: "codex app-server",
+    status: health ? "ok" : "skip",
+    detail: !health
+      ? "n/a — daemon not running"
+      : appServerInfo
+        ? `version=${appServerInfo.version ?? "unknown"}` +
+          (appServerInfo.platformOs ? ` platform=${appServerInfo.platformOs}` : "")
+        : "not captured yet — connect Codex (initialize handshake) to populate",
+    hint:
+      health && appServerInfo && appServerInfo.version === null
+        ? "app-server 未返回可解析的版本号（userAgent 异常）。若刚升级过 Codex，请核对 codex-adapter 的 version-coupling checklist。"
+        : undefined,
+  });
   checks.push({
     name: "build drift",
     status: buildDrift === false ? "ok" : buildDrift === true ? "fail" : "skip",

@@ -1,6 +1,7 @@
 import type { BridgeMessage } from "./types";
 import type { AgentBridgeBuildInfo } from "./build-info";
 import type { BudgetSnapshot } from "./budget/types";
+import type { AppServerInfo } from "./app-server-protocol";
 
 export interface ControlClientIdentity {
   pairId?: string | null;
@@ -53,6 +54,15 @@ export interface DaemonStatus {
    * of turnPhase.
    */
   attentionWindowActive?: boolean;
+  /**
+   * Captured Codex app-server identity (version / platform), derived from the
+   * `initialize` response (P1 #5). null until the first initialize handshake
+   * completes, or when the response carried no recognizable userAgent. Exposed
+   * so `abg doctor` / /healthz can show which app-server build the proxy is
+   * coupled to — the version-coupling intercept points (rate-limit patch,
+   * thread/closed sniff, …) assume a particular protocol snapshot.
+   */
+  appServerInfo?: AppServerInfo | null;
 }
 
 export type ControlClientMessage =
