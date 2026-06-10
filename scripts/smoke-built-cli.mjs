@@ -334,9 +334,24 @@ async function main() {
   let daemonPid = null;
   const statusPath = join(stateDir, "status.json");
 
+  // Two env hazards (both bit us in CI/locally — CI red since 2026-06-03):
+  // 1. The CLI's env-guard treats manual runtime env (STATE_DIR/ports) WITHOUT
+  //    AGENTBRIDGE_PAIR_ID or AGENTBRIDGE_MANUAL=1 as stale and CLEARS it —
+  //    the daemon then boots at the default location while we poll the smoke
+  //    ports ("Unable to connect"). Declare manual mode explicitly.
+  // 2. Ambient AGENTBRIDGE_*/CODEX_* from the invoking shell (a live pair
+  //    session) leaks through ...process.env and trips the guard's pair
+  //    consistency checks. Strip them before applying the smoke's own env.
+  const ambient = { ...process.env };
+  for (const key of Object.keys(ambient)) {
+    if (key.startsWith("AGENTBRIDGE_") || key === "CODEX_WS_PORT" || key === "CODEX_PROXY_PORT") {
+      delete ambient[key];
+    }
+  }
   const env = {
-    ...process.env,
+    ...ambient,
     PATH: `${binDir}:${process.env.PATH ?? ""}`,
+    AGENTBRIDGE_MANUAL: "1",
     AGENTBRIDGE_STATE_DIR: stateDir,
     AGENTBRIDGE_CONTROL_PORT: String(controlPort),
     CODEX_WS_PORT: String(appPort),
