@@ -18,7 +18,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.6", "0.0.0-source"),
-  commit: defineString("7f27707", "source"),
+  commit: defineString("935ca23", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -3901,8 +3901,16 @@ var tuiConnectionState = new TuiConnectionState({
   }
 });
 var statusBuffer = new StatusBuffer((summary) => emitToClaude(summary));
+function tryWriteStatusFile(reason) {
+  try {
+    writeStatusFile();
+  } catch (err) {
+    log(`status file write failed (${reason}): ${err?.message ?? err}`);
+  }
+}
 codex.on("turnStarted", () => {
   log("Codex turn started");
+  tryWriteStatusFile("turnStarted");
   emitToClaude(systemMessage("system_turn_started", "\u23F3 Codex is working on the current task. Wait for completion before sending a reply."));
 });
 codex.on("agentMessage", (msg) => {
@@ -3943,6 +3951,7 @@ codex.on("agentMessage", (msg) => {
 });
 codex.on("turnCompleted", () => {
   log("Codex turn completed");
+  tryWriteStatusFile("turnCompleted");
   statusBuffer.flush("turn completed");
   const { warnReplyMissing } = replyTracker.consumeOnTurnComplete();
   if (warnReplyMissing) {
@@ -3954,6 +3963,7 @@ codex.on("turnCompleted", () => {
 });
 codex.on("turnAborted", (reason) => {
   log(`Codex turn aborted (${reason}) \u2014 clearing reply-required state`);
+  tryWriteStatusFile("turnAborted");
   const replyWasRequired = replyTracker.isArmed;
   replyTracker.reset();
   const notice = buildTurnAbortedNotice(reason, replyWasRequired);
@@ -4433,7 +4443,8 @@ function currentStatus() {
     cwd: process.cwd(),
     stateDir: stateDir.dir,
     build: daemonStatusBuildInfo(),
-    budget: budgetCoordinator?.getSnapshot() ?? undefined
+    budget: budgetCoordinator?.getSnapshot() ?? undefined,
+    turnInProgress: codex.turnInProgress
   };
 }
 function currentWaitingMessage() {
@@ -4475,7 +4486,8 @@ function writeStatusFile() {
     pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
     cwd: process.cwd(),
     stateDir: stateDir.dir,
-    build: daemonStatusBuildInfo()
+    build: daemonStatusBuildInfo(),
+    turnInProgress: codex.turnInProgress
   });
 }
 function removeStatusFile() {

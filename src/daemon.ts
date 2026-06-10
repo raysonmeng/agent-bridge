@@ -226,8 +226,22 @@ const tuiConnectionState = new TuiConnectionState({
 
 const statusBuffer = new StatusBuffer((summary) => emitToClaude(summary));
 
+// Turn-transition status refreshes are OBSERVABILITY writes (issue #102) —
+// a disk/permission failure there must never break core turn handling, so
+// they go through this catcher (boot-path writes keep strict semantics).
+function tryWriteStatusFile(reason: string) {
+  try {
+    writeStatusFile();
+  } catch (err: any) {
+    log(`status file write failed (${reason}): ${err?.message ?? err}`);
+  }
+}
+
 codex.on("turnStarted", () => {
   log("Codex turn started");
+  // Keep status.json's turnInProgress current — the TUI wrapper reads it at
+  // exit time to classify exit_0_during_turn vs exit_0_idle (issue #102).
+  tryWriteStatusFile("turnStarted");
   emitToClaude(
     systemMessage(
       "system_turn_started",
@@ -280,6 +294,7 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
 
 codex.on("turnCompleted", () => {
   log("Codex turn completed");
+  tryWriteStatusFile("turnCompleted"); // turnInProgress flipped (#102)
   statusBuffer.flush("turn completed");
 
   // Check if reply was required but Codex didn't send any agentMessage, then
@@ -309,6 +324,7 @@ codex.on("turnAborted", (reason: string) => {
   // stop). Clear the require_reply tracker so its armed state cannot be inherited
   // by a later, unrelated turn (force-forward leak + misattributed warning).
   log(`Codex turn aborted (${reason}) — clearing reply-required state`);
+  tryWriteStatusFile("turnAborted"); // turnInProgress flipped (#102)
   const replyWasRequired = replyTracker.isArmed;
   replyTracker.reset();
 
@@ -999,6 +1015,7 @@ function currentStatus(): DaemonStatus {
     stateDir: stateDir.dir,
     build: daemonStatusBuildInfo(),
     budget: budgetCoordinator?.getSnapshot() ?? undefined,
+    turnInProgress: codex.turnInProgress,
   };
 }
 
@@ -1054,6 +1071,10 @@ function writeStatusFile() {
     cwd: process.cwd(),
     stateDir: stateDir.dir,
     build: daemonStatusBuildInfo(),
+    // Refreshed on every turn transition (turnStarted/turnCompleted/turnAborted
+    // handlers call writeStatusFile) so the TUI wrapper reads an up-to-date
+    // value at exit time: exit_0_during_turn vs exit_0_idle (issue #102).
+    turnInProgress: codex.turnInProgress,
   });
 }
 

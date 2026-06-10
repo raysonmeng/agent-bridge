@@ -1,4 +1,4 @@
-import { spawn, execSync } from "node:child_process";
+import { spawn, execSync, execFileSync } from "node:child_process";
 import {
   openSync,
   writeSync,
@@ -9,8 +9,15 @@ import {
   existsSync,
   mkdirSync,
 } from "node:fs";
+import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 import { checkAgentsMdContract } from "../agents-contract";
+import {
+  captureTuiLogTail,
+  discoverNativeChildPid,
+  readTurnInProgress,
+  refineCleanExitClassification,
+} from "../wrapper-exit-observability";
 import { ConfigService } from "../config-service";
 import { BUILD_INFO } from "../build-info";
 import { DaemonLifecycle } from "../daemon-lifecycle";
@@ -422,6 +429,32 @@ export async function runCodex(args: string[]) {
     appendWrapperLog(wrapperLogPath, `child pid=${child.pid}`);
   }
 
+  // The spawned `codex` is an npm launcher; the real TUI is ITS child, and
+  // the structured logs in ~/.codex/logs_*.sqlite are keyed by that native
+  // pid. Discover it shortly after spawn (retry: the launcher needs a moment
+  // to fork) so the exit block can freeze the right log tail (issue #102).
+  let nativeChildPid: number | null = null;
+  if (typeof child.pid === "number") {
+    const launcherPid = child.pid;
+    let attempts = 0;
+    const discover = () => {
+      attempts += 1;
+      nativeChildPid = discoverNativeChildPid(launcherPid, (cmd, args) =>
+        execFileSync(cmd, args, { encoding: "utf-8", timeout: 2000 }),
+      );
+      if (nativeChildPid !== null) {
+        appendWrapperLog(wrapperLogPath, `native child pid=${nativeChildPid} (launcher pid=${launcherPid})`);
+        return;
+      }
+      if (attempts < 5 && !childExited) {
+        const retry = setTimeout(discover, 500);
+        retry.unref();
+      }
+    };
+    const first = setTimeout(discover, 300);
+    first.unref();
+  }
+
   // Tee stderr: pass through to user's terminal, tail into ring buffer.
   if (child.stderr) {
     child.stderr.on("data", (chunk: Buffer) => {
@@ -536,15 +569,35 @@ export async function runCodex(args: string[]) {
     else if (/Error: .* failed:/.test(tail)) classification = "rpc_error_exit";
     else if (signal) classification = `signal:${signal}`;
     else if (typeof code === "number" && code !== 0) classification = `nonzero_exit:${code}`;
-    else if (code === 0 && tail.trim().length === 0) classification = "exit_0_empty_stderr";
+    else if (code === 0 && tail.trim().length === 0) {
+      // Refine the historically-opaque exit_0_empty_stderr via the daemon's
+      // turn state (status.json, refreshed on every turn transition). A clean
+      // exit DURING a turn is the alarming one — the user sees "Codex died"
+      // while the agent loop usually finishes app-server-side (issue #102).
+      classification = refineCleanExitClassification(readTurnInProgress(stateDir.statusFile));
+    }
+
+    // Freeze the native TUI's structured-log tail into the exit block — the
+    // sqlite db outlives the process, but correlating it manually cost a
+    // two-agent triage last time. Best-effort and bounded by design: worst
+    // case adds 2s (execFileSync timeout) to every exit path including
+    // Ctrl-C — accepted diagnostics cost, cannot hang.
+    const tuiLogTail = captureTuiLogTail({
+      codexHome: join(homedir(), ".codex"),
+      nativePid: nativeChildPid,
+      run: (cmd, args) => execFileSync(cmd, args, { encoding: "utf-8", timeout: 2000 }),
+    });
 
     appendWrapperLog(
       wrapperLogPath,
       [
-        `exit: code=${code ?? "null"} signal=${signal ?? "null"} runtime_ms=${runtimeMs} pid=${child.pid ?? "unknown"} classification=${classification}`,
+        `exit: code=${code ?? "null"} signal=${signal ?? "null"} runtime_ms=${runtimeMs} pid=${child.pid ?? "unknown"} native_pid=${nativeChildPid ?? "unknown"} classification=${classification}`,
         `--- last stderr (${stderrTail.byteLength} bytes) ---`,
         tailLines,
         `--- end stderr ---`,
+        `--- last tui log (native pid ${nativeChildPid ?? "unknown"}) ---`,
+        tuiLogTail,
+        `--- end tui log ---`,
       ].join("\n"),
     );
 

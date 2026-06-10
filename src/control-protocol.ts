@@ -27,6 +27,13 @@ export interface DaemonStatus {
   build?: AgentBridgeBuildInfo;
   /** Latest budget coordination snapshot; absent when budget sensing is unavailable/disabled. */
   budget?: BudgetSnapshot;
+  /**
+   * Whether a Codex turn is currently executing. Exposed on BOTH /healthz and
+   * status.json (kept in sync so the two payloads don't drift) so the TUI
+   * wrapper can classify a clean exit as exit_0_during_turn vs exit_0_idle at
+   * the moment the TUI dies (issue #102).
+   */
+  turnInProgress?: boolean;
 }
 
 export type ControlClientMessage =
