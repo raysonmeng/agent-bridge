@@ -1,4 +1,5 @@
 import { spawn, execSync } from "node:child_process";
+import { execFileSync } from "node:child_process";
 import {
   openSync,
   writeSync,
