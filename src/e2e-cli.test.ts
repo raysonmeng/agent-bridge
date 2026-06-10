@@ -738,6 +738,20 @@ describe("E2E: CLI surface", () => {
     });
   }, 20000);
 
+  test("agentbridge --help documents the prune dry-run-by-default / --apply contract", async () => {
+    // Regression guard: #9 inverted the prune contract (bare prune previews,
+    // --apply deletes). The help text must match — a destructive command whose
+    // safety story is "dry-run default" cannot have help that says bare prune
+    // deletes (the old, now-false wording) or omits --apply.
+    await withHarness(async (harness) => {
+      const result = await harness.runCli(["--help"]);
+      expect(result.code).toBe(0);
+      expect(result.stdout).toContain("prune [--apply]");
+      expect(result.stdout).toContain("--apply");
+      expect(result.stdout).not.toContain("delete those orphan state directories");
+    });
+  }, 20000);
+
   test("agentbridge kill rejects unknown flags without stopping a running daemon", async () => {
     await withHarness(async (harness) => {
       await harness.startManagedFakeDaemon();
@@ -908,8 +922,9 @@ describe("E2E: CLI surface", () => {
       try {
         const baseEnv = { AGENTBRIDGE_BASE_DIR: harness.baseDir };
 
-        // Dry run lists the orphans but deletes nothing.
-        const dry = await harness.runCliWithEnv(["pairs", "prune", "--dry-run"], baseEnv);
+        // Bare `prune` is now a DRY RUN (the safe default): it lists the orphans
+        // but deletes nothing. `--dry-run` stays accepted as an explicit alias.
+        const dry = await harness.runCliWithEnv(["pairs", "prune"], baseEnv);
         expect(dry.code).toBe(0);
         expect(dry.stdout).toContain("main-aaaa0001");
         expect(dry.stdout).toContain("main-bbbb0002");
@@ -917,8 +932,8 @@ describe("E2E: CLI surface", () => {
         expect(existsSync(orphanNoPid)).toBe(true);
         expect(existsSync(orphanDead)).toBe(true);
 
-        // Real prune deletes only the dead orphans.
-        const run = await harness.runCliWithEnv(["pairs", "prune"], baseEnv);
+        // --apply deletes only the dead orphans; live and registered are kept.
+        const run = await harness.runCliWithEnv(["pairs", "prune", "--apply"], baseEnv);
         expect(run.code).toBe(0);
         expect(existsSync(orphanNoPid)).toBe(false);
         expect(existsSync(orphanDead)).toBe(false);
@@ -929,6 +944,134 @@ describe("E2E: CLI surface", () => {
           liveChild.kill("SIGKILL");
         } catch {}
       }
+    });
+  }, 20000);
+
+  test("agentbridge pairs prune reclaims a stranded entry (cwd-gone + dead + old) only with --apply (P1 #9)", async () => {
+    await withHarness(async (harness) => {
+      const pairsRoot = join(harness.baseDir, "pairs");
+      mkdirSync(pairsRoot, { recursive: true });
+
+      // A stranded entry: its cwd does NOT exist, no daemon, created long ago.
+      // This mirrors the real double-hash-bug residue that permanently squats a slot.
+      const strandedId = "main-deadbeef";
+      const strandedDir = join(pairsRoot, strandedId);
+      mkdirSync(strandedDir, { recursive: true });
+      writeFileSync(join(strandedDir, "agentbridge.log"), "x", "utf-8");
+      const goneCwd = join(harness.rootDir, "vanished-project"); // never created on disk
+      const oldCreatedAt = new Date(Date.now() - 30 * 24 * 60 * 60 * 1000).toISOString();
+
+      // A valid current-cwd entry that must NEVER be reclaimed (cwd exists).
+      const liveId = derivePairId(harness.projectDir, "work");
+      const liveDir = join(pairsRoot, liveId);
+      mkdirSync(liveDir, { recursive: true });
+
+      writeFileSync(
+        join(pairsRoot, "registry.json"),
+        JSON.stringify(
+          {
+            version: 1,
+            pairs: [
+              { pairId: strandedId, slot: 1, cwd: goneCwd, name: "main", source: "cwd", createdAt: oldCreatedAt },
+              {
+                pairId: liveId,
+                slot: 2,
+                cwd: harness.projectDir,
+                name: "work",
+                source: "flag",
+                createdAt: new Date().toISOString(),
+              },
+            ],
+          },
+          null,
+          2,
+        ) + "\n",
+        "utf-8",
+      );
+
+      const baseEnv = { AGENTBRIDGE_BASE_DIR: harness.baseDir };
+
+      // Dry run (default): lists the stranded entry, deletes nothing.
+      const dry = await harness.runCliWithEnv(["pairs", "prune"], baseEnv);
+      expect(dry.code).toBe(0);
+      expect(dry.stdout).toContain("Would reclaim registry entries:");
+      expect(dry.stdout).toContain(strandedId);
+      expect(dry.stdout).toContain("cwd-gone, dead");
+      expect(dry.stdout).toContain("dry run");
+      // Nothing deleted yet.
+      expect(existsSync(strandedDir)).toBe(true);
+      // The valid entry is NOT listed for reclamation.
+      expect(dry.stdout).not.toContain(`Would reclaim registry entries:\n  ${liveId}`);
+
+      // --apply reclaims the stranded entry + dir; the valid entry stays.
+      const apply = await harness.runCliWithEnv(["pairs", "prune", "--apply"], baseEnv);
+      expect(apply.code).toBe(0);
+      expect(apply.stdout).toContain("Reclaimed registry entries:");
+      expect(apply.stdout).toContain(strandedId);
+      expect(existsSync(strandedDir)).toBe(false);
+      expect(existsSync(liveDir)).toBe(true);
+
+      // The registry now contains only the valid entry.
+      const reg = JSON.parse(readFileSync(join(pairsRoot, "registry.json"), "utf-8")) as {
+        pairs: Array<{ pairId: string }>;
+      };
+      expect(reg.pairs.map((p) => p.pairId)).toEqual([liveId]);
+    });
+  }, 20000);
+
+  test("agentbridge pairs prune combined: one orphan dir + one reclaimable entry, --apply cleans both (P1 #9)", async () => {
+    await withHarness(async (harness) => {
+      const pairsRoot = join(harness.baseDir, "pairs");
+      mkdirSync(pairsRoot, { recursive: true });
+
+      // (1) Orphan dir: a dir with NO registry entry, no daemon → dir-orphan prune.
+      const orphanDir = join(pairsRoot, "main-orph0001");
+      mkdirSync(orphanDir, { recursive: true });
+
+      // (2) Reclaimable entry: cwd-gone + dead + old → entry-level reclaim.
+      const strandedId = "main-strand02";
+      const strandedDir = join(pairsRoot, strandedId);
+      mkdirSync(strandedDir, { recursive: true });
+      const goneCwd = join(harness.rootDir, "no-such-dir");
+      const oldCreatedAt = new Date(Date.now() - 10 * 24 * 60 * 60 * 1000).toISOString();
+
+      writeFileSync(
+        join(pairsRoot, "registry.json"),
+        JSON.stringify(
+          {
+            version: 1,
+            pairs: [
+              { pairId: strandedId, slot: 3, cwd: goneCwd, name: "main", source: "cwd", createdAt: oldCreatedAt },
+            ],
+          },
+          null,
+          2,
+        ) + "\n",
+        "utf-8",
+      );
+
+      const baseEnv = { AGENTBRIDGE_BASE_DIR: harness.baseDir };
+
+      // Dry run reports BOTH kinds without deleting.
+      const dry = await harness.runCliWithEnv(["pairs", "prune"], baseEnv);
+      expect(dry.code).toBe(0);
+      expect(dry.stdout).toContain("Would remove orphan pair directories:");
+      expect(dry.stdout).toContain("main-orph0001");
+      expect(dry.stdout).toContain("Would reclaim registry entries:");
+      expect(dry.stdout).toContain(strandedId);
+      expect(existsSync(orphanDir)).toBe(true);
+      expect(existsSync(strandedDir)).toBe(true);
+
+      // --apply cleans BOTH.
+      const apply = await harness.runCliWithEnv(["pairs", "prune", "--apply"], baseEnv);
+      expect(apply.code).toBe(0);
+      expect(existsSync(orphanDir)).toBe(false);
+      expect(existsSync(strandedDir)).toBe(false);
+
+      const reg = JSON.parse(readFileSync(join(pairsRoot, "registry.json"), "utf-8")) as {
+        pairs: Array<{ pairId: string }>;
+      };
+      expect(reg.pairs).toHaveLength(0);
     });
   }, 20000);
 

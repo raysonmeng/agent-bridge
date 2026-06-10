@@ -13,10 +13,12 @@ import { createServer, type Server } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import {
+  classifyReclaimableEntries,
   DEFAULT_PAIR_NAME,
   derivePairId,
   derivePairIdFromCwd,
   detectLegacyRootDaemon,
+  isEntryReclaimable,
   listPairDirs,
   MAX_PAIR_SLOT,
   pairDirPath,
@@ -26,6 +28,7 @@ import {
   portsForSlot,
   probePortFree,
   readRegistry,
+  RECLAIMABLE_MIN_AGE_MS,
   removePairDir,
   removePairEntry,
   removePairEntryAndDir,
@@ -33,6 +36,7 @@ import {
   resolvePair,
   validatePairId,
   writeRegistry,
+  type EntryReclaimSignals,
   type PairEntry,
   type RegistryFile,
 } from "../pair-registry";
@@ -836,5 +840,178 @@ describe("removePairEntryAndDir / removeUnregisteredPairDir — locked atomic cl
 
     expect(await removeUnregisteredPairDir(base, live)).toEqual({ removed: false, reason: "live" });
     expect(existsSync(join(base, "pairs", live))).toBe(true);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Entry-level reclamation (P1 #9)
+// ---------------------------------------------------------------------------
+
+describe("isEntryReclaimable — pure reclaim predicate (P1 #9)", () => {
+  const signals = (over: Partial<EntryReclaimSignals> = {}): EntryReclaimSignals => ({
+    cwdGone: true,
+    dead: true,
+    old: true,
+    ageMs: RECLAIMABLE_MIN_AGE_MS,
+    ...over,
+  });
+
+  test("cwd-gone + dead + old → reclaimable", () => {
+    expect(isEntryReclaimable(signals())).toBe(true);
+  });
+
+  test("cwd still exists → NOT reclaimable", () => {
+    expect(isEntryReclaimable(signals({ cwdGone: false }))).toBe(false);
+  });
+
+  test("daemon alive (not dead) → NOT reclaimable", () => {
+    expect(isEntryReclaimable(signals({ dead: false }))).toBe(false);
+  });
+
+  test("too young (not old) → NOT reclaimable", () => {
+    expect(isEntryReclaimable(signals({ old: false }))).toBe(false);
+  });
+
+  test("only ALL three guards together reclaim — any single veto blocks it", () => {
+    // Exhaustively: any one false flag must veto.
+    expect(isEntryReclaimable(signals({ cwdGone: false, dead: true, old: true }))).toBe(false);
+    expect(isEntryReclaimable(signals({ cwdGone: true, dead: false, old: true }))).toBe(false);
+    expect(isEntryReclaimable(signals({ cwdGone: true, dead: true, old: false }))).toBe(false);
+  });
+});
+
+describe("classifyReclaimableEntries — signal gathering over the registry (P1 #9)", () => {
+  let base: string;
+  beforeEach(() => {
+    base = mkdtempSync(join(tmpdir(), "abg-pair-reclaim-"));
+  });
+  afterEach(() => {
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  // A createdAt comfortably older than the min age (used by the "old" cases).
+  const oldCreatedAt = new Date(Date.now() - 5 * RECLAIMABLE_MIN_AGE_MS).toISOString();
+  // Now used for deterministic age math in the assertions below.
+  const fixedNow = Date.now();
+
+  function entryWith(over: Partial<PairEntry>): PairEntry {
+    return {
+      pairId: over.pairId ?? "main-aaaa0001",
+      slot: over.slot ?? 1,
+      cwd: over.cwd ?? join(base, "gone-project"),
+      name: over.name ?? "main",
+      source: over.source ?? "cwd",
+      createdAt: over.createdAt ?? oldCreatedAt,
+    };
+  }
+
+  test("cwd-gone + dead + old entry is classified reclaimable", () => {
+    const e = entryWith({ pairId: "main-deadbeef", cwd: join(base, "vanished") });
+    writeRegistry(base, { version: 1, pairs: [e] });
+
+    const out = classifyReclaimableEntries(base, fixedNow);
+    expect(out).toHaveLength(1);
+    expect(out[0]!.entry.pairId).toBe("main-deadbeef");
+    expect(out[0]!.signals).toMatchObject({ cwdGone: true, dead: true, old: true });
+  });
+
+  test("entry whose cwd still EXISTS is not reclaimable", () => {
+    const livingCwd = join(base, "still-here");
+    mkdirSync(livingCwd, { recursive: true });
+    writeRegistry(base, { version: 1, pairs: [entryWith({ pairId: "main-exist001", cwd: livingCwd })] });
+
+    expect(classifyReclaimableEntries(base, fixedNow)).toHaveLength(0);
+  });
+
+  test("entry with a LIVE daemon is not reclaimable even if cwd is gone", () => {
+    const id = "main-alive001";
+    mkdirSync(join(base, "pairs", id), { recursive: true });
+    // process.pid is alive → pairDirDaemonAlive=true → dead=false → vetoed.
+    writeFileSync(join(base, "pairs", id, "daemon.pid"), `${process.pid}\n`, "utf-8");
+    writeRegistry(base, { version: 1, pairs: [entryWith({ pairId: id, cwd: join(base, "vanished") })] });
+
+    expect(classifyReclaimableEntries(base, fixedNow)).toHaveLength(0);
+  });
+
+  test("entry younger than RECLAIMABLE_MIN_AGE_MS is not reclaimable", () => {
+    // Created 1 hour ago → well under the 1-day floor.
+    const fresh = new Date(fixedNow - 60 * 60 * 1000).toISOString();
+    writeRegistry(base, {
+      version: 1,
+      pairs: [entryWith({ pairId: "main-fresh001", cwd: join(base, "vanished"), createdAt: fresh })],
+    });
+
+    expect(classifyReclaimableEntries(base, fixedNow)).toHaveLength(0);
+  });
+
+  test("age boundary: exactly RECLAIMABLE_MIN_AGE_MS old is reclaimable; one ms younger is not", () => {
+    const atFloor = new Date(fixedNow - RECLAIMABLE_MIN_AGE_MS).toISOString();
+    writeRegistry(base, {
+      version: 1,
+      pairs: [entryWith({ pairId: "main-floor001", cwd: join(base, "vanished"), createdAt: atFloor })],
+    });
+    expect(classifyReclaimableEntries(base, fixedNow)).toHaveLength(1);
+
+    // Re-evaluate the SAME entry against a `now` one ms earlier than the floor.
+    const justUnderNow = fixedNow - 1;
+    expect(classifyReclaimableEntries(base, justUnderNow)).toHaveLength(0);
+  });
+
+  test("malformed/unparseable createdAt is treated as NOT old (never reaped on age)", () => {
+    writeRegistry(base, {
+      version: 1,
+      pairs: [entryWith({ pairId: "main-badtime1", cwd: join(base, "vanished"), createdAt: "not-a-date" })],
+    });
+    const out = classifyReclaimableEntries(base, fixedNow);
+    expect(out).toHaveLength(0);
+  });
+
+  test("classifies a mix: only the cwd-gone + dead + old entry is selected", () => {
+    const goneId = "main-gone0001";
+    const liveCwd = join(base, "live-cwd");
+    mkdirSync(liveCwd, { recursive: true });
+    writeRegistry(base, {
+      version: 1,
+      pairs: [
+        entryWith({ pairId: goneId, slot: 1, cwd: join(base, "vanished") }), // reclaimable
+        entryWith({ pairId: "main-keepcwd1", slot: 2, cwd: liveCwd }), // cwd exists → kept
+        entryWith({ pairId: "main-young001", slot: 3, cwd: join(base, "vanished"), createdAt: new Date(fixedNow).toISOString() }), // too young → kept
+      ],
+    });
+
+    const out = classifyReclaimableEntries(base, fixedNow);
+    expect(out.map((c) => c.entry.pairId)).toEqual([goneId]);
+  });
+});
+
+describe("pruneReclaimableEntries via removePairEntryAndDir — apply deletes entry + dir (P1 #9)", () => {
+  let base: string;
+  beforeEach(() => {
+    base = mkdtempSync(join(tmpdir(), "abg-pair-reclaim-apply-"));
+  });
+  afterEach(() => {
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  test("removePairEntryAndDir on a reclaimable entry removes BOTH the entry and its dir", async () => {
+    const id = "main-strand01";
+    const oldCreatedAt = new Date(Date.now() - 5 * RECLAIMABLE_MIN_AGE_MS).toISOString();
+    const dir = join(base, "pairs", id);
+    mkdirSync(dir, { recursive: true });
+    writeFileSync(join(dir, "agentbridge.log"), "x", "utf-8");
+    writeRegistry(base, {
+      version: 1,
+      pairs: [{ pairId: id, slot: 1, cwd: join(base, "vanished"), name: "main", source: "cwd", createdAt: oldCreatedAt }],
+    });
+
+    // Sanity: classify flags it as reclaimable.
+    expect(classifyReclaimableEntries(base).map((c) => c.entry.pairId)).toEqual([id]);
+
+    const res = await removePairEntryAndDir(base, id);
+    expect(res.keptLive).toBe(false);
+    expect(res.dirRemoved).toBe(true);
+    expect(res.entry?.pairId).toBe(id);
+    expect(existsSync(dir)).toBe(false);
+    expect(readRegistry(base).pairs.some((p) => p.pairId === id)).toBe(false);
   });
 });

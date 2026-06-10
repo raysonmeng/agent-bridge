@@ -26,7 +26,6 @@ describe("StateDirResolver", () => {
     expect(resolver.tuiPidFile).toBe(join(tempDir, "codex-tui.pid"));
     expect(resolver.lockFile).toBe(join(tempDir, "daemon.lock"));
     expect(resolver.statusFile).toBe(join(tempDir, "status.json"));
-    expect(resolver.portsFile).toBe(join(tempDir, "ports.json"));
     expect(resolver.logFile).toBe(join(tempDir, "agentbridge.log"));
     expect(resolver.updateCheckFile).toBe(join(tempDir, "update-check.json"));
   });

@@ -44,6 +44,17 @@ export const PAIR_ID_REGEX = /^[A-Za-z0-9._-]{1,64}$/;
 /** Friendly pair name used when no `--pair <name>` is given. Scoped to the cwd. */
 export const DEFAULT_PAIR_NAME = "main";
 
+/**
+ * Minimum age a registry entry must reach before `abg pairs prune` will consider
+ * it for entry-level reclamation (cwd-gone + dead daemon). This guards against a
+ * just-created pair whose cwd is briefly unavailable (e.g. an unmounted volume, a
+ * transient rename) being reaped before the user has even used it — see
+ * {@link isEntryReclaimable}. One day is deliberately conservative: reclaiming a
+ * permanently-stranded entry a day late is harmless, reaping a live workflow's
+ * entry is not.
+ */
+export const RECLAIMABLE_MIN_AGE_MS = 24 * 60 * 60 * 1000;
+
 const LOCK_FILE_NAME = ".registry.lock";
 const REGISTRY_FILE_NAME = "registry.json";
 const LOCK_DEADLINE_MS = 10_000;
@@ -1000,4 +1011,94 @@ export async function removeUnregisteredPairDir(
     }
     return { removed: removePairDir(base, pairId) };
   });
+}
+
+// ---------------------------------------------------------------------------
+// Entry-level reclamation (P1 #9)
+//
+// The dir-orphan prune above reclaims "dir exists but NO registry entry". The
+// reverse leak — "entry exists but is permanently invalid" — is reclaimed here.
+// The canonical example is a stranded entry left by the old double-hash bug: the
+// code was fixed (resolvePair's three-tier match) but the DATA residue persists,
+// permanently occupying a slot/port range that pickLowestFreeSlot still reads.
+// ---------------------------------------------------------------------------
+
+/** Why an entry is (or is not) reclaimable. Display-only; surfaced in the dry run. */
+export interface EntryReclaimSignals {
+  /** The entry's cwd no longer exists on disk (statSync ENOENT). */
+  cwdGone: boolean;
+  /** No live daemon is associated with the entry's pair dir (pairDirDaemonAlive=false). */
+  dead: boolean;
+  /** createdAt is older than {@link RECLAIMABLE_MIN_AGE_MS} relative to `now`. */
+  old: boolean;
+  /** Age of the entry in ms (now - createdAt), clamped to ≥0; null when createdAt is unparseable. */
+  ageMs: number | null;
+}
+
+export interface ReclaimableEntry {
+  entry: PairEntry;
+  signals: EntryReclaimSignals;
+}
+
+/**
+ * Pure reclaim predicate. An entry is RECLAIMABLE only when ALL three guards
+ * hold: its cwd is gone, no live daemon owns it, and it is older than the
+ * minimum age. Any one of "cwd exists" / "daemon alive" / "too young" vetoes
+ * reclamation — the safety rails are conjunctive on purpose.
+ *
+ * Kept signal-only (no fs/clock access) so it is trivially unit-testable; the
+ * caller gathers the live signals via {@link classifyReclaimableEntries}.
+ */
+export function isEntryReclaimable(signals: EntryReclaimSignals): boolean {
+  return signals.cwdGone && signals.dead && signals.old;
+}
+
+/**
+ * Whether an entry's cwd no longer exists. Returns true ONLY on ENOENT (the path
+ * is genuinely gone). Any other stat error (EACCES, EPERM, a transient I/O error)
+ * is treated as "present/unknown" so we never reap an entry whose cwd we merely
+ * cannot inspect — failing closed protects a live workflow.
+ */
+function cwdMissing(cwd: string): boolean {
+  try {
+    statSync(cwd);
+    return false;
+  } catch (err: any) {
+    return err?.code === "ENOENT";
+  }
+}
+
+/** Parse an ISO createdAt into epoch ms; null when missing/unparseable (treated as NOT old). */
+function parseCreatedAtMs(createdAt: string | undefined): number | null {
+  if (typeof createdAt !== "string") return null;
+  const ms = Date.parse(createdAt);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * Gather reclaim signals for every registry entry (read-only — no lock, no
+ * deletes). Used by `abg pairs prune` to BOTH build the dry-run preview and pick
+ * which entries to hand to {@link removePairEntryAndDir} under `--apply`.
+ *
+ * Reads the registry once; per entry it stats the cwd and probes liveness with
+ * the SAME `pairDirDaemonAlive` the in-lock delete gate uses, so the preview
+ * matches the eventual action. `now` is injectable for deterministic tests.
+ */
+export function classifyReclaimableEntries(base: string, now: number = Date.now()): ReclaimableEntry[] {
+  const reg = readRegistry(base);
+  const out: ReclaimableEntry[] = [];
+  for (const entry of reg.pairs) {
+    const createdMs = parseCreatedAtMs(entry.createdAt);
+    const ageMs = createdMs === null ? null : Math.max(0, now - createdMs);
+    const signals: EntryReclaimSignals = {
+      cwdGone: cwdMissing(entry.cwd),
+      dead: !pairDirDaemonAlive(base, entry.pairId),
+      // A null/unparseable createdAt is treated as NOT old, so a malformed entry
+      // is never reaped on age grounds — it stays visible for manual `pairs rm`.
+      old: ageMs !== null && ageMs >= RECLAIMABLE_MIN_AGE_MS,
+      ageMs,
+    };
+    if (isEntryReclaimable(signals)) out.push({ entry, signals });
+  }
+  return out;
 }

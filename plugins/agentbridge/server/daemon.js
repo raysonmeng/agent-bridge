@@ -18,7 +18,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("c817916", "source"),
+  commit: defineString("9195031", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -83,9 +83,6 @@ class StateDirResolver {
   }
   get statusFile() {
     return join(this.stateDir, "status.json");
-  }
-  get portsFile() {
-    return join(this.stateDir, "ports.json");
   }
   get currentThreadFile() {
     return join(this.stateDir, "current-thread.json");
@@ -4480,6 +4477,7 @@ function formatWaitingForCodexTuiMessage(options) {
 // src/pair-registry.ts
 var PAIR_BASE_PORT = 4500;
 var PAIR_SLOT_STRIDE = 10;
+var RECLAIMABLE_MIN_AGE_MS = 24 * 60 * 60 * 1000;
 var MAX_PAIR_SLOT = Math.floor((65535 - 2 - PAIR_BASE_PORT) / PAIR_SLOT_STRIDE);
 
 // src/liveness-probe.ts

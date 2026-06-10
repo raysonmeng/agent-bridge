@@ -158,7 +158,7 @@ After modifying AgentBridge source code, re-run `agentbridge dev` to sync change
 | `abg claude [args...]` | Start Claude Code with push channel enabled. **Runs with `--dangerously-skip-permissions` by default** (opt out: `--safe` or `AGENTBRIDGE_SAFE=1`). Clears any killed sentinel from a previous `kill`. Pass-through args are forwarded to `claude` |
 | `abg codex [args...]` | Start Codex TUI connected to AgentBridge daemon. **Bare `abg codex` auto-resumes the pair's last thread; use `abg codex --new` for a fresh thread. TUI launches run with `--yolo` by default** (opt out: `--safe` or `AGENTBRIDGE_SAFE=1`; non-TUI subcommands like `exec` are never touched). Manages TUI process lifecycle (pid tracking, cleanup). Pass-through args forwarded to `codex` |
 | `abg resume [claude\|codex]` | No target: print the resume commands for this directory's last Claude Code session and this pair's current Codex thread. With a target: resume that side directly (delegates to `abg claude --resume <id>` / `abg codex resume-current`) |
-| `abg pairs` | List registered pairs; `abg pairs rm <name\|id>` removes one, `abg pairs prune` deletes orphan state dirs |
+| `abg pairs` | List registered pairs; `abg pairs rm <name\|id>` removes one; `abg pairs prune` previews reclaimable orphan dirs + stranded registry entries (cwd-gone, dead, >1 day), `abg pairs prune --apply` deletes them |
 | `abg doctor [--json]` | Read-only diagnosis: env, daemon health/readiness, build drift, artifact alignment, TUI attachment, logs |
 | `abg budget [--json]` | Both agents' subscription quota snapshot (5h/weekly windows, drift, pause state) |
 | `abg kill` | Gracefully stop this pair's daemon and managed Codex TUI, write killed sentinel; `abg kill --all` stops every pair |

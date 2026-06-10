@@ -150,8 +150,9 @@ Commands:
                      No target: print resume commands for this directory's last
                      Claude session + this pair's current Codex thread.
                      With target: resume that side directly.
-  pairs [rm <name|id> | prune [--dry-run]]
-                     List pairs; remove one (rm), or delete orphan state dirs (prune)
+  pairs [rm <name|id> | prune [--apply]]
+                     List pairs; remove one (rm), or reclaim orphan dirs + stranded
+                     entries (prune previews by default; --apply to delete)
   doctor [--json]    Diagnose env, daemon, build drift, logs, and current thread
   doctor resume-pollution [--apply]  Find/fix old AgentBridge kickoff metadata
   budget [--json]    Show both agents' subscription quota snapshot (5h/weekly, drift, pause state)
@@ -202,8 +203,8 @@ Examples:
   abg --pair work logs         # Tail the "work" pair's daemon log
   abg pairs rm work            # Stop this directory's "work" pair and free its slot
   abg pairs rm work-1a2b3c4d   # ...or by its full id (from that pair's directory)
-  abg pairs prune --dry-run    # Preview orphan pair dirs (no registry entry, not live)
-  abg pairs prune              # ...delete those orphan state directories
+  abg pairs prune              # Preview reclaimable: orphan dirs + stranded entries (cwd-gone, dead, >1d)
+  abg pairs prune --apply      # ...actually delete the previewed dirs + entries
   abg --pair work kill         # Stop only this directory's "work" pair
   abg kill                     # Stop this directory's pairs (+ any legacy-root daemon)
   abg kill all                 # Stop every pair in every directory (+ legacy-root)
