@@ -25,10 +25,11 @@ function readSnapshot(path) {
   return existsSync(path) ? readFileSync(path) : null;
 }
 
-function run(command, args) {
+function run(command, args, options = {}) {
   const result = spawnSync(command, args, {
     cwd: repoRoot,
     stdio: "inherit",
+    ...options,
   });
 
   if (result.error) {
@@ -41,12 +42,27 @@ function run(command, args) {
   }
 }
 
+function extractBuildCommit(snapshot) {
+  if (!snapshot) return null;
+
+  const match = snapshot
+    .toString("utf-8")
+    .match(/commit:\s*defineString\("([^"]+)",\s*"source"\)/);
+
+  return match ? match[1] : null;
+}
+
 const tempDir = mkdtempSync(join(tmpdir(), "agentbridge-plugin-sync-"));
 
 try {
   for (const bundle of pluginBundles) {
+    const current = readSnapshot(bundle.output);
+    const buildCommit = extractBuildCommit(current);
+    const env = buildCommit
+      ? { ...process.env, AGENTBRIDGE_BUILD_COMMIT_OVERRIDE: buildCommit }
+      : process.env;
     const tempOutput = join(tempDir, bundle.outfileName);
-    run("node", ["scripts/build-bundles.mjs", bundle.target, "--outfile", tempOutput]);
+    run("node", ["scripts/build-bundles.mjs", bundle.target, "--outfile", tempOutput], { env });
     bundle.generated = tempOutput;
   }
 

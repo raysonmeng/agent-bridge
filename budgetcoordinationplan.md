@@ -1,6 +1,6 @@
 # AgentBridge × AgentQuotaGuard 集成：预算感知的双 Agent 协调层（v2.4）
 
-> **版本说明**：v1 = 远端 ultraplan 产出。v2 = 三方汇总版。v2.1/v2.2 = 交叉 review 两轮修订（0 REAL 终版，进入实施）。v2.3 = P0 实施期实证修订（探针 per-agent 回退链）。**v2.4 = P0-P4 落地后的用户需求演进：R4 暂停语义按触发侧分级（接力模式）**——见「R4 分侧语义（v2.4）」节；其余照旧。
+> **版本说明**：v1 = 远端 ultraplan 产出。v2 = 三方汇总版。v2.1/v2.2 = 交叉 review 两轮修订（0 REAL 终版，进入实施）。v2.3 = P0 实施期实证修订（探针 per-agent 回退链）。**v2.4 = R4 暂停语义按触发侧分级（接力模式）**。v2.5 = 配置型 pull 模式删除。**v2.6 = 真机实证修订：探针限流（rate_limited_until）从「进入条件」降级为「仅阻断解除」**——真机运行 35 分钟即出现误触发（自家 60s 轮询 + 双侧 guard hooks 同打 usage 端点造成 429，与额度耗尽无因果；用量仅 26%/28% 时误发 handoff）。**v2.6 补充（信息量门槛）**：usage API 会随机返回瞬时空响应（ok:true、util 0、无任何窗口——真机 45 分钟两次），归一化在窗口识别后增加门槛：5h 与周窗口都识别不出且无有效限流 → 返回 null（探针失联语义，维持现状），不再信任假 0%。
 >
 > **Round-1 修订摘要**：① R4 进入/解除统一用 `gateUtil`（resettable hard winner）② probe 双形状归一化（bash `hard_util` / node 无此字段）③ capability probe 措辞降级（turn/started 不含 model）④ probe 解析序收紧 ⑤ 新增 `pauseAt=90`（先于 per-agent 硬线 92）⑥ **取消 park 转达**（消除闸门时序洞 + 省一轮 Codex 额度）⑦ R4 自动唤醒声明依赖 push 模式 ⑧ `rate_limited_until > now` ⑨ start() 立即首轮 poll ⑩ balance/parallel 并发合并文案 ⑪ `budget` 进 PAIR_AWARE_COMMANDS ⑫ 无 attached Claude 的 paused 可见性验收 ⑬ 重启重推导（容忍单次重复 STOP）。
 
@@ -65,13 +65,13 @@ flowchart TD
 
 **核心修正**：`claude_to_codex` 闸门烧的是**目标侧（Codex）**的额度（每条消息起一个 Codex turn）——闸门只应保护 Codex；Claude 自身由它的 quota-guard 92 硬线保护，bridge 拦 Claude 的委派反而阻止了「把活转移到有额度一侧」的最优策略。原「任一侧触发双停」忠实于用户最初表述，但用户在 P0-P4 落地后明确改为接力语义。
 
-| 触发侧（gateUtil ≥ pauseAt 或 rate-limited） | 闸门 gateClosed | 指令 | 解除条件 |
+| 触发侧（gateUtil ≥ pauseAt；~~或 rate-limited~~ v2.6 删除） | 闸门 gateClosed | 指令 | 解除条件 |
 |---|---|---|---|
 | **仅 Codex** | **true** | Claude：写 checkpoint，**可 solo 推进可独立部分**（不再委派），标注分工断点 | Codex 侧 `gateUtil < resumeBelow` 且无限流 → RESUME、闸门开 |
 | **仅 Claude** | **false（不关！）** | Claude：**立即交接**——把剩余任务清单/上下文/产出位置/验收标准打包成一条 reply 发给 Codex（接力棒），随后停手（自身 guard 92 将拦截）；交接文案要求 Codex 单 turn 尽量完成、尾巴写 checkpoint、暂停期不要期待 Claude 回复 | Claude 侧恢复（< resumeBelow）→ 发「Claude 已恢复」通知，Claude 自然回归 orchestrator |
 | **双侧** | **true** | 联合暂停（v2.2 原行为）：双方 checkpoint、等待刷新 | **双方** < resumeBelow 且无限流 → RESUME |
 
-- **状态机（v2.4.1 · Codex 共识修正 REAL-2）**：coordinator 维护 `activeSides ⊆ {claude, codex}` 显式集合——每轮把 `gateUtil ≥ pauseAt 或 rate_limited_until > now` 的侧加入；已 active 的侧仅在 `usage 非 null 且 gateUtil < resumeBelow 且限流过期` 时移除（探针 null 保持 active，延续 P1 保守语义）。状态映射：`{claude}`=handoff（gate 开）/ `{codex}`=Codex 暂停（gate 关）/ `{claude,codex}`=联合暂停（gate 关）/ `∅`=normal。升降级路径显式定义：both→codex（Claude 恢复：仍关 gate，发 Codex-only 暂停+Claude 可 solo 指令）、both→claude（Codex 恢复：开 gate，发 handoff 指令）、codex→∅（RESUME）、claude→∅（Claude 已恢复通知）、claude→both（升级双停关 gate）。
+- **状态机（v2.4.1 · Codex 共识修正 REAL-2；v2.6 修订进入条件）**：coordinator 维护 `activeSides ⊆ {claude, codex}` 显式集合——每轮把 `gateUtil ≥ pauseAt` 的侧加入（**v2.6：`rate_limited_until > now` 不再触发进入**——探针限流=数据不可用，语义同探针失联：保守维持现状；真机实证见版本说明）；已 active 的侧仅在 `usage 非 null 且 gateUtil < resumeBelow 且限流过期` 时移除（探针 null / 限流中保持 active，延续 P1 保守语义——限流期内无法实测确认恢复，阻断解除是正确的保守）。状态映射：`{claude}`=handoff（gate 开）/ `{codex}`=Codex 暂停（gate 关）/ `{claude,codex}`=联合暂停（gate 关）/ `∅`=normal。升降级路径显式定义：both→codex（Claude 恢复：仍关 gate，发 Codex-only 暂停+Claude 可 solo 指令）、both→claude（Codex 恢复：开 gate，发 handoff 指令）、codex→∅（RESUME）、claude→∅（Claude 已恢复通知）、claude→both（升级双停关 gate）。
 - **快照语义（v2.4.1 · REAL-1）**：`BudgetSnapshot.paused` 保留原义（R4 干预激活中，兼容旧消费者）；**新增** `gateClosed: boolean`（daemon 闸门唯一依据）+ `pauseSide: "claude"|"codex"|"both"|null`；daemon 由 `isPaused()` 改用 `isGateClosed()`；渲染按 pauseSide+gateClosed 展示「Claude 接力中 / Codex 暂停 / 双侧暂停」。
 - **事件 id（v2.4.1 · RECOMMEND）**：接力用独立 `system_budget_handoff_*` 与「Claude 已恢复」通知 id，不复用联合暂停文案，防 Claude 误判 reply 会被拒。
 - **【v2.4.1 补充 · 用户需求】互知与实时性**：①协议文本明确双方互查能力——Claude 用 `get_budget`（本就含双方）、Codex 用其 quota-guard MCP `check_budget(agent=claude|codex)`，鼓励决策前互查、主动协商分配，总目标=「任务尽量不停 + 充分用满订阅额度」；②**实时查询硬规则**：周额度可能未用完即提前刷新（且会连带重置 5h 与周窗口），额度数字一律以最新探测为准——协议文本明令「每次分配决策前重新查询，禁止依赖对话记忆里的旧数字」（coordinator 本身每轮实测重算，架构天然满足）；③「预计恢复不早于」措辞改为「预计恢复时间（以实测为准；提前刷新会更早解除）」。

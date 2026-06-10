@@ -30,9 +30,8 @@ function usageSummary(name: AgentName, usage: AgentUsage | null): string {
   return `${AGENT_LABEL[name]} gate=${pct(usage.gateUtil)} warn=${pct(usage.warnUtil)} 5h重置=${formatEpoch(usage.fiveHour?.resetEpoch ?? 0)}`;
 }
 
-function matchingGateReset(usage: AgentUsage | null, now: number): number {
+function matchingGateReset(usage: AgentUsage | null): number {
   if (!usage) return 0;
-  if (usage.rateLimitedUntil > now) return usage.rateLimitedUntil;
 
   const windows = [usage.fiveHour, usage.weekly].filter((window): window is NonNullable<typeof window> =>
     !!window && window.resetEpoch > 0
@@ -46,7 +45,7 @@ function matchingGateReset(usage: AgentUsage | null, now: number): number {
 function resumeBlockingEpoch(usage: AgentUsage | null, cfg: BudgetConfig, now: number): number {
   if (!usage) return 0;
   if (usage.rateLimitedUntil > now) return usage.rateLimitedUntil;
-  if (usage.gateUtil >= cfg.resumeBelow) return matchingGateReset(usage, now);
+  if (usage.gateUtil >= cfg.resumeBelow) return matchingGateReset(usage);
   return 0;
 }
 
@@ -64,14 +63,8 @@ function resumeAfterEpoch(
   return Math.max(...epochs);
 }
 
-function pauseTrigger(agent: AgentName, usage: AgentUsage | null, cfg: BudgetConfig, now: number): PauseTrigger | null {
+function pauseTrigger(agent: AgentName, usage: AgentUsage | null, cfg: BudgetConfig): PauseTrigger | null {
   if (!usage) return null;
-  if (usage.rateLimitedUntil > now) {
-    return {
-      agent,
-      reason: `${AGENT_LABEL[agent]} 探针被限流至 ${formatEpoch(usage.rateLimitedUntil)}`,
-    };
-  }
   if (usage.gateUtil >= cfg.pauseAt) {
     return {
       agent,
@@ -211,15 +204,15 @@ export function computeBudgetState(
   now: number,
 ): BudgetState {
   const triggers = [
-    pauseTrigger("claude", claude, cfg, now),
-    pauseTrigger("codex", codex, cfg, now),
+    pauseTrigger("claude", claude, cfg),
+    pauseTrigger("codex", codex, cfg),
   ].filter((trigger): trigger is PauseTrigger => trigger !== null);
   const paused = triggers.length > 0;
   const drift = driftFor(claude, codex, cfg);
   const parallel = paused ? { recommended: false, reason: null } : parallelState(claude, codex, cfg, now);
   const resetEpochs = {
-    claude: matchingGateReset(claude, now),
-    codex: matchingGateReset(codex, now),
+    claude: matchingGateReset(claude),
+    codex: matchingGateReset(codex),
   };
   const filteredResumeAfterEpoch = paused ? resumeAfterEpoch(claude, codex, cfg, now) : null;
 

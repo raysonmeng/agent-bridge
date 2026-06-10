@@ -36,9 +36,8 @@ function usageLine(agent: AgentName, usage: AgentUsage | null): string {
   return `${AGENT_LABEL[agent]} gate=${pct(usage.gateUtil)} warn=${pct(usage.warnUtil)}`;
 }
 
-function matchingGateReset(usage: AgentUsage | null, now: number): number {
+function matchingGateReset(usage: AgentUsage | null): number {
   if (!usage) return 0;
-  if (usage.rateLimitedUntil > now) return usage.rateLimitedUntil;
 
   const windows = [usage.fiveHour, usage.weekly].filter((window): window is NonNullable<typeof window> =>
     !!window && window.resetEpoch > 0
@@ -167,7 +166,7 @@ export class BudgetCoordinator {
       this.pauseResumeAfterEpoch = previousSide === currentSide
         ? nextResumeAfterEpoch ?? this.pauseResumeAfterEpoch
         : nextResumeAfterEpoch;
-      const fingerprint = previousSide === currentSide && this.activeSideUsageMissing(state) && this.lastDirectiveFingerprint
+      const fingerprint = previousSide === currentSide && this.activeSideProbeUncertain(state) && this.lastDirectiveFingerprint
         ? this.lastDirectiveFingerprint
         : this.directiveFingerprint(state, currentSide);
       if (!previousSide) {
@@ -218,7 +217,6 @@ export class BudgetCoordinator {
 
   private shouldEnter(usage: AgentUsage | null, now: number): boolean {
     if (!usage) return false;
-    if (usage.rateLimitedUntil > now) return true;
     return usage.gateUtil >= this.config.pauseAt;
   }
 
@@ -240,7 +238,7 @@ export class BudgetCoordinator {
   private resumeBlockingEpoch(usage: AgentUsage | null, now: number): number {
     if (!usage) return 0;
     if (usage.rateLimitedUntil > now) return usage.rateLimitedUntil;
-    if (usage.gateUtil >= this.config.resumeBelow) return matchingGateReset(usage, now);
+    if (usage.gateUtil >= this.config.resumeBelow) return matchingGateReset(usage);
     return 0;
   }
 
@@ -348,10 +346,12 @@ export class BudgetCoordinator {
       .join("；");
   }
 
-  private activeSideUsageMissing(state: BudgetState): boolean {
-    return (["claude", "codex"] as const).some((agent) =>
-      this.activeSides.has(agent) && state.perAgent[agent] === null
-    );
+  private activeSideProbeUncertain(state: BudgetState): boolean {
+    return (["claude", "codex"] as const).some((agent) => {
+      if (!this.activeSides.has(agent)) return false;
+      const usage = state.perAgent[agent];
+      return usage === null || usage.rateLimitedUntil > state.now;
+    });
   }
 
   private activeSideReason(agent: AgentName, usage: AgentUsage | null, now: number): string {

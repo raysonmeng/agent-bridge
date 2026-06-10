@@ -25,6 +25,11 @@ Targets: ${Object.keys(TARGETS).join(", ")}
 }
 
 function gitCommit() {
+  const override = process.env.AGENTBRIDGE_BUILD_COMMIT_OVERRIDE;
+  if (typeof override === "string" && override.trim().length > 0) {
+    return override.trim();
+  }
+
   try {
     return execFileSync("git", ["rev-parse", "--short", "HEAD"], {
       cwd: repoRoot,

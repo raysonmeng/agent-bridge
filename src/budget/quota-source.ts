@@ -212,6 +212,9 @@ export function normalizeProbeResult(raw: unknown): AgentUsage | null {
   if (!ok && rateLimitedUntil <= 0 && buckets.length === 0) return null;
 
   const { fiveHour, weekly } = identifyWindows(buckets);
+  // A successful response with no resettable windows is not actionable budget
+  // data. Treat it like a transient probe miss instead of trusting fake 0% util.
+  if (!fiveHour && !weekly && rateLimitedUntil === 0) return null;
 
   return {
     ok,

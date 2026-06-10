@@ -15,7 +15,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.6", "0.0.0-source"),
-  commit: defineString("6b1e948", "source"),
+  commit: defineString("71ff4f3", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, 1)
 });
@@ -2652,11 +2652,9 @@ function usageSummary(name, usage) {
     return `${AGENT_LABEL[name]} \u672A\u77E5`;
   return `${AGENT_LABEL[name]} gate=${pct(usage.gateUtil)} warn=${pct(usage.warnUtil)} 5h\u91CD\u7F6E=${formatEpoch(usage.fiveHour?.resetEpoch ?? 0)}`;
 }
-function matchingGateReset(usage, now) {
+function matchingGateReset(usage) {
   if (!usage)
     return 0;
-  if (usage.rateLimitedUntil > now)
-    return usage.rateLimitedUntil;
   const windows = [usage.fiveHour, usage.weekly].filter((window) => !!window && window.resetEpoch > 0);
   const matching = windows.filter((window) => Math.abs(window.util - usage.gateUtil) < 0.0001);
   const candidates = matching.length > 0 ? matching : windows;
@@ -2670,7 +2668,7 @@ function resumeBlockingEpoch(usage, cfg, now) {
   if (usage.rateLimitedUntil > now)
     return usage.rateLimitedUntil;
   if (usage.gateUtil >= cfg.resumeBelow)
-    return matchingGateReset(usage, now);
+    return matchingGateReset(usage);
   return 0;
 }
 function resumeAfterEpoch(claude, codex, cfg, now) {
@@ -2682,15 +2680,9 @@ function resumeAfterEpoch(claude, codex, cfg, now) {
     return null;
   return Math.max(...epochs);
 }
-function pauseTrigger(agent, usage, cfg, now) {
+function pauseTrigger(agent, usage, cfg) {
   if (!usage)
     return null;
-  if (usage.rateLimitedUntil > now) {
-    return {
-      agent,
-      reason: `${AGENT_LABEL[agent]} \u63A2\u9488\u88AB\u9650\u6D41\u81F3 ${formatEpoch(usage.rateLimitedUntil)}`
-    };
-  }
   if (usage.gateUtil >= cfg.pauseAt) {
     return {
       agent,
@@ -2801,15 +2793,15 @@ function claudeAdviceFor(claude) {
 }
 function computeBudgetState(claude, codex, cfg, now) {
   const triggers = [
-    pauseTrigger("claude", claude, cfg, now),
-    pauseTrigger("codex", codex, cfg, now)
+    pauseTrigger("claude", claude, cfg),
+    pauseTrigger("codex", codex, cfg)
   ].filter((trigger) => trigger !== null);
   const paused = triggers.length > 0;
   const drift = driftFor(claude, codex, cfg);
   const parallel = paused ? { recommended: false, reason: null } : parallelState(claude, codex, cfg, now);
   const resetEpochs = {
-    claude: matchingGateReset(claude, now),
-    codex: matchingGateReset(codex, now)
+    claude: matchingGateReset(claude),
+    codex: matchingGateReset(codex)
   };
   const filteredResumeAfterEpoch = paused ? resumeAfterEpoch(claude, codex, cfg, now) : null;
   let phase = "normal";
@@ -2860,11 +2852,9 @@ function usageLine(agent, usage) {
     return `${AGENT_LABEL2[agent]} \u672A\u77E5`;
   return `${AGENT_LABEL2[agent]} gate=${pct2(usage.gateUtil)} warn=${pct2(usage.warnUtil)}`;
 }
-function matchingGateReset2(usage, now) {
+function matchingGateReset2(usage) {
   if (!usage)
     return 0;
-  if (usage.rateLimitedUntil > now)
-    return usage.rateLimitedUntil;
   const windows = [usage.fiveHour, usage.weekly].filter((window) => !!window && window.resetEpoch > 0);
   const matching = windows.filter((window) => Math.abs(window.util - usage.gateUtil) < 0.0001);
   const candidates = matching.length > 0 ? matching : windows;
@@ -2979,7 +2969,7 @@ class BudgetCoordinator {
       this.pauseReason = this.interventionReason(state);
       const nextResumeAfterEpoch = this.resumeAfterEpoch(state);
       this.pauseResumeAfterEpoch = previousSide === currentSide ? nextResumeAfterEpoch ?? this.pauseResumeAfterEpoch : nextResumeAfterEpoch;
-      const fingerprint2 = previousSide === currentSide && this.activeSideUsageMissing(state) && this.lastDirectiveFingerprint ? this.lastDirectiveFingerprint : this.directiveFingerprint(state, currentSide);
+      const fingerprint2 = previousSide === currentSide && this.activeSideProbeUncertain(state) && this.lastDirectiveFingerprint ? this.lastDirectiveFingerprint : this.directiveFingerprint(state, currentSide);
       if (!previousSide) {
         this.onPauseChange(true);
       }
@@ -3021,8 +3011,6 @@ class BudgetCoordinator {
   shouldEnter(usage, now) {
     if (!usage)
       return false;
-    if (usage.rateLimitedUntil > now)
-      return true;
     return usage.gateUtil >= this.config.pauseAt;
   }
   canAgentResume(usage, now) {
@@ -3044,7 +3032,7 @@ class BudgetCoordinator {
     if (usage.rateLimitedUntil > now)
       return usage.rateLimitedUntil;
     if (usage.gateUtil >= this.config.resumeBelow)
-      return matchingGateReset2(usage, now);
+      return matchingGateReset2(usage);
     return 0;
   }
   tierControlEnabled() {
@@ -3131,8 +3119,13 @@ class BudgetCoordinator {
   interventionReason(state) {
     return ["claude", "codex"].filter((agent) => this.activeSides.has(agent)).map((agent) => this.activeSideReason(agent, state.perAgent[agent], state.now)).join("\uFF1B");
   }
-  activeSideUsageMissing(state) {
-    return ["claude", "codex"].some((agent) => this.activeSides.has(agent) && state.perAgent[agent] === null);
+  activeSideProbeUncertain(state) {
+    return ["claude", "codex"].some((agent) => {
+      if (!this.activeSides.has(agent))
+        return false;
+      const usage = state.perAgent[agent];
+      return usage === null || usage.rateLimitedUntil > state.now;
+    });
   }
   activeSideReason(agent, usage, now) {
     if (!usage)
@@ -3339,6 +3332,8 @@ function normalizeProbeResult(raw) {
   if (!ok && rateLimitedUntil <= 0 && buckets.length === 0)
     return null;
   const { fiveHour, weekly } = identifyWindows(buckets);
+  if (!fiveHour && !weekly && rateLimitedUntil === 0)
+    return null;
   return {
     ok,
     stale: record.stale === true,

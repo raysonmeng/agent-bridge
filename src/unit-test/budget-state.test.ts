@@ -102,15 +102,17 @@ describe("computeBudgetState", () => {
     expect(state.drift).toMatchObject({ pct: 78, heavier: "claude", lighter: "codex" });
   });
 
-  test("pauses for active rate limits and ignores expired rate limits", () => {
+  test("does not enter intervention for rate-limited-only usage", () => {
     const active = computeBudgetState(
       usage({ gateUtil: 5, warnUtil: 5, rateLimitedUntil: NOW + 600 }),
-      usage(),
+      usage({ gateUtil: 5, warnUtil: 5, remaining: 95 }),
       CONFIG,
       NOW,
     );
-    expect(active.phase).toBe("paused");
-    expect(active.pause.reason).toContain("限流");
+    expect(active.phase).toBe("normal");
+    expect(active.pause.active).toBe(false);
+    expect(active.pause.reason).toBeNull();
+    expect(active.directiveToClaude).toBeNull();
 
     const expired = computeBudgetState(
       usage({ gateUtil: 5, warnUtil: 5, rateLimitedUntil: NOW }),

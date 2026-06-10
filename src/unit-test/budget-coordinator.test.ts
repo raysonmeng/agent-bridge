@@ -282,7 +282,7 @@ describe("BudgetCoordinator", () => {
     expect(source.calls).toBe(1);
   });
 
-  test("pauses on rate-limited-only usage", async () => {
+  test("does not enter intervention on rate-limited-only usage", async () => {
     const source = new FakeSource([
       {
         claude: usage({
@@ -294,7 +294,7 @@ describe("BudgetCoordinator", () => {
           fiveHour: null,
           weekly: null,
         }),
-        codex: usage(),
+        codex: usage({ gateUtil: 0, warnUtil: 0, remaining: 100 }),
       },
     ]);
     const { coordinator, emitted, pauseChanges } = makeCoordinator(source);
@@ -302,12 +302,44 @@ describe("BudgetCoordinator", () => {
     await coordinator.start();
     coordinator.stop();
 
+    expect(coordinator.isPaused()).toBe(false);
+    expect(coordinator.isGateClosed()).toBe(false);
+    expect(coordinator.getSnapshot()).toMatchObject({ paused: false, gateClosed: false, pauseSide: null });
+    expect(coordinator.getSnapshot()?.claude?.rateLimitedUntil).toBe(NOW + 900);
+    expect(pauseChanges).toEqual([]);
+    expect(emitted).toEqual([]);
+  });
+
+  test("keeps an existing active side paused while its probe is rate-limited", async () => {
+    const source = new FakeSource([
+      { claude: usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }), codex: usage() },
+      {
+        claude: usage({
+          gateUtil: 5,
+          warnUtil: 5,
+          remaining: 95,
+          rateLimitedUntil: NOW + 900,
+        }),
+        codex: usage(),
+      },
+    ]);
+    const { coordinator, emitted, pauseChanges } = makeCoordinator(source);
+
+    await coordinator.start();
+    await waitFor(() => source.calls >= 2);
+    coordinator.stop();
+
     expect(coordinator.isPaused()).toBe(true);
     expect(coordinator.isGateClosed()).toBe(false);
-    expect(coordinator.getSnapshot()?.resumeAfterEpoch).toBe(NOW + 900);
+    expect(coordinator.getSnapshot()).toMatchObject({
+      paused: true,
+      gateClosed: false,
+      pauseSide: "claude",
+      resumeAfterEpoch: NOW + 900,
+    });
+    expect(emitted.filter((event) => event.id.startsWith("system_budget_handoff"))).toHaveLength(1);
+    expect(emitted.some((event) => event.id.startsWith("system_budget_claude_recovered"))).toBe(false);
     expect(pauseChanges).toEqual([true]);
-    expect(emitted[0].id).toStartWith("system_budget_handoff");
-    expect(emitted[0].content).toContain("限流");
   });
 
   test("keeps working when one side probe is unavailable", async () => {

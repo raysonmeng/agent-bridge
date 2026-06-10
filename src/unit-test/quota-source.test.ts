@@ -64,7 +64,42 @@ describe("quota-source normalization", () => {
     expect(usage).not.toBeNull();
     expect(usage!.ok).toBe(false);
     expect(usage!.gateUtil).toBe(0);
+    expect(usage!.fiveHour).toBeNull();
+    expect(usage!.weekly).toBeNull();
     expect(usage!.rateLimitedUntil).toBe(NOW + 900);
+  });
+
+  test("returns null for empty successful probe responses with no windows or rate limit", () => {
+    expect(normalizeProbeResult({
+      ok: true,
+      util: 0,
+      warn_util: 0,
+      fetched_at: NOW,
+      buckets: [],
+    })).toBeNull();
+  });
+
+  test("keeps cache fallback results when bucket windows are still present", () => {
+    const usage = normalizeProbeResult({
+      ok: false,
+      error: "network",
+      stale: true,
+      util: 27,
+      hard_util: 27,
+      warn_util: 27,
+      fetched_at: NOW,
+      buckets: [
+        { id: "primary_window", util: 27, reset_epoch: NOW + 2400 },
+        { id: "secondary_window", util: 27, reset_epoch: NOW + 400_000 },
+      ],
+    });
+
+    expect(usage).not.toBeNull();
+    expect(usage!.ok).toBe(false);
+    expect(usage!.stale).toBe(true);
+    expect(usage!.gateUtil).toBe(27);
+    expect(usage!.fiveHour).toEqual({ util: 27, resetEpoch: NOW + 2400 });
+    expect(usage!.weekly).toEqual({ util: 27, resetEpoch: NOW + 400_000 });
   });
 
   test("returns null for failed probe results with no usable data", () => {
@@ -142,6 +177,7 @@ describe("QuotaSource", () => {
             util: agent === "claude" ? 12 : 18,
             warn_util: agent === "claude" ? 12 : 18,
             fetched_at: NOW,
+            reset_epoch: NOW + 1200,
             buckets: [],
           }),
         };
@@ -175,6 +211,7 @@ describe("QuotaSource", () => {
             util: 9,
             warn_util: 9,
             fetched_at: NOW,
+            reset_epoch: NOW + 1200,
             buckets: [],
           }),
         };
@@ -223,6 +260,7 @@ describe("QuotaSource", () => {
               hard_util: 24,
               warn_util: 24,
               fetched_at: NOW,
+              reset_epoch: NOW + 1200,
               buckets: [],
             }),
           };
@@ -233,6 +271,7 @@ describe("QuotaSource", () => {
             util: 22,
             warn_util: 22,
             fetched_at: NOW,
+            reset_epoch: NOW + 1200,
             buckets: [],
           }),
         };
@@ -261,6 +300,7 @@ describe("QuotaSource", () => {
             util: 11,
             warn_util: 11,
             fetched_at: NOW,
+            reset_epoch: NOW + 1200,
             buckets: [],
           }),
         };
@@ -317,6 +357,7 @@ describe("QuotaSource", () => {
             util: 7,
             warn_util: 7,
             fetched_at: NOW,
+            reset_epoch: NOW + 1200,
             buckets: [],
           }),
         };
