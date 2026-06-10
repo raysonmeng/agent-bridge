@@ -18,7 +18,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.11", "0.0.0-source"),
-  commit: defineString("63c4412", "source"),
+  commit: defineString("bbdc792", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -2673,7 +2673,7 @@ import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSy
 import { join as join3 } from "path";
 var DEFAULT_BUDGET_CONFIG = {
   enabled: true,
-  pollSeconds: 60,
+  pollSeconds: 300,
   pauseAt: 90,
   resumeBelow: 30,
   syncDriftPct: 10,
@@ -2740,35 +2740,35 @@ function normalizeCodexOverride(raw) {
     override.effort = raw.effort.trim();
   return Object.keys(override).length > 0 ? override : null;
 }
-function normalizeCodexTiers(raw) {
+function normalizeCodexTiers(raw, fallback = DEFAULT_BUDGET_CONFIG.codexTiers) {
   const tiers = isRecord(raw) ? raw : {};
   return {
     full: normalizeCodexOverride(tiers.full),
-    balanced: normalizeCodexOverride(tiers.balanced) ?? DEFAULT_BUDGET_CONFIG.codexTiers.balanced,
-    eco: normalizeCodexOverride(tiers.eco) ?? DEFAULT_BUDGET_CONFIG.codexTiers.eco
+    balanced: normalizeCodexOverride(tiers.balanced) ?? fallback.balanced,
+    eco: normalizeCodexOverride(tiers.eco) ?? fallback.eco
   };
 }
-function normalizeBudgetConfig(raw) {
+function normalizeBudgetConfig(raw, fallback = DEFAULT_BUDGET_CONFIG) {
   const budget = isRecord(raw) ? raw : {};
   const parallel = isRecord(budget.parallel) ? budget.parallel : {};
-  const codexTiers = normalizeCodexTiers(budget.codexTiers);
-  let pauseAt = normalizeBoundedInteger(budget.pauseAt, DEFAULT_BUDGET_CONFIG.pauseAt, 1, 100);
-  let resumeBelow = normalizeBoundedInteger(budget.resumeBelow, DEFAULT_BUDGET_CONFIG.resumeBelow, 0, 99);
+  const codexTiers = normalizeCodexTiers(budget.codexTiers, fallback.codexTiers);
+  let pauseAt = normalizeBoundedInteger(budget.pauseAt, fallback.pauseAt, 1, 100);
+  let resumeBelow = normalizeBoundedInteger(budget.resumeBelow, fallback.resumeBelow, 0, 99);
   if (pauseAt <= resumeBelow) {
     pauseAt = DEFAULT_BUDGET_CONFIG.pauseAt;
     resumeBelow = DEFAULT_BUDGET_CONFIG.resumeBelow;
   }
   return {
-    enabled: normalizeBoolean(budget.enabled, DEFAULT_BUDGET_CONFIG.enabled),
-    pollSeconds: normalizeBoundedInteger(budget.pollSeconds, DEFAULT_BUDGET_CONFIG.pollSeconds, 5, 3600),
+    enabled: normalizeBoolean(budget.enabled, fallback.enabled),
+    pollSeconds: normalizeBoundedInteger(budget.pollSeconds, fallback.pollSeconds, 5, 3600),
     pauseAt,
     resumeBelow,
-    syncDriftPct: normalizeBoundedInteger(budget.syncDriftPct, DEFAULT_BUDGET_CONFIG.syncDriftPct, 1, 100),
+    syncDriftPct: normalizeBoundedInteger(budget.syncDriftPct, fallback.syncDriftPct, 1, 100),
     parallel: {
-      minRemainingPct: normalizeBoundedInteger(parallel.minRemainingPct, DEFAULT_BUDGET_CONFIG.parallel.minRemainingPct, 1, 100),
-      timeWindowSec: normalizeBoundedInteger(parallel.timeWindowSec, DEFAULT_BUDGET_CONFIG.parallel.timeWindowSec, 60, 604800)
+      minRemainingPct: normalizeBoundedInteger(parallel.minRemainingPct, fallback.parallel.minRemainingPct, 1, 100),
+      timeWindowSec: normalizeBoundedInteger(parallel.timeWindowSec, fallback.parallel.timeWindowSec, 60, 604800)
     },
-    codexTierControl: normalizeBoolean(budget.codexTierControl, DEFAULT_BUDGET_CONFIG.codexTierControl) && codexTiers.full !== null,
+    codexTierControl: normalizeBoolean(budget.codexTierControl, fallback.codexTierControl) && codexTiers.full !== null,
     codexTiers
   };
 }
@@ -2786,7 +2786,7 @@ function applyBudgetEnvOverrides(budget, env = process.env) {
     codexTierControl: env.AGENTBRIDGE_BUDGET_CODEX_TIER_CONTROL ?? budget.codexTierControl,
     codexTiers: budget.codexTiers
   };
-  return normalizeBudgetConfig(overlay);
+  return normalizeBudgetConfig(overlay, budget);
 }
 function normalizeConfig(raw) {
   if (!isRecord(raw))
@@ -3082,6 +3082,23 @@ function computeBudgetState(claude, codex, cfg, now) {
 
 // src/budget/budget-coordinator.ts
 var RESET_FINGERPRINT_BUCKET_SEC = 600;
+var LOW_UTIL_PCT = 50;
+var NEAR_PAUSE_MARGIN_PCT = 10;
+var NEAR_WARN_UTIL_PCT = 75;
+var NEAR_THRESHOLD_POLL_MS = 60000;
+var PAUSED_POLL_MS = 15000;
+var RESET_WAKE_AFTER_SEC = 5;
+var RESET_RECENTLY_PASSED_WINDOW_SEC = 120;
+var REAL_BUDGET_POLL_SCHEDULER = {
+  setTimeout(callback, delayMs) {
+    return setTimeout(() => {
+      callback();
+    }, delayMs);
+  },
+  clearTimeout(timer) {
+    clearTimeout(timer);
+  }
+};
 var AGENT_LABEL2 = {
   claude: "Claude",
   codex: "Codex"
@@ -3104,6 +3121,55 @@ function matchingGateReset2(usage) {
     return 0;
   return Math.min(...candidates.map((window) => window.resetEpoch));
 }
+function maxPollDelayMs(config) {
+  return Math.max(0, config.pollSeconds * 1000);
+}
+function capDelay(delayMs, maxDelayMs) {
+  if (maxDelayMs <= 0)
+    return 0;
+  return Math.min(delayMs, maxDelayMs);
+}
+function usagePressure(usage) {
+  const readings = [usage?.claude, usage?.codex].filter((agentUsage) => agentUsage !== null && agentUsage !== undefined).flatMap((agentUsage) => [agentUsage.gateUtil, agentUsage.warnUtil]);
+  if (readings.length === 0)
+    return null;
+  return Math.max(...readings);
+}
+function usageResetEpochs(usage) {
+  return [usage?.claude, usage?.codex].filter((agentUsage) => agentUsage !== null && agentUsage !== undefined).flatMap((agentUsage) => [agentUsage.fiveHour?.resetEpoch ?? 0, agentUsage.weekly?.resetEpoch ?? 0]).filter((epoch) => epoch > 0);
+}
+function adaptiveBudgetPollDelayMs(input) {
+  const maxDelayMs = maxPollDelayMs(input.config);
+  if (input.paused)
+    return capDelay(PAUSED_POLL_MS, maxDelayMs);
+  const pressure = usagePressure(input.usage);
+  if (pressure === null || pressure < LOW_UTIL_PCT)
+    return maxDelayMs;
+  const nearPauseAt = Math.max(0, input.config.pauseAt - NEAR_PAUSE_MARGIN_PCT);
+  if (pressure >= nearPauseAt || pressure >= NEAR_WARN_UTIL_PCT) {
+    return capDelay(NEAR_THRESHOLD_POLL_MS, maxDelayMs);
+  }
+  return capDelay(maxDelayMs / 2, maxDelayMs);
+}
+function resetAlignedDelayMs(input, adaptiveDelayMs) {
+  const epochs = usageResetEpochs(input.usage);
+  if (epochs.length === 0)
+    return null;
+  const candidates = epochs.map((epoch) => {
+    if (epoch >= input.now)
+      return (epoch - input.now + RESET_WAKE_AFTER_SEC) * 1000;
+    if (input.now - epoch <= RESET_RECENTLY_PASSED_WINDOW_SEC)
+      return RESET_WAKE_AFTER_SEC * 1000;
+    return null;
+  }).filter((delayMs) => delayMs !== null && delayMs >= 0 && delayMs <= adaptiveDelayMs);
+  if (candidates.length === 0)
+    return null;
+  return Math.min(...candidates);
+}
+function nextBudgetPollDelayMs(input) {
+  const adaptiveDelayMs = adaptiveBudgetPollDelayMs(input);
+  return resetAlignedDelayMs(input, adaptiveDelayMs) ?? adaptiveDelayMs;
+}
 
 class BudgetCoordinator {
   source;
@@ -3111,6 +3177,7 @@ class BudgetCoordinator {
   emit;
   onPauseChange;
   now;
+  scheduler;
   log;
   timer = null;
   running = false;
@@ -3130,6 +3197,7 @@ class BudgetCoordinator {
     this.emit = options.emit;
     this.onPauseChange = options.onPauseChange;
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
+    this.scheduler = options.scheduler ?? REAL_BUDGET_POLL_SCHEDULER;
     this.log = options.log ?? (() => {});
   }
   async start() {
@@ -3143,7 +3211,7 @@ class BudgetCoordinator {
   stop() {
     this.running = false;
     if (this.timer) {
-      clearTimeout(this.timer);
+      this.scheduler.clearTimeout(this.timer);
       this.timer = null;
     }
   }
@@ -3177,11 +3245,17 @@ class BudgetCoordinator {
     if (!this.running)
       return;
     if (this.timer)
-      clearTimeout(this.timer);
-    const delayMs = Math.max(0, this.config.pollSeconds * 1000);
-    this.timer = setTimeout(() => {
+      this.scheduler.clearTimeout(this.timer);
+    const snapshotUsage = this.latestSnapshot ? { claude: this.latestSnapshot.claude, codex: this.latestSnapshot.codex } : null;
+    const delayMs = nextBudgetPollDelayMs({
+      config: this.config,
+      usage: snapshotUsage,
+      now: this.now(),
+      paused: this.isPaused()
+    });
+    this.timer = this.scheduler.setTimeout(() => {
       this.timer = null;
-      this.pollAndReschedule();
+      return this.pollAndReschedule();
     }, delayMs);
   }
   async pollAndReschedule() {

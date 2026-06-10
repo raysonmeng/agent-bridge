@@ -18,7 +18,7 @@ export interface AgentBridgeConfig {
 
 const DEFAULT_BUDGET_CONFIG: BudgetConfig = {
   enabled: true,
-  pollSeconds: 60,
+  pollSeconds: 300,
   // Intentionally below quota-guard's per-agent hard line (92) so the bridge's
   // coordinated pause fires first and leaves wrap-up headroom; the guard stays
   // as the per-agent backstop.
@@ -114,13 +114,16 @@ function normalizeCodexOverride(raw: unknown): CodexTurnOverrides | null {
   return Object.keys(override).length > 0 ? override : null;
 }
 
-function normalizeCodexTiers(raw: unknown): CodexTierMap {
+function normalizeCodexTiers(
+  raw: unknown,
+  fallback: CodexTierMap = DEFAULT_BUDGET_CONFIG.codexTiers,
+): CodexTierMap {
   const tiers = isRecord(raw) ? raw : {};
   return {
     full: normalizeCodexOverride(tiers.full),
     balanced:
-      normalizeCodexOverride(tiers.balanced) ?? DEFAULT_BUDGET_CONFIG.codexTiers.balanced,
-    eco: normalizeCodexOverride(tiers.eco) ?? DEFAULT_BUDGET_CONFIG.codexTiers.eco,
+      normalizeCodexOverride(tiers.balanced) ?? fallback.balanced,
+    eco: normalizeCodexOverride(tiers.eco) ?? fallback.eco,
   };
 }
 
@@ -134,15 +137,18 @@ function normalizeCodexTiers(raw: unknown): CodexTierMap {
  * stays true ONLY when `codexTiers.full` is configured — sticky turn/start
  * overrides cannot be restored without an explicit restore point.
  */
-function normalizeBudgetConfig(raw: unknown): BudgetConfig {
+function normalizeBudgetConfig(
+  raw: unknown,
+  fallback: BudgetConfig = DEFAULT_BUDGET_CONFIG,
+): BudgetConfig {
   const budget = isRecord(raw) ? raw : {};
   const parallel = isRecord(budget.parallel) ? budget.parallel : {};
-  const codexTiers = normalizeCodexTiers(budget.codexTiers);
+  const codexTiers = normalizeCodexTiers(budget.codexTiers, fallback.codexTiers);
 
-  let pauseAt = normalizeBoundedInteger(budget.pauseAt, DEFAULT_BUDGET_CONFIG.pauseAt, 1, 100);
+  let pauseAt = normalizeBoundedInteger(budget.pauseAt, fallback.pauseAt, 1, 100);
   let resumeBelow = normalizeBoundedInteger(
     budget.resumeBelow,
-    DEFAULT_BUDGET_CONFIG.resumeBelow,
+    fallback.resumeBelow,
     0,
     99,
   );
@@ -152,10 +158,10 @@ function normalizeBudgetConfig(raw: unknown): BudgetConfig {
   }
 
   return {
-    enabled: normalizeBoolean(budget.enabled, DEFAULT_BUDGET_CONFIG.enabled),
+    enabled: normalizeBoolean(budget.enabled, fallback.enabled),
     pollSeconds: normalizeBoundedInteger(
       budget.pollSeconds,
-      DEFAULT_BUDGET_CONFIG.pollSeconds,
+      fallback.pollSeconds,
       5,
       3600,
     ),
@@ -163,26 +169,26 @@ function normalizeBudgetConfig(raw: unknown): BudgetConfig {
     resumeBelow,
     syncDriftPct: normalizeBoundedInteger(
       budget.syncDriftPct,
-      DEFAULT_BUDGET_CONFIG.syncDriftPct,
+      fallback.syncDriftPct,
       1,
       100,
     ),
     parallel: {
       minRemainingPct: normalizeBoundedInteger(
         parallel.minRemainingPct,
-        DEFAULT_BUDGET_CONFIG.parallel.minRemainingPct,
+        fallback.parallel.minRemainingPct,
         1,
         100,
       ),
       timeWindowSec: normalizeBoundedInteger(
         parallel.timeWindowSec,
-        DEFAULT_BUDGET_CONFIG.parallel.timeWindowSec,
+        fallback.parallel.timeWindowSec,
         60,
         604800,
       ),
     },
     codexTierControl:
-      normalizeBoolean(budget.codexTierControl, DEFAULT_BUDGET_CONFIG.codexTierControl) &&
+      normalizeBoolean(budget.codexTierControl, fallback.codexTierControl) &&
       codexTiers.full !== null,
     codexTiers,
   };
@@ -213,7 +219,7 @@ export function applyBudgetEnvOverrides(
     // re-normalization re-applies the full-restore activation rule.
     codexTiers: budget.codexTiers,
   };
-  return normalizeBudgetConfig(overlay);
+  return normalizeBudgetConfig(overlay, budget);
 }
 
 function normalizeConfig(raw: unknown): AgentBridgeConfig | null {

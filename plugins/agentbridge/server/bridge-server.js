@@ -14231,7 +14231,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.11", "0.0.0-source"),
-  commit: defineString("63c4412", "source"),
+  commit: defineString("bbdc792", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -14936,7 +14936,7 @@ import { readFileSync as readFileSync2, writeFileSync as writeFileSync2, mkdirSy
 import { join as join2 } from "path";
 var DEFAULT_BUDGET_CONFIG = {
   enabled: true,
-  pollSeconds: 60,
+  pollSeconds: 300,
   pauseAt: 90,
   resumeBelow: 30,
   syncDriftPct: 10,
@@ -15003,35 +15003,35 @@ function normalizeCodexOverride(raw) {
     override.effort = raw.effort.trim();
   return Object.keys(override).length > 0 ? override : null;
 }
-function normalizeCodexTiers(raw) {
+function normalizeCodexTiers(raw, fallback = DEFAULT_BUDGET_CONFIG.codexTiers) {
   const tiers = isRecord(raw) ? raw : {};
   return {
     full: normalizeCodexOverride(tiers.full),
-    balanced: normalizeCodexOverride(tiers.balanced) ?? DEFAULT_BUDGET_CONFIG.codexTiers.balanced,
-    eco: normalizeCodexOverride(tiers.eco) ?? DEFAULT_BUDGET_CONFIG.codexTiers.eco
+    balanced: normalizeCodexOverride(tiers.balanced) ?? fallback.balanced,
+    eco: normalizeCodexOverride(tiers.eco) ?? fallback.eco
   };
 }
-function normalizeBudgetConfig(raw) {
+function normalizeBudgetConfig(raw, fallback = DEFAULT_BUDGET_CONFIG) {
   const budget = isRecord(raw) ? raw : {};
   const parallel = isRecord(budget.parallel) ? budget.parallel : {};
-  const codexTiers = normalizeCodexTiers(budget.codexTiers);
-  let pauseAt = normalizeBoundedInteger(budget.pauseAt, DEFAULT_BUDGET_CONFIG.pauseAt, 1, 100);
-  let resumeBelow = normalizeBoundedInteger(budget.resumeBelow, DEFAULT_BUDGET_CONFIG.resumeBelow, 0, 99);
+  const codexTiers = normalizeCodexTiers(budget.codexTiers, fallback.codexTiers);
+  let pauseAt = normalizeBoundedInteger(budget.pauseAt, fallback.pauseAt, 1, 100);
+  let resumeBelow = normalizeBoundedInteger(budget.resumeBelow, fallback.resumeBelow, 0, 99);
   if (pauseAt <= resumeBelow) {
     pauseAt = DEFAULT_BUDGET_CONFIG.pauseAt;
     resumeBelow = DEFAULT_BUDGET_CONFIG.resumeBelow;
   }
   return {
-    enabled: normalizeBoolean(budget.enabled, DEFAULT_BUDGET_CONFIG.enabled),
-    pollSeconds: normalizeBoundedInteger(budget.pollSeconds, DEFAULT_BUDGET_CONFIG.pollSeconds, 5, 3600),
+    enabled: normalizeBoolean(budget.enabled, fallback.enabled),
+    pollSeconds: normalizeBoundedInteger(budget.pollSeconds, fallback.pollSeconds, 5, 3600),
     pauseAt,
     resumeBelow,
-    syncDriftPct: normalizeBoundedInteger(budget.syncDriftPct, DEFAULT_BUDGET_CONFIG.syncDriftPct, 1, 100),
+    syncDriftPct: normalizeBoundedInteger(budget.syncDriftPct, fallback.syncDriftPct, 1, 100),
     parallel: {
-      minRemainingPct: normalizeBoundedInteger(parallel.minRemainingPct, DEFAULT_BUDGET_CONFIG.parallel.minRemainingPct, 1, 100),
-      timeWindowSec: normalizeBoundedInteger(parallel.timeWindowSec, DEFAULT_BUDGET_CONFIG.parallel.timeWindowSec, 60, 604800)
+      minRemainingPct: normalizeBoundedInteger(parallel.minRemainingPct, fallback.parallel.minRemainingPct, 1, 100),
+      timeWindowSec: normalizeBoundedInteger(parallel.timeWindowSec, fallback.parallel.timeWindowSec, 60, 604800)
     },
-    codexTierControl: normalizeBoolean(budget.codexTierControl, DEFAULT_BUDGET_CONFIG.codexTierControl) && codexTiers.full !== null,
+    codexTierControl: normalizeBoolean(budget.codexTierControl, fallback.codexTierControl) && codexTiers.full !== null,
     codexTiers
   };
 }

@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { BudgetCoordinator } from "../budget/budget-coordinator";
+import { BudgetCoordinator, nextBudgetPollDelayMs } from "../budget/budget-coordinator";
 import type { AgentUsage, BudgetConfig } from "../budget/types";
 
 const NOW = 1_700_000_000;
@@ -23,6 +23,7 @@ const CONFIG: BudgetConfig = {
 };
 
 type FetchResult = { claude: AgentUsage | null; codex: AgentUsage | null } | null;
+type ScheduledCallback = () => void | Promise<void>;
 
 function usage(overrides: Partial<AgentUsage> = {}): AgentUsage {
   const gateUtil = overrides.gateUtil ?? 20;
@@ -58,6 +59,27 @@ class FakeSource {
   }
 }
 
+class FakeScheduler {
+  scheduled: Array<{ delayMs: number; callback: ScheduledCallback; active: boolean }> = [];
+
+  setTimeout(callback: ScheduledCallback, delayMs: number): number {
+    const id = this.scheduled.length;
+    this.scheduled.push({ delayMs, callback, active: true });
+    return id;
+  }
+
+  clearTimeout(id: number): void {
+    if (this.scheduled[id]) this.scheduled[id].active = false;
+  }
+
+  async runNext(): Promise<void> {
+    const next = this.scheduled.find((timer) => timer.active);
+    if (!next) throw new Error("no active scheduled timer");
+    next.active = false;
+    await next.callback();
+  }
+}
+
 function makeCoordinator(source: FakeSource, config: BudgetConfig = CONFIG) {
   const emitted: Array<{ id: string; content: string }> = [];
   const pauseChanges: boolean[] = [];
@@ -74,6 +96,14 @@ function makeCoordinator(source: FakeSource, config: BudgetConfig = CONFIG) {
   return { coordinator, emitted, pauseChanges, logs };
 }
 
+function longPollConfig(overrides: Partial<BudgetConfig> = {}): BudgetConfig {
+  return {
+    ...CONFIG,
+    pollSeconds: 300,
+    ...overrides,
+  };
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
@@ -88,6 +118,132 @@ async function waitFor(condition: () => boolean, timeoutMs = 250): Promise<void>
 }
 
 describe("BudgetCoordinator", () => {
+  test("adaptive poll delay uses longer intervals far from thresholds", () => {
+    const config = longPollConfig();
+
+    expect(nextBudgetPollDelayMs({
+      config,
+      now: NOW,
+      usage: { claude: usage({ gateUtil: 20, warnUtil: 25 }), codex: usage({ gateUtil: 10, warnUtil: 15 }) },
+      paused: false,
+    })).toBe(300_000);
+
+    expect(nextBudgetPollDelayMs({
+      config,
+      now: NOW,
+      usage: { claude: usage({ gateUtil: 55, warnUtil: 55 }), codex: usage({ gateUtil: 40, warnUtil: 40 }) },
+      paused: false,
+    })).toBe(150_000);
+
+    expect(nextBudgetPollDelayMs({
+      config,
+      now: NOW,
+      usage: { claude: usage({ gateUtil: 82, warnUtil: 82 }), codex: usage({ gateUtil: 40, warnUtil: 40 }) },
+      paused: false,
+    })).toBe(60_000);
+  });
+
+  test("adaptive poll delay stays short during an active intervention", () => {
+    expect(nextBudgetPollDelayMs({
+      config: longPollConfig(),
+      now: NOW,
+      usage: { claude: usage({ gateUtil: 91, warnUtil: 91 }), codex: usage() },
+      paused: true,
+    })).toBe(15_000);
+  });
+
+  test("adaptive poll delay aligns to nearby reset epochs", () => {
+    const config = longPollConfig();
+    expect(nextBudgetPollDelayMs({
+      config,
+      now: NOW,
+      usage: {
+        claude: usage({ gateUtil: 20, warnUtil: 20, fiveHour: { util: 20, resetEpoch: NOW + 42 } }),
+        codex: usage({ gateUtil: 15, warnUtil: 15, fiveHour: { util: 15, resetEpoch: NOW + 3600 } }),
+      },
+      paused: false,
+    })).toBe(47_000);
+
+    expect(nextBudgetPollDelayMs({
+      config,
+      now: NOW,
+      usage: {
+        claude: usage({ gateUtil: 20, warnUtil: 20, fiveHour: { util: 20, resetEpoch: NOW - 20 } }),
+        codex: usage({ gateUtil: 15, warnUtil: 15 }),
+      },
+      paused: false,
+    })).toBe(5_000);
+  });
+
+  test("scheduler seam arms reset-aligned timers without wall-clock waits", async () => {
+    let now = NOW;
+    const scheduler = new FakeScheduler();
+    const source = new FakeSource([
+      {
+        claude: usage({ gateUtil: 20, warnUtil: 20, fiveHour: { util: 20, resetEpoch: NOW + 42 } }),
+        codex: usage({ gateUtil: 15, warnUtil: 15 }),
+      },
+      { claude: usage({ gateUtil: 21, warnUtil: 21 }), codex: usage({ gateUtil: 16, warnUtil: 16 }) },
+    ]);
+    const coordinator = new BudgetCoordinator({
+      source,
+      config: longPollConfig(),
+      emit: () => {},
+      onPauseChange: () => {},
+      now: () => now,
+      scheduler,
+    });
+
+    await coordinator.start();
+    expect(source.calls).toBe(1);
+    expect(scheduler.scheduled.at(-1)?.delayMs).toBe(47_000);
+
+    now += 47;
+    await scheduler.runNext();
+    coordinator.stop();
+
+    expect(source.calls).toBe(2);
+    expect(scheduler.scheduled.at(-1)?.delayMs).toBe(300_000);
+  });
+
+  test("fake scheduler preserves pause hysteresis and quick recovery polling", async () => {
+    let now = NOW;
+    const scheduler = new FakeScheduler();
+    const source = new FakeSource([
+      { claude: usage(), codex: usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }) },
+      { claude: usage(), codex: usage({ gateUtil: 50, warnUtil: 50, remaining: 50 }) },
+      { claude: usage(), codex: usage({ gateUtil: 20, warnUtil: 20, remaining: 80 }) },
+    ]);
+    const emitted: Array<{ id: string; content: string }> = [];
+    const pauseChanges: boolean[] = [];
+    const coordinator = new BudgetCoordinator({
+      source,
+      config: longPollConfig(),
+      emit: (id, content) => emitted.push({ id, content }),
+      onPauseChange: (paused) => pauseChanges.push(paused),
+      now: () => now,
+      scheduler,
+    });
+
+    await coordinator.start();
+    expect(coordinator.isPaused()).toBe(true);
+    expect(scheduler.scheduled.at(-1)?.delayMs).toBe(15_000);
+
+    now += 15;
+    await scheduler.runNext();
+    expect(coordinator.isPaused()).toBe(true);
+    expect(emitted.some((event) => event.id.startsWith("system_budget_resume"))).toBe(false);
+    expect(scheduler.scheduled.at(-1)?.delayMs).toBe(15_000);
+
+    now += 15;
+    await scheduler.runNext();
+    coordinator.stop();
+
+    expect(coordinator.isPaused()).toBe(false);
+    expect(pauseChanges).toEqual([true, false]);
+    expect(emitted.some((event) => event.id.startsWith("system_budget_resume"))).toBe(true);
+  });
+
   test("start immediately polls and stores the first snapshot", async () => {
     const source = new FakeSource([{ claude: usage(), codex: usage({ gateUtil: 21, warnUtil: 21 }) }]);
     const { coordinator, emitted } = makeCoordinator(source);

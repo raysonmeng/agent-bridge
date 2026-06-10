@@ -167,7 +167,7 @@ describe("ConfigService — budget section", () => {
     const config = svc.loadOrDefault();
     expect(config.budget).toEqual({
       enabled: true,
-      pollSeconds: 60,
+      pollSeconds: 300,
       pauseAt: 90,
       resumeBelow: 30,
       syncDriftPct: 10,
@@ -257,7 +257,7 @@ describe("ConfigService — budget section", () => {
       },
     });
     const loaded = svc.load();
-    expect(loaded!.budget.pollSeconds).toBe(60);
+    expect(loaded!.budget.pollSeconds).toBe(300);
     expect(loaded!.budget.pauseAt).toBe(90);
     expect(loaded!.budget.syncDriftPct).toBe(10);
     expect(loaded!.budget.parallel.minRemainingPct).toBe(60);
