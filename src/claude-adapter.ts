@@ -33,6 +33,14 @@ export type ReplySender = (
   idempotencyKey?: string,
 ) => Promise<{ success: boolean; error?: string; code?: string; phase?: string; retryAfterMs?: number }>;
 
+export interface ClaudeAdapterOptions {
+  maxBufferedMessages?: number;
+  maxBufferedBytes?: number;
+}
+
+const DEFAULT_MAX_BUFFERED_MESSAGES = 100;
+const DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
+
 export const CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
   "",
@@ -82,13 +90,19 @@ export class ClaudeAdapter extends EventEmitter {
 
   // Push transport with a per-message fallback queue (drained by get_messages).
   private pendingMessages: BridgeMessage[] = [];
+  private pendingMessageByteSizes: number[] = [];
+  private pendingMessageBytes = 0;
   private readonly maxBufferedMessages: number;
+  private readonly maxBufferedBytes: number;
   private droppedMessageCount = 0;
+  private oversizedMessageCount = 0;
+  private oversizedMessageBytes = 0;
+  private oversizedMessageSourceCounts: Partial<Record<BridgeMessage["source"], number>> = {};
 
   // Latest budget snapshot, fed by bridge from DaemonStatus.budget broadcasts.
   private budgetSnapshot: BudgetSnapshot | null = null;
 
-  constructor(logFile = new StateDirResolver().logFile) {
+  constructor(logFile = new StateDirResolver().logFile, options: ClaudeAdapterOptions = {}) {
     super();
     this.logFile = logFile;
     this.logger = createProcessLogger({ component: "ClaudeAdapter", logFile: this.logFile });
@@ -105,7 +119,14 @@ export class ClaudeAdapter extends EventEmitter {
         "pull mode was removed; push delivery (with per-message fallback queue) is always used.",
       );
     }
-    this.maxBufferedMessages = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
+    this.maxBufferedMessages = positiveIntegerOr(
+      options.maxBufferedMessages,
+      parsePositiveIntegerEnv("AGENTBRIDGE_MAX_BUFFERED_MESSAGES", DEFAULT_MAX_BUFFERED_MESSAGES),
+    );
+    this.maxBufferedBytes = positiveIntegerOr(
+      options.maxBufferedBytes,
+      parsePositiveIntegerEnv("AGENTBRIDGE_MAX_BUFFERED_BYTES", DEFAULT_MAX_BUFFERED_BYTES),
+    );
 
     this.server = new Server(
       { name: "agentbridge", version: "0.1.0" },
@@ -180,20 +201,57 @@ export class ClaudeAdapter extends EventEmitter {
 
   /** Per-message fallback when a push fails; drained by the get_messages tool. */
   private queueFallbackMessage(message: BridgeMessage) {
-    if (this.pendingMessages.length >= this.maxBufferedMessages) {
-      this.pendingMessages.shift();
-      this.droppedMessageCount++;
-      this.log(`Fallback queue full, dropped oldest message (total dropped: ${this.droppedMessageCount})`);
+    const messageBytes = utf8ByteLength(message.content);
+    if (messageBytes > this.maxBufferedBytes) {
+      this.oversizedMessageCount++;
+      this.oversizedMessageBytes += messageBytes;
+      this.oversizedMessageSourceCounts[message.source] =
+        (this.oversizedMessageSourceCounts[message.source] ?? 0) + 1;
+      this.log(
+        `Fallback queue omitted oversized ${message.source} message ` +
+        `(${formatBytes(messageBytes)} > ${formatBytes(this.maxBufferedBytes)}; ` +
+        `total oversized: ${this.oversizedMessageCount})`,
+      );
+      return;
     }
+
+    let dropped = 0;
+    while (
+      this.pendingMessages.length >= this.maxBufferedMessages ||
+      this.pendingMessageBytes + messageBytes > this.maxBufferedBytes
+    ) {
+      const droppedMessage = this.pendingMessages.shift();
+      const droppedBytes = this.pendingMessageByteSizes.shift() ?? 0;
+      if (!droppedMessage) break;
+      this.pendingMessageBytes = Math.max(0, this.pendingMessageBytes - droppedBytes);
+      this.droppedMessageCount++;
+      dropped++;
+    }
+    if (dropped > 0) {
+      this.log(
+        `Fallback queue overflow: dropped ${dropped} oldest message${dropped > 1 ? "s" : ""} ` +
+        `(${this.pendingMessages.length} pending, ${formatBytes(this.pendingMessageBytes)} buffered, ` +
+        `${this.droppedMessageCount} dropped since last drain)`,
+      );
+    }
+
     this.pendingMessages.push(message);
-    this.log(`Queued fallback message (${this.pendingMessages.length} pending, instance=${this.instanceId})`);
+    this.pendingMessageByteSizes.push(messageBytes);
+    this.pendingMessageBytes += messageBytes;
+    this.log(
+      `Queued fallback message (${this.pendingMessages.length} pending, ` +
+      `${formatBytes(this.pendingMessageBytes)} buffered, instance=${this.instanceId})`,
+    );
   }
 
   // ── get_messages ───────────────────────────────────────────
 
   private drainMessages(): { content: Array<{ type: "text"; text: string }> } {
-    this.log(`get_messages called (instance=${this.instanceId}, pending=${this.pendingMessages.length}, dropped=${this.droppedMessageCount})`);
-    if (this.pendingMessages.length === 0 && this.droppedMessageCount === 0) {
+    this.log(
+      `get_messages called (instance=${this.instanceId}, pending=${this.pendingMessages.length}, ` +
+      `bytes=${this.pendingMessageBytes}, dropped=${this.droppedMessageCount}, oversized=${this.oversizedMessageCount})`,
+    );
+    if (this.pendingMessages.length === 0 && this.droppedMessageCount === 0 && this.oversizedMessageCount === 0) {
       return {
         content: [{ type: "text" as const, text: "No new messages from Codex." }],
       };
@@ -202,15 +260,34 @@ export class ClaudeAdapter extends EventEmitter {
     // Snapshot and clear atomically to avoid issues with concurrent writes
     const messages = this.pendingMessages;
     this.pendingMessages = [];
+    this.pendingMessageByteSizes = [];
+    this.pendingMessageBytes = 0;
     const dropped = this.droppedMessageCount;
     this.droppedMessageCount = 0;
+    const oversizedSourceCounts = this.oversizedMessageSourceCounts;
+    const oversized = this.oversizedMessageCount;
+    const oversizedBytes = this.oversizedMessageBytes;
+    this.oversizedMessageSourceCounts = {};
+    this.oversizedMessageCount = 0;
+    this.oversizedMessageBytes = 0;
 
     const count = messages.length;
-    let header = `[${count} new message${count > 1 ? "s" : ""} from Codex]`;
+    const notices: string[] = [];
     if (dropped > 0) {
-      header += ` (${dropped} older message${dropped > 1 ? "s" : ""} were dropped due to queue overflow)`;
+      notices.push(
+        `${dropped} older message${dropped > 1 ? "s" : ""} ` +
+        `${dropped > 1 ? "were" : "was"} dropped due to fallback queue overflow`,
+      );
     }
-    header += `\nchat_id: ${this.sessionId}`;
+    if (oversized > 0) {
+      for (const [source, sourceCount] of Object.entries(oversizedSourceCounts)) {
+        notices.push(
+          `${sourceCount} oversized message${sourceCount === 1 ? "" : "s"} ` +
+          `from ${formatSource(source as BridgeMessage["source"])} omitted ` +
+          `(>${formatBytes(this.maxBufferedBytes)})`,
+        );
+      }
+    }
 
     const formatted = messages
       .map((msg, i) => {
@@ -219,12 +296,23 @@ export class ClaudeAdapter extends EventEmitter {
       })
       .join("\n\n");
 
-    this.log(`get_messages returning ${count} message(s) (instance=${this.instanceId}, dropped=${dropped})`);
+    const noticeText = notices.map((notice) => `WARNING: ${notice}`).join("\n");
+    const parts: string[] = [];
+    if (count > 0) {
+      parts.push(`[${count} new message${count > 1 ? "s" : ""} from Codex]\nchat_id: ${this.sessionId}`);
+    }
+    if (noticeText) parts.push(noticeText);
+    if (formatted) parts.push(formatted);
+
+    this.log(
+      `get_messages returning ${count} message(s) ` +
+      `(instance=${this.instanceId}, dropped=${dropped}, oversized=${oversized}, oversizedBytes=${oversizedBytes})`,
+    );
     return {
       content: [
         {
           type: "text" as const,
-          text: `${header}\n\n${formatted}`,
+          text: parts.join("\n\n"),
         },
       ],
     };
@@ -415,4 +503,29 @@ export class ClaudeAdapter extends EventEmitter {
   private log(msg: string) {
     this.logger.log(msg);
   }
+}
+
+function parsePositiveIntegerEnv(name: string, fallback: number): number {
+  return positiveIntegerOr(parseInt(process.env[name] ?? "", 10), fallback);
+}
+
+function positiveIntegerOr(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : fallback;
+}
+
+function utf8ByteLength(value: string): number {
+  return Buffer.byteLength(value, "utf8");
+}
+
+function formatSource(source: BridgeMessage["source"]): string {
+  return source === "codex" ? "Codex" : "Claude";
+}
+
+function formatBytes(bytes: number): string {
+  if (bytes < 1024) return `${bytes}B`;
+  if (bytes % (1024 * 1024) === 0) return `${bytes / (1024 * 1024)}MiB`;
+  if (bytes % 1024 === 0) return `${bytes / 1024}KiB`;
+  return `${bytes}B`;
 }
