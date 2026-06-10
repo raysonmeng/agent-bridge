@@ -963,7 +963,15 @@ function broadcastStatus() {
 
 function sendProtocolMessage(ws: ServerWebSocket<ControlSocketData>, message: ControlServerMessage) {
   try {
-    ws.send(JSON.stringify(message));
+    const result = ws.send(JSON.stringify(message));
+    // Control responses are request-scoped: re-sending them to a future socket
+    // would be wrong (the client's pending request has already timed out), so
+    // a dropped send is not retried — but it must not be silent. A dropped
+    // `claude_to_codex_result` is the trail for "Claude saw a timeout but the
+    // turn WAS injected" reports.
+    if (typeof result === "number" && result === 0) {
+      log(`Control message dropped (socket closed): type=${message.type}`);
+    }
   } catch (err: any) {
     log(`Failed to send control message: ${err.message}`);
   }
@@ -975,7 +983,11 @@ function currentStatus(): DaemonStatus {
     bridgeReady: tuiConnectionState.canReply(),
     tuiConnected: snapshot.tuiConnected,
     threadId: codex.activeThreadId,
-    queuedMessageCount: bufferedMessages.length + statusBuffer.size,
+    // Includes messages enqueued in Bun's socket buffer awaiting drain
+    // confirmation — without them a diagnosis can read "0 queued" while
+    // unconfirmed messages still sit in the socket.
+    queuedMessageCount:
+      bufferedMessages.length + statusBuffer.size + (attachedClaude?.data.pendingBackpressure.length ?? 0),
     proxyUrl: codex.proxyUrl,
     appServerUrl: codex.appServerUrl,
     pid: process.pid,

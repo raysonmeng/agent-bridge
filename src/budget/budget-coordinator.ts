@@ -13,6 +13,10 @@ import type { QuotaSource } from "./quota-source";
 type QuotaSourceLike = Pick<QuotaSource, "fetchBoth">;
 type PauseSide = BudgetSnapshot["pauseSide"];
 
+// Directive-fingerprint quantum for reset epochs. Must absorb probe jitter
+// (seconds) while still distinguishing a genuine window reset (hours).
+const RESET_FINGERPRINT_BUCKET_SEC = 600;
+
 export interface BudgetCoordinatorOptions {
   source: QuotaSourceLike;
   config: BudgetConfig;
@@ -332,7 +336,13 @@ export class BudgetCoordinator {
       activeSide ? "paused" : state.phase,
       state.drift.heavier ?? "none",
       side,
-      reset,
+      // Round-to-nearest bucket, not the raw epoch: the probe's reset_epoch
+      // jitters by ±1s between polls (observed live: 09:49:59 ⇄ 09:50:00),
+      // and a raw value re-emits the same directive every poll. Rounding —
+      // not floor — because real reset times sit ON round boundaries, so a
+      // floor bucket edge would keep flapping. A genuine window reset jumps
+      // hours and still lands in a different bucket.
+      Math.round(reset / RESET_FINGERPRINT_BUCKET_SEC),
     ].join("|");
   }
 

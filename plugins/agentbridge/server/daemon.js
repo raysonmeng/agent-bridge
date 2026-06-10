@@ -15,7 +15,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.6", "0.0.0-source"),
-  commit: defineString("2079374", "source"),
+  commit: defineString("aecc6b4", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, 1)
 });
@@ -2909,6 +2909,7 @@ function computeBudgetState(claude, codex, cfg, now) {
 }
 
 // src/budget/budget-coordinator.ts
+var RESET_FINGERPRINT_BUCKET_SEC = 600;
 var AGENT_LABEL2 = {
   claude: "Claude",
   codex: "Codex"
@@ -3166,7 +3167,7 @@ class BudgetCoordinator {
       activeSide ? "paused" : state.phase,
       state.drift.heavier ?? "none",
       side,
-      reset
+      Math.round(reset / RESET_FINGERPRINT_BUCKET_SEC)
     ].join("|");
   }
   emitDirective(prefix, content) {
@@ -4313,7 +4314,10 @@ function broadcastStatus() {
 }
 function sendProtocolMessage(ws, message) {
   try {
-    ws.send(JSON.stringify(message));
+    const result = ws.send(JSON.stringify(message));
+    if (typeof result === "number" && result === 0) {
+      log(`Control message dropped (socket closed): type=${message.type}`);
+    }
   } catch (err) {
     log(`Failed to send control message: ${err.message}`);
   }
@@ -4324,7 +4328,7 @@ function currentStatus() {
     bridgeReady: tuiConnectionState.canReply(),
     tuiConnected: snapshot.tuiConnected,
     threadId: codex.activeThreadId,
-    queuedMessageCount: bufferedMessages.length + statusBuffer.size,
+    queuedMessageCount: bufferedMessages.length + statusBuffer.size + (attachedClaude?.data.pendingBackpressure.length ?? 0),
     proxyUrl: codex.proxyUrl,
     appServerUrl: codex.appServerUrl,
     pid: process.pid,

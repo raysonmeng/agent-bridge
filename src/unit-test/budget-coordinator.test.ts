@@ -125,6 +125,34 @@ describe("BudgetCoordinator", () => {
     expect(emitted[0].content).toContain("用量比例漂移");
   });
 
+  test("does not re-emit balance directive on probe reset-epoch jitter (observed live: ±1s per poll)", async () => {
+    // The probe's reset_epoch wobbles by a second between polls. A raw epoch
+    // in the directive fingerprint re-emitted the same balance directive
+    // every 60s poll — one spam notification per minute for as long as the
+    // drift persisted.
+    const source = new FakeSource([
+      {
+        claude: usage({ gateUtil: 35, warnUtil: 45 }),
+        codex: usage({ gateUtil: 20, warnUtil: 20, fiveHour: { util: 20, resetEpoch: NOW + 3600 } }),
+      },
+      {
+        claude: usage({ gateUtil: 35, warnUtil: 45 }),
+        codex: usage({ gateUtil: 20, warnUtil: 20, fiveHour: { util: 20, resetEpoch: NOW + 3601 } }),
+      },
+      {
+        claude: usage({ gateUtil: 35, warnUtil: 45 }),
+        codex: usage({ gateUtil: 20, warnUtil: 20, fiveHour: { util: 20, resetEpoch: NOW + 3599 } }),
+      },
+    ]);
+    const { coordinator, emitted } = makeCoordinator(source);
+
+    await coordinator.start();
+    await waitFor(() => source.calls >= 3);
+    coordinator.stop();
+
+    expect(emitted.filter((event) => event.id.startsWith("system_budget_balance"))).toHaveLength(1);
+  });
+
   test("re-emits balance directive when the lighter side enters a new five-hour window", async () => {
     const source = new FakeSource([
       {
