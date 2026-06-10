@@ -1,5 +1,10 @@
 import { describe, expect, test } from "bun:test";
-import { parseTopLevel } from "../cli";
+import {
+  NOTIFY_COMMANDS,
+  PAIR_AWARE_COMMANDS,
+  REFRESH_COMMANDS,
+  parseTopLevel,
+} from "../cli";
 
 describe("parseTopLevel — leading --pair before the subcommand", () => {
   test("no args → undefined command", () => {
@@ -84,5 +89,28 @@ describe("parseTopLevel — budget is pair-aware", () => {
       command: "budget",
       restArgs: ["--json"],
     });
+  });
+});
+
+describe("parseTopLevel — logs is pair-aware", () => {
+  test("leading --pair is re-attached for logs", () => {
+    expect(parseTopLevel(["--pair", "work", "logs", "-f"])).toEqual({
+      command: "logs",
+      restArgs: ["--pair", "work", "-f"],
+    });
+  });
+
+  test("logs without --pair passes args through", () => {
+    expect(parseTopLevel(["logs", "-n", "200", "--codex"])).toEqual({
+      command: "logs",
+      restArgs: ["-n", "200", "--codex"],
+    });
+  });
+
+  test("logs is registered as pair-aware but NOT as a notify/refresh command", () => {
+    // A read-only log tail must never trigger the daily update check/notice.
+    expect(PAIR_AWARE_COMMANDS.has("logs")).toBe(true);
+    expect(NOTIFY_COMMANDS.has("logs")).toBe(false);
+    expect(REFRESH_COMMANDS.has("logs")).toBe(false);
   });
 });
