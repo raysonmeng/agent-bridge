@@ -1,9 +1,10 @@
-import { spawn, execFileSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { BUILD_INFO, compatibleContractVersion, formatBuildInfo, sameRuntimeContract } from "./build-info";
 import { StateDirResolver } from "./state-dir";
 import { parsePositiveIntEnv } from "./env-utils";
+import { isAgentBridgeDaemon, isAgentBridgeProcess, isProcessAlive } from "./process-lifecycle";
 import type { DaemonStatus } from "./control-protocol";
 
 // In source/dev mode this module is loaded from src/*.ts and can launch the
@@ -190,7 +191,7 @@ export class DaemonLifecycle {
     if (existingPid) {
       if (isProcessAlive(existingPid)) {
         // Verify the live process is actually our daemon, not an OS-reused PID
-        if (this.isDaemonProcess(existingPid)) {
+        if (isAgentBridgeDaemon(existingPid)) {
           try {
             await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
             return;
@@ -504,7 +505,7 @@ export class DaemonLifecycle {
           if (
             Number.isFinite(holderPid) &&
             this.lockAgeMs() > LOCK_IDENTITY_GRACE_MS &&
-            !this.isAgentBridgeProcess(holderPid)
+            !isAgentBridgeProcess(holderPid)
           ) {
             this.log(
               `Startup lock is ${Math.round(this.lockAgeMs() / 1000)}s old and holder pid ${holderPid} ` +
@@ -533,21 +534,6 @@ export class DaemonLifecycle {
     }
   }
 
-  /**
-   * Loose identity check for lock holders: launchers (CLI / plugin frontend)
-   * and daemons all carry agentbridge markers in their command line. Used only
-   * to detect OS pid recycling — NOT for kill decisions (kill() keeps the
-   * stricter daemon-entry match).
-   */
-  private isAgentBridgeProcess(pid: number): boolean {
-    try {
-      const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
-      return cmd.includes("agentbridge") || cmd.includes("agent_bridge");
-    } catch {
-      return false;
-    }
-  }
-
   /** Release the startup lock file. */
   private releaseLock(): void {
     try {
@@ -562,7 +548,7 @@ export class DaemonLifecycle {
   async kill(gracefulTimeoutMs = 3000, pidOverride?: number): Promise<boolean> {
     // pidOverride lets us target a daemon reported via /healthz body whose pid file
     // we don't own (e.g. a foreign daemon squatting our control port). Falls back to
-    // the pid file. The isDaemonProcess() guard below still prevents killing a
+    // the pid file. The isAgentBridgeDaemon() guard below still prevents killing a
     // non-AgentBridge process if the OS reused the pid.
     const pid = pidOverride ?? this.readPid();
     if (!pid) {
@@ -580,7 +566,7 @@ export class DaemonLifecycle {
     // Verify the PID actually belongs to an AgentBridge daemon.
     // If the PID file is stale and the OS has reused the PID,
     // we must NOT kill an unrelated process.
-    if (!this.isDaemonProcess(pid)) {
+    if (!isAgentBridgeDaemon(pid)) {
       this.log(`Pid ${pid} is alive but is NOT an AgentBridge daemon — refusing to kill. Cleaning up stale pid file.`);
       this.cleanup();
       return false;
@@ -617,34 +603,6 @@ export class DaemonLifecycle {
   }
 
   /**
-   * Verify that a live PID actually belongs to an AgentBridge daemon
-   * by checking the process command line. Prevents killing an unrelated
-   * process when the OS has reused a stale PID.
-   */
-  private isDaemonProcess(pid: number): boolean {
-    // Verify via process command line that this PID is actually our daemon, not
-    // an OS-reused PID belonging to some unrelated process. Match on the
-    // executable basename being a daemon-role script (`daemon.{ts,js}` for
-    // production, `*-daemon.{ts,js}` for the e2e harness's fake) — NOT on the
-    // loose substring "daemon", which would also match e.g. a test file named
-    // `daemon-self-heal.test.ts` invoked by an IDE runner.
-    try {
-      const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
-      // Match: .../<anything>-daemon.js or .../<anything>-daemon.ts as a runnable
-      // argument (preceded by whitespace/path-sep, followed by whitespace or EOL).
-      // We additionally require the command to mention the agentbridge package OR
-      // the repo dir to avoid matching some unrelated `*-daemon.js` from another
-      // project.
-      const hasDaemonEntry = /(?:^|[\s/\\])[\w.-]*-?daemon\.(?:ts|js)(?:\s|$)/.test(cmd);
-      const hasAgentbridge = cmd.includes("agentbridge") || cmd.includes("agent_bridge");
-      return hasDaemonEntry && hasAgentbridge;
-    } catch {
-      // ps failed — process may have exited between our check and the ps call
-      return false;
-    }
-  }
-
-  /**
    * Clean up daemon state files (pid + status). Does NOT touch the startup lock:
    * kill() runs INSIDE withStartupLockStrict's held section during a replace, and
    * releasing the lock here would let a concurrent launcher grab it mid-replace and
@@ -668,13 +626,6 @@ async function fetchWithTimeout(url: string, timeoutMs = HEALTH_FETCH_TIMEOUT_MS
   }
 }
 
-function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
+// Re-exported for the existing daemon-lifecycle.test.ts import surface. The
+// implementation now lives in process-lifecycle.ts (single source of truth).
 export { isProcessAlive };

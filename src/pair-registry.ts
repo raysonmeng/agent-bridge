@@ -20,6 +20,7 @@ import { createServer } from "node:net";
 import { createHash, randomUUID } from "node:crypto";
 import { hostname, userInfo } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
+import { isAgentBridgeDaemon, pidLooksAlive } from "./process-lifecycle";
 
 /**
  * Pair registry — the single shared resource of the multi-pair feature.
@@ -346,21 +347,6 @@ function readLockOwner(lockFile: string): LockOwner | null {
   }
 }
 
-/** `process.kill(pid, 0)` liveness, but treat EPERM (exists, not signalable by us) as ALIVE. */
-function pidLooksAlive(pid: number): boolean {
-  // pid <= 0 is never a real holder: process.kill(0, 0) targets the current
-  // process GROUP and "succeeds", which would wrongly mark a corrupt
-  // `{pid:0}` lock as live and deadlock acquisition. Negatives are signal-broadcast
-  // semantics, not a pid. Treat all of these as dead so the lock is reclaimable.
-  if (!Number.isInteger(pid) || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err: any) {
-    return err?.code === "EPERM";
-  }
-}
-
 function lockFileAgeMs(lockFile: string): number {
   try {
     return Date.now() - statSync(lockFile).mtimeMs;
@@ -571,19 +557,17 @@ export async function withRegistryLock<T>(base: string, fn: () => Promise<T> | T
 // Legacy-root daemon detection
 // ---------------------------------------------------------------------------
 
-function isDaemonProcess(pid: number): boolean {
-  try {
-    const cmd = execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
-    return cmd.includes("daemon") && (cmd.includes("agentbridge") || cmd.includes("agent_bridge"));
-  } catch {
-    return false;
-  }
-}
-
 /**
  * Detect a pre-multi-pair daemon that wrote its pid directly at <base>/daemon.pid
  * (the classic single-pair layout) and is still alive on control port 4502.
  * Returns its pid, or null.
+ *
+ * Identity uses the shared strict {@link isAgentBridgeDaemon} matcher (anchored
+ * on a `daemon.{ts,js}` argv plus an agentbridge marker). This is a TIGHTENING
+ * over the former loose `cmd.includes("daemon")` check: a legacy root daemon was
+ * still spawned as `<bun> run <…>/daemon.{ts,js}` / `<…>/server/daemon.js` whose
+ * path carries an agentbridge marker, so it still matches — while an OS-reused
+ * pid that merely has "daemon" somewhere in its argv no longer false-positives.
  */
 export function detectLegacyRootDaemon(base: string): { pid: number; controlPort: number } | null {
   const rootPidFile = join(base, "daemon.pid");
@@ -595,7 +579,7 @@ export function detectLegacyRootDaemon(base: string): { pid: number; controlPort
   } catch {
     return null;
   }
-  if (!Number.isFinite(pid) || !pidLooksAlive(pid) || !isDaemonProcess(pid)) return null;
+  if (!Number.isFinite(pid) || !pidLooksAlive(pid) || !isAgentBridgeDaemon(pid)) return null;
   return { pid, controlPort: LEGACY_ROOT_CONTROL_PORT };
 }
 

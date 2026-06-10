@@ -18,6 +18,7 @@
 
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
+import { pidLooksAlive } from "./process-lifecycle";
 
 export type RunCommand = (cmd: string, args: string[]) => string;
 
@@ -65,17 +66,9 @@ export function readTurnInProgress(
   }
 }
 
-function defaultIsPidAlive(pid: number): boolean {
-  if (pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    // EPERM = exists but not ours (not the case for our own daemon, but err
-    // on the side of "alive" like pair-registry's pidLooksAlive).
-    return (err as NodeJS.ErrnoException).code === "EPERM";
-  }
-}
+// Delegates to the consolidated liveness probe (pid<=0 guard + EPERM = alive),
+// the single source of truth in process-lifecycle.ts.
+const defaultIsPidAlive = pidLooksAlive;
 
 /**
  * Refine the clean-exit classification using the daemon-side turn state.

@@ -125,21 +125,103 @@ export function listBridgeFrontendProcesses(): ProcessListEntry[] {
   }
 }
 
-export function isProcessAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
-  }
-}
-
 export function commandForPid(pid: number): string | null {
   try {
     return execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
   } catch {
     return null;
   }
+}
+
+// ---------------------------------------------------------------------------
+// Process identity & liveness — the SINGLE source of truth
+//
+// These three helpers used to be re-implemented (with drifted semantics) in
+// daemon-lifecycle.ts and pair-registry.ts. They are consolidated here, next to
+// the `ps` parsing and the argv[0]-anchored `commandMatchesManagedCodexTui`
+// matcher, which is the project's most rigorous matcher template. All call sites
+// import from this module; do NOT re-add local copies.
+// ---------------------------------------------------------------------------
+
+/** A `ps` command-line lookup for a pid — injectable so the identity matchers are pure/testable. */
+export type CommandLookup = (pid: number) => string | null;
+
+/**
+ * `process.kill(pid, 0)` liveness with two deliberate hardenings, applied
+ * uniformly so every call site agrees:
+ *
+ *  - pid <= 0 (and non-integer) is NEVER a real holder. `process.kill(0, 0)`
+ *    targets the current process GROUP and "succeeds", which would wrongly mark
+ *    a corrupt `{pid:0}` pid file / lock as live and wedge acquisition forever.
+ *    Negatives carry signal-broadcast semantics, not a pid. Treat all as dead so
+ *    the slot/lock/pid file is reclaimable.
+ *  - EPERM (the process exists but we may not signal it) is treated as ALIVE.
+ *    On a single-user machine EPERM is near-unreachable, but if it does occur,
+ *    declaring an existing-but-unsignalable process dead and then stomping its
+ *    state is strictly worse than conservatively keeping it. This adopts
+ *    pair-registry's historical "EPERM = alive" choice; the previous
+ *    daemon-lifecycle/process-lifecycle copies wrongly treated EPERM as dead.
+ */
+export function pidLooksAlive(pid: number): boolean {
+  if (!Number.isInteger(pid) || pid <= 0) return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err: any) {
+    return err?.code === "EPERM";
+  }
+}
+
+/**
+ * Backward-compatible alias for {@link pidLooksAlive}. Kept because many call
+ * sites and tests import `isProcessAlive`. Identical semantics — there is now a
+ * single liveness implementation (incl. the pid<=0 guard and EPERM = alive).
+ */
+export const isProcessAlive = pidLooksAlive;
+
+/**
+ * The SINGLE strict AgentBridge-daemon matcher, shared by daemon-lifecycle
+ * (kill / reuse identity guard) and pair-registry (legacy-root detection).
+ *
+ * Verifies via the process command line that `pid` is actually our daemon, not
+ * an OS-reused pid belonging to an unrelated process. It anchors on the
+ * executable basename being a daemon-role script (`daemon.{ts,js}` in
+ * production, `*-daemon.{ts,js}` for the e2e harness's fake) — NOT on the loose
+ * substring "daemon", which also matches e.g. a test file named
+ * `daemon-self-heal.test.ts` invoked by an IDE runner. It additionally requires
+ * an agentbridge marker so an unrelated `*-daemon.js` from another project is
+ * not matched.
+ *
+ * This is a behaviour TIGHTENING relative to pair-registry's former loose
+ * `cmd.includes("daemon")`. The legacy single-pair-root daemon is still spawned
+ * as `<bun> run <…>/daemon.{ts,js}` (dev) or `<…>/server/daemon.js` (bundled),
+ * whose path carries an `agentbridge`/`agent_bridge` marker, so the anchored
+ * pattern still catches it — see process-lifecycle.test.ts ("isAgentBridgeDaemon" block) for the proof cases.
+ *
+ * `lookup` defaults to a real `ps` call; tests inject a pure function.
+ */
+export function isAgentBridgeDaemon(pid: number, lookup: CommandLookup = commandForPid): boolean {
+  const cmd = lookup(pid);
+  if (cmd === null) return false;
+  // Match .../<anything>-daemon.js or .../<anything>-daemon.ts as a runnable
+  // argument (preceded by whitespace/path-sep, followed by whitespace or EOL).
+  const hasDaemonEntry = /(?:^|[\s/\\])[\w.-]*-?daemon\.(?:ts|js)(?:\s|$)/.test(cmd);
+  const hasAgentbridge = cmd.includes("agentbridge") || cmd.includes("agent_bridge");
+  return hasDaemonEntry && hasAgentbridge;
+}
+
+/**
+ * The general AgentBridge-process matcher (loose by design): launchers (CLI /
+ * plugin frontend) and daemons all carry an agentbridge marker. Used only to
+ * detect OS pid recycling of a STALE lock holder — NOT for kill decisions
+ * (kill paths use the stricter {@link isAgentBridgeDaemon}).
+ *
+ * `lookup` defaults to a real `ps` call; tests inject a pure function.
+ */
+export function isAgentBridgeProcess(pid: number, lookup: CommandLookup = commandForPid): boolean {
+  const cmd = lookup(pid);
+  if (cmd === null) return false;
+  return cmd.includes("agentbridge") || cmd.includes("agent_bridge");
 }
 
 export function terminateProcessSync(pid: number, options: TerminateProcessOptions = {}): boolean {

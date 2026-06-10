@@ -18,7 +18,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.10", "0.0.0-source"),
-  commit: defineString("10dfd58", "source"),
+  commit: defineString("51a44cb", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -2225,7 +2225,7 @@ class TuiConnectionState {
 }
 
 // src/daemon-lifecycle.ts
-import { spawn as spawn2, execFileSync as execFileSync2 } from "child_process";
+import { spawn as spawn2 } from "child_process";
 import { existsSync as existsSync3, readFileSync, statSync as statSync2, unlinkSync as unlinkSync2, writeFileSync, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
 
@@ -2240,6 +2240,41 @@ function parsePositiveIntEnv(name, fallback, log = () => {}, env = process.env) 
     return fallback;
   }
   return parsed;
+}
+
+// src/process-lifecycle.ts
+import { execFileSync as execFileSync2 } from "child_process";
+function commandForPid(pid) {
+  try {
+    return execFileSync2("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
+  } catch {
+    return null;
+  }
+}
+function pidLooksAlive(pid) {
+  if (!Number.isInteger(pid) || pid <= 0)
+    return false;
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return err?.code === "EPERM";
+  }
+}
+var isProcessAlive = pidLooksAlive;
+function isAgentBridgeDaemon(pid, lookup = commandForPid) {
+  const cmd = lookup(pid);
+  if (cmd === null)
+    return false;
+  const hasDaemonEntry = /(?:^|[\s/\\])[\w.-]*-?daemon\.(?:ts|js)(?:\s|$)/.test(cmd);
+  const hasAgentbridge = cmd.includes("agentbridge") || cmd.includes("agent_bridge");
+  return hasDaemonEntry && hasAgentbridge;
+}
+function isAgentBridgeProcess(pid, lookup = commandForPid) {
+  const cmd = lookup(pid);
+  if (cmd === null)
+    return false;
+  return cmd.includes("agentbridge") || cmd.includes("agent_bridge");
 }
 
 // src/daemon-lifecycle.ts
@@ -2341,7 +2376,7 @@ class DaemonLifecycle {
     const existingPid = this.readPid();
     if (existingPid) {
       if (isProcessAlive(existingPid)) {
-        if (this.isDaemonProcess(existingPid)) {
+        if (isAgentBridgeDaemon(existingPid)) {
           try {
             await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
             return;
@@ -2552,7 +2587,7 @@ class DaemonLifecycle {
             this.releaseLock();
             return this.acquireLockStrict(true);
           }
-          if (Number.isFinite(holderPid) && this.lockAgeMs() > LOCK_IDENTITY_GRACE_MS && !this.isAgentBridgeProcess(holderPid)) {
+          if (Number.isFinite(holderPid) && this.lockAgeMs() > LOCK_IDENTITY_GRACE_MS && !isAgentBridgeProcess(holderPid)) {
             this.log(`Startup lock is ${Math.round(this.lockAgeMs() / 1000)}s old and holder pid ${holderPid} ` + `is an unrelated process (pid recycled), reclaiming`);
             this.releaseLock();
             return this.acquireLockStrict(true);
@@ -2573,14 +2608,6 @@ class DaemonLifecycle {
       return 0;
     }
   }
-  isAgentBridgeProcess(pid) {
-    try {
-      const cmd = execFileSync2("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
-      return cmd.includes("agentbridge") || cmd.includes("agent_bridge");
-    } catch {
-      return false;
-    }
-  }
   releaseLock() {
     try {
       unlinkSync2(this.stateDir.lockFile);
@@ -2598,7 +2625,7 @@ class DaemonLifecycle {
       this.cleanup();
       return false;
     }
-    if (!this.isDaemonProcess(pid)) {
+    if (!isAgentBridgeDaemon(pid)) {
       this.log(`Pid ${pid} is alive but is NOT an AgentBridge daemon \u2014 refusing to kill. Cleaning up stale pid file.`);
       this.cleanup();
       return false;
@@ -2626,16 +2653,6 @@ class DaemonLifecycle {
     this.cleanup();
     return true;
   }
-  isDaemonProcess(pid) {
-    try {
-      const cmd = execFileSync2("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
-      const hasDaemonEntry = /(?:^|[\s/\\])[\w.-]*-?daemon\.(?:ts|js)(?:\s|$)/.test(cmd);
-      const hasAgentbridge = cmd.includes("agentbridge") || cmd.includes("agent_bridge");
-      return hasDaemonEntry && hasAgentbridge;
-    } catch {
-      return false;
-    }
-  }
   cleanup() {
     this.removePidFile();
     this.removeStatusFile();
@@ -2648,14 +2665,6 @@ async function fetchWithTimeout(url, timeoutMs = HEALTH_FETCH_TIMEOUT_MS) {
     return await fetch(url, { signal: controller.signal });
   } finally {
     clearTimeout(timer);
-  }
-}
-function isProcessAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch {
-    return false;
   }
 }
 
