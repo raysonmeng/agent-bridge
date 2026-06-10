@@ -26,7 +26,12 @@ import type { BridgeMessage } from "./types";
 import type { BudgetSnapshot } from "./budget/types";
 import { renderBudgetSnapshot, BUDGET_UNAVAILABLE_TEXT } from "./budget/render";
 
-export type ReplySender = (msg: BridgeMessage, requireReply?: boolean, onBusy?: "reject" | "steer") => Promise<{ success: boolean; error?: string }>;
+export type ReplySender = (
+  msg: BridgeMessage,
+  requireReply?: boolean,
+  onBusy?: "reject" | "steer" | "interrupt",
+  idempotencyKey?: string,
+) => Promise<{ success: boolean; error?: string; code?: string; phase?: string; retryAfterMs?: number }>;
 
 export const CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
@@ -58,7 +63,7 @@ export const CLAUDE_INSTRUCTIONS = [
   "## Turn coordination",
   "- When you see '⏳ Codex is working', do NOT call the reply tool — wait for '✅ Codex finished'.",
   "- After Codex finishes a turn, you have an attention window to review and respond before new messages arrive.",
-  "- If the reply tool returns a busy error, Codex is still executing. You decide: wait and retry later, or resend with on_busy=\"steer\" to feed the message INTO the running turn (good for mid-course corrections; it does not interrupt or restart the work).",
+  "- If the reply tool returns a busy error, Codex is still executing. You decide: wait and retry later, resend with on_busy=\"steer\" to feed the message INTO the running turn (good for mid-course corrections; it does not interrupt or restart the work), or resend with on_busy=\"interrupt\" to STOP the running turn and start a new one with your message (use only when the current work is obsolete — prefer steer otherwise).",
   "",
   "## Budget awareness",
   "- Use the get_budget tool to check both agents' subscription quota (5h/weekly windows, drift, pause state).",
@@ -247,12 +252,16 @@ export class ClaudeAdapter extends EventEmitter {
               },
               require_reply: {
                 type: "boolean",
-                description: "When true, Codex is required to send a reply. All Codex messages from this turn will be forwarded immediately (bypassing STATUS buffering). Use this when you need a direct answer from Codex.",
+                description: "When true, Codex is required to send a reply. All Codex messages from this turn will be forwarded immediately (bypassing STATUS buffering). Use this when you need a direct answer from Codex. Combinable with on_busy=\"steer\": the reply expectation arms once the steer is accepted into the running turn.",
               },
               on_busy: {
                 type: "string",
-                enum: ["reject", "steer"],
-                description: "What to do when Codex is mid-turn. \"reject\" (default): fail with a busy error — wait and retry. \"steer\": feed this message INTO the running turn — Codex sees it immediately and integrates it without losing work. Use steer for mid-course corrections, added constraints, or updated acceptance criteria; it does NOT start a new turn, so don't combine it with require_reply. If you need Codex to STOP and do something else, wait for the turn to finish (interrupt support is coming separately).",
+                enum: ["reject", "steer", "interrupt"],
+                description: "What to do when Codex is mid-turn. \"reject\" (default): fail with a busy error — wait and retry. \"steer\": feed this message INTO the running turn — Codex sees it immediately and integrates it without losing work; use it for mid-course corrections, added constraints, or updated acceptance criteria (it does NOT start a new turn). \"interrupt\": STOP the running turn, wait for it to terminate, then send this message as a NEW turn — use only when the current work is obsolete; prefer steer otherwise.",
+              },
+              idempotency_key: {
+                type: "string",
+                description: "Optional client-generated key (non-empty, max 128 chars) that makes this reply idempotent: a retry carrying the same key is NOT re-injected — the bridge answers duplicate_in_flight / duplicate_terminal instead. Use a fresh key per logical message.",
               },
             },
             required: ["text"],
@@ -324,19 +333,35 @@ export class ClaudeAdapter extends EventEmitter {
 
     const requireReply = args?.require_reply === true;
     const onBusyRaw = args?.on_busy;
-    const onBusy: "reject" | "steer" = onBusyRaw === "steer" ? "steer" : "reject";
-    if (onBusyRaw !== undefined && onBusyRaw !== "reject" && onBusyRaw !== "steer") {
+    if (onBusyRaw !== undefined && onBusyRaw !== "reject" && onBusyRaw !== "steer" && onBusyRaw !== "interrupt") {
       return {
-        content: [{ type: "text" as const, text: `Error: invalid on_busy value ${JSON.stringify(onBusyRaw)} — use "reject" or "steer".` }],
+        content: [{ type: "text" as const, text: `Error: invalid on_busy value ${JSON.stringify(onBusyRaw)} — use "reject", "steer" or "interrupt".` }],
         isError: true,
       };
     }
-    if (onBusy === "steer" && requireReply) {
-      return {
-        content: [{ type: "text" as const, text: "Error: require_reply cannot be combined with on_busy=\"steer\" yet — a steer joins the RUNNING turn instead of starting a new one, so reply tracking would mis-arm. Send the steer without require_reply." }],
-        isError: true,
-      };
+    const onBusy: "reject" | "steer" | "interrupt" =
+      onBusyRaw === "steer" || onBusyRaw === "interrupt" ? onBusyRaw : "reject";
+    // require_reply × steer is allowed (protocol v2 PR B): the daemon arms the
+    // reply expectation once the steer is ACCEPTED into the running turn.
+    // require_reply × interrupt is allowed too — it ultimately starts a NEW
+    // turn, so the tracker arms after injection exactly like a normal reply.
+
+    const idempotencyKeyRaw = args?.idempotency_key;
+    if (idempotencyKeyRaw !== undefined) {
+      if (typeof idempotencyKeyRaw !== "string" || idempotencyKeyRaw.length === 0) {
+        return {
+          content: [{ type: "text" as const, text: "Error: idempotency_key must be a non-empty string." }],
+          isError: true,
+        };
+      }
+      if (idempotencyKeyRaw.length > 128) {
+        return {
+          content: [{ type: "text" as const, text: `Error: idempotency_key is too long (${idempotencyKeyRaw.length} chars, max 128).` }],
+          isError: true,
+        };
+      }
     }
+    const idempotencyKey = idempotencyKeyRaw as string | undefined;
 
     const bridgeMsg: BridgeMessage = {
       id: (args?.chat_id as string) ?? `reply_${Date.now()}`,
@@ -353,20 +378,31 @@ export class ClaudeAdapter extends EventEmitter {
       };
     }
 
-    const result = await this.replySender(bridgeMsg, requireReply, onBusy);
+    const result = await this.replySender(bridgeMsg, requireReply, onBusy, idempotencyKey);
     if (!result.success) {
-      this.log(`Reply delivery failed: ${result.error}`);
+      this.log(`Reply delivery failed: ${result.error}${result.code ? ` (code=${result.code})` : ""}`);
+      // Surface the machine-readable code (PR B structured result) alongside
+      // the human error so the model can branch on it deterministically.
+      const codePrefix = result.code ? ` [${result.code}]` : "";
       return {
-        content: [{ type: "text" as const, text: `Error: ${result.error}` }],
+        content: [{ type: "text" as const, text: `Error${codePrefix}: ${result.error}` }],
         isError: true,
       };
     }
 
     // Include pending message hint
     const pending = this.pendingMessages.length;
-    let responseText = onBusy === "steer"
-      ? "Reply sent to Codex (will be steered into the running turn if one is active; watch for a system_steer_failed notice if the app-server rejects it)."
-      : "Reply sent to Codex.";
+    let responseText = "Reply sent to Codex.";
+    if (onBusy === "steer") {
+      responseText = "Reply sent to Codex (will be steered into the running turn if one is active; watch for a system_steer_failed notice if the app-server rejects it).";
+    } else if (onBusy === "interrupt") {
+      // Honest wording: a success can mean EITHER an interrupt happened then the
+      // message was injected, OR the running turn had already ended by dispatch
+      // time so it fell straight through to a normal injection (race-degrade) —
+      // nothing was interrupted in that case. The result does not distinguish
+      // the two, so do not assert an interrupt occurred.
+      responseText = "Reply sent to Codex as a new turn (any turn still running was interrupted first; if it had already finished, your message was simply injected).";
+    }
     if (pending > 0) {
       responseText += ` Note: ${pending} unread Codex message${pending > 1 ? "s" : ""} already waiting \u2014 call get_messages to read them.`;
     }

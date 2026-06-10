@@ -6,7 +6,21 @@ import {
   CLOSE_CODE_PROBE_IN_PROGRESS,
   CLOSE_CODE_PAIR_MISMATCH,
 } from "./control-protocol";
-import type { ControlClientIdentity, ControlClientMessage, ControlServerMessage, DaemonStatus } from "./control-protocol";
+import type { ControlClientIdentity, ControlClientMessage, ControlServerMessage, DaemonStatus, TurnPhase } from "./control-protocol";
+import { CLIENT_REPLY_TIMEOUT_MS } from "./interrupt-timing";
+
+/**
+ * Result of a claude_to_codex round trip. `code` / `phase` / `retryAfterMs`
+ * are the protocol v2 PR B structured fields (populated by newer daemons
+ * alongside the legacy error string; absent against older daemons).
+ */
+export interface SendReplyResult {
+  success: boolean;
+  error?: string;
+  code?: string;
+  phase?: TurnPhase;
+  retryAfterMs?: number;
+}
 
 interface DaemonClientEvents {
   codexMessage: [BridgeMessage];
@@ -14,6 +28,8 @@ interface DaemonClientEvents {
   rejected: [number];
   status: [DaemonStatus];
   incumbentStatus: [{ connected: boolean; alive: boolean }];
+  /** turn_started ACK (protocol v2 PR B): a bridge-injected turn was confirmed started. */
+  turnStarted: [{ requestId: string; idempotencyKey?: string; threadId: string; turnId: string }];
 }
 
 let nextSocketId = 0;
@@ -29,7 +45,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   private pendingReplies = new Map<
     string,
     {
-      resolve: (value: { success: boolean; error?: string }) => void;
+      resolve: (value: SendReplyResult) => void;
       timer: ReturnType<typeof setTimeout>;
     }
   >();
@@ -195,17 +211,30 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     this.rejectPendingReplies("Daemon connection closed");
   }
 
-  async sendReply(message: BridgeMessage, requireReply?: boolean, onBusy?: "reject" | "steer"): Promise<{ success: boolean; error?: string }> {
+  async sendReply(
+    message: BridgeMessage,
+    requireReply?: boolean,
+    onBusy?: "reject" | "steer" | "interrupt",
+    idempotencyKey?: string,
+  ): Promise<SendReplyResult> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return { success: false, error: "AgentBridge daemon is not connected." };
     }
 
     const requestId = `reply_${Date.now()}_${this.nextRequestId++}`;
     return new Promise((resolve) => {
+      // CLIENT_REPLY_TIMEOUT_MS applies to the daemon's IMMEDIATE result. The
+      // interrupt path can legitimately defer the result until the daemon-side
+      // terminal-wait budget elapses — that budget is CLAMPED below this value
+      // (see interrupt-timing.ts: clampInterruptTimeoutMs), so the daemon always
+      // answers before this timer fires. INVARIANT: do not shrink this timeout
+      // without also lowering MAX_INTERRUPT_TIMEOUT_MS, or an over-large
+      // AGENTBRIDGE_INTERRUPT_TIMEOUT_MS could outlast it and a false timeout +
+      // Claude retry would double-turn.
       const timer = setTimeout(() => {
         this.pendingReplies.delete(requestId);
         resolve({ success: false, error: "Timed out waiting for AgentBridge daemon reply." });
-      }, 15000);
+      }, CLIENT_REPLY_TIMEOUT_MS);
 
       this.pendingReplies.set(requestId, { resolve, timer });
       this.send({
@@ -214,6 +243,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
         message,
         ...(requireReply ? { requireReply: true } : {}),
         ...(onBusy && onBusy !== "reject" ? { onBusy } : {}),
+        ...(idempotencyKey ? { idempotencyKey } : {}),
       });
     });
   }
@@ -238,9 +268,25 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
           if (!pending) return;
           clearTimeout(pending.timer);
           this.pendingReplies.delete(message.requestId);
-          pending.resolve({ success: message.success, error: message.error });
+          // Pass the PR B structured fields through when the daemon sent them
+          // (older daemons only populate success/error).
+          pending.resolve({
+            success: message.success,
+            error: message.error,
+            ...(message.code !== undefined ? { code: message.code } : {}),
+            ...(message.phase !== undefined ? { phase: message.phase } : {}),
+            ...(message.retryAfterMs !== undefined ? { retryAfterMs: message.retryAfterMs } : {}),
+          });
           return;
         }
+        case "turn_started":
+          this.emit("turnStarted", {
+            requestId: message.requestId,
+            ...(message.idempotencyKey !== undefined ? { idempotencyKey: message.idempotencyKey } : {}),
+            threadId: message.threadId,
+            turnId: message.turnId,
+          });
+          return;
         case "status":
           this.emit("status", message.status);
           return;

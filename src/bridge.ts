@@ -90,7 +90,12 @@ if (process.env.AGENTBRIDGE_TRACE === "1") {
   }
 }
 
-claude.setReplySender(async (msg: BridgeMessage, requireReply?: boolean, onBusy?: "reject" | "steer") => {
+claude.setReplySender(async (
+  msg: BridgeMessage,
+  requireReply?: boolean,
+  onBusy?: "reject" | "steer" | "interrupt",
+  idempotencyKey?: string,
+) => {
   if (msg.source !== "claude") {
     return { success: false, error: "Invalid message source" };
   }
@@ -102,7 +107,18 @@ claude.setReplySender(async (msg: BridgeMessage, requireReply?: boolean, onBusy?
     };
   }
 
-  return daemonClient.sendReply(msg, requireReply, onBusy);
+  return daemonClient.sendReply(msg, requireReply, onBusy, idempotencyKey);
+});
+
+// turn_started ACK (protocol v2 PR B): logged for correlation forensics. The
+// reply tool's synchronous result already told the model its message was
+// accepted; the ACK confirms the turn actually started (the "Claude saw a
+// timeout but the turn WAS injected" trail).
+daemonClient.on("turnStarted", ({ requestId, idempotencyKey, threadId, turnId }) => {
+  log(
+    `Codex turn started for reply ${requestId} (turn=${turnId}, thread=${threadId}` +
+    `${idempotencyKey ? `, idempotencyKey=${idempotencyKey}` : ""})`,
+  );
 });
 
 daemonClient.on("codexMessage", (message) => {

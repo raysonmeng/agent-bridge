@@ -64,12 +64,22 @@ export type ControlClientMessage =
       message: BridgeMessage;
       requireReply?: boolean;
       /**
-       * Busy-turn policy (protocol v2 B0). "reject" (default): fail with the
+       * Busy-turn policy (protocol v2 B0/B). "reject" (default): fail with the
        * busy error when a Codex turn is running. "steer": feed the message
        * into the RUNNING turn via turn/steer — Codex sees it mid-turn without
-       * losing work. ("interrupt" lands with PR B's ACK/idempotency machinery.)
+       * losing work. "interrupt" (PR B): terminate ALL active turns via
+       * turn/interrupt, wait for the terminal boundary, then inject this
+       * message as a normal new turn.
        */
-      onBusy?: "reject" | "steer";
+      onBusy?: "reject" | "steer" | "interrupt";
+      /**
+       * Optional idempotency key (protocol v2 PR B). Keyed messages are
+       * deduplicated per (threadId, idempotencyKey): a retry whose key is
+       * already tracked (live or terminal tombstone) is NOT re-injected — the
+       * daemon answers with duplicate_in_flight / duplicate_terminal instead.
+       * Messages without a key bypass the machine entirely (backward compat).
+       */
+      idempotencyKey?: string;
     }
   | { type: "status" }
   // Non-attaching probe: ask the daemon whether it already has a LIVE Claude
@@ -81,7 +91,38 @@ export type ControlClientMessage =
 
 export type ControlServerMessage =
   | { type: "codex_to_claude"; message: BridgeMessage }
-  | { type: "claude_to_codex_result"; requestId: string; success: boolean; error?: string }
+  | {
+      type: "claude_to_codex_result";
+      requestId: string;
+      success: boolean;
+      error?: string;
+      /**
+       * Structured result (protocol v2 PR B). `ok` mirrors `success` and both
+       * are populated for one version; `code` is the machine-readable failure
+       * code (e.g. busy_reject / budget_paused / steer_failed /
+       * interrupt_timeout / interrupt_rejected / interrupt_unavailable /
+       * duplicate_in_flight / duplicate_terminal / no_thread); `phase` is the
+       * codex turnPhase at result time; `retryAfterMs` is advisory and only
+       * set where a meaningful estimate exists.
+       */
+      ok?: boolean;
+      code?: string;
+      phase?: TurnPhase;
+      retryAfterMs?: number;
+    }
+  /**
+   * turn_started ACK (protocol v2 PR B): a bridge-originated turn/start was
+   * confirmed by the app-server (its response carried the created turn id).
+   * `requestId` correlates back to the originating claude_to_codex request;
+   * `idempotencyKey` is echoed when the request carried one.
+   */
+  | {
+      type: "turn_started";
+      requestId: string;
+      idempotencyKey?: string;
+      threadId: string;
+      turnId: string;
+    }
   | { type: "status"; status: DaemonStatus }
   // Reply to `probe_incumbent`. `connected` = a Claude frontend socket is
   // currently attached; `alive` = it responded to a liveness ping (a half-open

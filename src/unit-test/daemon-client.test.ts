@@ -321,6 +321,85 @@ describe("DaemonClient", () => {
     expect(result.success).toBe(true);
   });
 
+  test("sendReply passes the PR B structured result fields through", async () => {
+    onServerMessage = (ws: any, raw: any) => {
+      const msg = JSON.parse(typeof raw === "string" ? raw : raw.toString());
+      if (msg.type === "claude_to_codex") {
+        ws.send(JSON.stringify({
+          type: "claude_to_codex_result",
+          requestId: msg.requestId,
+          success: false,
+          error: "Codex is busy executing a turn.",
+          ok: false,
+          code: "busy_reject",
+          phase: "running",
+          retryAfterMs: 15000,
+        }));
+      }
+    };
+
+    await client.connect();
+
+    const result = await client.sendReply({
+      id: "r-structured",
+      source: "claude",
+      content: "structured fields",
+      timestamp: Date.now(),
+    });
+    expect(result.success).toBe(false);
+    expect(result.code).toBe("busy_reject");
+    expect(result.phase).toBe("running");
+    expect(result.retryAfterMs).toBe(15000);
+    expect(result.error).toContain("busy");
+  });
+
+  test("sendReply serializes onBusy=interrupt and idempotencyKey onto the control message", async () => {
+    const seen: any[] = [];
+    onServerMessage = (ws: any, raw: any) => {
+      const msg = JSON.parse(typeof raw === "string" ? raw : raw.toString());
+      if (msg.type === "claude_to_codex") {
+        seen.push(msg);
+        ws.send(JSON.stringify({ type: "claude_to_codex_result", requestId: msg.requestId, success: true }));
+      }
+    };
+
+    await client.connect();
+
+    await client.sendReply(
+      { id: "r-int", source: "claude", content: "interrupt me", timestamp: Date.now() },
+      false,
+      "interrupt",
+      "key-77",
+    );
+    expect(seen).toHaveLength(1);
+    expect(seen[0].onBusy).toBe("interrupt");
+    expect(seen[0].idempotencyKey).toBe("key-77");
+  });
+
+  test("emits turnStarted on a turn_started control event", async () => {
+    await client.connect();
+
+    const ackPromise = new Promise<any>((resolve) => {
+      client.on("turnStarted", (ack) => resolve(ack));
+    });
+
+    sendToClient({
+      type: "turn_started",
+      requestId: "reply_1_1",
+      idempotencyKey: "key-9",
+      threadId: "thread-1",
+      turnId: "turn-abc",
+    });
+
+    const ack = await ackPromise;
+    expect(ack).toEqual({
+      requestId: "reply_1_1",
+      idempotencyKey: "key-9",
+      threadId: "thread-1",
+      turnId: "turn-abc",
+    });
+  });
+
   test("pending replies rejected on disconnect", async () => {
     await client.connect();
 

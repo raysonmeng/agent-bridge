@@ -256,12 +256,12 @@ describe("Message delivery: reply pending hint", () => {
   });
 });
 
-describe("Reply on_busy option (protocol v2 B0)", () => {
-  function withCapturingSender(adapter: any) {
-    const calls: Array<{ content: string; requireReply?: boolean; onBusy?: string }> = [];
-    adapter.replySender = async (msg: any, requireReply?: boolean, onBusy?: string) => {
-      calls.push({ content: msg.content, requireReply, onBusy });
-      return { success: true };
+describe("Reply on_busy option (protocol v2 B0/B)", () => {
+  function withCapturingSender(adapter: any, result: Record<string, unknown> = { success: true }) {
+    const calls: Array<{ content: string; requireReply?: boolean; onBusy?: string; idempotencyKey?: string }> = [];
+    adapter.replySender = async (msg: any, requireReply?: boolean, onBusy?: string, idempotencyKey?: string) => {
+      calls.push({ content: msg.content, requireReply, onBusy, idempotencyKey });
+      return result;
     };
     return calls;
   }
@@ -291,27 +291,58 @@ describe("Reply on_busy option (protocol v2 B0)", () => {
     expect(result.content[0].text).toContain("system_steer_failed");
   });
 
+  test("on_busy=interrupt is accepted and passed through (protocol v2 PR B)", async () => {
+    const adapter = createAdapter();
+    const calls = withCapturingSender(adapter);
+
+    const result = await adapter.handleReply({ text: "drop everything, new priority", on_busy: "interrupt" });
+
+    expect(result.isError).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].onBusy).toBe("interrupt");
+    expect(result.content[0].text).toContain("new turn");
+    // Recommend #1: the wording must NOT unconditionally assert an interrupt
+    // happened (the race-degrade path injects without interrupting anything).
+    expect(result.content[0].text).toContain("interrupted first");
+    expect(result.content[0].text).toContain("already finished");
+  });
+
   test("invalid on_busy value errors before sending anything", async () => {
     const adapter = createAdapter();
     const calls = withCapturingSender(adapter);
 
-    const result = await adapter.handleReply({ text: "hello", on_busy: "interrupt" });
+    const result = await adapter.handleReply({ text: "hello", on_busy: "abort" });
 
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("invalid on_busy value");
-    expect(result.content[0].text).toContain('"interrupt"');
+    expect(result.content[0].text).toContain('"abort"');
     expect(calls).toHaveLength(0);
   });
 
-  test("on_busy=steer combined with require_reply errors before sending (B0 limitation)", async () => {
+  test("require_reply combined with on_busy=steer is now allowed (PR B real semantics)", async () => {
+    // The B0 loud rejection is gone: the daemon arms the reply expectation
+    // when the steer is ACCEPTED into the running turn.
     const adapter = createAdapter();
     const calls = withCapturingSender(adapter);
 
     const result = await adapter.handleReply({ text: "hello", on_busy: "steer", require_reply: true });
 
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("require_reply cannot be combined");
-    expect(calls).toHaveLength(0);
+    expect(result.isError).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].onBusy).toBe("steer");
+    expect(calls[0].requireReply).toBe(true);
+  });
+
+  test("require_reply combined with on_busy=interrupt is allowed (starts a NEW turn)", async () => {
+    const adapter = createAdapter();
+    const calls = withCapturingSender(adapter);
+
+    const result = await adapter.handleReply({ text: "hello", on_busy: "interrupt", require_reply: true });
+
+    expect(result.isError).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].onBusy).toBe("interrupt");
+    expect(calls[0].requireReply).toBe(true);
   });
 
   test("on_busy=reject explicit value behaves like the default", async () => {
@@ -324,6 +355,104 @@ describe("Reply on_busy option (protocol v2 B0)", () => {
     expect(calls).toHaveLength(1);
     expect(calls[0].onBusy).toBe("reject");
     expect(calls[0].requireReply).toBe(true);
+  });
+
+  test("a failure result's machine-readable code is surfaced in the error text", async () => {
+    const adapter = createAdapter();
+    withCapturingSender(adapter, { success: false, error: "Codex is busy executing a turn.", code: "busy_reject" });
+
+    const result = await adapter.handleReply({ text: "hello" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("[busy_reject]");
+    expect(result.content[0].text).toContain("Codex is busy");
+  });
+
+  test("a failure result without a code keeps the legacy error shape", async () => {
+    const adapter = createAdapter();
+    withCapturingSender(adapter, { success: false, error: "plain failure" });
+
+    const result = await adapter.handleReply({ text: "hello" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toBe("Error: plain failure");
+  });
+});
+
+describe("Reply idempotency_key option (protocol v2 PR B)", () => {
+  function withCapturingSender(adapter: any) {
+    const calls: Array<{ idempotencyKey?: string }> = [];
+    adapter.replySender = async (_msg: any, _requireReply?: boolean, _onBusy?: string, idempotencyKey?: string) => {
+      calls.push({ idempotencyKey });
+      return { success: true };
+    };
+    return calls;
+  }
+
+  test("idempotency_key is passed through to the sender", async () => {
+    const adapter = createAdapter();
+    const calls = withCapturingSender(adapter);
+
+    const result = await adapter.handleReply({ text: "hello", idempotency_key: "task-42-attempt-1" });
+
+    expect(result.isError).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].idempotencyKey).toBe("task-42-attempt-1");
+  });
+
+  test("omitted idempotency_key sends undefined (bypasses the machine)", async () => {
+    const adapter = createAdapter();
+    const calls = withCapturingSender(adapter);
+
+    await adapter.handleReply({ text: "hello" });
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].idempotencyKey).toBeUndefined();
+  });
+
+  test("empty idempotency_key errors before sending", async () => {
+    const adapter = createAdapter();
+    const calls = withCapturingSender(adapter);
+
+    const result = await adapter.handleReply({ text: "hello", idempotency_key: "" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("non-empty string");
+    expect(calls).toHaveLength(0);
+  });
+
+  test("non-string idempotency_key errors before sending", async () => {
+    const adapter = createAdapter();
+    const calls = withCapturingSender(adapter);
+
+    const result = await adapter.handleReply({ text: "hello", idempotency_key: 42 });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("non-empty string");
+    expect(calls).toHaveLength(0);
+  });
+
+  test("idempotency_key longer than 128 chars errors before sending", async () => {
+    const adapter = createAdapter();
+    const calls = withCapturingSender(adapter);
+
+    const result = await adapter.handleReply({ text: "hello", idempotency_key: "x".repeat(129) });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("too long");
+    expect(result.content[0].text).toContain("max 128");
+    expect(calls).toHaveLength(0);
+  });
+
+  test("a 128-char idempotency_key is exactly at the limit and accepted", async () => {
+    const adapter = createAdapter();
+    const calls = withCapturingSender(adapter);
+
+    const result = await adapter.handleReply({ text: "hello", idempotency_key: "k".repeat(128) });
+
+    expect(result.isError).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].idempotencyKey).toBe("k".repeat(128));
   });
 });
 

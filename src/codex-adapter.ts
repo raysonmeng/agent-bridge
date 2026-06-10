@@ -28,9 +28,12 @@ import {
   type AppServerResponse,
   type AppServerServerRequestMethod,
   type AppServerTrackedRequestMethod,
+  type TurnInterruptParams,
   type TurnStartParams,
   type TurnSteerParams,
 } from "./app-server-protocol";
+import { parsePositiveIntEnv } from "./env-utils";
+import { DEFAULT_INTERRUPT_TIMEOUT_MS, clampInterruptTimeoutMs } from "./interrupt-timing";
 import {
   CODEX_TRANSPORT_ENV,
   TcpToUnixRelay,
@@ -167,10 +170,13 @@ export class CodexAdapter extends EventEmitter {
   private staleProxyIds = new Map<number, ReturnType<typeof setTimeout>>();
   private bridgeRequestIds = new Map<number, ReturnType<typeof setTimeout>>();
   // What each bridge-originated request was (turn/start injection vs
-  // turn/steer) — error handling differs: a rejected injection emits
-  // turnAborted, a rejected steer must NOT (the original turn is still
-  // running) and surfaces steerFailed instead.
-  private bridgeRequestKinds = new Map<number, "turn-start" | "steer">();
+  // turn/steer vs turn/interrupt) — error handling differs: a rejected
+  // injection emits turnAborted (+ bridgeTurnRejected for correlation), a
+  // rejected steer must NOT (the original turn is still running) and surfaces
+  // steerFailed instead, and a rejected interrupt surfaces interruptFailed
+  // (the original turn keeps running — response handlers never mutate turn
+  // state; the notification flow owns it).
+  private bridgeRequestKinds = new Map<number, "turn-start" | "steer" | "interrupt">();
   private intentionalDisconnect = false;
   // Fresh-session reconnection: buffer TUI messages while reconnecting app-server
   private pendingTuiMessages: string[] = [];
@@ -370,7 +376,12 @@ export class CodexAdapter extends EventEmitter {
   }
 
   /**
-   * Inject a message into the active Codex thread via turn/start. Returns true if sent.
+   * Inject a message into the active Codex thread via turn/start.
+   *
+   * Returns the (negative) bridge-originated JSON-RPC request id when the
+   * message was transport-accepted, or null on failure. Callers use the id to
+   * correlate the later "bridgeTurnStarted"/"bridgeTurnRejected" events back
+   * to the originating request (protocol v2 PR B turn_started ACK).
    *
    * Optional budget-tier overrides (plan v2.3 P4/R5) ride on the same turn/start:
    * `model`/`effort` are sticky for this thread's subsequent turns
@@ -378,18 +389,18 @@ export class CodexAdapter extends EventEmitter {
    * own the restore lifecycle. No JSON-RPC error for the request means
    * transport-accepted — NOT confirmed-applied (turn/started carries no model).
    */
-  injectMessage(text: string, overrides?: { model?: string; effort?: string }): boolean {
+  injectMessage(text: string, overrides?: { model?: string; effort?: string }): number | null {
     if (!this.threadId) {
       this.log("Cannot inject: no active thread");
-      return false;
+      return null;
     }
     if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
       this.log("Cannot inject: app-server WebSocket not connected");
-      return false;
+      return null;
     }
     if (this.turnInProgress) {
       this.log(`Rejected injection: Codex turn is in progress (thread ${this.threadId})`);
-      return false;
+      return null;
     }
     this.log(`Injecting message into Codex (${text.length} chars)`);
     const requestId = this.nextInjectionId--;
@@ -408,11 +419,11 @@ export class CodexAdapter extends EventEmitter {
         id: requestId,
         params,
       } satisfies AppServerRequest<"turn/start", TurnStartParams>));
-      return true;
+      return requestId;
     } catch (err: any) {
       this.untrackBridgeRequestId(requestId);
       this.log(`Injection send failed: ${err.message}`);
-      return false;
+      return null;
     }
   }
 
@@ -420,21 +431,26 @@ export class CodexAdapter extends EventEmitter {
    * Feed additional input into the CURRENTLY RUNNING turn via turn/steer —
    * Codex sees it mid-turn and adjusts without losing work (protocol v2 B0,
    * design consensus: explicit [STEER] framing is the CALLER's job).
-   * Returns true when transport-accepted; a later JSON-RPC error surfaces as
-   * a "steerFailed" event (NOT turnAborted — the original turn keeps running).
+   * Returns the (negative) bridge request id when transport-accepted, or null
+   * on failure. The id correlates the later steerAccepted/steerFailed event
+   * back to this dispatch so the daemon can release the steer's idempotency
+   * key + reply expectation by id (NOT by FIFO) — a lost or out-of-order
+   * response cannot then strand them onto the wrong turn. A later JSON-RPC
+   * error surfaces as a "steerFailed" event (NOT turnAborted — the original
+   * turn keeps running).
    */
-  steerMessage(text: string): boolean {
+  steerMessage(text: string): number | null {
     if (!this.threadId) {
       this.log("Cannot steer: no active thread");
-      return false;
+      return null;
     }
     if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
       this.log("Cannot steer: app-server WebSocket not connected");
-      return false;
+      return null;
     }
     if (!this.turnInProgress) {
       this.log("Cannot steer: no turn in progress (use injectMessage)");
-      return false;
+      return null;
     }
     // turn/steer requires the active turn id as a precondition (expectedTurnId
     // — REQUIRED on every codex release that has turn/steer; omitting it gets
@@ -444,7 +460,7 @@ export class CodexAdapter extends EventEmitter {
     const expectedTurnId = this.currentSteerableTurnId();
     if (!expectedTurnId) {
       this.log("Cannot steer: no addressable active turn id (turn/started carried no id)");
-      return false;
+      return null;
     }
     this.log(`Steering message into active Codex turn ${expectedTurnId} (${text.length} chars)`);
     const requestId = this.nextInjectionId--;
@@ -460,12 +476,171 @@ export class CodexAdapter extends EventEmitter {
         id: requestId,
         params,
       } satisfies AppServerRequest<"turn/steer", TurnSteerParams>));
-      return true;
+      return requestId;
     } catch (err: any) {
       this.untrackBridgeRequestId(requestId);
       this.log(`Steer send failed: ${err.message}`);
-      return false;
+      return null;
     }
+  }
+
+  /**
+   * Interrupt EVERY addressable active turn via turn/interrupt (protocol v2
+   * PR B; design consensus with Codex: multi-turn ambiguity is resolved as
+   * "terminate ALL active turns"). `unknown:` fallback keys carry no
+   * addressable id and cannot be interrupted — when no addressable id exists
+   * this fails locally with a structured result instead of sending anything.
+   *
+   * Wire facts verified against codex-rs: params are {threadId, turnId}
+   * (turn.rs TurnInterruptParams); a mismatching/inactive turnId gets an
+   * immediate JSON-RPC error, while the SUCCESS response ({}) is deferred by
+   * the app-server until the core's TurnAborted — arriving alongside the
+   * terminal `turn/completed` (status "interrupted") notification. Callers
+   * must therefore wait for the terminal boundary via waitForTurnsTerminal,
+   * NOT for the interrupt responses.
+   */
+  interruptActiveTurns():
+    | { ok: true; turnIds: string[] }
+    | { ok: false; code: "interrupt_unavailable"; error: string } {
+    if (!this.threadId) {
+      this.log("Cannot interrupt: no active thread");
+      return { ok: false, code: "interrupt_unavailable", error: "no active thread" };
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      this.log("Cannot interrupt: app-server WebSocket not connected");
+      return { ok: false, code: "interrupt_unavailable", error: "app-server WebSocket not connected" };
+    }
+    const addressable = [...this.activeTurnIds].filter((id) => !id.startsWith("unknown:"));
+    if (addressable.length === 0) {
+      this.log("Cannot interrupt: no addressable active turn id (turn/started carried no id)");
+      return {
+        ok: false,
+        code: "interrupt_unavailable",
+        error: "no addressable active turn id (turn/started carried no id)",
+      };
+    }
+    for (const turnId of addressable) {
+      const requestId = this.nextInjectionId--;
+      this.trackBridgeRequestId(requestId, "interrupt");
+      const params: TurnInterruptParams = { threadId: this.threadId, turnId };
+      try {
+        this.appServerWs.send(JSON.stringify({
+          method: "turn/interrupt",
+          id: requestId,
+          params,
+        } satisfies AppServerRequest<"turn/interrupt", TurnInterruptParams>));
+        this.log(`Sent turn/interrupt for active turn ${turnId} (request ${requestId})`);
+      } catch (err: any) {
+        // A send failure here means the socket just died mid-loop; earlier
+        // interrupts MAY already be in flight, but the caller must not assume
+        // the turns stopped — surface a loud structured failure (the close
+        // path will reset turn state on its own if the socket is truly gone).
+        this.untrackBridgeRequestId(requestId);
+        this.log(`turn/interrupt send failed for ${turnId}: ${err.message}`);
+        return {
+          ok: false,
+          code: "interrupt_unavailable",
+          error: `turn/interrupt send failed (${err.message}); earlier interrupts may still land`,
+        };
+      }
+    }
+    return { ok: true, turnIds: addressable };
+  }
+
+  /**
+   * Interrupt terminal-wait budget (env-overridable; default 10 seconds).
+   *
+   * INVARIANT (see interrupt-timing.ts): this budget must resolve BEFORE the
+   * bridge client's reply timeout (daemon-client CLIENT_REPLY_TIMEOUT_MS), or
+   * the client reports a false "Timed out waiting for daemon" while the daemon
+   * still proceeds to inject — a Claude retry then double-turns. parsePositiveIntEnv
+   * has no upper bound, so we CLAMP the env value below the client timeout to
+   * make the relationship impossible to misconfigure.
+   */
+  private interruptTimeoutMs(): number {
+    const requested = parsePositiveIntEnv(
+      "AGENTBRIDGE_INTERRUPT_TIMEOUT_MS",
+      DEFAULT_INTERRUPT_TIMEOUT_MS,
+      (m) => this.log(m),
+    );
+    const clamped = clampInterruptTimeoutMs(requested);
+    if (clamped !== requested) {
+      this.log(
+        `AGENTBRIDGE_INTERRUPT_TIMEOUT_MS=${requested}ms exceeds the safe ceiling — ` +
+        `clamped to ${clamped}ms (must resolve before the client reply timeout to avoid a double-turn)`,
+      );
+    }
+    return clamped;
+  }
+
+  /**
+   * Resolve once every TARGETED turnId has reached its terminal boundary — i.e.
+   * each is gone from activeTurnIds AND no longer flagged stalled — the safe
+   * point after which a new turn/start cannot race the dying targeted turn(s).
+   * On timeout the caller must NOT inject (double-turn race) — it gets a
+   * structured failure instead.
+   *
+   * SCOPING (PR B fix): the predicate keys ONLY on the targeted ids, NOT on the
+   * global turnPhase. turnPhase reports "running" whenever ANY turn is active,
+   * so a coexisting NON-targeted turn — e.g. an unaddressable `unknown:` turn
+   * that interruptActiveTurns can never target — would otherwise hold turnPhase
+   * at "running" forever and guarantee a spurious timeout even after every
+   * targeted turn ended. Per-id scoping makes the wait depend solely on the
+   * turns we actually interrupted.
+   *
+   * Listens on the existing event funnels that mutate turn state:
+   * turnIdCompleted (per-turn completion), turnTrackingReset (close /
+   * reconnect / stop / abort resets) and turnPhaseChanged (covers
+   * stalled↔running moves). The timeout timer is unref'd so a pending wait
+   * never keeps the process alive.
+   */
+  waitForTurnsTerminal(
+    turnIds: string[],
+    timeoutMs = this.interruptTimeoutMs(),
+    signal?: AbortSignal,
+  ): Promise<{ ok: true } | { ok: false; code: "interrupt_timeout" | "interrupt_aborted" }> {
+    const satisfied = () =>
+      turnIds.every(
+        (id) => !this.activeTurnIds.has(id) && !this.currentlyStalledTurnIds.has(id),
+      );
+
+    if (satisfied()) return Promise.resolve({ ok: true });
+    // Cancelable (PR B recommend #4): when the caller already settled on another
+    // signal (e.g. interruptFailed), aborting tears down THIS wait's listeners +
+    // timer promptly instead of leaking them until timeoutMs elapses.
+    if (signal?.aborted) return Promise.resolve({ ok: false, code: "interrupt_aborted" });
+
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (
+        result: { ok: true } | { ok: false; code: "interrupt_timeout" | "interrupt_aborted" },
+      ) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        this.off("turnIdCompleted", check);
+        this.off("turnTrackingReset", check);
+        this.off("turnPhaseChanged", check);
+        signal?.removeEventListener("abort", onAbort);
+        resolve(result);
+      };
+      const check = () => {
+        if (satisfied()) finish({ ok: true });
+      };
+      const onAbort = () => finish({ ok: false, code: "interrupt_aborted" });
+      const timer = setTimeout(() => {
+        this.log(
+          `waitForTurnsTerminal timed out after ${timeoutMs}ms (still active: ` +
+          `${turnIds.filter((id) => this.activeTurnIds.has(id)).join(", ") || "none"}, phase=${this.turnPhase})`,
+        );
+        finish({ ok: false, code: "interrupt_timeout" });
+      }, timeoutMs);
+      timer.unref?.();
+      this.on("turnIdCompleted", check);
+      this.on("turnTrackingReset", check);
+      this.on("turnPhaseChanged", check);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
   }
 
   // ── Health Check ───────────────────────────────────────────
@@ -1520,24 +1695,58 @@ export class CodexAdapter extends EventEmitter {
           // no abort, no phase change. Surface it so the daemon can tell
           // Claude the mid-turn message did NOT reach Codex (e.g.
           // ActiveTurnNotSteerable on Review/Compact turns, or the turn ended
-          // in the NoActiveTurn race window).
-          this.emit("steerFailed", parsed.error.message ?? "unknown error");
+          // in the NoActiveTurn race window). The bridge requestId (numericId)
+          // correlates this verdict back to its dispatch so the daemon can
+          // release the steer's idempotency key + reply expectation by id
+          // instead of relying on FIFO ordering (lost-response orphan guard).
+          this.emit("steerFailed", { requestId: numericId, reason: parsed.error.message ?? "unknown error" });
+        } else if (bridgeKind === "interrupt") {
+          // A rejected turn/interrupt ("expected active turn id X but found Y",
+          // "no active turn to interrupt") means the ORIGINAL turn keeps
+          // running. Like steer rejections, the response handler must NOT
+          // touch turn state — the notification flow owns it. Surface the
+          // failure so the daemon can abort its terminal wait loudly.
+          this.emit("interruptFailed", parsed.error.message ?? "unknown error");
         } else {
           // An injected turn/start was REJECTED before any turn/started — no
           // turn ever goes in-progress, so resetTurnState's wasInProgress-gated
           // turnAborted never fires. Signal the abort here so daemon-level
           // per-turn state (the require_reply tracker) is not stranded.
-          // turnPhase must agree with the emitted event (PR A contract); the
-          // richer "rejected" terminal classification is PR B territory.
+          // turnPhase must agree with the emitted event (PR A contract).
+          // bridgeTurnRejected adds per-request correlation so the daemon can
+          // mark the matching idempotency key terminal `rejected` (PR B).
           this.lastTurnEndedAbnormally = true;
           this.emit("turnAborted", `injected turn/start rejected: ${parsed.error.message ?? "unknown error"}`);
+          this.emit("bridgeTurnRejected", {
+            requestId: numericId,
+            error: parsed.error.message ?? "unknown error",
+          });
           this.notifyPhaseIfChanged();
         }
       } else {
         this.log(`Bridge-originated ${bridgeKind} request completed (id ${responseId})`);
         if (bridgeKind === "steer") {
-          this.emit("steerAccepted");
+          // Carry the bridge requestId so the daemon correlates the accept
+          // back to its dispatch by id (same orphan guard as steerFailed).
+          this.emit("steerAccepted", { requestId: numericId });
+        } else if (bridgeKind === "turn-start") {
+          // turn_started ACK correlation (PR B): the turn/start response
+          // carries the created turn (TurnStartResponse.turn.id). Emit the
+          // correlation so the daemon can send the turn_started control event
+          // and advance the idempotency machine to started(turnId).
+          const result = parsed.result as { turn?: { id?: unknown } } | undefined;
+          const turnId = result?.turn?.id;
+          if (typeof turnId === "string" && turnId.length > 0) {
+            this.emit("bridgeTurnStarted", { requestId: numericId, turnId });
+          } else {
+            this.log(
+              `Bridge-originated turn/start response carried no turn id (id ${responseId}) — turn_started ACK skipped`,
+            );
+          }
         }
+        // interrupt success (TurnInterruptResponse is {}): log only — the
+        // app-server defers it until TurnAborted, and the terminal
+        // turn/completed notification is what drives state.
       }
       return null;
     }
@@ -1802,6 +2011,16 @@ export class CodexAdapter extends EventEmitter {
   }
 
   /**
+   * Public view of the steer target (PR B): the daemon reads it BEFORE calling
+   * steerMessage so an idempotency key dispatched as a steer can be bound to
+   * the turn it joined (started(turnId)) without changing steerMessage's
+   * boolean contract.
+   */
+  get steerableTurnId(): string | null {
+    return this.currentSteerableTurnId();
+  }
+
+  /**
    * Turn lifecycle phase (protocol v2 PR A). Strictly the turn axis — the
    * bridge's attention/routing window is reported separately by the daemon.
    */
@@ -1849,11 +2068,12 @@ export class CodexAdapter extends EventEmitter {
   }
 
   private markTurnCompleted(turnId?: string) {
-    if (typeof turnId === "string" && turnId.length > 0) {
-      this.activeTurnIds.delete(turnId);
-      this.clearTurnWatchdog(turnId);
-      this.stalledTurnIds.delete(turnId);
-      this.currentlyStalledTurnIds.delete(turnId);
+    const completedId = typeof turnId === "string" && turnId.length > 0 ? turnId : null;
+    if (completedId !== null) {
+      this.activeTurnIds.delete(completedId);
+      this.clearTurnWatchdog(completedId);
+      this.stalledTurnIds.delete(completedId);
+      this.currentlyStalledTurnIds.delete(completedId);
     } else {
       this.activeTurnIds.clear();
       this.clearAllTurnWatchdogs();
@@ -1863,6 +2083,12 @@ export class CodexAdapter extends EventEmitter {
 
     this.lastTurnEndedAbnormally = false;
     this.turnInProgress = this.activeTurnIds.size > 0;
+    // Per-turn completion signal (PR B): unlike the aggregate "turnCompleted"
+    // (which fires only when ALL turns are done), this carries the specific
+    // turn id so the daemon can terminate the matching idempotency key and
+    // waitForTurnsTerminal can re-check after EVERY completion. null = the
+    // notification carried no id and ALL active turns were cleared.
+    this.emit("turnIdCompleted", completedId);
     this.notifyPhaseIfChanged();
   }
 
@@ -1963,6 +2189,12 @@ export class CodexAdapter extends EventEmitter {
       this.log(`Turn state reset (${reason})`);
     }
     this.notifyPhaseIfChanged();
+    // Unconditional (NOT wasInProgress-gated) reset signal (PR B): an
+    // app-server close / reconnect / stop also invalidates bridge requests
+    // that were transport-accepted but never answered — the daemon must clear
+    // its per-injection correlation state and terminate idempotency keys even
+    // when no turn/started ever arrived for them.
+    this.emit("turnTrackingReset", reason);
   }
 
   private requestKey(id: unknown): string | null {
@@ -2019,7 +2251,7 @@ export class CodexAdapter extends EventEmitter {
     return this.clearTrackedId(this.staleProxyIds, proxyId);
   }
 
-  private trackBridgeRequestId(requestId: number, kind: "turn-start" | "steer" = "turn-start") {
+  private trackBridgeRequestId(requestId: number, kind: "turn-start" | "steer" | "interrupt" = "turn-start") {
     this.clearTrackedId(this.bridgeRequestIds, requestId);
 
     const timer = setTimeout(() => {
@@ -2032,7 +2264,7 @@ export class CodexAdapter extends EventEmitter {
   }
 
   /** Returns the request kind when this id was bridge-originated, else null. */
-  private consumeBridgeRequestId(requestId: number): "turn-start" | "steer" | null {
+  private consumeBridgeRequestId(requestId: number): "turn-start" | "steer" | "interrupt" | null {
     const kind = this.bridgeRequestKinds.get(requestId) ?? "turn-start";
     this.bridgeRequestKinds.delete(requestId);
     return this.clearTrackedId(this.bridgeRequestIds, requestId) ? kind : null;

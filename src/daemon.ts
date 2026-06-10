@@ -23,6 +23,7 @@ import {
 } from "./control-protocol";
 import { parsePositiveIntEnv } from "./env-utils";
 import { isAllowedWsUpgrade, wsOriginRejectedResponse } from "./ws-origin-guard";
+import { IdempotencyTracker, type IdempotencyDuplicate } from "./idempotency-tracker";
 import { ReplyRequiredTracker } from "./reply-required-tracker";
 import { persistCurrentThreadWithRolloutRetry } from "./thread-state";
 import { createProcessLogger } from "./process-log";
@@ -99,6 +100,32 @@ let codexBootstrapped = false;
 let attentionWindowTimer: ReturnType<typeof setTimeout> | null = null;
 let inAttentionWindow = false;
 const replyTracker = new ReplyRequiredTracker();
+// --- Protocol v2 PR B state ---
+// Idempotency machine: (threadId, idempotencyKey) → accepted → started → terminal.
+const idempotencyTracker = new IdempotencyTracker();
+// Correlation from a bridge injection's negative JSON-RPC id back to the
+// originating claude_to_codex request (turn_started ACK + idempotency started).
+const pendingTurnStarts = new Map<
+  number,
+  { requestId: string; idempotencyKey?: string; threadId: string }
+>();
+// Transport-accepted steers awaiting their JSON-RPC verdict, keyed by the
+// bridge request id the adapter assigned (steerAccepted/steerFailed echo that
+// id). Keying by id — instead of a FIFO that assumes responses arrive in send
+// order — means a LOST or out-of-order steer response can never strand a
+// dispatch onto the wrong turn (PR B #3). Each entry ties together the steer's
+// reply expectation (armed ONLY once the steer is accepted — contract: "armed
+// since steer accepted") and its idempotency key, so steerFailed /
+// turnTrackingReset clean up BOTH together (PR B #2).
+interface PendingSteerDispatch {
+  requireReply: boolean;
+  idempotencyKey?: string;
+  threadId?: string;
+}
+const pendingSteerDispatches = new Map<number, PendingSteerDispatch>();
+// Advisory retry hint for busy_reject results: no honest turn-end estimate
+// exists, so this is a suggested poll interval, not a promise.
+const BUSY_RETRY_ADVISORY_MS = 15_000;
 let shuttingDown = false;
 let bootDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
 let idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
@@ -252,8 +279,24 @@ codex.on("turnPhaseChanged", ({ phase, previous }: { phase: string; previous: st
 // (Review/Compact turns are not steerable; the turn may have ended in the race
 // window) means Claude's mid-turn message did NOT reach Codex — say so
 // explicitly instead of letting Claude assume it landed.
-codex.on("steerFailed", (reason: string) => {
+codex.on("steerFailed", ({ requestId, reason }: { requestId: number; reason: string }) => {
   log(`Steer rejected by app-server: ${reason}`);
+  // Correlate the verdict to its dispatch by id (not FIFO) so a lost/reordered
+  // response cannot mis-consume a later dispatch.
+  const dispatch = pendingSteerDispatches.get(requestId);
+  pendingSteerDispatches.delete(requestId);
+  // The steer never reached Codex — its requireReply expectation (if any) must
+  // not arm (handled by NOT calling replyTracker.arm() here), AND its
+  // idempotency key must be RELEASED (PR B #2): the key was accept()+markStarted
+  // bound to the still-running ORIGINAL turn at dispatch, so without this it
+  // would strand in `started` until that turn terminates and a legitimate
+  // same-key retry would wrongly get duplicate_in_flight. Release mirrors the
+  // interrupt-failure path. release() is a no-op if the turn already terminated
+  // and tombstoned the key (terminal entries are preserved).
+  if (dispatch?.idempotencyKey && dispatch.threadId) {
+    idempotencyTracker.release(dispatch.threadId, dispatch.idempotencyKey);
+    log(`Released idempotency key after steer failure (request ${requestId}) — same key is retryable again`);
+  }
   // Branch the advice on the live turn state (same reasoning as the sync
   // steer-failure path): while the turn still runs (e.g. ActiveTurnNotSteerable
   // on a Review/Compact turn), "resend as a normal reply" just bounces off the
@@ -269,8 +312,88 @@ codex.on("steerFailed", (reason: string) => {
   );
 });
 
-codex.on("steerAccepted", () => {
+codex.on("steerAccepted", ({ requestId }: { requestId: number }) => {
   log("Steer accepted by app-server");
+  // require_reply × steer (PR B): the expectation arms only NOW — "a NEW
+  // forwarded agentMessage after steer-accept and before the turn's terminal
+  // counts as the reply". Arming at dispatch would mis-attribute pre-steer
+  // chatter of the running turn as the reply. Correlate by id so a lost/reordered
+  // response cannot mis-arm against the wrong dispatch (PR B #3).
+  const dispatch = pendingSteerDispatches.get(requestId);
+  pendingSteerDispatches.delete(requestId);
+  if (dispatch?.requireReply) {
+    replyTracker.arm();
+    log("Reply required armed on steer-accept (steer-scoped expectation)");
+  }
+  // The idempotency key stays bound (accept()+markStarted at dispatch) to the
+  // turn the steer joined; that turn's terminal boundary (turnIdCompleted /
+  // turnTrackingReset) terminates it. Nothing to release on the success path.
+});
+
+// --- Protocol v2 PR B: turn_started ACK + idempotency terminal wiring ---
+
+codex.on("bridgeTurnStarted", ({ requestId, turnId }: { requestId: number; turnId: string }) => {
+  const pending = pendingTurnStarts.get(requestId);
+  if (!pending) {
+    // Possible after a turnTrackingReset cleared the map while the response
+    // was in flight — the reset already terminated the idempotency keys.
+    log(`bridgeTurnStarted for unknown injection ${requestId} (turn ${turnId}) — correlation dropped`);
+    return;
+  }
+  pendingTurnStarts.delete(requestId);
+  log(`Bridge turn started: injection ${requestId} → turn ${turnId} (request ${pending.requestId})`);
+  if (pending.idempotencyKey) {
+    idempotencyTracker.markStarted(pending.threadId, pending.idempotencyKey, turnId);
+  }
+  if (attachedClaude) {
+    sendProtocolMessage(attachedClaude, {
+      type: "turn_started",
+      requestId: pending.requestId,
+      ...(pending.idempotencyKey ? { idempotencyKey: pending.idempotencyKey } : {}),
+      threadId: pending.threadId,
+      turnId,
+    });
+  }
+});
+
+codex.on("bridgeTurnRejected", ({ requestId, error }: { requestId: number; error: string }) => {
+  const pending = pendingTurnStarts.get(requestId);
+  if (!pending) return;
+  pendingTurnStarts.delete(requestId);
+  log(`Bridge turn rejected before start: injection ${requestId} (request ${pending.requestId}): ${error}`);
+  if (pending.idempotencyKey) {
+    // Contract: a bridge-originated JSON-RPC error BEFORE started → rejected.
+    idempotencyTracker.markRejected(pending.threadId, pending.idempotencyKey);
+  }
+});
+
+codex.on("turnIdCompleted", (turnId: string | null) => {
+  // turn/completed terminates the key whose started.turnId matches (null =
+  // the notification carried no id and ALL active turns were cleared). Scope
+  // the null case to the active thread so a null completion can never reach a
+  // different thread's started keys (consistent with terminateThread;
+  // single-thread-per-pair makes this benign today but explicit + future-proof).
+  idempotencyTracker.completeTurn(turnId, codex.activeThreadId ?? undefined);
+});
+
+codex.on("turnTrackingReset", (reason: string) => {
+  // app-server close / reconnect / stop: every pending/running idempotency key
+  // is now unresolvable (responses for in-flight bridge requests will never
+  // arrive), and per-injection correlation state is stale.
+  // terminateAll already tombstones every steer-bound idempotency key as
+  // `aborted` (so a same-key retry is told duplicate_terminal(aborted), not
+  // stranded), so dropping the dispatch entries here is enough to clean up the
+  // steer-scoped reply expectation + key correlation together (PR B #2/#3): a
+  // never-delivered steer response can no longer orphan either.
+  idempotencyTracker.terminateAll("aborted");
+  if (pendingTurnStarts.size > 0) {
+    log(`Cleared ${pendingTurnStarts.size} pending turn-start correlation(s) on turn tracking reset (${reason})`);
+  }
+  if (pendingSteerDispatches.size > 0) {
+    log(`Cleared ${pendingSteerDispatches.size} pending steer dispatch(es) on turn tracking reset (${reason})`);
+  }
+  pendingTurnStarts.clear();
+  pendingSteerDispatches.clear();
 });
 
 codex.on("turnStarted", () => {
@@ -439,6 +562,11 @@ codex.on("exit", (code: number | null) => {
   log(`Codex process exited (code ${code})`);
   codexBootstrapped = false;
   replyTracker.reset(); // any in-flight require_reply turn is gone with the process
+  // The process is gone — every pending/running idempotency key is terminal,
+  // and per-injection correlation can never resolve (PR B).
+  idempotencyTracker.terminateAll("aborted");
+  pendingTurnStarts.clear();
+  pendingSteerDispatches.clear();
   statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
   clearPendingClaudeDisconnect("Codex process exited");
@@ -572,142 +700,359 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
       });
       return;
     case "claude_to_codex": {
-      if (message.message.source !== "claude") {
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
+      // The handler is async only on the interrupt path (terminal-boundary
+      // wait); steer/inject paths run synchronously to the first result.
+      handleClaudeToCodex(ws, message).catch((err: any) => {
+        log(`handleClaudeToCodex threw for request ${message.requestId}: ${err?.message ?? err}`);
+        sendClaudeToCodexResult(ws, message.requestId, {
           success: false,
-          error: "Invalid message source",
+          code: "internal_error",
+          error: `Internal bridge error: ${err?.message ?? err}`,
         });
-        return;
-      }
-
-      if (!tuiConnectionState.canReply()) {
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: false,
-          error: "Codex is not ready. Wait for TUI to connect and create a thread.",
-        });
-        return;
-      }
-
-      // Budget pause gate (plan v2.4 side-aware R4): the gate protects the
-      // TARGET side's quota, so it closes only when the Codex side is exhausted
-      // (gateClosed = pauseSide codex/both). A Claude-only handoff keeps the
-      // gate OPEN so the baton reply can reach Codex. Same rejection shape as
-      // the busy-guard below.
-      if (budgetCoordinator?.isGateClosed()) {
-        const reason = budgetPauseGateError();
-        log(`Injection rejected by budget pause gate`);
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: false,
-          error: reason,
-        });
-        return;
-      }
-
-      const requireReply = !!message.requireReply;
-      // The static bridge contract (markers / git-forbidden / role guidance) now
-      // lives in AGENTS.md (injected by `abg init`), so it is no longer appended to
-      // every message — appending it polluted every Codex turn and the thread title.
-      // Only the DYNAMIC reply-required instruction is appended, on demand.
-      let contentToSend = message.message.content;
-      if (requireReply) {
-        contentToSend += REPLY_REQUIRED_INSTRUCTION;
-      }
-      log(`Forwarding Claude → Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
-      // Budget tier overrides (P4/R5) piggyback on this user-initiated turn —
-      // never injected standalone. Delivery is confirmed back to the coordinator
-      // so the pending override is sent at most once per tier change.
-      const tierOverrides = BUDGET_CONFIG.codexTierControl
-        ? budgetCoordinator?.getCodexTurnOverrides() ?? undefined
-        : undefined;
-      // Busy-turn policy (protocol v2 B0): when a turn is running and the
-      // caller opted into "steer", feed the message INTO the running turn via
-      // turn/steer instead of rejecting — Codex integrates it mid-turn without
-      // losing work. Framed explicitly so Codex can distinguish it from the
-      // original task instructions (design consensus with Codex).
-      if (codex.turnInProgress && message.onBusy === "steer") {
-        if (requireReply) {
-          // B0 limitation (explicit, not silent): require_reply semantics for
-          // steer ("a NEW agentMessage after steer-accept, before terminal")
-          // need the PR B state machine. Reject loudly instead of mis-arming
-          // the tracker on the already-running turn.
-          sendProtocolMessage(ws, {
-            type: "claude_to_codex_result",
-            requestId: message.requestId,
-            success: false,
-            error: "require_reply is not supported together with on_busy=\"steer\" yet. Send the steer without require_reply, or wait for the turn to finish.",
-          });
-          return;
-        }
-        const steerContent =
-          "[STEER from Claude]\n" +
-          "Mid-turn update for the current Codex turn. Integrate if relevant; do not restart work unless explicitly requested.\n\n" +
-          message.message.content;
-        const steered = codex.steerMessage(steerContent);
-        log(`Steer ${steered ? "transport-accepted" : "failed"} (${message.message.content.length} chars)`);
-        if (steered) {
-          // An IMPORTANT message forwarded mid-turn opens an attention window;
-          // a steer is exactly Claude responding to it — close the window like
-          // the inject path does, so status buffering resumes promptly.
-          clearAttentionWindow();
-        }
-        // "Retry as a normal reply" is only good advice when the turn actually
-        // ended — while it is still running, a normal reply just bounces off
-        // the busy guard, whose error suggests steer again: an advice
-        // ping-pong. Branch on the live turn state. (The "ended" branch is
-        // defensive: in the current synchronous flow turnInProgress was true
-        // at dispatch and nothing async runs before this re-read.)
-        const steerFailureAdvice = codex.turnInProgress
-          ? "Steer failed: the running turn cannot be steered right now — wait for it to finish (✅), then send normally."
-          : "Steer failed: the turn may have just ended or the connection dropped — retry as a normal reply.";
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: steered,
-          error: steered ? undefined : steerFailureAdvice,
-        });
-        return;
-      }
-
-      const injected = codex.injectMessage(contentToSend, tierOverrides);
-      if (!injected) {
-        const reason = codex.turnInProgress
-          ? "Codex is busy executing a turn. Options: wait for it to finish, or retry with on_busy=\"steer\" to feed this message into the running turn without interrupting it."
-          : "Injection failed: no active thread or WebSocket not connected.";
-        log(`Injection rejected: ${reason}`);
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: false,
-          error: reason,
-        });
-        return;
-      }
-      if (tierOverrides) {
-        budgetCoordinator?.notifyOverridesDelivered();
-      }
-      // Arm reply-required tracking ONLY after a successful injection: a turn has
-      // now started, so turnCompleted will reset it. Arming before this guard
-      // (on a rejected injection, e.g. Codex busy) would strand the flag on an
-      // unrelated in-flight turn and silently lose this require_reply request.
-      if (requireReply) {
-        replyTracker.arm();
-        log(`Reply required flag set for this message`);
-      }
-      clearAttentionWindow(); // Claude successfully replied, end attention window
-      sendProtocolMessage(ws, {
-        type: "claude_to_codex_result",
-        requestId: message.requestId,
-        success: true,
       });
       return;
     }
   }
+}
+
+/**
+ * Single funnel for claude_to_codex_result (protocol v2 PR B structured
+ * result): legacy success/error stay populated, and every result also carries
+ * ok (mirror of success), the machine-readable code on failure, the live
+ * turnPhase at result time, and an advisory retryAfterMs where meaningful.
+ */
+function sendClaudeToCodexResult(
+  ws: ServerWebSocket<ControlSocketData>,
+  requestId: string,
+  opts: { success: boolean; error?: string; code?: string; retryAfterMs?: number },
+) {
+  sendProtocolMessage(ws, {
+    type: "claude_to_codex_result",
+    requestId,
+    success: opts.success,
+    ...(opts.error !== undefined ? { error: opts.error } : {}),
+    ok: opts.success,
+    ...(opts.code !== undefined ? { code: opts.code } : {}),
+    phase: codex.turnPhase,
+    ...(opts.retryAfterMs !== undefined ? { retryAfterMs: opts.retryAfterMs } : {}),
+  });
+}
+
+function describeDuplicate(dup: Extract<IdempotencyDuplicate, { duplicate: true }>): string {
+  if (dup.code === "duplicate_terminal") {
+    const outcome = dup.state.phase === "terminal" ? dup.state.outcome : "unknown";
+    return (
+      `Duplicate idempotency_key: the original message already reached a terminal state (${outcome}) ` +
+      `and was NOT re-injected. Use a fresh key to send a genuinely new message.`
+    );
+  }
+  const detail = dup.state.phase === "started"
+    ? `already running as turn ${dup.state.turnId}`
+    : "still in flight";
+  return (
+    `Duplicate idempotency_key: a message with this key is ${detail} — NOT re-injected. ` +
+    `Wait for its outcome, or use a fresh key for a genuinely new message.`
+  );
+}
+
+/**
+ * Wait for the interrupt's terminal boundary, racing the adapter's
+ * interruptFailed signal: an app-server rejection ("expected active turn id X
+ * but found Y" / "no active turn to interrupt") means the ORIGINAL turn keeps
+ * running and waiting out the timeout would only delay the loud failure.
+ */
+function waitForInterruptOutcome(
+  turnIds: string[],
+): Promise<{ ok: true } | { ok: false; code: "interrupt_timeout" | "interrupt_rejected"; reason?: string }> {
+  return new Promise((resolve) => {
+    let settled = false;
+    // Recommend #4: abort the inner terminal wait the moment interruptFailed
+    // wins so its listeners + timer are torn down promptly instead of leaking
+    // until the (clamped) interrupt budget elapses.
+    const abort = new AbortController();
+    const finish = (
+      result: { ok: true } | { ok: false; code: "interrupt_timeout" | "interrupt_rejected"; reason?: string },
+    ) => {
+      if (settled) return;
+      settled = true;
+      codex.off("interruptFailed", onFailed);
+      abort.abort();
+      resolve(result);
+    };
+    const onFailed = (reason: string) => finish({ ok: false, code: "interrupt_rejected", reason });
+    codex.on("interruptFailed", onFailed);
+    codex.waitForTurnsTerminal(turnIds, undefined, abort.signal).then((result) => {
+      if (result.ok) {
+        finish({ ok: true });
+      } else if (result.code === "interrupt_timeout") {
+        finish({ ok: false, code: "interrupt_timeout" });
+      }
+      // result.code === "interrupt_aborted" → interruptFailed already settled
+      // this outcome; discard (the settled guard would drop it anyway).
+    });
+  });
+}
+
+async function handleClaudeToCodex(
+  ws: ServerWebSocket<ControlSocketData>,
+  message: Extract<ControlClientMessage, { type: "claude_to_codex" }>,
+): Promise<void> {
+  if (message.message.source !== "claude") {
+    sendClaudeToCodexResult(ws, message.requestId, {
+      success: false,
+      code: "invalid_source",
+      error: "Invalid message source",
+    });
+    return;
+  }
+
+  // Idempotency duplicate guard (PR B): a key already tracked in ANY state
+  // (live or unexpired tombstone) is answered with the original-outcome code
+  // instead of re-injecting. Messages without a key bypass the machine.
+  // NOTE: a key is REGISTERED only when a wire attempt actually happens (see
+  // idempotency-tracker.ts header) — pre-wire rejections below stay retryable
+  // with the same key on purpose.
+  const idempotencyKey =
+    typeof message.idempotencyKey === "string" && message.idempotencyKey.length > 0
+      ? message.idempotencyKey
+      : undefined;
+  if (idempotencyKey && codex.activeThreadId) {
+    const dup = idempotencyTracker.check(codex.activeThreadId, idempotencyKey);
+    if (dup.duplicate) {
+      log(`Rejected duplicate idempotency key (${dup.code})`);
+      sendClaudeToCodexResult(ws, message.requestId, {
+        success: false,
+        code: dup.code,
+        error: describeDuplicate(dup),
+      });
+      return;
+    }
+  }
+
+  if (!tuiConnectionState.canReply()) {
+    sendClaudeToCodexResult(ws, message.requestId, {
+      success: false,
+      code: "no_thread",
+      error: "Codex is not ready. Wait for TUI to connect and create a thread.",
+    });
+    return;
+  }
+
+  // Budget pause gate (plan v2.4 side-aware R4): the gate protects the
+  // TARGET side's quota, so it closes only when the Codex side is exhausted
+  // (gateClosed = pauseSide codex/both). A Claude-only handoff keeps the
+  // gate OPEN so the baton reply can reach Codex. Same rejection shape as
+  // the busy-guard below.
+  if (budgetCoordinator?.isGateClosed()) {
+    const reason = budgetPauseGateError();
+    log(`Injection rejected by budget pause gate`);
+    const resumeAfterEpoch = budgetCoordinator?.getSnapshot()?.resumeAfterEpoch ?? null;
+    const retryAfterMs = resumeAfterEpoch !== null
+      ? Math.max(0, resumeAfterEpoch * 1000 - Date.now())
+      : undefined;
+    sendClaudeToCodexResult(ws, message.requestId, {
+      success: false,
+      code: "budget_paused",
+      error: reason,
+      ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+    });
+    return;
+  }
+
+  const requireReply = !!message.requireReply;
+  // The static bridge contract (markers / git-forbidden / role guidance) now
+  // lives in AGENTS.md (injected by `abg init`), so it is no longer appended to
+  // every message — appending it polluted every Codex turn and the thread title.
+  // Only the DYNAMIC reply-required instruction is appended, on demand.
+  let contentToSend = message.message.content;
+  if (requireReply) {
+    contentToSend += REPLY_REQUIRED_INSTRUCTION;
+  }
+  log(`Forwarding Claude → Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
+  // Budget tier overrides (P4/R5) piggyback on this user-initiated turn —
+  // never injected standalone. Delivery is confirmed back to the coordinator
+  // so the pending override is sent at most once per tier change.
+  const tierOverrides = BUDGET_CONFIG.codexTierControl
+    ? budgetCoordinator?.getCodexTurnOverrides() ?? undefined
+    : undefined;
+  // Busy-turn policy (protocol v2 B0): when a turn is running and the
+  // caller opted into "steer", feed the message INTO the running turn via
+  // turn/steer instead of rejecting — Codex integrates it mid-turn without
+  // losing work. Framed explicitly so Codex can distinguish it from the
+  // original task instructions (design consensus with Codex).
+  if (codex.turnInProgress && message.onBusy === "steer") {
+    // require_reply × steer (PR B): allowed — the steer body carries the
+    // reply-required instruction and the daemon arms the expectation when
+    // the app-server ACCEPTS the steer (steerAccepted handler), so any new
+    // forwarded agentMessage before the turn's terminal counts as the reply.
+    const steerContent =
+      "[STEER from Claude]\n" +
+      "Mid-turn update for the current Codex turn. Integrate if relevant; do not restart work unless explicitly requested.\n\n" +
+      contentToSend;
+    // Read the steer target BEFORE dispatch so an idempotency key can be
+    // bound to the turn this steer joins (started(turnId)).
+    const steerTurnId = codex.steerableTurnId;
+    const steerThreadId = codex.activeThreadId;
+    const steerRequestId = codex.steerMessage(steerContent);
+    const steered = steerRequestId !== null;
+    log(`Steer ${steered ? "transport-accepted" : "failed"} (${message.message.content.length} chars, requireReply=${requireReply})`);
+    if (steered) {
+      // An IMPORTANT message forwarded mid-turn opens an attention window;
+      // a steer is exactly Claude responding to it — close the window like
+      // the inject path does, so status buffering resumes promptly.
+      clearAttentionWindow();
+      // Key the dispatch by the bridge request id so steerAccepted/steerFailed
+      // correlate to THIS dispatch by id (PR B #3). Carry the idempotency key +
+      // thread so steerFailed can release the key and turnTrackingReset can
+      // clean both up together (PR B #2).
+      pendingSteerDispatches.set(steerRequestId, {
+        requireReply,
+        ...(idempotencyKey ? { idempotencyKey } : {}),
+        ...(steerThreadId ? { threadId: steerThreadId } : {}),
+      });
+      if (idempotencyKey && steerThreadId) {
+        idempotencyTracker.accept(steerThreadId, idempotencyKey);
+        if (steerTurnId) {
+          // The key lives and dies with the turn the steer joined: the
+          // turn's terminal boundary (turnIdCompleted / turnTrackingReset)
+          // terminates it, so it can never strand in accepted/started. If the
+          // app-server later REJECTS the steer, steerFailed releases the key.
+          idempotencyTracker.markStarted(steerThreadId, idempotencyKey, steerTurnId);
+        }
+      }
+    }
+    // "Retry as a normal reply" is only good advice when the turn actually
+    // ended — while it is still running, a normal reply just bounces off
+    // the busy guard, whose error suggests steer again: an advice
+    // ping-pong. Branch on the live turn state. (The "ended" branch is
+    // defensive: in the current synchronous flow turnInProgress was true
+    // at dispatch and nothing async runs before this re-read.)
+    const steerFailureAdvice = codex.turnInProgress
+      ? "Steer failed: the running turn cannot be steered right now — wait for it to finish (✅), then send normally."
+      : "Steer failed: the turn may have just ended or the connection dropped — retry as a normal reply.";
+    sendClaudeToCodexResult(ws, message.requestId, {
+      success: steered,
+      ...(steered ? {} : { code: "steer_failed", error: steerFailureAdvice }),
+    });
+    return;
+  }
+
+  // Busy-turn policy "interrupt" (protocol v2 PR B): terminate ALL active
+  // turns, wait for the terminal boundary, then inject this message as a
+  // NORMAL new turn (the shared injection block below — tier overrides,
+  // require_reply arming and attention-window close all apply unchanged).
+  // Race degradation mirrors steer: if the turn ended between the caller's
+  // decision and this dispatch, fall straight through to normal injection.
+  if (codex.turnInProgress && message.onBusy === "interrupt") {
+    // Register the key BEFORE the async wait so a concurrent retry with the
+    // same key during the window is answered duplicate_in_flight instead of
+    // double-interrupting/double-injecting. Released on every failure exit —
+    // nothing was injected, so the same key must stay retryable. (Corner
+    // race: if the app-server CLOSES during the wait, turnTrackingReset
+    // terminates this key as `aborted` and release() preserves the tombstone
+    // — semantically honest: the attempt aborted mid-flight, and a retry is
+    // told duplicate_terminal(aborted) so it knows to use a fresh key.)
+    const interruptThreadId = codex.activeThreadId;
+    if (idempotencyKey && interruptThreadId) {
+      idempotencyTracker.accept(interruptThreadId, idempotencyKey);
+    }
+    const releaseInterruptKey = () => {
+      if (idempotencyKey && interruptThreadId) {
+        idempotencyTracker.release(interruptThreadId, idempotencyKey);
+      }
+    };
+
+    const interrupted = codex.interruptActiveTurns();
+    if (!interrupted.ok) {
+      releaseInterruptKey();
+      log(`Interrupt unavailable: ${interrupted.error}`);
+      sendClaudeToCodexResult(ws, message.requestId, {
+        success: false,
+        code: interrupted.code,
+        error:
+          `Interrupt failed (${interrupted.error}). The original turn keeps running — ` +
+          `your message was NOT injected. Wait for ✅, or retry with on_busy="steer".`,
+      });
+      return;
+    }
+
+    log(`Interrupt dispatched for turn(s) ${interrupted.turnIds.join(", ")} — waiting for terminal boundary`);
+    const outcome = await waitForInterruptOutcome(interrupted.turnIds);
+    if (!outcome.ok) {
+      releaseInterruptKey();
+      const error = outcome.code === "interrupt_rejected"
+        ? `Interrupt was rejected by the app-server (${outcome.reason ?? "unknown reason"}). ` +
+          `The original turn keeps running — your message was NOT injected. ` +
+          `Wait for ✅, or retry with on_busy="steer".`
+        : `Interrupt did not reach a terminal boundary in time. The turn MAY still be running — ` +
+          `do not assume it stopped. Your message was NOT injected (this avoids a double-turn race); ` +
+          `check for ✅/⚠️ notices before retrying.`;
+      log(`Interrupt failed (${outcome.code})`);
+      sendClaudeToCodexResult(ws, message.requestId, {
+        success: false,
+        code: outcome.code,
+        error,
+      });
+      return;
+    }
+    log("Interrupt reached terminal boundary — injecting the message as a new turn");
+    // Defensive: if the active thread changed during the wait, the upfront
+    // accept() would strand under the old thread — release it; the shared
+    // injection block re-registers under the thread it actually injects into.
+    if (interruptThreadId && codex.activeThreadId !== interruptThreadId) {
+      releaseInterruptKey();
+    }
+    // Fall through to the shared injection block.
+  }
+
+  const injectThreadId = codex.activeThreadId;
+  const injectionId = codex.injectMessage(contentToSend, tierOverrides);
+  if (injectionId === null) {
+    // No wire attempt happened — any upfront interrupt-path accept() must not
+    // block a retry with the same key.
+    if (idempotencyKey && injectThreadId) {
+      idempotencyTracker.release(injectThreadId, idempotencyKey);
+    }
+    const busy = codex.turnInProgress;
+    const reason = busy
+      ? "Codex is busy executing a turn. Options: wait for it to finish, retry with on_busy=\"steer\" to feed this message into the running turn without interrupting it, or retry with on_busy=\"interrupt\" to stop the current turn and start a new one with this message."
+      : "Injection failed: no active thread or WebSocket not connected.";
+    log(`Injection rejected: ${reason}`);
+    sendClaudeToCodexResult(ws, message.requestId, {
+      success: false,
+      code: busy ? "busy_reject" : "no_thread",
+      error: reason,
+      ...(busy ? { retryAfterMs: BUSY_RETRY_ADVISORY_MS } : {}),
+    });
+    return;
+  }
+  if (tierOverrides) {
+    budgetCoordinator?.notifyOverridesDelivered();
+  }
+  // Arm reply-required tracking ONLY after a successful injection: a turn has
+  // now started, so turnCompleted will reset it. Arming before this guard
+  // (on a rejected injection, e.g. Codex busy) would strand the flag on an
+  // unrelated in-flight turn and silently lose this require_reply request.
+  if (requireReply) {
+    replyTracker.arm();
+    log(`Reply required flag set for this message`);
+  }
+  clearAttentionWindow(); // Claude successfully replied, end attention window
+  // turn_started ACK correlation (PR B): remember which control request this
+  // injection belongs to so bridgeTurnStarted/bridgeTurnRejected can emit the
+  // turn_started event / drive the idempotency machine. injectMessage only
+  // succeeds with an active thread, so injectThreadId is non-null here.
+  if (injectThreadId) {
+    if (idempotencyKey) {
+      idempotencyTracker.accept(injectThreadId, idempotencyKey); // no-op if the interrupt path already accepted
+    }
+    pendingTurnStarts.set(injectionId, {
+      requestId: message.requestId,
+      ...(idempotencyKey ? { idempotencyKey } : {}),
+      threadId: injectThreadId,
+    });
+  }
+  sendClaudeToCodexResult(ws, message.requestId, { success: true });
 }
 
 async function attachClaude(ws: ServerWebSocket<ControlSocketData>, identity?: ControlClientIdentity) {
@@ -1283,6 +1628,7 @@ function shutdown(reason: string, exitCode = 0) {
   log(`Shutting down daemon (${reason})...`);
   clearBootDeadline();
   stopBudgetCoordinator();
+  idempotencyTracker.dispose();
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);
   clearPendingClaudeDisconnect(`daemon shutdown (${reason})`);
   controlServer?.stop();

@@ -18,7 +18,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.11", "0.0.0-source"),
-  commit: defineString("a2eb5fa", "source"),
+  commit: defineString("2d4804a", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -383,6 +383,28 @@ function isAppServerResponseMessage(value) {
   if (!isObjectRecord(value))
     return false;
   return (typeof value.id === "number" || typeof value.id === "string") && value.method === undefined && (("result" in value) || ("error" in value));
+}
+
+// src/env-utils.ts
+function parsePositiveIntEnv(name, fallback, log = () => {}, env = process.env) {
+  const raw = env[name];
+  if (raw == null || raw === "")
+    return fallback;
+  const parsed = Number(raw);
+  if (!Number.isInteger(parsed) || parsed <= 0 || parsed > Number.MAX_SAFE_INTEGER) {
+    log(`Invalid ${name}=${JSON.stringify(raw)} (must be a positive integer within ` + `Number.MAX_SAFE_INTEGER); falling back to ${fallback}`);
+    return fallback;
+  }
+  return parsed;
+}
+
+// src/interrupt-timing.ts
+var CLIENT_REPLY_TIMEOUT_MS = 15000;
+var INTERRUPT_CLIENT_MARGIN_MS = 2000;
+var DEFAULT_INTERRUPT_TIMEOUT_MS = 1e4;
+var MAX_INTERRUPT_TIMEOUT_MS = CLIENT_REPLY_TIMEOUT_MS - INTERRUPT_CLIENT_MARGIN_MS;
+function clampInterruptTimeoutMs(requested) {
+  return Math.min(requested, MAX_INTERRUPT_TIMEOUT_MS);
 }
 
 // src/codex-transport.ts
@@ -806,15 +828,15 @@ class CodexAdapter extends EventEmitter {
   injectMessage(text, overrides) {
     if (!this.threadId) {
       this.log("Cannot inject: no active thread");
-      return false;
+      return null;
     }
     if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
       this.log("Cannot inject: app-server WebSocket not connected");
-      return false;
+      return null;
     }
     if (this.turnInProgress) {
       this.log(`Rejected injection: Codex turn is in progress (thread ${this.threadId})`);
-      return false;
+      return null;
     }
     this.log(`Injecting message into Codex (${text.length} chars)`);
     const requestId = this.nextInjectionId--;
@@ -833,30 +855,30 @@ class CodexAdapter extends EventEmitter {
         id: requestId,
         params
       }));
-      return true;
+      return requestId;
     } catch (err) {
       this.untrackBridgeRequestId(requestId);
       this.log(`Injection send failed: ${err.message}`);
-      return false;
+      return null;
     }
   }
   steerMessage(text) {
     if (!this.threadId) {
       this.log("Cannot steer: no active thread");
-      return false;
+      return null;
     }
     if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
       this.log("Cannot steer: app-server WebSocket not connected");
-      return false;
+      return null;
     }
     if (!this.turnInProgress) {
       this.log("Cannot steer: no turn in progress (use injectMessage)");
-      return false;
+      return null;
     }
     const expectedTurnId = this.currentSteerableTurnId();
     if (!expectedTurnId) {
       this.log("Cannot steer: no addressable active turn id (turn/started carried no id)");
-      return false;
+      return null;
     }
     this.log(`Steering message into active Codex turn ${expectedTurnId} (${text.length} chars)`);
     const requestId = this.nextInjectionId--;
@@ -872,12 +894,96 @@ class CodexAdapter extends EventEmitter {
         id: requestId,
         params
       }));
-      return true;
+      return requestId;
     } catch (err) {
       this.untrackBridgeRequestId(requestId);
       this.log(`Steer send failed: ${err.message}`);
-      return false;
+      return null;
     }
+  }
+  interruptActiveTurns() {
+    if (!this.threadId) {
+      this.log("Cannot interrupt: no active thread");
+      return { ok: false, code: "interrupt_unavailable", error: "no active thread" };
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      this.log("Cannot interrupt: app-server WebSocket not connected");
+      return { ok: false, code: "interrupt_unavailable", error: "app-server WebSocket not connected" };
+    }
+    const addressable = [...this.activeTurnIds].filter((id) => !id.startsWith("unknown:"));
+    if (addressable.length === 0) {
+      this.log("Cannot interrupt: no addressable active turn id (turn/started carried no id)");
+      return {
+        ok: false,
+        code: "interrupt_unavailable",
+        error: "no addressable active turn id (turn/started carried no id)"
+      };
+    }
+    for (const turnId of addressable) {
+      const requestId = this.nextInjectionId--;
+      this.trackBridgeRequestId(requestId, "interrupt");
+      const params = { threadId: this.threadId, turnId };
+      try {
+        this.appServerWs.send(JSON.stringify({
+          method: "turn/interrupt",
+          id: requestId,
+          params
+        }));
+        this.log(`Sent turn/interrupt for active turn ${turnId} (request ${requestId})`);
+      } catch (err) {
+        this.untrackBridgeRequestId(requestId);
+        this.log(`turn/interrupt send failed for ${turnId}: ${err.message}`);
+        return {
+          ok: false,
+          code: "interrupt_unavailable",
+          error: `turn/interrupt send failed (${err.message}); earlier interrupts may still land`
+        };
+      }
+    }
+    return { ok: true, turnIds: addressable };
+  }
+  interruptTimeoutMs() {
+    const requested = parsePositiveIntEnv("AGENTBRIDGE_INTERRUPT_TIMEOUT_MS", DEFAULT_INTERRUPT_TIMEOUT_MS, (m) => this.log(m));
+    const clamped = clampInterruptTimeoutMs(requested);
+    if (clamped !== requested) {
+      this.log(`AGENTBRIDGE_INTERRUPT_TIMEOUT_MS=${requested}ms exceeds the safe ceiling \u2014 ` + `clamped to ${clamped}ms (must resolve before the client reply timeout to avoid a double-turn)`);
+    }
+    return clamped;
+  }
+  waitForTurnsTerminal(turnIds, timeoutMs = this.interruptTimeoutMs(), signal) {
+    const satisfied = () => turnIds.every((id) => !this.activeTurnIds.has(id) && !this.currentlyStalledTurnIds.has(id));
+    if (satisfied())
+      return Promise.resolve({ ok: true });
+    if (signal?.aborted)
+      return Promise.resolve({ ok: false, code: "interrupt_aborted" });
+    return new Promise((resolve) => {
+      let settled = false;
+      const finish = (result) => {
+        if (settled)
+          return;
+        settled = true;
+        clearTimeout(timer);
+        this.off("turnIdCompleted", check);
+        this.off("turnTrackingReset", check);
+        this.off("turnPhaseChanged", check);
+        signal?.removeEventListener("abort", onAbort);
+        resolve(result);
+      };
+      const check = () => {
+        if (satisfied())
+          finish({ ok: true });
+      };
+      const onAbort = () => finish({ ok: false, code: "interrupt_aborted" });
+      const timer = setTimeout(() => {
+        this.log(`waitForTurnsTerminal timed out after ${timeoutMs}ms (still active: ` + `${turnIds.filter((id) => this.activeTurnIds.has(id)).join(", ") || "none"}, phase=${this.turnPhase})`);
+        finish({ ok: false, code: "interrupt_timeout" });
+      }, timeoutMs);
+      timer.unref?.();
+      this.on("turnIdCompleted", check);
+      this.on("turnTrackingReset", check);
+      this.on("turnPhaseChanged", check);
+      signal?.addEventListener("abort", onAbort, { once: true });
+    });
   }
   async waitForHealthy(maxRetries = 20, delayMs = 500) {
     for (let i = 0;i < maxRetries; i++) {
@@ -1610,16 +1716,30 @@ class CodexAdapter extends EventEmitter {
       if (parsed.error) {
         this.log(`Bridge-originated ${bridgeKind} request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
         if (bridgeKind === "steer") {
-          this.emit("steerFailed", parsed.error.message ?? "unknown error");
+          this.emit("steerFailed", { requestId: numericId, reason: parsed.error.message ?? "unknown error" });
+        } else if (bridgeKind === "interrupt") {
+          this.emit("interruptFailed", parsed.error.message ?? "unknown error");
         } else {
           this.lastTurnEndedAbnormally = true;
           this.emit("turnAborted", `injected turn/start rejected: ${parsed.error.message ?? "unknown error"}`);
+          this.emit("bridgeTurnRejected", {
+            requestId: numericId,
+            error: parsed.error.message ?? "unknown error"
+          });
           this.notifyPhaseIfChanged();
         }
       } else {
         this.log(`Bridge-originated ${bridgeKind} request completed (id ${responseId})`);
         if (bridgeKind === "steer") {
-          this.emit("steerAccepted");
+          this.emit("steerAccepted", { requestId: numericId });
+        } else if (bridgeKind === "turn-start") {
+          const result = parsed.result;
+          const turnId = result?.turn?.id;
+          if (typeof turnId === "string" && turnId.length > 0) {
+            this.emit("bridgeTurnStarted", { requestId: numericId, turnId });
+          } else {
+            this.log(`Bridge-originated turn/start response carried no turn id (id ${responseId}) \u2014 turn_started ACK skipped`);
+          }
         }
       }
       return null;
@@ -1821,6 +1941,9 @@ class CodexAdapter extends EventEmitter {
     }
     return newest;
   }
+  get steerableTurnId() {
+    return this.currentSteerableTurnId();
+  }
   get turnPhase() {
     if (this.activeTurnIds.size > 0) {
       const allStalled = [...this.activeTurnIds].every((id) => this.currentlyStalledTurnIds.has(id));
@@ -1852,11 +1975,12 @@ class CodexAdapter extends EventEmitter {
     this.notifyPhaseIfChanged();
   }
   markTurnCompleted(turnId) {
-    if (typeof turnId === "string" && turnId.length > 0) {
-      this.activeTurnIds.delete(turnId);
-      this.clearTurnWatchdog(turnId);
-      this.stalledTurnIds.delete(turnId);
-      this.currentlyStalledTurnIds.delete(turnId);
+    const completedId = typeof turnId === "string" && turnId.length > 0 ? turnId : null;
+    if (completedId !== null) {
+      this.activeTurnIds.delete(completedId);
+      this.clearTurnWatchdog(completedId);
+      this.stalledTurnIds.delete(completedId);
+      this.currentlyStalledTurnIds.delete(completedId);
     } else {
       this.activeTurnIds.clear();
       this.clearAllTurnWatchdogs();
@@ -1865,6 +1989,7 @@ class CodexAdapter extends EventEmitter {
     }
     this.lastTurnEndedAbnormally = false;
     this.turnInProgress = this.activeTurnIds.size > 0;
+    this.emit("turnIdCompleted", completedId);
     this.notifyPhaseIfChanged();
   }
   turnWatchdogMs() {
@@ -1934,6 +2059,7 @@ class CodexAdapter extends EventEmitter {
       this.log(`Turn state reset (${reason})`);
     }
     this.notifyPhaseIfChanged();
+    this.emit("turnTrackingReset", reason);
   }
   requestKey(id) {
     if (typeof id === "number" || typeof id === "string")
@@ -2274,19 +2400,6 @@ class TuiConnectionState {
 import { spawn as spawn2 } from "child_process";
 import { existsSync as existsSync3, readFileSync, statSync as statSync2, unlinkSync as unlinkSync2, writeFileSync, openSync, closeSync, constants } from "fs";
 import { fileURLToPath } from "url";
-
-// src/env-utils.ts
-function parsePositiveIntEnv(name, fallback, log = () => {}, env = process.env) {
-  const raw = env[name];
-  if (raw == null || raw === "")
-    return fallback;
-  const parsed = Number(raw);
-  if (!Number.isInteger(parsed) || parsed <= 0 || parsed > Number.MAX_SAFE_INTEGER) {
-    log(`Invalid ${name}=${JSON.stringify(raw)} (must be a positive integer within ` + `Number.MAX_SAFE_INTEGER); falling back to ${fallback}`);
-    return fallback;
-  }
-  return parsed;
-}
 
 // src/process-lifecycle.ts
 import { execFileSync as execFileSync2 } from "child_process";
@@ -3879,6 +3992,127 @@ function createQuotaSource(options) {
   return new QuotaSource(options);
 }
 
+// src/idempotency-tracker.ts
+var DEFAULT_TOMBSTONE_TTL_MS = 20 * 60 * 1000;
+
+class IdempotencyTracker {
+  entries = new Map;
+  ttlMs;
+  now;
+  constructor(options = {}) {
+    this.ttlMs = options.ttlMs ?? DEFAULT_TOMBSTONE_TTL_MS;
+    this.now = options.now ?? Date.now;
+  }
+  get size() {
+    return this.entries.size;
+  }
+  check(threadId, key) {
+    const entry = this.getLive(threadId, key);
+    if (!entry)
+      return { duplicate: false };
+    if (entry.state.phase === "terminal") {
+      return { duplicate: true, code: "duplicate_terminal", state: entry.state };
+    }
+    return { duplicate: true, code: "duplicate_in_flight", state: entry.state };
+  }
+  peek(threadId, key) {
+    return this.getLive(threadId, key)?.state ?? null;
+  }
+  accept(threadId, key) {
+    if (this.getLive(threadId, key))
+      return;
+    this.entries.set(this.compositeKey(threadId, key), {
+      threadId,
+      state: { phase: "accepted" },
+      expiresAtMs: null,
+      timer: null
+    });
+  }
+  release(threadId, key) {
+    const composite = this.compositeKey(threadId, key);
+    const entry = this.entries.get(composite);
+    if (!entry || entry.state.phase === "terminal")
+      return;
+    this.entries.delete(composite);
+  }
+  markStarted(threadId, key, turnId) {
+    const entry = this.getLive(threadId, key);
+    if (!entry || entry.state.phase === "terminal")
+      return;
+    entry.state = { phase: "started", turnId };
+  }
+  markRejected(threadId, key) {
+    const entry = this.getLive(threadId, key);
+    if (!entry || entry.state.phase === "terminal")
+      return;
+    this.terminate(entry, "rejected");
+  }
+  completeTurn(turnId, threadId) {
+    for (const entry of this.entries.values()) {
+      if (entry.state.phase !== "started")
+        continue;
+      if (turnId !== null) {
+        if (entry.state.turnId !== turnId)
+          continue;
+      } else if (threadId !== undefined && entry.threadId !== threadId) {
+        continue;
+      }
+      this.terminate(entry, "completed");
+    }
+  }
+  terminateThread(threadId, outcome) {
+    for (const entry of this.entries.values()) {
+      if (entry.threadId !== threadId || entry.state.phase === "terminal")
+        continue;
+      this.terminate(entry, outcome);
+    }
+  }
+  terminateAll(outcome) {
+    for (const entry of this.entries.values()) {
+      if (entry.state.phase === "terminal")
+        continue;
+      this.terminate(entry, outcome);
+    }
+  }
+  dispose() {
+    for (const entry of this.entries.values()) {
+      if (entry.timer)
+        clearTimeout(entry.timer);
+    }
+    this.entries.clear();
+  }
+  compositeKey(threadId, key) {
+    return `${threadId}\x00${key}`;
+  }
+  getLive(threadId, key) {
+    const composite = this.compositeKey(threadId, key);
+    const entry = this.entries.get(composite);
+    if (!entry)
+      return null;
+    if (entry.expiresAtMs !== null && this.now() >= entry.expiresAtMs) {
+      if (entry.timer)
+        clearTimeout(entry.timer);
+      this.entries.delete(composite);
+      return null;
+    }
+    return entry;
+  }
+  terminate(entry, outcome) {
+    entry.state = { phase: "terminal", outcome };
+    entry.expiresAtMs = this.now() + this.ttlMs;
+    const timer = setTimeout(() => {
+      for (const [composite, candidate] of this.entries.entries()) {
+        if (candidate === entry) {
+          this.entries.delete(composite);
+          break;
+        }
+      }
+    }, this.ttlMs);
+    timer.unref?.();
+    entry.timer = timer;
+  }
+}
+
 // src/reply-required-tracker.ts
 class ReplyRequiredTracker {
   armed = false;
@@ -4113,6 +4347,10 @@ var codexBootstrapped = false;
 var attentionWindowTimer = null;
 var inAttentionWindow = false;
 var replyTracker = new ReplyRequiredTracker;
+var idempotencyTracker = new IdempotencyTracker;
+var pendingTurnStarts = new Map;
+var pendingSteerDispatches = new Map;
+var BUSY_RETRY_ADVISORY_MS = 15000;
 var shuttingDown = false;
 var bootDeadlineTimer = null;
 var idleShutdownTimer = null;
@@ -4187,13 +4425,70 @@ codex.on("turnPhaseChanged", ({ phase, previous }) => {
   tryWriteStatusFile(`turnPhase:${phase}`);
   broadcastStatus();
 });
-codex.on("steerFailed", (reason) => {
+codex.on("steerFailed", ({ requestId, reason }) => {
   log(`Steer rejected by app-server: ${reason}`);
+  const dispatch = pendingSteerDispatches.get(requestId);
+  pendingSteerDispatches.delete(requestId);
+  if (dispatch?.idempotencyKey && dispatch.threadId) {
+    idempotencyTracker.release(dispatch.threadId, dispatch.idempotencyKey);
+    log(`Released idempotency key after steer failure (request ${requestId}) \u2014 same key is retryable again`);
+  }
   const advice = codex.turnInProgress ? "wait for it to finish (\u2705), then send normally" : "the turn has ended \u2014 resend as a normal reply";
   emitToClaude(systemMessage("system_steer_failed", `\u26A0\uFE0F Your steer message did NOT reach Codex (${reason}). The original turn continues unaffected \u2014 ${advice}.`));
 });
-codex.on("steerAccepted", () => {
+codex.on("steerAccepted", ({ requestId }) => {
   log("Steer accepted by app-server");
+  const dispatch = pendingSteerDispatches.get(requestId);
+  pendingSteerDispatches.delete(requestId);
+  if (dispatch?.requireReply) {
+    replyTracker.arm();
+    log("Reply required armed on steer-accept (steer-scoped expectation)");
+  }
+});
+codex.on("bridgeTurnStarted", ({ requestId, turnId }) => {
+  const pending = pendingTurnStarts.get(requestId);
+  if (!pending) {
+    log(`bridgeTurnStarted for unknown injection ${requestId} (turn ${turnId}) \u2014 correlation dropped`);
+    return;
+  }
+  pendingTurnStarts.delete(requestId);
+  log(`Bridge turn started: injection ${requestId} \u2192 turn ${turnId} (request ${pending.requestId})`);
+  if (pending.idempotencyKey) {
+    idempotencyTracker.markStarted(pending.threadId, pending.idempotencyKey, turnId);
+  }
+  if (attachedClaude) {
+    sendProtocolMessage(attachedClaude, {
+      type: "turn_started",
+      requestId: pending.requestId,
+      ...pending.idempotencyKey ? { idempotencyKey: pending.idempotencyKey } : {},
+      threadId: pending.threadId,
+      turnId
+    });
+  }
+});
+codex.on("bridgeTurnRejected", ({ requestId, error }) => {
+  const pending = pendingTurnStarts.get(requestId);
+  if (!pending)
+    return;
+  pendingTurnStarts.delete(requestId);
+  log(`Bridge turn rejected before start: injection ${requestId} (request ${pending.requestId}): ${error}`);
+  if (pending.idempotencyKey) {
+    idempotencyTracker.markRejected(pending.threadId, pending.idempotencyKey);
+  }
+});
+codex.on("turnIdCompleted", (turnId) => {
+  idempotencyTracker.completeTurn(turnId, codex.activeThreadId ?? undefined);
+});
+codex.on("turnTrackingReset", (reason) => {
+  idempotencyTracker.terminateAll("aborted");
+  if (pendingTurnStarts.size > 0) {
+    log(`Cleared ${pendingTurnStarts.size} pending turn-start correlation(s) on turn tracking reset (${reason})`);
+  }
+  if (pendingSteerDispatches.size > 0) {
+    log(`Cleared ${pendingSteerDispatches.size} pending steer dispatch(es) on turn tracking reset (${reason})`);
+  }
+  pendingTurnStarts.clear();
+  pendingSteerDispatches.clear();
 });
 codex.on("turnStarted", () => {
   log("Codex turn started");
@@ -4301,6 +4596,9 @@ codex.on("exit", (code) => {
   log(`Codex process exited (code ${code})`);
   codexBootstrapped = false;
   replyTracker.reset();
+  idempotencyTracker.terminateAll("aborted");
+  pendingTurnStarts.clear();
+  pendingSteerDispatches.clear();
   statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
   clearPendingClaudeDisconnect("Codex process exited");
@@ -4402,98 +4700,217 @@ function handleControlMessage(ws, raw) {
       });
       return;
     case "claude_to_codex": {
-      if (message.message.source !== "claude") {
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
+      handleClaudeToCodex(ws, message).catch((err) => {
+        log(`handleClaudeToCodex threw for request ${message.requestId}: ${err?.message ?? err}`);
+        sendClaudeToCodexResult(ws, message.requestId, {
           success: false,
-          error: "Invalid message source"
+          code: "internal_error",
+          error: `Internal bridge error: ${err?.message ?? err}`
         });
-        return;
-      }
-      if (!tuiConnectionState.canReply()) {
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: false,
-          error: "Codex is not ready. Wait for TUI to connect and create a thread."
-        });
-        return;
-      }
-      if (budgetCoordinator?.isGateClosed()) {
-        const reason = budgetPauseGateError();
-        log(`Injection rejected by budget pause gate`);
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: false,
-          error: reason
-        });
-        return;
-      }
-      const requireReply = !!message.requireReply;
-      let contentToSend = message.message.content;
-      if (requireReply) {
-        contentToSend += REPLY_REQUIRED_INSTRUCTION;
-      }
-      log(`Forwarding Claude \u2192 Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
-      const tierOverrides = BUDGET_CONFIG.codexTierControl ? budgetCoordinator?.getCodexTurnOverrides() ?? undefined : undefined;
-      if (codex.turnInProgress && message.onBusy === "steer") {
-        if (requireReply) {
-          sendProtocolMessage(ws, {
-            type: "claude_to_codex_result",
-            requestId: message.requestId,
-            success: false,
-            error: 'require_reply is not supported together with on_busy="steer" yet. Send the steer without require_reply, or wait for the turn to finish.'
-          });
-          return;
-        }
-        const steerContent = `[STEER from Claude]
-` + `Mid-turn update for the current Codex turn. Integrate if relevant; do not restart work unless explicitly requested.
-
-` + message.message.content;
-        const steered = codex.steerMessage(steerContent);
-        log(`Steer ${steered ? "transport-accepted" : "failed"} (${message.message.content.length} chars)`);
-        if (steered) {
-          clearAttentionWindow();
-        }
-        const steerFailureAdvice = codex.turnInProgress ? "Steer failed: the running turn cannot be steered right now \u2014 wait for it to finish (\u2705), then send normally." : "Steer failed: the turn may have just ended or the connection dropped \u2014 retry as a normal reply.";
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: steered,
-          error: steered ? undefined : steerFailureAdvice
-        });
-        return;
-      }
-      const injected = codex.injectMessage(contentToSend, tierOverrides);
-      if (!injected) {
-        const reason = codex.turnInProgress ? 'Codex is busy executing a turn. Options: wait for it to finish, or retry with on_busy="steer" to feed this message into the running turn without interrupting it.' : "Injection failed: no active thread or WebSocket not connected.";
-        log(`Injection rejected: ${reason}`);
-        sendProtocolMessage(ws, {
-          type: "claude_to_codex_result",
-          requestId: message.requestId,
-          success: false,
-          error: reason
-        });
-        return;
-      }
-      if (tierOverrides) {
-        budgetCoordinator?.notifyOverridesDelivered();
-      }
-      if (requireReply) {
-        replyTracker.arm();
-        log(`Reply required flag set for this message`);
-      }
-      clearAttentionWindow();
-      sendProtocolMessage(ws, {
-        type: "claude_to_codex_result",
-        requestId: message.requestId,
-        success: true
       });
       return;
     }
   }
+}
+function sendClaudeToCodexResult(ws, requestId, opts) {
+  sendProtocolMessage(ws, {
+    type: "claude_to_codex_result",
+    requestId,
+    success: opts.success,
+    ...opts.error !== undefined ? { error: opts.error } : {},
+    ok: opts.success,
+    ...opts.code !== undefined ? { code: opts.code } : {},
+    phase: codex.turnPhase,
+    ...opts.retryAfterMs !== undefined ? { retryAfterMs: opts.retryAfterMs } : {}
+  });
+}
+function describeDuplicate(dup) {
+  if (dup.code === "duplicate_terminal") {
+    const outcome = dup.state.phase === "terminal" ? dup.state.outcome : "unknown";
+    return `Duplicate idempotency_key: the original message already reached a terminal state (${outcome}) ` + `and was NOT re-injected. Use a fresh key to send a genuinely new message.`;
+  }
+  const detail = dup.state.phase === "started" ? `already running as turn ${dup.state.turnId}` : "still in flight";
+  return `Duplicate idempotency_key: a message with this key is ${detail} \u2014 NOT re-injected. ` + `Wait for its outcome, or use a fresh key for a genuinely new message.`;
+}
+function waitForInterruptOutcome(turnIds) {
+  return new Promise((resolve) => {
+    let settled = false;
+    const abort = new AbortController;
+    const finish = (result) => {
+      if (settled)
+        return;
+      settled = true;
+      codex.off("interruptFailed", onFailed);
+      abort.abort();
+      resolve(result);
+    };
+    const onFailed = (reason) => finish({ ok: false, code: "interrupt_rejected", reason });
+    codex.on("interruptFailed", onFailed);
+    codex.waitForTurnsTerminal(turnIds, undefined, abort.signal).then((result) => {
+      if (result.ok) {
+        finish({ ok: true });
+      } else if (result.code === "interrupt_timeout") {
+        finish({ ok: false, code: "interrupt_timeout" });
+      }
+    });
+  });
+}
+async function handleClaudeToCodex(ws, message) {
+  if (message.message.source !== "claude") {
+    sendClaudeToCodexResult(ws, message.requestId, {
+      success: false,
+      code: "invalid_source",
+      error: "Invalid message source"
+    });
+    return;
+  }
+  const idempotencyKey = typeof message.idempotencyKey === "string" && message.idempotencyKey.length > 0 ? message.idempotencyKey : undefined;
+  if (idempotencyKey && codex.activeThreadId) {
+    const dup = idempotencyTracker.check(codex.activeThreadId, idempotencyKey);
+    if (dup.duplicate) {
+      log(`Rejected duplicate idempotency key (${dup.code})`);
+      sendClaudeToCodexResult(ws, message.requestId, {
+        success: false,
+        code: dup.code,
+        error: describeDuplicate(dup)
+      });
+      return;
+    }
+  }
+  if (!tuiConnectionState.canReply()) {
+    sendClaudeToCodexResult(ws, message.requestId, {
+      success: false,
+      code: "no_thread",
+      error: "Codex is not ready. Wait for TUI to connect and create a thread."
+    });
+    return;
+  }
+  if (budgetCoordinator?.isGateClosed()) {
+    const reason = budgetPauseGateError();
+    log(`Injection rejected by budget pause gate`);
+    const resumeAfterEpoch2 = budgetCoordinator?.getSnapshot()?.resumeAfterEpoch ?? null;
+    const retryAfterMs = resumeAfterEpoch2 !== null ? Math.max(0, resumeAfterEpoch2 * 1000 - Date.now()) : undefined;
+    sendClaudeToCodexResult(ws, message.requestId, {
+      success: false,
+      code: "budget_paused",
+      error: reason,
+      ...retryAfterMs !== undefined ? { retryAfterMs } : {}
+    });
+    return;
+  }
+  const requireReply = !!message.requireReply;
+  let contentToSend = message.message.content;
+  if (requireReply) {
+    contentToSend += REPLY_REQUIRED_INSTRUCTION;
+  }
+  log(`Forwarding Claude \u2192 Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
+  const tierOverrides = BUDGET_CONFIG.codexTierControl ? budgetCoordinator?.getCodexTurnOverrides() ?? undefined : undefined;
+  if (codex.turnInProgress && message.onBusy === "steer") {
+    const steerContent = `[STEER from Claude]
+` + `Mid-turn update for the current Codex turn. Integrate if relevant; do not restart work unless explicitly requested.
+
+` + contentToSend;
+    const steerTurnId = codex.steerableTurnId;
+    const steerThreadId = codex.activeThreadId;
+    const steerRequestId = codex.steerMessage(steerContent);
+    const steered = steerRequestId !== null;
+    log(`Steer ${steered ? "transport-accepted" : "failed"} (${message.message.content.length} chars, requireReply=${requireReply})`);
+    if (steered) {
+      clearAttentionWindow();
+      pendingSteerDispatches.set(steerRequestId, {
+        requireReply,
+        ...idempotencyKey ? { idempotencyKey } : {},
+        ...steerThreadId ? { threadId: steerThreadId } : {}
+      });
+      if (idempotencyKey && steerThreadId) {
+        idempotencyTracker.accept(steerThreadId, idempotencyKey);
+        if (steerTurnId) {
+          idempotencyTracker.markStarted(steerThreadId, idempotencyKey, steerTurnId);
+        }
+      }
+    }
+    const steerFailureAdvice = codex.turnInProgress ? "Steer failed: the running turn cannot be steered right now \u2014 wait for it to finish (\u2705), then send normally." : "Steer failed: the turn may have just ended or the connection dropped \u2014 retry as a normal reply.";
+    sendClaudeToCodexResult(ws, message.requestId, {
+      success: steered,
+      ...steered ? {} : { code: "steer_failed", error: steerFailureAdvice }
+    });
+    return;
+  }
+  if (codex.turnInProgress && message.onBusy === "interrupt") {
+    const interruptThreadId = codex.activeThreadId;
+    if (idempotencyKey && interruptThreadId) {
+      idempotencyTracker.accept(interruptThreadId, idempotencyKey);
+    }
+    const releaseInterruptKey = () => {
+      if (idempotencyKey && interruptThreadId) {
+        idempotencyTracker.release(interruptThreadId, idempotencyKey);
+      }
+    };
+    const interrupted = codex.interruptActiveTurns();
+    if (!interrupted.ok) {
+      releaseInterruptKey();
+      log(`Interrupt unavailable: ${interrupted.error}`);
+      sendClaudeToCodexResult(ws, message.requestId, {
+        success: false,
+        code: interrupted.code,
+        error: `Interrupt failed (${interrupted.error}). The original turn keeps running \u2014 ` + `your message was NOT injected. Wait for \u2705, or retry with on_busy="steer".`
+      });
+      return;
+    }
+    log(`Interrupt dispatched for turn(s) ${interrupted.turnIds.join(", ")} \u2014 waiting for terminal boundary`);
+    const outcome = await waitForInterruptOutcome(interrupted.turnIds);
+    if (!outcome.ok) {
+      releaseInterruptKey();
+      const error = outcome.code === "interrupt_rejected" ? `Interrupt was rejected by the app-server (${outcome.reason ?? "unknown reason"}). ` + `The original turn keeps running \u2014 your message was NOT injected. ` + `Wait for \u2705, or retry with on_busy="steer".` : `Interrupt did not reach a terminal boundary in time. The turn MAY still be running \u2014 ` + `do not assume it stopped. Your message was NOT injected (this avoids a double-turn race); ` + `check for \u2705/\u26A0\uFE0F notices before retrying.`;
+      log(`Interrupt failed (${outcome.code})`);
+      sendClaudeToCodexResult(ws, message.requestId, {
+        success: false,
+        code: outcome.code,
+        error
+      });
+      return;
+    }
+    log("Interrupt reached terminal boundary \u2014 injecting the message as a new turn");
+    if (interruptThreadId && codex.activeThreadId !== interruptThreadId) {
+      releaseInterruptKey();
+    }
+  }
+  const injectThreadId = codex.activeThreadId;
+  const injectionId = codex.injectMessage(contentToSend, tierOverrides);
+  if (injectionId === null) {
+    if (idempotencyKey && injectThreadId) {
+      idempotencyTracker.release(injectThreadId, idempotencyKey);
+    }
+    const busy = codex.turnInProgress;
+    const reason = busy ? 'Codex is busy executing a turn. Options: wait for it to finish, retry with on_busy="steer" to feed this message into the running turn without interrupting it, or retry with on_busy="interrupt" to stop the current turn and start a new one with this message.' : "Injection failed: no active thread or WebSocket not connected.";
+    log(`Injection rejected: ${reason}`);
+    sendClaudeToCodexResult(ws, message.requestId, {
+      success: false,
+      code: busy ? "busy_reject" : "no_thread",
+      error: reason,
+      ...busy ? { retryAfterMs: BUSY_RETRY_ADVISORY_MS } : {}
+    });
+    return;
+  }
+  if (tierOverrides) {
+    budgetCoordinator?.notifyOverridesDelivered();
+  }
+  if (requireReply) {
+    replyTracker.arm();
+    log(`Reply required flag set for this message`);
+  }
+  clearAttentionWindow();
+  if (injectThreadId) {
+    if (idempotencyKey) {
+      idempotencyTracker.accept(injectThreadId, idempotencyKey);
+    }
+    pendingTurnStarts.set(injectionId, {
+      requestId: message.requestId,
+      ...idempotencyKey ? { idempotencyKey } : {},
+      threadId: injectThreadId
+    });
+  }
+  sendClaudeToCodexResult(ws, message.requestId, { success: true });
 }
 async function attachClaude(ws, identity) {
   const occupant = attachedClaude;
@@ -4881,6 +5298,7 @@ function shutdown(reason, exitCode = 0) {
   log(`Shutting down daemon (${reason})...`);
   clearBootDeadline();
   stopBudgetCoordinator();
+  idempotencyTracker.dispose();
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);
   clearPendingClaudeDisconnect(`daemon shutdown (${reason})`);
   controlServer?.stop();

@@ -1,11 +1,11 @@
 # Collaboration Protocol v2 — 设计契约 / Design Contract
 
-> 状态：PR A 实施中。本文档是 Claude × Codex 两轮设计共识的固化版本（2026-06-10），
-> 实施任何一个 PR 时以此为契约；修改契约需双方重新共识。
+> 状态：PR A、B0、B 已实施；PR C 未实施。本文档是 Claude × Codex 两轮设计共识的
+> 固化版本（2026-06-10），实施任何一个 PR 时以此为契约；修改契约需双方重新共识。
 >
-> Status: PR A in progress. This document freezes the two-round design
-> consensus between Claude and Codex (2026-06-10). Implementations MUST follow
-> it; contract changes require renewed consensus.
+> Status: PR A, B0 and B implemented; PR C pending. This document freezes the
+> two-round design consensus between Claude and Codex (2026-06-10).
+> Implementations MUST follow it; contract changes require renewed consensus.
 
 ## 背景 / Background
 
@@ -62,7 +62,7 @@ observable, correlatable contract.
   `turn_started` ACK 补足。
 - `turn/interrupt`（打断入口）**不在 B0**，与 ACK/幂等机制一起进 PR B。
 
-### PR B — 核心协议：ACK + 幂等 / core protocol: ACK + idempotency（未实施）
+### PR B — 核心协议：ACK + 幂等 / core protocol: ACK + idempotency（已实施）
 
 - `claude_to_codex_result` 维持即时返回，语义收窄为 **accepted** =
   「daemon 已接收并已尝试写入 turn/start」；Claude 侧 15s 超时仅适用于
@@ -83,6 +83,50 @@ observable, correlatable contract.
 - 结构化 result 最小版：`{ok:false, code, phase?, retryAfterMs?, retryAfterEpoch?}`；
   旧 `error` 字符串并存一个版本。`phase` 引用 turnPhase 值域；
   `code/phase/retryAfter` 是 per-request 诊断，不与 status 状态合并改造。
+
+#### PR B 实施定案 / Implementation deltas（2026-06-11）
+
+- **打断入口 = `reply` 的 `on_busy:"interrupt"`**：busy 时经 app-server
+  `turn/interrupt {threadId, turnId}` 终结**全部**可寻址 active turn（多 turn
+  歧义按共识「全部终结」处理；只有 `unknown:` fallback key 时本地结构化失败
+  `interrupt_unavailable`，不发 wire）。等待 terminal 边界
+  （`waitForTurnsTerminal`：**仅** targeted ids 全部离开 activeTurnIds 且不再
+  被标记 stalled——按 targeted id 逐一判定，**不**读全局 phase，否则一个共存的
+  不可寻址 `unknown:` turn 会让 phase 永远 running 而误判超时；超时默认 10s，
+  `AGENTBRIDGE_INTERRUPT_TIMEOUT_MS` 可调但**被钳制**在 client reply timeout
+  之下（见 `interrupt-timing.ts`：`clampInterruptTimeoutMs`，防 false client
+  timeout + 重试 double-turn）。等待可经 `AbortSignal` 取消，`interruptFailed`
+  抢先时立即拆掉内层 listeners/timer）
+  后走**与普通 reply 完全相同的注入路径**（tier overrides / require_reply
+  arming / attention window 收口）。失败面：`interrupt_unavailable` /
+  `interrupt_rejected`（原 turn 继续跑，文案明示）/ `interrupt_timeout`
+  （**不注入**，防 double-turn race）。codex-rs 实证：interrupt 的 success
+  response（`{}`）被 app-server 推迟到 TurnAborted 才回；被打断 turn 的
+  terminal 通知是带 `status:"interrupted"` 的普通 `turn/completed` ——
+  既有 turn/completed 处理就是 terminal 边界。
+- **结构化 result codes 清单**：`invalid_source / no_thread / busy_reject /
+  budget_paused / steer_failed / interrupt_unavailable / interrupt_rejected /
+  interrupt_timeout / duplicate_in_flight / duplicate_terminal /
+  internal_error`。`ok` 与 `success` 镜像并存一个版本；`phase` 每个 result
+  都带；`retryAfterMs` 仅 busy_reject（建议性轮询间隔 15s，无诚实的 turn
+  结束估计）与 budget_paused（由 resumeAfterEpoch 推导）填。
+- **幂等键注册时机**：只有**真正发生 wire 写入尝试**（turn/start、turn/steer
+  传输受理，或 interrupt 等待窗开启）才注册 key；前置拒绝
+  （busy_reject / budget_paused / no_thread）**不注册**——消息从未进管道，
+  同 key 重试必须放行。interrupt 失败/超时路径 `release()` 已注册的 key，
+  同理保持可重试。带 key 的 steer 在传输受理时绑定到所加入的 turn
+  （started(steeredTurnId)），随该 turn 的 terminal 终结，不会滞留；若 steer
+  **被 app-server 拒绝**（`steerFailed`），daemon 也 `release()` 该 key——steer
+  从未到达 Codex，同 key 必须立即可重试（与 interrupt 失败释放对称，修复
+  「被拒 steer 把 key 滞留在 started」）。
+- **require_reply × steer 正式语义**：tool 层与 daemon 层的拒绝均已移除；
+  steer 正文携带 reply-required instruction，daemon 在 **steerAccepted**
+  事件（app-server 受理）时 arm 期望——「steer-accept 之后、该 turn terminal
+  之前的新 agentMessage 即视为 reply」。steer dispatch 与响应**按 bridge
+  request id 关联**（`steerAccepted`/`steerFailed` 携带 id），而非 FIFO ——
+  丢失/乱序的 steer 响应不会把 dispatch（含 require_reply 期望与幂等键）误配
+  到错误 turn；`turnTrackingReset` 一并清掉孤儿 dispatch。require_reply ×
+  interrupt 允许（最终开新 turn，注入成功后照常 arm）。
 
 ### PR C — 预算指令降噪分层 / budget directive layering（未实施）
 

@@ -95,6 +95,28 @@ export interface TurnSteerParams {
   [key: string]: unknown;
 }
 
+/**
+ * turn/interrupt — terminate the CURRENTLY RUNNING turn (protocol v2 PR B).
+ * Verified against codex-rs (app-server-protocol/src/protocol/v2/turn.rs:
+ * TurnInterruptParams { thread_id, turn_id }, camelCase on the wire).
+ *
+ * Semantics verified in app-server/src/request_processors/turn_processor.rs
+ * (turn_interrupt_inner) + bespoke_event_handling.rs:
+ *   - turnId must match the active turn, else an immediate JSON-RPC error
+ *     ("expected active turn id X but found Y" / "no active turn to interrupt").
+ *   - The SUCCESS response ({}) is DEFERRED until the core emits TurnAborted —
+ *     it arrives at roughly the same time as the terminal notification.
+ *   - The interrupted turn's terminal notification is a normal `turn/completed`
+ *     with `turn.status = "interrupted"` (handle_turn_interrupted →
+ *     emit_turn_completed_with_status) — the adapter's existing turn/completed
+ *     handling IS the terminal boundary; no extra notification type exists.
+ */
+export interface TurnInterruptParams {
+  threadId: string;
+  turnId: string;
+  [key: string]: unknown;
+}
+
 export interface ThreadStartResponse {
   thread?: AppServerThread;
   [key: string]: unknown;

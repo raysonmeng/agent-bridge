@@ -5,6 +5,7 @@ import { createServer, Socket, type AddressInfo, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CodexAdapter } from "../codex-adapter";
+import { CLIENT_REPLY_TIMEOUT_MS, MAX_INTERRUPT_TIMEOUT_MS } from "../interrupt-timing";
 
 // Hermetic log sink: the constructor's default logFile resolves the REAL pair
 // state dir — these tests were appending into (and could rotate!) a live
@@ -323,15 +324,17 @@ describe("CodexAdapter turn state machine", () => {
     adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
 
     adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
-    expect(adapter.injectMessage("hello")).toBe(false);
+    expect(adapter.injectMessage("hello")).toBeNull();
   });
 
-  test("injectMessage succeeds when no turn active", () => {
+  test("injectMessage succeeds when no turn active and returns the negative request id", () => {
     const adapter = createAdapter();
     adapter.threadId = "thread-1";
     adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
 
-    expect(adapter.injectMessage("hello")).toBe(true);
+    const injectionId = adapter.injectMessage("hello");
+    expect(typeof injectionId).toBe("number");
+    expect(injectionId).toBeLessThan(0);
   });
 
   test("clearResponseTrackingState + turn reset simulates onclose behavior", () => {
@@ -351,7 +354,7 @@ describe("CodexAdapter turn state machine", () => {
     // After reset, injection should work again
     adapter.threadId = "thread-1";
     adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
-    expect(adapter.injectMessage("hello after reset")).toBe(true);
+    expect(adapter.injectMessage("hello after reset")).toBeLessThan(0);
   });
 
   test("thread/start tracked request lifecycle emits ready from response thread id", () => {
@@ -1662,7 +1665,7 @@ describe("CodexAdapter initialize reconnect", () => {
     adapter.onTuiConnect(ws);
 
     expect(adapter.threadId).toBeNull();
-    expect(adapter.injectMessage("hello")).toBe(false);
+    expect(adapter.injectMessage("hello")).toBeNull();
   });
 });
 
@@ -2284,7 +2287,7 @@ describe("CodexAdapter turn/steer (protocol v2 B0)", () => {
     const adapter = createAdapter();
     adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
     adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
-    expect(adapter.steerMessage("hello")).toBe(false);
+    expect(adapter.steerMessage("hello")).toBeNull();
   });
 
   test("steerMessage rejects when the app-server WebSocket is not connected", () => {
@@ -2292,7 +2295,7 @@ describe("CodexAdapter turn/steer (protocol v2 B0)", () => {
     adapter.threadId = "thread-steer";
     adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
     adapter.appServerWs = null;
-    expect(adapter.steerMessage("hello")).toBe(false);
+    expect(adapter.steerMessage("hello")).toBeNull();
   });
 
   test("steerMessage rejects when NO turn is in progress (injectMessage territory)", () => {
@@ -2300,14 +2303,19 @@ describe("CodexAdapter turn/steer (protocol v2 B0)", () => {
     adapter.threadId = "thread-steer";
     adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
     expect(adapter.turnInProgress).toBe(false);
-    expect(adapter.steerMessage("hello")).toBe(false);
+    expect(adapter.steerMessage("hello")).toBeNull();
   });
 
   test("steerMessage sends turn/steer with a tracked negative id, expectedTurnId and text input", () => {
     const { adapter, appSent } = createSteerableAdapter();
 
-    expect(adapter.steerMessage("mid-turn correction")).toBe(true);
+    // Returns the (negative) bridge request id when transport-accepted (PR B:
+    // the daemon correlates steerAccepted/steerFailed back to the dispatch by id).
+    const steerReqId = adapter.steerMessage("mid-turn correction");
+    expect(typeof steerReqId).toBe("number");
+    expect(steerReqId).toBeLessThan(0);
     expect(appSent).toHaveLength(1);
+    expect(JSON.parse(appSent[0]).id).toBe(steerReqId);
 
     const sent = JSON.parse(appSent[0]);
     expect(sent.method).toBe("turn/steer");
@@ -2334,7 +2342,7 @@ describe("CodexAdapter turn/steer (protocol v2 B0)", () => {
     adapter.handleServerNotification({ method: "turn/started", params: {} });
     expect(adapter.turnInProgress).toBe(true);
 
-    expect(adapter.steerMessage("hello")).toBe(false);
+    expect(adapter.steerMessage("hello")).toBeNull();
   });
 
   test("steerMessage targets the NEWEST real turn id when several are active", () => {
@@ -2342,7 +2350,7 @@ describe("CodexAdapter turn/steer (protocol v2 B0)", () => {
     // A second (nested/newer) turn starts; insertion order makes it the newest.
     adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t2" } } });
 
-    expect(adapter.steerMessage("target the newest")).toBe(true);
+    expect(adapter.steerMessage("target the newest")).toBeLessThan(0);
     expect(JSON.parse(appSent[0]).params.expectedTurnId).toBe("t2");
 
     adapter.clearResponseTrackingState();
@@ -2354,7 +2362,7 @@ describe("CodexAdapter turn/steer (protocol v2 B0)", () => {
     adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "t2" } } });
 
     expect(adapter.turnInProgress).toBe(true); // t1 still active
-    expect(adapter.steerMessage("back to t1")).toBe(true);
+    expect(adapter.steerMessage("back to t1")).toBeLessThan(0);
     expect(JSON.parse(appSent[0]).params.expectedTurnId).toBe("t1");
 
     adapter.clearResponseTrackingState();
@@ -2364,12 +2372,12 @@ describe("CodexAdapter turn/steer (protocol v2 B0)", () => {
     // Core B0 invariant: ActiveTurnNotSteerable / NoActiveTurn-race rejections
     // must not be confused with a turn abort — the ORIGINAL turn is untouched.
     const { adapter, appSent } = createSteerableAdapter();
-    const failures: string[] = [];
+    const failures: Array<{ requestId: number; reason: string }> = [];
     const aborts: string[] = [];
-    adapter.on("steerFailed", (reason: string) => failures.push(reason));
+    adapter.on("steerFailed", (e: { requestId: number; reason: string }) => failures.push(e));
     adapter.on("turnAborted", (reason: string) => aborts.push(reason));
 
-    adapter.steerMessage("mid-turn correction");
+    const steerReqId = adapter.steerMessage("mid-turn correction");
     const steerId = JSON.parse(appSent[0]).id;
 
     const forwarded = adapter.handleAppServerPayload(JSON.stringify({
@@ -2378,7 +2386,8 @@ describe("CodexAdapter turn/steer (protocol v2 B0)", () => {
     }));
 
     expect(forwarded).toBeNull(); // swallowed, never forwarded to the TUI
-    expect(failures).toEqual(["ActiveTurnNotSteerable"]);
+    // steerFailed now carries the bridge requestId (PR B id correlation).
+    expect(failures).toEqual([{ requestId: steerReqId as number, reason: "ActiveTurnNotSteerable" }]);
     expect(aborts).toEqual([]);
     expect(adapter.turnInProgress).toBe(true);
     expect(adapter.turnPhase).toBe("running");
@@ -2387,19 +2396,21 @@ describe("CodexAdapter turn/steer (protocol v2 B0)", () => {
     adapter.clearResponseTrackingState();
   });
 
-  test("an accepted steer emits steerAccepted and nothing else", () => {
+  test("an accepted steer emits steerAccepted (carrying the requestId) and nothing else", () => {
     const { adapter, appSent } = createSteerableAdapter();
     const events: string[] = [];
-    adapter.on("steerAccepted", () => events.push("accepted"));
+    const acceptedIds: number[] = [];
+    adapter.on("steerAccepted", (e: { requestId: number }) => { events.push("accepted"); acceptedIds.push(e.requestId); });
     adapter.on("steerFailed", () => events.push("failed"));
     adapter.on("turnAborted", () => events.push("aborted"));
 
-    adapter.steerMessage("mid-turn correction");
+    const steerReqId = adapter.steerMessage("mid-turn correction");
     const steerId = JSON.parse(appSent[0]).id;
 
     adapter.handleAppServerPayload(JSON.stringify({ id: steerId, result: {} }));
 
     expect(events).toEqual(["accepted"]);
+    expect(acceptedIds).toEqual([steerReqId as number]);
     expect(adapter.turnInProgress).toBe(true);
 
     adapter.clearResponseTrackingState();
@@ -2410,9 +2421,9 @@ describe("CodexAdapter turn/steer (protocol v2 B0)", () => {
     // turn-start error path must keep its abort semantics.
     const { adapter } = createSteerableAdapter();
     const aborts: string[] = [];
-    const failures: string[] = [];
+    const failures: Array<{ requestId: number; reason: string }> = [];
     adapter.on("turnAborted", (reason: string) => aborts.push(reason));
-    adapter.on("steerFailed", (reason: string) => failures.push(reason));
+    adapter.on("steerFailed", (e: { requestId: number; reason: string }) => failures.push(e));
 
     adapter.trackBridgeRequestId(-77); // default kind: "turn-start"
     adapter.handleAppServerPayload(JSON.stringify({
@@ -2451,14 +2462,385 @@ describe("CodexAdapter turn/steer (protocol v2 B0)", () => {
       readyState: WebSocket.OPEN,
       send: () => { throw new Error("socket write failed"); },
     } as any;
-    const failures: string[] = [];
-    adapter.on("steerFailed", (reason: string) => failures.push(reason));
+    const failures: Array<{ requestId: number; reason: string }> = [];
+    adapter.on("steerFailed", (e: { requestId: number; reason: string }) => failures.push(e));
 
-    expect(adapter.steerMessage("doomed")).toBe(false);
+    expect(adapter.steerMessage("doomed")).toBeNull();
     expect(adapter.bridgeRequestIds.size).toBe(0);
     expect(adapter.bridgeRequestKinds.size).toBe(0);
     expect(failures).toEqual([]); // send failure is the return value's job, not the event's
 
     adapter.clearResponseTrackingState();
+  });
+
+  test("steerableTurnId exposes the newest addressable turn id (daemon's idempotency binding)", () => {
+    const { adapter } = createSteerableAdapter();
+    expect(adapter.steerableTurnId).toBe("t1");
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t2" } } });
+    expect(adapter.steerableTurnId).toBe("t2");
+    adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "t2" } } });
+    adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "t1" } } });
+    expect(adapter.steerableTurnId).toBeNull();
+  });
+});
+
+describe("CodexAdapter turn/interrupt (protocol v2 PR B)", () => {
+  function createBusyAdapter(turnIds: string[] = ["t1"]) {
+    const adapter = createAdapter();
+    const appSent: string[] = [];
+    adapter.threadId = "thread-int";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: (data: string) => appSent.push(data) } as any;
+    for (const id of turnIds) {
+      adapter.handleServerNotification({ method: "turn/started", params: { turn: { id } } });
+    }
+    return { adapter, appSent };
+  }
+
+  test("interruptActiveTurns sends turn/interrupt {threadId, turnId} per addressable active id, kind-tracked", () => {
+    const { adapter, appSent } = createBusyAdapter(["t1", "t2"]);
+
+    const result = adapter.interruptActiveTurns();
+    expect(result.ok).toBe(true);
+    expect(result.turnIds).toEqual(["t1", "t2"]);
+    expect(appSent).toHaveLength(2);
+
+    const sentTurnIds: string[] = [];
+    for (const raw of appSent) {
+      const sent = JSON.parse(raw);
+      expect(sent.method).toBe("turn/interrupt");
+      expect(typeof sent.id).toBe("number");
+      expect(sent.id).toBeLessThan(0);
+      // Wire shape verified against codex-rs TurnInterruptParams (turn.rs):
+      // {threadId, turnId}, nothing else.
+      expect(sent.params).toEqual({ threadId: "thread-int", turnId: sent.params.turnId });
+      sentTurnIds.push(sent.params.turnId);
+      expect(adapter.bridgeRequestIds.has(sent.id)).toBe(true);
+      expect(adapter.bridgeRequestKinds.get(sent.id)).toBe("interrupt");
+    }
+    expect(sentTurnIds).toEqual(["t1", "t2"]);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("interruptActiveTurns fails structured when the only active turn has no addressable id", () => {
+    const adapter = createAdapter();
+    const appSent: string[] = [];
+    adapter.threadId = "thread-int";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: (data: string) => appSent.push(data) } as any;
+    // turn/started without a turn id → tracked under an `unknown:<ts>` key.
+    adapter.handleServerNotification({ method: "turn/started", params: {} });
+    expect(adapter.turnInProgress).toBe(true);
+
+    const result = adapter.interruptActiveTurns();
+    expect(result.ok).toBe(false);
+    expect(result.code).toBe("interrupt_unavailable");
+    expect(appSent).toHaveLength(0); // local failure — nothing hit the wire
+  });
+
+  test("interruptActiveTurns fails structured with no thread or no app-server WS", () => {
+    const noThread = createAdapter();
+    noThread.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+    noThread.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    const r1 = noThread.interruptActiveTurns();
+    expect(r1.ok).toBe(false);
+    expect(r1.code).toBe("interrupt_unavailable");
+
+    const noWs = createAdapter();
+    noWs.threadId = "thread-int";
+    noWs.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    noWs.appServerWs = null;
+    const r2 = noWs.interruptActiveTurns();
+    expect(r2.ok).toBe(false);
+    expect(r2.code).toBe("interrupt_unavailable");
+  });
+
+  test("a rejected turn/interrupt emits interruptFailed and does NOT touch turn state", () => {
+    // Real app-server rejections: "expected active turn id X but found Y",
+    // "no active turn to interrupt" (turn_processor.rs). The original turn
+    // keeps running — response handlers never mutate turn state.
+    const { adapter, appSent } = createBusyAdapter(["t1"]);
+    const failures: string[] = [];
+    const aborts: string[] = [];
+    adapter.on("interruptFailed", (reason: string) => failures.push(reason));
+    adapter.on("turnAborted", (reason: string) => aborts.push(reason));
+
+    adapter.interruptActiveTurns();
+    const interruptId = JSON.parse(appSent[0]).id;
+
+    const forwarded = adapter.handleAppServerPayload(JSON.stringify({
+      id: interruptId,
+      error: { message: "no active turn to interrupt" },
+    }));
+
+    expect(forwarded).toBeNull(); // swallowed, never forwarded to the TUI
+    expect(failures).toEqual(["no active turn to interrupt"]);
+    expect(aborts).toEqual([]);
+    expect(adapter.turnInProgress).toBe(true);
+    expect(adapter.turnPhase).toBe("running");
+    expect(adapter.bridgeRequestIds.has(interruptId)).toBe(false); // consumed
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("an interrupt SUCCESS response ({}) is log-only — no events, no state change", () => {
+    // The real app-server defers this response until TurnAborted; the
+    // terminal turn/completed (status interrupted) notification owns state.
+    const { adapter, appSent } = createBusyAdapter(["t1"]);
+    const events: string[] = [];
+    adapter.on("interruptFailed", () => events.push("failed"));
+    adapter.on("turnAborted", () => events.push("aborted"));
+    adapter.on("steerAccepted", () => events.push("steerAccepted"));
+    adapter.on("bridgeTurnStarted", () => events.push("bridgeTurnStarted"));
+
+    adapter.interruptActiveTurns();
+    const interruptId = JSON.parse(appSent[0]).id;
+    const forwarded = adapter.handleAppServerPayload(JSON.stringify({ id: interruptId, result: {} }));
+
+    expect(forwarded).toBeNull();
+    expect(events).toEqual([]);
+    expect(adapter.turnInProgress).toBe(true); // still running until turn/completed
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("waitForTurnsTerminal resolves immediately when already terminal", async () => {
+    const adapter = createAdapter();
+    const result = await adapter.waitForTurnsTerminal(["t1"], 50);
+    expect(result).toEqual({ ok: true });
+  });
+
+  test("waitForTurnsTerminal resolves when the targeted turn completes", async () => {
+    const { adapter } = createBusyAdapter(["t1"]);
+    const wait = adapter.waitForTurnsTerminal(["t1"], 2000);
+    adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "t1" } } });
+    expect(await wait).toEqual({ ok: true });
+  });
+
+  test("waitForTurnsTerminal holds until ALL targeted ids leave (a still-targeted turn holds)", async () => {
+    // The wait is now per-TARGETED-id: targeting both t1 and t2 must hold until
+    // both complete (a residual targeted turn keeps the wait pending).
+    const { adapter } = createBusyAdapter(["t1", "t2"]);
+    const wait = adapter.waitForTurnsTerminal(["t1", "t2"], 2000);
+
+    adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "t1" } } });
+    const pending = await Promise.race([wait, sleep(50).then(() => "pending")]);
+    expect(pending).toBe("pending"); // t2 still targeted + running
+
+    adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "t2" } } });
+    expect(await wait).toEqual({ ok: true });
+  });
+
+  test("waitForTurnsTerminal resolves when the TARGETED turns end even if an UNtargeted turn is still active (recommend #3 latent-REAL fix)", async () => {
+    // PR B fix: the predicate must key on the TARGETED ids only, NOT the global
+    // turnPhase. A coexisting unaddressable `unknown:` turn (which the interrupt
+    // path can never target) keeps turnPhase at "running" forever — under the
+    // OLD predicate that guaranteed a spurious interrupt_timeout. The residual
+    // turn is harmless: the daemon's injectMessage busy-guard rejects an
+    // injection while ANY turn is still in progress, so resolving early here
+    // cannot double-turn.
+    const adapter = createAdapter();
+    adapter.threadId = "thread-int";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    // An id-less turn/started → tracked under an `unknown:<ts>` key; it coexists
+    // and is NEVER addressable/targetable by the interrupt path.
+    adapter.handleServerNotification({ method: "turn/started", params: {} });
+    expect(adapter.turnPhase).toBe("running");
+
+    const wait = adapter.waitForTurnsTerminal(["t1"], 2000);
+    adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "t1" } } });
+
+    // Resolves as soon as the targeted t1 ends, even though the unknown: turn
+    // keeps turnPhase === "running".
+    expect(await wait).toEqual({ ok: true });
+    expect(adapter.turnPhase).toBe("running"); // unknown: turn still active
+
+    adapter.resetTurnState("test cleanup");
+  });
+
+  test("waitForTurnsTerminal holds while a TARGETED turn is stalled, then resolves on completion", async () => {
+    // A stalled turn is still busy: a targeted id flagged stalled must keep the
+    // wait pending (scoped to currentlyStalledTurnIds, not the global phase).
+    const { adapter } = createBusyAdapter(["t1"]);
+    // Simulate the watchdog marking the targeted turn stalled.
+    (adapter as any).markTurnStalled("t1");
+    expect(adapter.turnPhase).toBe("stalled");
+
+    const wait = adapter.waitForTurnsTerminal(["t1"], 2000);
+    const pending = await Promise.race([wait, sleep(50).then(() => "pending")]);
+    expect(pending).toBe("pending"); // t1 stalled but still active+targeted
+
+    adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "t1" } } });
+    expect(await wait).toEqual({ ok: true });
+  });
+
+  test("waitForTurnsTerminal is cancelable via AbortSignal (recommend #4 — prompt listener teardown)", async () => {
+    const { adapter } = createBusyAdapter(["t1"]);
+    const controller = new AbortController();
+    const wait = adapter.waitForTurnsTerminal(["t1"], 5000, controller.signal);
+
+    // Abort BEFORE the (large) timeout — the wait must resolve promptly with a
+    // distinct interrupt_aborted code instead of leaking listeners until 5s.
+    const startedAt = Date.now();
+    controller.abort();
+    const result = await wait;
+    expect(result).toEqual({ ok: false, code: "interrupt_aborted" });
+    expect(Date.now() - startedAt).toBeLessThan(1_000);
+    // Listeners were removed on abort — the turn state is untouched.
+    expect(adapter.turnInProgress).toBe(true);
+
+    adapter.resetTurnState("test cleanup");
+  });
+
+  test("waitForTurnsTerminal returns interrupt_aborted synchronously when the signal is already aborted", async () => {
+    const { adapter } = createBusyAdapter(["t1"]);
+    const controller = new AbortController();
+    controller.abort();
+    const result = await adapter.waitForTurnsTerminal(["t1"], 5000, controller.signal);
+    expect(result).toEqual({ ok: false, code: "interrupt_aborted" });
+
+    adapter.resetTurnState("test cleanup");
+  });
+
+  test("waitForTurnsTerminal resolves on an abnormal turn end (reset/abort path)", async () => {
+    const { adapter } = createBusyAdapter(["t1"]);
+    const wait = adapter.waitForTurnsTerminal(["t1"], 2000);
+    adapter.resetTurnState("app-server connection closed");
+    // phase is "aborted" after the reset — explicitly within the boundary.
+    expect(adapter.turnPhase).toBe("aborted");
+    expect(await wait).toEqual({ ok: true });
+  });
+
+  test("waitForTurnsTerminal times out with a structured interrupt_timeout", async () => {
+    const { adapter } = createBusyAdapter(["t1"]);
+    const result = await adapter.waitForTurnsTerminal(["t1"], 40);
+    expect(result).toEqual({ ok: false, code: "interrupt_timeout" });
+    expect(adapter.turnInProgress).toBe(true); // the wait never mutates state
+
+    adapter.resetTurnState("test cleanup");
+  });
+
+  test("AGENTBRIDGE_INTERRUPT_TIMEOUT_MS overrides the default wait budget", async () => {
+    const previous = process.env.AGENTBRIDGE_INTERRUPT_TIMEOUT_MS;
+    process.env.AGENTBRIDGE_INTERRUPT_TIMEOUT_MS = "30";
+    try {
+      const { adapter } = createBusyAdapter(["t1"]);
+      const startedAt = Date.now();
+      const result = await adapter.waitForTurnsTerminal(["t1"]); // default arg reads the env
+      expect(result).toEqual({ ok: false, code: "interrupt_timeout" });
+      expect(Date.now() - startedAt).toBeLessThan(5_000); // far below the 10s default
+      adapter.resetTurnState("test cleanup");
+    } finally {
+      if (previous === undefined) {
+        delete process.env.AGENTBRIDGE_INTERRUPT_TIMEOUT_MS;
+      } else {
+        process.env.AGENTBRIDGE_INTERRUPT_TIMEOUT_MS = previous;
+      }
+    }
+  });
+
+  test("AGENTBRIDGE_INTERRUPT_TIMEOUT_MS is CLAMPED below the client reply timeout (REAL #1 double-turn guard)", () => {
+    const previous = process.env.AGENTBRIDGE_INTERRUPT_TIMEOUT_MS;
+    // An operator sets a wildly over-large budget (10 minutes) — far past the
+    // client's 15s reply timeout. Without the clamp, the client would report a
+    // FALSE "Timed out waiting for daemon" while the daemon still injects, and a
+    // Claude retry would double-turn.
+    process.env.AGENTBRIDGE_INTERRUPT_TIMEOUT_MS = "600000";
+    try {
+      const adapter = createAdapter();
+      const effective = (adapter as any).interruptTimeoutMs() as number;
+      expect(effective).toBe(MAX_INTERRUPT_TIMEOUT_MS);
+      expect(effective).toBeLessThan(CLIENT_REPLY_TIMEOUT_MS);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.AGENTBRIDGE_INTERRUPT_TIMEOUT_MS;
+      } else {
+        process.env.AGENTBRIDGE_INTERRUPT_TIMEOUT_MS = previous;
+      }
+    }
+  });
+
+  test("a within-ceiling AGENTBRIDGE_INTERRUPT_TIMEOUT_MS passes through unchanged", () => {
+    const previous = process.env.AGENTBRIDGE_INTERRUPT_TIMEOUT_MS;
+    process.env.AGENTBRIDGE_INTERRUPT_TIMEOUT_MS = "5000";
+    try {
+      const adapter = createAdapter();
+      expect((adapter as any).interruptTimeoutMs()).toBe(5000);
+    } finally {
+      if (previous === undefined) {
+        delete process.env.AGENTBRIDGE_INTERRUPT_TIMEOUT_MS;
+      } else {
+        process.env.AGENTBRIDGE_INTERRUPT_TIMEOUT_MS = previous;
+      }
+    }
+  });
+
+  test("bridgeTurnStarted correlates a turn/start success response to the injection id", () => {
+    const adapter = createAdapter();
+    adapter.threadId = "thread-int";
+    const appSent: string[] = [];
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: (data: string) => appSent.push(data) } as any;
+    const started: Array<{ requestId: number; turnId: string }> = [];
+    adapter.on("bridgeTurnStarted", (event: { requestId: number; turnId: string }) => started.push(event));
+
+    const injectionId = adapter.injectMessage("hello");
+    expect(injectionId).toBeLessThan(0);
+
+    const forwarded = adapter.handleAppServerPayload(JSON.stringify({
+      id: injectionId,
+      result: { turn: { id: "turn-xyz" } },
+    }));
+
+    expect(forwarded).toBeNull(); // swallowed — never forwarded to the TUI
+    expect(started).toEqual([{ requestId: injectionId, turnId: "turn-xyz" }]);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("a turn/start success response WITHOUT a turn id skips the ACK (log-only)", () => {
+    const adapter = createAdapter();
+    adapter.threadId = "thread-int";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+    const started: unknown[] = [];
+    adapter.on("bridgeTurnStarted", (event: unknown) => started.push(event));
+
+    const injectionId = adapter.injectMessage("hello");
+    adapter.handleAppServerPayload(JSON.stringify({ id: injectionId, result: {} }));
+
+    expect(started).toEqual([]);
+    adapter.clearResponseTrackingState();
+  });
+
+  test("a rejected injected turn/start emits bridgeTurnRejected alongside turnAborted", () => {
+    const adapter = createAdapter();
+    adapter.threadId = "thread-int";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+    const rejections: Array<{ requestId: number; error: string }> = [];
+    const aborts: string[] = [];
+    adapter.on("bridgeTurnRejected", (event: { requestId: number; error: string }) => rejections.push(event));
+    adapter.on("turnAborted", (reason: string) => aborts.push(reason));
+
+    const injectionId = adapter.injectMessage("hello");
+    adapter.handleAppServerPayload(JSON.stringify({
+      id: injectionId,
+      error: { message: "turn/start rejected" },
+    }));
+
+    expect(rejections).toEqual([{ requestId: injectionId, error: "turn/start rejected" }]);
+    expect(aborts).toHaveLength(1);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("turnIdCompleted fires per turn/completed with the specific id (null when absent)", () => {
+    const { adapter } = createBusyAdapter(["t1", "t2"]);
+    const completedIds: Array<string | null> = [];
+    adapter.on("turnIdCompleted", (turnId: string | null) => completedIds.push(turnId));
+
+    adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "t1" } } });
+    expect(adapter.turnInProgress).toBe(true); // t2 still active — aggregate event silent
+    adapter.handleServerNotification({ method: "turn/completed", params: {} });
+
+    expect(completedIds).toEqual(["t1", null]);
   });
 });

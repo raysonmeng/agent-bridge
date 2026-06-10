@@ -44,7 +44,7 @@ interface Harness {
   sendClaudeToCodex: (
     requestId: string,
     text: string,
-    opts?: { onBusy?: "reject" | "steer"; requireReply?: boolean },
+    opts?: { onBusy?: "reject" | "steer" | "interrupt"; requireReply?: boolean; idempotencyKey?: string },
   ) => void;
 }
 
@@ -517,23 +517,24 @@ describe("daemon wiring", () => {
       );
 
       // Default policy unchanged: a plain reply during the turn is rejected,
-      // and the busy error now advertises the steer escape hatch.
+      // and the busy error advertises both escape hatches. The structured
+      // result fields (PR B) ride alongside the legacy error string.
       harness.sendClaudeToCodex("req-steer-0", "plain message during turn");
       const rejected = await waitForResult("req-steer-0");
       expect(rejected.success).toBe(false);
       expect(rejected.error).toContain('on_busy="steer"');
-
-      // B0 limitation is loud, not silent: require_reply×steer is refused.
-      harness.sendClaudeToCodex("req-steer-rr", "needs ack", { onBusy: "steer", requireReply: true });
-      const refused = await waitForResult("req-steer-rr");
-      expect(refused.success).toBe(false);
-      expect(refused.error).toContain("require_reply is not supported");
+      expect(rejected.error).toContain('on_busy="interrupt"');
+      expect(rejected.ok).toBe(false);
+      expect(rejected.code).toBe("busy_reject");
+      expect(rejected.phase).toBe("running");
+      expect(typeof rejected.retryAfterMs).toBe("number");
 
       // The steer path: message reaches the app-server as turn/steer with the
       // explicit [STEER from Claude] framing, on the live thread.
       harness.sendClaudeToCodex("req-steer-1", "course correction: use approach B", { onBusy: "steer" });
       const accepted = await waitForResult("req-steer-1");
       expect(accepted.success).toBe(true);
+      expect(accepted.ok).toBe(true);
       await waitFor(() => readSteers().length >= 1, "recorded turn/steer", 100, 100);
       const steer = readSteers()[0]!;
       expect(steer.threadId).toBe("thread-fake-1");
@@ -557,6 +558,259 @@ describe("daemon wiring", () => {
       expect(failedNotice.content).toContain("did NOT reach Codex");
       expect(failedNotice.content).toContain("ActiveTurnNotSteerable");
       expect(harness.messages.some((m) => m.id.startsWith("system_turn_aborted"))).toBe(false);
+
+      // require_reply × steer is now ALLOWED (PR B real semantics): the steer
+      // is accepted, the body carries the reply-required instruction, and the
+      // daemon arms the expectation on steer-accept.
+      harness.sendClaudeToCodex("req-steer-rr", "needs ack", { onBusy: "steer", requireReply: true });
+      const rrResult = await waitForResult("req-steer-rr");
+      expect(rrResult.success).toBe(true);
+      await waitFor(() => readSteers().length >= 3, "recorded require_reply steer", 100, 100);
+      const rrSteer = readSteers()[2]!;
+      expect(rrSteer.input[0]!.text).toContain("needs ack");
+      expect(rrSteer.input[0]!.text).toContain("[⚠️ REPLY REQUIRED]");
+
+      // Completing the turn WITHOUT any agentMessage must fire the
+      // reply-missing warning — proof the expectation armed on steer-accept.
+      await sleep(300); // let the fake's steer-success verdict arrive and arm the tracker
+      harness.sendAppCommand("complete-turn");
+      const replyMissing = await waitForMessage(
+        harness.messages,
+        (message) => message.id.startsWith("system_reply_missing"),
+        "system_reply_missing after require_reply steer",
+      );
+      expect(replyMissing.content).toContain("require_reply");
+      expect(harness.messages.some((m) => m.id.startsWith("system_turn_completed"))).toBe(true);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("on_busy=interrupt stops the running turn, injects as a new turn, and turn_started ACK correlates (protocol v2 PR B)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-interrupt-fixture-"));
+    const interruptLog = join(fixtureRoot, "turninterrupt.jsonl");
+    const turnStartLog = join(fixtureRoot, "turn-starts.jsonl");
+    const readJsonl = (path: string): Array<Record<string, any>> =>
+      existsSync(path)
+        ? readFileSync(path, "utf-8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
+        : [];
+    const resultFor = (requestId: string) =>
+      harness.statusMessages.find(
+        (m) => m.type === "claude_to_codex_result" && m.requestId === requestId,
+      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }> | undefined;
+    const waitForResult = async (requestId: string) => {
+      await waitFor(() => resultFor(requestId) !== undefined, `claude_to_codex_result for ${requestId}`);
+      return resultFor(requestId)!;
+    };
+
+    const harness = await startHarness({
+      pairId: "main-intrabcde",
+      pairName: "main",
+      extraEnv: {
+        FAKE_APP_TURNINTERRUPT_LOG: interruptLog,
+        FAKE_APP_TURNSTART_LOG: turnStartLog,
+      },
+    });
+
+    try {
+      await harness.attachClaude();
+      await harness.connectTui();
+
+      // Drive the adapter into a running turn so the interrupt path is active.
+      harness.sendAppCommand("start-turn");
+      await waitForMessage(
+        harness.messages,
+        (message) => message.id.startsWith("system_turn_started"),
+        "system_turn_started",
+      );
+
+      // Interrupt + inject, carrying an idempotency key.
+      harness.sendClaudeToCodex("req-int-1", "drop everything: new priority task", {
+        onBusy: "interrupt",
+        idempotencyKey: "key-int-1",
+      });
+      const result = await waitForResult("req-int-1");
+      expect(result.success).toBe(true);
+      expect(result.ok).toBe(true);
+
+      // The fake app-server received turn/interrupt with the RIGHT ids.
+      expect(readJsonl(interruptLog)).toEqual([{ threadId: "thread-fake-1", turnId: "turn-1" }]);
+
+      // The message was then injected as a NORMAL turn/start (no steer framing).
+      await waitFor(() => readJsonl(turnStartLog).length >= 1, "recorded post-interrupt turn/start", 100, 100);
+      const injected = readJsonl(turnStartLog)[0]!;
+      expect(injected.threadId).toBe("thread-fake-1");
+      expect(injected.input[0].type).toBe("text");
+      expect(injected.input[0].text).toContain("drop everything: new priority task");
+      expect(injected.input[0].text).not.toContain("[STEER from Claude]");
+
+      // turn_started control event correlates requestId + idempotencyKey.
+      await waitFor(
+        () => harness.statusMessages.some((m) => m.type === "turn_started" && m.requestId === "req-int-1"),
+        "turn_started control event for req-int-1",
+      );
+      const ack = harness.statusMessages.find(
+        (m) => m.type === "turn_started" && m.requestId === "req-int-1",
+      ) as Extract<ControlServerMessage, { type: "turn_started" }>;
+      expect(ack.idempotencyKey).toBe("key-int-1");
+      expect(ack.threadId).toBe("thread-fake-1");
+      expect(ack.turnId).toMatch(/^turn-injected-/);
+
+      // A duplicate idempotencyKey while the key is in flight (started, no
+      // terminal yet) is NOT re-injected and reports duplicate_in_flight.
+      harness.sendClaudeToCodex("req-int-2", "same message retried", { idempotencyKey: "key-int-1" });
+      const dup = await waitForResult("req-int-2");
+      expect(dup.success).toBe(false);
+      expect(dup.ok).toBe(false);
+      expect(dup.code).toBe("duplicate_in_flight");
+      expect(dup.error).toContain("Duplicate idempotency_key");
+
+      // ...and the fake never saw a second turn/start.
+      await sleep(200);
+      expect(readJsonl(turnStartLog)).toHaveLength(1);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("a rejected keyed steer RELEASES its idempotency key — a same-key retry is allowed (PR B REAL #2)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-steerfail-fixture-"));
+    const steerLog = join(fixtureRoot, "turnsteer.jsonl");
+    const readSteers = (): Array<{ threadId: string; expectedTurnId?: string; input: Array<{ type: string; text: string }> }> =>
+      existsSync(steerLog)
+        ? readFileSync(steerLog, "utf-8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
+        : [];
+    const resultFor = (requestId: string) =>
+      harness.statusMessages.find(
+        (m) => m.type === "claude_to_codex_result" && m.requestId === requestId,
+      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }> | undefined;
+    const waitForResult = async (requestId: string) => {
+      await waitFor(() => resultFor(requestId) !== undefined, `claude_to_codex_result for ${requestId}`);
+      return resultFor(requestId)!;
+    };
+
+    const harness = await startHarness({
+      pairId: "main-strflabcd",
+      pairName: "main",
+      extraEnv: { FAKE_APP_TURNSTEER_LOG: steerLog },
+    });
+
+    try {
+      await harness.attachClaude();
+      await harness.connectTui();
+
+      // Drive into a running turn so the steer path is active.
+      harness.sendAppCommand("start-turn");
+      await waitForMessage(
+        harness.messages,
+        (message) => message.id.startsWith("system_turn_started"),
+        "system_turn_started",
+      );
+
+      // A KEYED steer that the fake app-server REJECTS ([force-steer-error]).
+      // The daemon transport-accepts it (so the sync result is success) and
+      // accept()+markStarted-binds the key to the running original turn; the
+      // async rejection then fires steerFailed.
+      harness.sendClaudeToCodex("req-sf-1", "[force-steer-error] doomed steer", {
+        onBusy: "steer",
+        idempotencyKey: "key-sf-1",
+      });
+      const first = await waitForResult("req-sf-1");
+      expect(first.success).toBe(true); // transport-accepted
+      await waitFor(() => readSteers().length >= 1, "recorded the doomed turn/steer", 100, 100);
+
+      // The async rejection surfaces as system_steer_failed (the key is released here).
+      await waitForMessage(
+        harness.messages,
+        (message) => message.id.startsWith("system_steer_failed"),
+        "system_steer_failed for the doomed steer",
+      );
+
+      // The SAME key is now retryable: a fresh steer with key-sf-1 must NOT be
+      // rejected as duplicate_in_flight — it reaches the wire as a real steer.
+      harness.sendClaudeToCodex("req-sf-2", "second attempt, same key", {
+        onBusy: "steer",
+        idempotencyKey: "key-sf-1",
+      });
+      const second = await waitForResult("req-sf-2");
+      expect(second.success).toBe(true);
+      // Critically NOT duplicate_in_flight — the release made the key retryable.
+      expect(second.code).not.toBe("duplicate_in_flight");
+      await waitFor(() => readSteers().length >= 2, "recorded the retried turn/steer", 100, 100);
+      const retried = readSteers()[1]!;
+      expect(retried.input[0]!.text).toContain("second attempt, same key");
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("a lost-response (orphaned) require_reply steer cannot mis-arm a LATER steer's reply expectation (PR B REAL #3)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-steerorphan-fixture-"));
+    const steerLog = join(fixtureRoot, "turnsteer.jsonl");
+    const readSteers = (): Array<{ input: Array<{ type: string; text: string }> }> =>
+      existsSync(steerLog)
+        ? readFileSync(steerLog, "utf-8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
+        : [];
+    const resultFor = (requestId: string) =>
+      harness.statusMessages.find(
+        (m) => m.type === "claude_to_codex_result" && m.requestId === requestId,
+      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }> | undefined;
+    const waitForResult = async (requestId: string) => {
+      await waitFor(() => resultFor(requestId) !== undefined, `claude_to_codex_result for ${requestId}`);
+      return resultFor(requestId)!;
+    };
+
+    const harness = await startHarness({
+      pairId: "main-strorabcd",
+      pairName: "main",
+      extraEnv: { FAKE_APP_TURNSTEER_LOG: steerLog },
+    });
+
+    try {
+      await harness.attachClaude();
+      await harness.connectTui();
+
+      harness.sendAppCommand("start-turn");
+      await waitForMessage(
+        harness.messages,
+        (message) => message.id.startsWith("system_turn_started"),
+        "system_turn_started",
+      );
+
+      // 1) A require_reply steer whose app-server verdict is LOST ([hang-steer]).
+      // It orphans a dispatch entry carrying requireReply=true. Under the OLD
+      // FIFO pairing, a LATER steerAccepted would shift() this orphan and arm
+      // the reply expectation against the wrong turn.
+      harness.sendClaudeToCodex("req-orphan-1", "[hang-steer] never answered", {
+        onBusy: "steer",
+        requireReply: true,
+      });
+      await waitForResult("req-orphan-1"); // transport-accepted, but no verdict
+      await waitFor(() => readSteers().length >= 1, "recorded the hung steer", 100, 100);
+
+      // 2) A SECOND steer (NO require_reply) that the fake ACCEPTS → steerAccepted.
+      // Id-keyed correlation must consume THIS dispatch (req-orphan-2), never the
+      // orphaned require_reply one.
+      harness.sendClaudeToCodex("req-orphan-2", "plain steer that gets accepted", {
+        onBusy: "steer",
+      });
+      await waitForResult("req-orphan-2");
+      await waitFor(() => readSteers().length >= 2, "recorded the accepted steer", 100, 100);
+
+      // Give the accepted steer's verdict time to (wrongly, under the old bug)
+      // arm the orphaned require_reply expectation.
+      await sleep(300);
+
+      // 3) Complete the turn WITHOUT any agentMessage. If the orphan had mis-armed
+      // the reply expectation, a system_reply_missing warning would fire. With the
+      // id-keyed fix it must NOT — the orphan was never consumed by req-orphan-2.
+      harness.sendAppCommand("complete-turn");
+      await waitForMessage(
+        harness.messages,
+        (message) => message.id.startsWith("system_turn_completed"),
+        "system_turn_completed",
+      );
+      expect(harness.messages.some((m) => m.id.startsWith("system_reply_missing"))).toBe(false);
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
@@ -702,13 +956,14 @@ async function startHarness(opts: {
         }
       }, "bridge ready after TUI handshake", 100, 100);
     },
-    sendClaudeToCodex: (requestId: string, text: string, sendOpts?: { onBusy?: "reject" | "steer"; requireReply?: boolean }) => {
+    sendClaudeToCodex: (requestId: string, text: string, sendOpts?: { onBusy?: "reject" | "steer" | "interrupt"; requireReply?: boolean; idempotencyKey?: string }) => {
       harness.controlWs?.send(JSON.stringify({
         type: "claude_to_codex",
         requestId,
         message: { id: requestId, source: "claude", content: text, timestamp: Date.now() },
         ...(sendOpts?.requireReply ? { requireReply: true } : {}),
         ...(sendOpts?.onBusy && sendOpts.onBusy !== "reject" ? { onBusy: sendOpts.onBusy } : {}),
+        ...(sendOpts?.idempotencyKey ? { idempotencyKey: sendOpts.idempotencyKey } : {}),
       }));
     },
   };
@@ -785,6 +1040,7 @@ const port = Number(new URL(listen).port);
 const commandFile = process.env.FAKE_APP_COMMAND_FILE;
 let appWs = null;
 let lastStartedTurnId = null;
+let turnStartCounter = 0;
 
 const server = Bun.serve({
   hostname: "127.0.0.1",
@@ -809,9 +1065,32 @@ const server = Bun.serve({
         if (msg.method === "thread/start") {
           ws.send(JSON.stringify({ id: msg.id, result: { thread: { id: "thread-fake-1" } } }));
         }
-        // Record received turn/start params (tier-override assertions).
-        if (msg.method === "turn/start" && process.env.FAKE_APP_TURNSTART_LOG) {
-          appendFileSync(process.env.FAKE_APP_TURNSTART_LOG, JSON.stringify(msg.params) + "\\n");
+        // Record received turn/start params (tier-override assertions), then
+        // respond success with the created turn id like the real app-server
+        // (TurnStartResponse.turn.id) so the bridge's turn_started ACK
+        // correlation can be asserted end-to-end. NOTE: deliberately NO
+        // turn/started notification here — emitting one would mark the
+        // adapter busy and break the multi-injection budget tests; the
+        // "start-turn" command drives the busy state explicitly.
+        if (msg.method === "turn/start") {
+          if (process.env.FAKE_APP_TURNSTART_LOG) {
+            appendFileSync(process.env.FAKE_APP_TURNSTART_LOG, JSON.stringify(msg.params) + "\\n");
+          }
+          turnStartCounter += 1;
+          ws.send(JSON.stringify({ id: msg.id, result: { turn: { id: "turn-injected-" + turnStartCounter } } }));
+        }
+        // turn/interrupt: record params, respond success ({}), then emit the
+        // terminal turn/completed for that turnId — mirroring the REAL
+        // app-server (verified in codex-rs): the success response is deferred
+        // until TurnAborted and the interrupted turn's terminal notification
+        // is a normal turn/completed with status "interrupted".
+        if (msg.method === "turn/interrupt") {
+          if (process.env.FAKE_APP_TURNINTERRUPT_LOG) {
+            appendFileSync(process.env.FAKE_APP_TURNINTERRUPT_LOG, JSON.stringify(msg.params) + "\\n");
+          }
+          ws.send(JSON.stringify({ id: msg.id, result: {} }));
+          ws.send(JSON.stringify({ method: "turn/completed", params: { turn: { id: msg.params.turnId, status: "interrupted" } } }));
+          if (lastStartedTurnId === msg.params.turnId) lastStartedTurnId = null;
         }
         // turn/steer: record params, then ack — or reject when the text carries
         // the [force-steer-error] marker (drives the steerFailed wiring test).
@@ -828,6 +1107,10 @@ const server = Bun.serve({
             ws.send(JSON.stringify({ id: msg.id, error: { message: "Invalid request: missing field \`expectedTurnId\`" } }));
           } else if (lastStartedTurnId && msg.params.expectedTurnId !== lastStartedTurnId) {
             ws.send(JSON.stringify({ id: msg.id, error: { message: "expected active turn id \`" + msg.params.expectedTurnId + "\` but found \`" + lastStartedTurnId + "\`" } }));
+          } else if (steerText.includes("[hang-steer]")) {
+            // Deliberately send NO verdict — simulate a steer whose app-server
+            // response is lost while the WS stays open (drives the PR B #3
+            // lost-response orphan test: turnTrackingReset must clean it up).
           } else if (steerText.includes("[force-steer-error]")) {
             ws.send(JSON.stringify({ id: msg.id, error: { message: "ActiveTurnNotSteerable" } }));
           } else {
@@ -850,6 +1133,10 @@ setInterval(() => {
   if (command === "start-turn") {
     lastStartedTurnId = "turn-1";
     appWs.send(JSON.stringify({ method: "turn/started", params: { turn: { id: "turn-1" } } }));
+  }
+  if (command === "complete-turn" && lastStartedTurnId) {
+    appWs.send(JSON.stringify({ method: "turn/completed", params: { turn: { id: lastStartedTurnId } } }));
+    lastStartedTurnId = null;
   }
   if (command === "close-app-server") {
     appWs.close(1011, "test app-server close");
