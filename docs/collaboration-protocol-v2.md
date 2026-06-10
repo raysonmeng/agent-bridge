@@ -43,7 +43,14 @@ observable, correlatable contract.
   把消息喂进**当前 turn**（不新开 turn、不打断、不丢已有工作）。
 - daemon 侧统一加 `[STEER from Claude]` 前缀 framing，让 Codex 能区分
   mid-turn 更新与原始任务指令。
-- steer 被 app-server 拒绝（`ActiveTurnNotSteerable`（Review/Plan turn）、
+- wire 前置条件：`turn/steer` 自引入（rust-v0.99）起即要求必填
+  `expectedTurnId`（当前活跃 turn id，缺失/不匹配即拒）。bridge 侧由
+  codex-adapter 从 turn/started 跟踪的活跃 turn id 自动填充；若活跃 turn
+  无可寻址 id（防御分支，真实 codex 的 turn id 为 UUID 不会触发），steer
+  在本地 transport-reject、不发往 app-server，错误文案按 turn 是否仍在
+  运行分叉（防「改发普通 reply」↔ busy guard 的建议乒乓）。
+- steer 被 app-server 拒绝（`missing field expectedTurnId`、
+  `ExpectedTurnMismatch`、`ActiveTurnNotSteerable`（Review/Compact turn）、
   `NoActiveTurn` race 等）**不是 turn 终结**：不发 `turnAborted`、不改
   `turnPhase`；以 `system_steer_failed` 系统消息显式告知 Claude
   「消息没送进去，原 turn 不受影响」。

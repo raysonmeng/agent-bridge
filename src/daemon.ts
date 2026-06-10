@@ -248,15 +248,22 @@ codex.on("turnPhaseChanged", ({ phase, previous }: { phase: string; previous: st
 });
 
 // A steer is transport-accepted at send time; a later JSON-RPC rejection
-// (Review/Plan turns are not steerable; the turn may have ended in the race
+// (Review/Compact turns are not steerable; the turn may have ended in the race
 // window) means Claude's mid-turn message did NOT reach Codex — say so
 // explicitly instead of letting Claude assume it landed.
 codex.on("steerFailed", (reason: string) => {
   log(`Steer rejected by app-server: ${reason}`);
+  // Branch the advice on the live turn state (same reasoning as the sync
+  // steer-failure path): while the turn still runs (e.g. ActiveTurnNotSteerable
+  // on a Review/Compact turn), "resend as a normal reply" just bounces off the
+  // busy guard, whose error suggests steer again — an advice ping-pong.
+  const advice = codex.turnInProgress
+    ? "wait for it to finish (✅), then send normally"
+    : "the turn has ended — resend as a normal reply";
   emitToClaude(
     systemMessage(
       "system_steer_failed",
-      `⚠️ Your steer message did NOT reach Codex (${reason}). The original turn continues unaffected — wait for it to finish, or resend as a normal reply.`,
+      `⚠️ Your steer message did NOT reach Codex (${reason}). The original turn continues unaffected — ${advice}.`,
     ),
   );
 });
@@ -638,13 +645,20 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
           // the inject path does, so status buffering resumes promptly.
           clearAttentionWindow();
         }
+        // "Retry as a normal reply" is only good advice when the turn actually
+        // ended — while it is still running, a normal reply just bounces off
+        // the busy guard, whose error suggests steer again: an advice
+        // ping-pong. Branch on the live turn state. (The "ended" branch is
+        // defensive: in the current synchronous flow turnInProgress was true
+        // at dispatch and nothing async runs before this re-read.)
+        const steerFailureAdvice = codex.turnInProgress
+          ? "Steer failed: the running turn cannot be steered right now — wait for it to finish (✅), then send normally."
+          : "Steer failed: the turn may have just ended or the connection dropped — retry as a normal reply.";
         sendProtocolMessage(ws, {
           type: "claude_to_codex_result",
           requestId: message.requestId,
           success: steered,
-          error: steered
-            ? undefined
-            : "Steer failed: the turn may have just ended or the connection dropped — retry as a normal reply.",
+          error: steered ? undefined : steerFailureAdvice,
         });
         return;
       }

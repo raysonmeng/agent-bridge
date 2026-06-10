@@ -79,12 +79,18 @@ export interface TurnStartParams {
 
 /**
  * turn/steer — feed additional input into the CURRENTLY RUNNING turn without
- * interrupting it (available since codex app-server v0.100; the TUI uses it
- * when the user types mid-turn). Fails with NoActiveTurn / ExpectedTurnMismatch
- * / ActiveTurnNotSteerable (Review/Plan turns) / EmptyInput.
+ * interrupting it (introduced in codex rust-v0.99; the TUI uses it when the
+ * user types mid-turn). Fails with NoActiveTurn / ExpectedTurnMismatch /
+ * ActiveTurnNotSteerable (Review/Compact turns) / EmptyInput.
+ *
+ * expectedTurnId is a REQUIRED active-turn precondition since the API was
+ * introduced (every codex release that has turn/steer requires it). B0
+ * shipped without it, so every real steer bounced with "missing field
+ * `expectedTurnId`" — found by live E2E against codex 0.139.
  */
 export interface TurnSteerParams {
   threadId: string;
+  expectedTurnId: string;
   input: AppServerUserInput[];
   [key: string]: unknown;
 }

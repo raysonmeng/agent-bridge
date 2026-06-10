@@ -459,7 +459,7 @@ describe("daemon wiring", () => {
   test("on_busy=steer feeds the message into a running turn via turn/steer (protocol v2 B0)", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-steer-fixture-"));
     const steerLog = join(fixtureRoot, "turnsteer.jsonl");
-    const readSteers = (): Array<{ threadId: string; input: Array<{ type: string; text: string }> }> =>
+    const readSteers = (): Array<{ threadId: string; expectedTurnId?: string; input: Array<{ type: string; text: string }> }> =>
       existsSync(steerLog)
         ? readFileSync(steerLog, "utf-8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
         : [];
@@ -511,6 +511,11 @@ describe("daemon wiring", () => {
       await waitFor(() => readSteers().length >= 1, "recorded turn/steer", 100, 100);
       const steer = readSteers()[0]!;
       expect(steer.threadId).toBe("thread-fake-1");
+      // This assertion is the real regression gate: `accepted.success` above is
+      // only the daemon's SYNCHRONOUS transport-accept (sent before the fake's
+      // JSON-RPC verdict arrives), so a strict-fake rejection would NOT flip it
+      // — it would surface later as an async system_steer_failed.
+      expect(steer.expectedTurnId).toBe("turn-1");
       expect(steer.input[0]!.type).toBe("text");
       expect(steer.input[0]!.text.startsWith("[STEER from Claude]\n")).toBe(true);
       expect(steer.input[0]!.text).toContain("course correction: use approach B");
@@ -714,6 +719,7 @@ const listen = process.argv[listenIndex + 1];
 const port = Number(new URL(listen).port);
 const commandFile = process.env.FAKE_APP_COMMAND_FILE;
 let appWs = null;
+let lastStartedTurnId = null;
 
 const server = Bun.serve({
   hostname: "127.0.0.1",
@@ -744,15 +750,23 @@ const server = Bun.serve({
         }
         // turn/steer: record params, then ack — or reject when the text carries
         // the [force-steer-error] marker (drives the steerFailed wiring test).
+        // Strict emulation of the real app-server (expectedTurnId has been
+        // REQUIRED since turn/steer was introduced — live-E2E regression: B0
+        // shipped without the field and every steer bounced): missing field →
+        // serde-style error; wrong value → ExpectedTurnMismatch-style error.
         if (msg.method === "turn/steer") {
           if (process.env.FAKE_APP_TURNSTEER_LOG) {
             appendFileSync(process.env.FAKE_APP_TURNSTEER_LOG, JSON.stringify(msg.params) + "\\n");
           }
           const steerText = msg.params?.input?.[0]?.text ?? "";
-          if (steerText.includes("[force-steer-error]")) {
+          if (typeof msg.params?.expectedTurnId !== "string" || msg.params.expectedTurnId.length === 0) {
+            ws.send(JSON.stringify({ id: msg.id, error: { message: "Invalid request: missing field \`expectedTurnId\`" } }));
+          } else if (lastStartedTurnId && msg.params.expectedTurnId !== lastStartedTurnId) {
+            ws.send(JSON.stringify({ id: msg.id, error: { message: "expected active turn id \`" + msg.params.expectedTurnId + "\` but found \`" + lastStartedTurnId + "\`" } }));
+          } else if (steerText.includes("[force-steer-error]")) {
             ws.send(JSON.stringify({ id: msg.id, error: { message: "ActiveTurnNotSteerable" } }));
           } else {
-            ws.send(JSON.stringify({ id: msg.id, result: {} }));
+            ws.send(JSON.stringify({ id: msg.id, result: { turnId: msg.params.expectedTurnId } }));
           }
         }
       } catch {}
@@ -769,6 +783,7 @@ setInterval(() => {
   try { unlinkSync(commandFile); } catch {}
   if (!appWs) return;
   if (command === "start-turn") {
+    lastStartedTurnId = "turn-1";
     appWs.send(JSON.stringify({ method: "turn/started", params: { turn: { id: "turn-1" } } }));
   }
   if (command === "close-app-server") {

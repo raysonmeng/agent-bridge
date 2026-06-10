@@ -4,10 +4,8 @@
   "workspaces": {
     "": {
       "name": "agentbridge",
-      "dependencies": {
-        "@modelcontextprotocol/sdk": "^1.27.1",
-      },
       "devDependencies": {
+        "@modelcontextprotocol/sdk": "^1.27.1",
         "@types/bun": "^1.3.11",
         "typescript": "^5.8.0",
       },

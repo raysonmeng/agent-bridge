@@ -435,10 +435,24 @@ export class CodexAdapter extends EventEmitter {
       this.log("Cannot steer: no turn in progress (use injectMessage)");
       return false;
     }
-    this.log(`Steering message into active Codex turn (${text.length} chars)`);
+    // turn/steer requires the active turn id as a precondition (expectedTurnId
+    // — REQUIRED on every codex release that has turn/steer; omitting it gets
+    // "missing field `expectedTurnId`", which is how the live E2E caught B0
+    // sending steers that could never land). A turn tracked only under an
+    // `unknown:` fallback key has no addressable id and cannot be steered.
+    const expectedTurnId = this.currentSteerableTurnId();
+    if (!expectedTurnId) {
+      this.log("Cannot steer: no addressable active turn id (turn/started carried no id)");
+      return false;
+    }
+    this.log(`Steering message into active Codex turn ${expectedTurnId} (${text.length} chars)`);
     const requestId = this.nextInjectionId--;
     this.trackBridgeRequestId(requestId, "steer");
-    const params: TurnSteerParams = { threadId: this.threadId, input: [{ type: "text", text }] };
+    const params: TurnSteerParams = {
+      threadId: this.threadId,
+      expectedTurnId,
+      input: [{ type: "text", text }],
+    };
     try {
       this.appServerWs.send(JSON.stringify({
         method: "turn/steer",
@@ -1495,7 +1509,7 @@ export class CodexAdapter extends EventEmitter {
           // A rejected steer leaves the ORIGINAL turn running untouched —
           // no abort, no phase change. Surface it so the daemon can tell
           // Claude the mid-turn message did NOT reach Codex (e.g.
-          // ActiveTurnNotSteerable on Review/Plan turns, or the turn ended
+          // ActiveTurnNotSteerable on Review/Compact turns, or the turn ended
           // in the NoActiveTurn race window).
           this.emit("steerFailed", parsed.error.message ?? "unknown error");
         } else {
@@ -1764,6 +1778,20 @@ export class CodexAdapter extends EventEmitter {
   }
 
   /**
+   * The most recently started REAL active turn id — the value turn/steer must
+   * pass as expectedTurnId. `unknown:` fallback keys (turn/started without an
+   * id) are not addressable and are skipped. Insertion order of the Set makes
+   * the last real entry the newest turn.
+   */
+  private currentSteerableTurnId(): string | null {
+    let newest: string | null = null;
+    for (const id of this.activeTurnIds) {
+      if (!id.startsWith("unknown:")) newest = id;
+    }
+    return newest;
+  }
+
+  /**
    * Turn lifecycle phase (protocol v2 PR A). Strictly the turn axis — the
    * bridge's attention/routing window is reported separately by the daemon.
    */
@@ -1790,6 +1818,10 @@ export class CodexAdapter extends EventEmitter {
     // Compute the key ONCE and use it for both the set and the watchdog so the
     // two never diverge (incl. the no-turn-id `unknown:` fallback).
     const turnKey = typeof turnId === "string" && turnId.length > 0 ? turnId : `unknown:${Date.now()}`;
+    // delete-before-add keeps Set insertion order = recency even if the
+    // app-server re-emits turn/started for an already-active id —
+    // currentSteerableTurnId relies on "last entry = newest turn".
+    this.activeTurnIds.delete(turnKey);
     this.activeTurnIds.add(turnKey);
     // A new turn must be eligible to notify on stall even if a prior turn
     // reused the same id (e.g. the `unknown:` fallback is time-stamped, but

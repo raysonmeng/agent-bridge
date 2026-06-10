@@ -18,7 +18,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.8", "0.0.0-source"),
-  commit: defineString("1df8b91", "source"),
+  commit: defineString("c80a7fd", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -811,10 +811,19 @@ class CodexAdapter extends EventEmitter {
       this.log("Cannot steer: no turn in progress (use injectMessage)");
       return false;
     }
-    this.log(`Steering message into active Codex turn (${text.length} chars)`);
+    const expectedTurnId = this.currentSteerableTurnId();
+    if (!expectedTurnId) {
+      this.log("Cannot steer: no addressable active turn id (turn/started carried no id)");
+      return false;
+    }
+    this.log(`Steering message into active Codex turn ${expectedTurnId} (${text.length} chars)`);
     const requestId = this.nextInjectionId--;
     this.trackBridgeRequestId(requestId, "steer");
-    const params = { threadId: this.threadId, input: [{ type: "text", text }] };
+    const params = {
+      threadId: this.threadId,
+      expectedTurnId,
+      input: [{ type: "text", text }]
+    };
     try {
       this.appServerWs.send(JSON.stringify({
         method: "turn/steer",
@@ -1758,6 +1767,14 @@ class CodexAdapter extends EventEmitter {
     this.log(`Thread detected: ${threadId} (${reason})`);
     this.emit("ready", threadId);
   }
+  currentSteerableTurnId() {
+    let newest = null;
+    for (const id of this.activeTurnIds) {
+      if (!id.startsWith("unknown:"))
+        newest = id;
+    }
+    return newest;
+  }
   get turnPhase() {
     if (this.activeTurnIds.size > 0) {
       const allStalled = [...this.activeTurnIds].every((id) => this.currentlyStalledTurnIds.has(id));
@@ -1776,6 +1793,7 @@ class CodexAdapter extends EventEmitter {
   markTurnStarted(turnId) {
     const wasInProgress = this.turnInProgress;
     const turnKey = typeof turnId === "string" && turnId.length > 0 ? turnId : `unknown:${Date.now()}`;
+    this.activeTurnIds.delete(turnKey);
     this.activeTurnIds.add(turnKey);
     this.stalledTurnIds.delete(turnKey);
     this.currentlyStalledTurnIds.delete(turnKey);
@@ -3994,7 +4012,8 @@ codex.on("turnPhaseChanged", ({ phase, previous }) => {
 });
 codex.on("steerFailed", (reason) => {
   log(`Steer rejected by app-server: ${reason}`);
-  emitToClaude(systemMessage("system_steer_failed", `\u26A0\uFE0F Your steer message did NOT reach Codex (${reason}). The original turn continues unaffected \u2014 wait for it to finish, or resend as a normal reply.`));
+  const advice = codex.turnInProgress ? "wait for it to finish (\u2705), then send normally" : "the turn has ended \u2014 resend as a normal reply";
+  emitToClaude(systemMessage("system_steer_failed", `\u26A0\uFE0F Your steer message did NOT reach Codex (${reason}). The original turn continues unaffected \u2014 ${advice}.`));
 });
 codex.on("steerAccepted", () => {
   log("Steer accepted by app-server");
@@ -4255,11 +4274,12 @@ function handleControlMessage(ws, raw) {
         if (steered) {
           clearAttentionWindow();
         }
+        const steerFailureAdvice = codex.turnInProgress ? "Steer failed: the running turn cannot be steered right now \u2014 wait for it to finish (\u2705), then send normally." : "Steer failed: the turn may have just ended or the connection dropped \u2014 retry as a normal reply.";
         sendProtocolMessage(ws, {
           type: "claude_to_codex_result",
           requestId: message.requestId,
           success: steered,
-          error: steered ? undefined : "Steer failed: the turn may have just ended or the connection dropped \u2014 retry as a normal reply."
+          error: steered ? undefined : steerFailureAdvice
         });
         return;
       }

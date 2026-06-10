@@ -2303,7 +2303,7 @@ describe("CodexAdapter turn/steer (protocol v2 B0)", () => {
     expect(adapter.steerMessage("hello")).toBe(false);
   });
 
-  test("steerMessage sends turn/steer with a tracked negative id and text input", () => {
+  test("steerMessage sends turn/steer with a tracked negative id, expectedTurnId and text input", () => {
     const { adapter, appSent } = createSteerableAdapter();
 
     expect(adapter.steerMessage("mid-turn correction")).toBe(true);
@@ -2315,10 +2315,47 @@ describe("CodexAdapter turn/steer (protocol v2 B0)", () => {
     expect(sent.id).toBeLessThan(0);
     expect(sent.params).toEqual({
       threadId: "thread-steer",
+      // REQUIRED on every codex release with turn/steer — omitting it gets the
+      // steer rejected with "missing field `expectedTurnId`" (live-E2E regression).
+      expectedTurnId: "t1",
       input: [{ type: "text", text: "mid-turn correction" }],
     });
     expect(adapter.bridgeRequestIds.has(sent.id)).toBe(true);
     expect(adapter.bridgeRequestKinds.get(sent.id)).toBe("steer");
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("steerMessage rejects when the only active turn has no addressable id (unknown: fallback)", () => {
+    const adapter = createAdapter();
+    adapter.threadId = "thread-steer";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+    // turn/started without a turn id → tracked under an `unknown:<ts>` key.
+    adapter.handleServerNotification({ method: "turn/started", params: {} });
+    expect(adapter.turnInProgress).toBe(true);
+
+    expect(adapter.steerMessage("hello")).toBe(false);
+  });
+
+  test("steerMessage targets the NEWEST real turn id when several are active", () => {
+    const { adapter, appSent } = createSteerableAdapter();
+    // A second (nested/newer) turn starts; insertion order makes it the newest.
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t2" } } });
+
+    expect(adapter.steerMessage("target the newest")).toBe(true);
+    expect(JSON.parse(appSent[0]).params.expectedTurnId).toBe("t2");
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("steerMessage falls back to the remaining turn id after the newest completes", () => {
+    const { adapter, appSent } = createSteerableAdapter();
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t2" } } });
+    adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "t2" } } });
+
+    expect(adapter.turnInProgress).toBe(true); // t1 still active
+    expect(adapter.steerMessage("back to t1")).toBe(true);
+    expect(JSON.parse(appSent[0]).params.expectedTurnId).toBe("t1");
 
     adapter.clearResponseTrackingState();
   });
