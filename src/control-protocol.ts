@@ -12,6 +12,14 @@ export interface ControlClientIdentity {
   contractVersion?: number;
 }
 
+/**
+ * Codex turn lifecycle phase (collaboration-protocol v2, PR A).
+ * STRICTLY the turn lifecycle — the bridge's routing/attention window is a
+ * separate axis (attentionWindowActive). `aborted` means the LAST turn ended
+ * abnormally and no new turn has started since.
+ */
+export type TurnPhase = "idle" | "running" | "stalled" | "aborted";
+
 export interface DaemonStatus {
   bridgeReady: boolean;
   tuiConnected: boolean;
@@ -32,8 +40,19 @@ export interface DaemonStatus {
    * status.json (kept in sync so the two payloads don't drift) so the TUI
    * wrapper can classify a clean exit as exit_0_during_turn vs exit_0_idle at
    * the moment the TUI dies (issue #102).
+   *
+   * COMPAT: kept for one version as the mapping `turnPhase ∈ {running,stalled}`.
+   * New consumers should read turnPhase.
    */
   turnInProgress?: boolean;
+  /** Codex turn lifecycle phase (protocol v2 PR A). */
+  turnPhase?: TurnPhase;
+  /**
+   * Whether the bridge's attention window is open (STATUS messages buffered to
+   * give Claude space to respond). A routing-layer axis, deliberately NOT part
+   * of turnPhase.
+   */
+  attentionWindowActive?: boolean;
 }
 
 export type ControlClientMessage =

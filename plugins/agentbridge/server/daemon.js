@@ -18,7 +18,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.6", "0.0.0-source"),
-  commit: defineString("935ca23", "source"),
+  commit: defineString("ec1ab68", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -628,6 +628,9 @@ class CodexAdapter extends EventEmitter {
   turnInProgress = false;
   turnWatchdogs = new Map;
   stalledTurnIds = new Set;
+  currentlyStalledTurnIds = new Set;
+  lastTurnEndedAbnormally = false;
+  lastEmittedPhase = "idle";
   threadSwitchSeq = 0;
   nextProxyId = 1e5;
   upstreamToClient = new Map;
@@ -1519,7 +1522,9 @@ class CodexAdapter extends EventEmitter {
     if (!isNaN(numericId) && this.consumeBridgeRequestId(numericId)) {
       if (parsed.error) {
         this.log(`Bridge-originated request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
+        this.lastTurnEndedAbnormally = true;
         this.emit("turnAborted", `injected turn/start rejected: ${parsed.error.message ?? "unknown error"}`);
+        this.notifyPhaseIfChanged();
       } else {
         this.log(`Bridge-originated request completed (id ${responseId})`);
       }
@@ -1714,28 +1719,50 @@ class CodexAdapter extends EventEmitter {
     this.log(`Thread detected: ${threadId} (${reason})`);
     this.emit("ready", threadId);
   }
+  get turnPhase() {
+    if (this.activeTurnIds.size > 0) {
+      const allStalled = [...this.activeTurnIds].every((id) => this.currentlyStalledTurnIds.has(id));
+      return allStalled ? "stalled" : "running";
+    }
+    return this.lastTurnEndedAbnormally ? "aborted" : "idle";
+  }
+  notifyPhaseIfChanged() {
+    const phase = this.turnPhase;
+    if (phase === this.lastEmittedPhase)
+      return;
+    const previous = this.lastEmittedPhase;
+    this.lastEmittedPhase = phase;
+    this.emit("turnPhaseChanged", { phase, previous });
+  }
   markTurnStarted(turnId) {
     const wasInProgress = this.turnInProgress;
     const turnKey = typeof turnId === "string" && turnId.length > 0 ? turnId : `unknown:${Date.now()}`;
     this.activeTurnIds.add(turnKey);
     this.stalledTurnIds.delete(turnKey);
+    this.currentlyStalledTurnIds.delete(turnKey);
+    this.lastTurnEndedAbnormally = false;
     this.scheduleTurnWatchdog(turnKey);
     this.turnInProgress = this.activeTurnIds.size > 0;
     if (!wasInProgress && this.turnInProgress) {
       this.emit("turnStarted");
     }
+    this.notifyPhaseIfChanged();
   }
   markTurnCompleted(turnId) {
     if (typeof turnId === "string" && turnId.length > 0) {
       this.activeTurnIds.delete(turnId);
       this.clearTurnWatchdog(turnId);
       this.stalledTurnIds.delete(turnId);
+      this.currentlyStalledTurnIds.delete(turnId);
     } else {
       this.activeTurnIds.clear();
       this.clearAllTurnWatchdogs();
       this.stalledTurnIds.clear();
+      this.currentlyStalledTurnIds.clear();
     }
+    this.lastTurnEndedAbnormally = false;
     this.turnInProgress = this.activeTurnIds.size > 0;
+    this.notifyPhaseIfChanged();
   }
   turnWatchdogMs() {
     const v = Number(process.env.AGENTBRIDGE_TURN_WATCHDOG_MS);
@@ -1770,11 +1797,15 @@ class CodexAdapter extends EventEmitter {
     for (const turnKey of [...this.turnWatchdogs.keys()]) {
       this.scheduleTurnWatchdog(turnKey);
     }
+    this.currentlyStalledTurnIds.clear();
+    this.notifyPhaseIfChanged();
   }
   markTurnStalled(turnKey) {
     if (!this.activeTurnIds.has(turnKey))
       return;
     this.turnInProgress = true;
+    this.currentlyStalledTurnIds.add(turnKey);
+    this.notifyPhaseIfChanged();
     if (this.stalledTurnIds.has(turnKey))
       return;
     this.stalledTurnIds.add(turnKey);
@@ -1788,8 +1819,10 @@ class CodexAdapter extends EventEmitter {
     this.activeTurnIds.clear();
     this.clearAllTurnWatchdogs();
     this.stalledTurnIds.clear();
+    this.currentlyStalledTurnIds.clear();
     this.turnInProgress = false;
     if (wasInProgress) {
+      this.lastTurnEndedAbnormally = !emitCompleted;
       if (emitCompleted) {
         this.emit("turnCompleted");
       } else {
@@ -1797,6 +1830,7 @@ class CodexAdapter extends EventEmitter {
       }
       this.log(`Turn state reset (${reason})`);
     }
+    this.notifyPhaseIfChanged();
   }
   requestKey(id) {
     if (typeof id === "number" || typeof id === "string")
@@ -3908,9 +3942,13 @@ function tryWriteStatusFile(reason) {
     log(`status file write failed (${reason}): ${err?.message ?? err}`);
   }
 }
+codex.on("turnPhaseChanged", ({ phase, previous }) => {
+  log(`Codex turn phase: ${previous} \u2192 ${phase}`);
+  tryWriteStatusFile(`turnPhase:${phase}`);
+  broadcastStatus();
+});
 codex.on("turnStarted", () => {
   log("Codex turn started");
-  tryWriteStatusFile("turnStarted");
   emitToClaude(systemMessage("system_turn_started", "\u23F3 Codex is working on the current task. Wait for completion before sending a reply."));
 });
 codex.on("agentMessage", (msg) => {
@@ -3951,7 +3989,6 @@ codex.on("agentMessage", (msg) => {
 });
 codex.on("turnCompleted", () => {
   log("Codex turn completed");
-  tryWriteStatusFile("turnCompleted");
   statusBuffer.flush("turn completed");
   const { warnReplyMissing } = replyTracker.consumeOnTurnComplete();
   if (warnReplyMissing) {
@@ -3963,7 +4000,6 @@ codex.on("turnCompleted", () => {
 });
 codex.on("turnAborted", (reason) => {
   log(`Codex turn aborted (${reason}) \u2014 clearing reply-required state`);
-  tryWriteStatusFile("turnAborted");
   const replyWasRequired = replyTracker.isArmed;
   replyTracker.reset();
   const notice = buildTurnAbortedNotice(reason, replyWasRequired);
@@ -4304,11 +4340,13 @@ function startAttentionWindow() {
   inAttentionWindow = true;
   statusBuffer.pause();
   log(`Attention window started (${ATTENTION_WINDOW_MS}ms)`);
+  tryWriteStatusFile("attentionWindowStarted");
   attentionWindowTimer = setTimeout(() => {
     attentionWindowTimer = null;
     inAttentionWindow = false;
     statusBuffer.resume();
     log("Attention window ended");
+    tryWriteStatusFile("attentionWindowEnded");
   }, ATTENTION_WINDOW_MS);
 }
 function clearAttentionWindow() {
@@ -4318,8 +4356,9 @@ function clearAttentionWindow() {
   }
   if (inAttentionWindow) {
     statusBuffer.resume();
+    inAttentionWindow = false;
+    tryWriteStatusFile("attentionWindowCleared");
   }
-  inAttentionWindow = false;
 }
 function scheduleIdleShutdown() {
   cancelIdleShutdown();
@@ -4444,7 +4483,9 @@ function currentStatus() {
     stateDir: stateDir.dir,
     build: daemonStatusBuildInfo(),
     budget: budgetCoordinator?.getSnapshot() ?? undefined,
-    turnInProgress: codex.turnInProgress
+    turnInProgress: codex.turnInProgress,
+    turnPhase: codex.turnPhase,
+    attentionWindowActive: inAttentionWindow
   };
 }
 function currentWaitingMessage() {
@@ -4487,7 +4528,9 @@ function writeStatusFile() {
     cwd: process.cwd(),
     stateDir: stateDir.dir,
     build: daemonStatusBuildInfo(),
-    turnInProgress: codex.turnInProgress
+    turnInProgress: codex.turnInProgress,
+    turnPhase: codex.turnPhase,
+    attentionWindowActive: inAttentionWindow
   });
 }
 function removeStatusFile() {

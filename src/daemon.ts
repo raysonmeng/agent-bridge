@@ -237,11 +237,18 @@ function tryWriteStatusFile(reason: string) {
   }
 }
 
+// Single funnel for status persistence (#102 + protocol v2 PR A): EVERY turn
+// phase transition — including stalled and the stalled→running resume that has
+// no dedicated event — refreshes status.json and pushes a live status update,
+// so /healthz, status.json and the control status stream cannot drift.
+codex.on("turnPhaseChanged", ({ phase, previous }: { phase: string; previous: string }) => {
+  log(`Codex turn phase: ${previous} → ${phase}`);
+  tryWriteStatusFile(`turnPhase:${phase}`);
+  broadcastStatus();
+});
+
 codex.on("turnStarted", () => {
   log("Codex turn started");
-  // Keep status.json's turnInProgress current — the TUI wrapper reads it at
-  // exit time to classify exit_0_during_turn vs exit_0_idle (issue #102).
-  tryWriteStatusFile("turnStarted");
   emitToClaude(
     systemMessage(
       "system_turn_started",
@@ -294,7 +301,6 @@ codex.on("agentMessage", (msg: BridgeMessage) => {
 
 codex.on("turnCompleted", () => {
   log("Codex turn completed");
-  tryWriteStatusFile("turnCompleted"); // turnInProgress flipped (#102)
   statusBuffer.flush("turn completed");
 
   // Check if reply was required but Codex didn't send any agentMessage, then
@@ -324,7 +330,6 @@ codex.on("turnAborted", (reason: string) => {
   // stop). Clear the require_reply tracker so its armed state cannot be inherited
   // by a later, unrelated turn (force-forward leak + misattributed warning).
   log(`Codex turn aborted (${reason}) — clearing reply-required state`);
-  tryWriteStatusFile("turnAborted"); // turnInProgress flipped (#102)
   const replyWasRequired = replyTracker.isArmed;
   replyTracker.reset();
 
@@ -831,11 +836,13 @@ function startAttentionWindow() {
   inAttentionWindow = true;
   statusBuffer.pause();
   log(`Attention window started (${ATTENTION_WINDOW_MS}ms)`);
+  tryWriteStatusFile("attentionWindowStarted"); // keep status.json in step with /healthz (PR A)
   attentionWindowTimer = setTimeout(() => {
     attentionWindowTimer = null;
     inAttentionWindow = false;
     statusBuffer.resume();
     log("Attention window ended");
+    tryWriteStatusFile("attentionWindowEnded");
   }, ATTENTION_WINDOW_MS);
 }
 
@@ -846,8 +853,9 @@ function clearAttentionWindow() {
   }
   if (inAttentionWindow) {
     statusBuffer.resume();
+    inAttentionWindow = false;
+    tryWriteStatusFile("attentionWindowCleared");
   }
-  inAttentionWindow = false;
 }
 
 function scheduleIdleShutdown() {
@@ -1015,7 +1023,11 @@ function currentStatus(): DaemonStatus {
     stateDir: stateDir.dir,
     build: daemonStatusBuildInfo(),
     budget: budgetCoordinator?.getSnapshot() ?? undefined,
+    // COMPAT mapping (= turnPhase ∈ {running, stalled}); new consumers read
+    // turnPhase. attentionWindowActive is the routing axis, NOT a turn phase.
     turnInProgress: codex.turnInProgress,
+    turnPhase: codex.turnPhase,
+    attentionWindowActive: inAttentionWindow,
   };
 }
 
@@ -1071,10 +1083,14 @@ function writeStatusFile() {
     cwd: process.cwd(),
     stateDir: stateDir.dir,
     build: daemonStatusBuildInfo(),
-    // Refreshed on every turn transition (turnStarted/turnCompleted/turnAborted
-    // handlers call writeStatusFile) so the TUI wrapper reads an up-to-date
+    // Refreshed on every turn-phase transition (the unified turnPhaseChanged
+    // handler calls tryWriteStatusFile) so the TUI wrapper reads an up-to-date
     // value at exit time: exit_0_during_turn vs exit_0_idle (issue #102).
     turnInProgress: codex.turnInProgress,
+    // Same fields as /healthz (currentStatus) — the two payloads must not
+    // drift (protocol v2 PR A). Attention transitions also refresh this file.
+    turnPhase: codex.turnPhase,
+    attentionWindowActive: inAttentionWindow,
   });
 }
 

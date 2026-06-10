@@ -138,6 +138,21 @@ export class CodexAdapter extends EventEmitter {
   // suppress repeats; a turnId is removed when its turn completes/resets or a
   // new turn starts, so a genuinely new stall in a later turn still notifies.
   private stalledTurnIds = new Set<string>();
+  // CURRENT stall state, distinct from stalledTurnIds (which is the
+  // notify-at-most-once dedup set and is deliberately NOT cleared on activity).
+  // A stalled turn that resumes streaming leaves this set, so turnPhase can
+  // honestly report running again (protocol v2 PR A).
+  private currentlyStalledTurnIds = new Set<string>();
+  // Did the LAST turn end abnormally (turnAborted) with no new turn since?
+  // Drives turnPhase === "aborted". Deliberately PERSISTS across app-server
+  // reconnects with no intervening turn — the contract reads "no new turn
+  // since", and a reconnect alone doesn't change what happened to that turn.
+  private lastTurnEndedAbnormally = false;
+  // Last phase reported via the unified turnPhaseChanged event — every state
+  // mutation funnels through notifyPhaseIfChanged so consumers (the daemon's
+  // status.json writer) can never miss a transition, including stalled→running
+  // resumes that have no dedicated event of their own.
+  private lastEmittedPhase: "idle" | "running" | "stalled" | "aborted" = "idle";
   // #70: latest-issued thread-switch sequence (see PendingRequest.threadSwitchSeq).
   private threadSwitchSeq = 0;
 
@@ -1436,7 +1451,13 @@ export class CodexAdapter extends EventEmitter {
         // in-progress, so resetTurnState's wasInProgress-gated turnAborted never
         // fires. Signal the abort here so daemon-level per-turn state (the
         // require_reply tracker) is not stranded on a turn that never started.
+        // turnPhase must agree with the emitted event: an observer seeing
+        // turnAborted while the phase reads "idle" violates the PR A contract
+        // ("aborted" = the last turn ended abnormally, no new turn since).
+        // The richer "rejected" terminal classification is PR B territory.
+        this.lastTurnEndedAbnormally = true;
         this.emit("turnAborted", `injected turn/start rejected: ${parsed.error.message ?? "unknown error"}`);
+        this.notifyPhaseIfChanged();
       } else {
         this.log(`Bridge-originated request completed (id ${responseId})`);
       }
@@ -1688,6 +1709,28 @@ export class CodexAdapter extends EventEmitter {
     this.emit("ready", threadId);
   }
 
+  /**
+   * Turn lifecycle phase (protocol v2 PR A). Strictly the turn axis — the
+   * bridge's attention/routing window is reported separately by the daemon.
+   */
+  get turnPhase(): "idle" | "running" | "stalled" | "aborted" {
+    if (this.activeTurnIds.size > 0) {
+      const allStalled = [...this.activeTurnIds].every((id) => this.currentlyStalledTurnIds.has(id));
+      return allStalled ? "stalled" : "running";
+    }
+    return this.lastTurnEndedAbnormally ? "aborted" : "idle";
+  }
+
+  /** Emit turnPhaseChanged when the derived phase moved — single funnel for
+   *  ALL transitions so status persistence cannot drift from /healthz. */
+  private notifyPhaseIfChanged() {
+    const phase = this.turnPhase;
+    if (phase === this.lastEmittedPhase) return;
+    const previous = this.lastEmittedPhase;
+    this.lastEmittedPhase = phase;
+    this.emit("turnPhaseChanged", { phase, previous });
+  }
+
   private markTurnStarted(turnId?: string) {
     const wasInProgress = this.turnInProgress;
     // Compute the key ONCE and use it for both the set and the watchdog so the
@@ -1698,12 +1741,15 @@ export class CodexAdapter extends EventEmitter {
     // reused the same id (e.g. the `unknown:` fallback is time-stamped, but
     // real ids could repeat across reconnects).
     this.stalledTurnIds.delete(turnKey);
+    this.currentlyStalledTurnIds.delete(turnKey);
+    this.lastTurnEndedAbnormally = false;
     this.scheduleTurnWatchdog(turnKey);
 
     this.turnInProgress = this.activeTurnIds.size > 0;
     if (!wasInProgress && this.turnInProgress) {
       this.emit("turnStarted");
     }
+    this.notifyPhaseIfChanged();
   }
 
   private markTurnCompleted(turnId?: string) {
@@ -1711,13 +1757,17 @@ export class CodexAdapter extends EventEmitter {
       this.activeTurnIds.delete(turnId);
       this.clearTurnWatchdog(turnId);
       this.stalledTurnIds.delete(turnId);
+      this.currentlyStalledTurnIds.delete(turnId);
     } else {
       this.activeTurnIds.clear();
       this.clearAllTurnWatchdogs();
       this.stalledTurnIds.clear();
+      this.currentlyStalledTurnIds.clear();
     }
 
+    this.lastTurnEndedAbnormally = false;
     this.turnInProgress = this.activeTurnIds.size > 0;
+    this.notifyPhaseIfChanged();
   }
 
   /** Inactivity timeout for a turn (env-overridable; default 5 minutes). */
@@ -1765,12 +1815,22 @@ export class CodexAdapter extends EventEmitter {
     for (const turnKey of [...this.turnWatchdogs.keys()]) {
       this.scheduleTurnWatchdog(turnKey);
     }
+    // Activity arrived — any turn previously marked stalled is moving again.
+    // (stalledTurnIds, the notify-once set, intentionally stays.)
+    this.currentlyStalledTurnIds.clear();
+    this.notifyPhaseIfChanged();
   }
 
   /** Mark a turn stalled without clearing busy state (watchdog expiry path). */
   private markTurnStalled(turnKey: string) {
     if (!this.activeTurnIds.has(turnKey)) return;
     this.turnInProgress = true;
+    this.currentlyStalledTurnIds.add(turnKey);
+    // Phase notify must precede the at-most-once dedup return below: a turn
+    // that stalls, resumes, then stalls AGAIN re-enters the stalled phase but
+    // is suppressed from a second turnStalled notification — the phase event
+    // must still fire or status persistence drifts from the getter.
+    this.notifyPhaseIfChanged();
     // Emit at most once per turn: a stalled turn keeps its watchdog armed, so
     // later notifications can re-fire it. Suppress repeats for the same turnId.
     if (this.stalledTurnIds.has(turnKey)) return;
@@ -1791,8 +1851,10 @@ export class CodexAdapter extends EventEmitter {
     this.activeTurnIds.clear();
     this.clearAllTurnWatchdogs();
     this.stalledTurnIds.clear();
+    this.currentlyStalledTurnIds.clear();
     this.turnInProgress = false;
     if (wasInProgress) {
+      this.lastTurnEndedAbnormally = !emitCompleted;
       if (emitCompleted) {
         this.emit("turnCompleted");
       } else {
@@ -1804,6 +1866,7 @@ export class CodexAdapter extends EventEmitter {
       }
       this.log(`Turn state reset (${reason})`);
     }
+    this.notifyPhaseIfChanged();
   }
 
   private requestKey(id: unknown): string | null {

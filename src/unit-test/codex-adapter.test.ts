@@ -515,6 +515,61 @@ describe("CodexAdapter turn state machine", () => {
     adapter.clearResponseTrackingState();
   });
 
+  test("turnPhase walks the v2 lifecycle: idle \u2192 running \u2192 stalled \u2192 running \u2192 idle (PR A)", async () => {
+    await withTurnWatchdogMs(40, async () => {
+      const adapter = createAdapter();
+      const phaseEvents: string[] = [];
+      adapter.on("turnPhaseChanged", (e: { phase: string; previous: string }) => phaseEvents.push(`${e.previous}>${e.phase}`));
+      expect(adapter.turnPhase).toBe("idle");
+
+      adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "phase-turn" } } });
+      expect(adapter.turnPhase).toBe("running");
+      expect(adapter.turnInProgress).toBe(true); // compat mapping: running|stalled
+
+      await sleep(90); // watchdog fires \u2192 stalled (current-state, not just the notify dedup)
+      expect(adapter.turnPhase).toBe("stalled");
+      expect(adapter.turnInProgress).toBe(true);
+
+      // Activity resumes \u2014 phase must honestly return to running even though
+      // the at-most-once turnStalled notification dedup set keeps its entry.
+      adapter.handleAppServerPayload(
+        JSON.stringify({ jsonrpc: "2.0", method: "item/agentReasoning/delta", params: {} }),
+        1,
+      );
+      expect(adapter.turnPhase).toBe("running");
+
+      adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "phase-turn" } } });
+      expect(adapter.turnPhase).toBe("idle");
+      expect(adapter.turnInProgress).toBe(false);
+
+      // The unified event fired on EVERY transition — including the
+      // stalled→running resume that has no dedicated event of its own. The
+      // daemon's status persistence subscribes to exactly this.
+      expect(phaseEvents).toEqual(["idle>running", "running>stalled", "stalled>running", "running>idle"]);
+
+      adapter.clearResponseTrackingState();
+    });
+  });
+
+  test("turnPhase reports aborted after an abnormal end, until the next turn starts (PR A)", async () => {
+    const adapter = createAdapter();
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "abort-turn" } } });
+    expect(adapter.turnPhase).toBe("running");
+
+    (adapter as any).resetTurnState("test app-server close");
+    expect(adapter.turnPhase).toBe("aborted");
+    expect(adapter.turnInProgress).toBe(false); // compat: aborted maps to false
+
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "next-turn" } } });
+    expect(adapter.turnPhase).toBe("running");
+
+    // A NORMAL completion must clear the aborted memory too.
+    adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "next-turn" } } });
+    expect(adapter.turnPhase).toBe("idle");
+
+    adapter.clearResponseTrackingState();
+  });
+
   test("turn watchdog marks stalled but does not fake turnCompleted after inactivity", async () => {
     await withTurnWatchdogMs(40, async () => {
       const adapter = createAdapter();
