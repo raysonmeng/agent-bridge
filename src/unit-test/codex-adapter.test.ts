@@ -2231,6 +2231,176 @@ describe("CodexAdapter thread/closed diagnostic sniffer", () => {
   });
 });
 
+describe("CodexAdapter protocol-version awareness (P1 #5)", () => {
+  // Drive an initialize response through the real funnel: register the proxy-id
+  // mapping the way onTuiMessage would, mark it as a pending initialize, then
+  // feed the response. Mirrors the existing "initialize reconnect" test shape.
+  function feedInitializeResponse(
+    adapter: any,
+    proxyId: number,
+    result: unknown,
+    logs: string[],
+  ) {
+    adapter.tuiConnId = 1;
+    adapter.tuiWs = { send: () => {} } as any;
+    adapter.upstreamToClient.set(proxyId, { connId: 1, clientId: 1 });
+    adapter.pendingInitializeProxyIds.add(proxyId);
+    adapter.log = (m: string) => logs.push(m);
+    adapter.handleAppServerPayload(JSON.stringify({ id: proxyId, result }));
+  }
+
+  test("captures version / platform from an initialize response and exposes it", () => {
+    const adapter = createAdapter();
+    const logs: string[] = [];
+    expect(adapter.capturedAppServerInfo).toBeNull(); // null before initialize
+
+    feedInitializeResponse(
+      adapter,
+      200001,
+      {
+        userAgent: "codex_cli_rs/0.139.0 (Mac OS 15.1; arm64) reqwest/0.12",
+        codexHome: "/Users/x/.codex",
+        platformFamily: "unix",
+        platformOs: "macos",
+      },
+      logs,
+    );
+
+    const info = adapter.capturedAppServerInfo;
+    expect(info).not.toBeNull();
+    expect(info.version).toBe("0.139.0");
+    expect(info.userAgent).toBe("codex_cli_rs/0.139.0 (Mac OS 15.1; arm64) reqwest/0.12");
+    expect(info.platformFamily).toBe("unix");
+    expect(info.platformOs).toBe("macos");
+    // Captured-info log line present; no unknown-version WARNING for a good UA.
+    expect(logs.some((l) => l.includes("Captured app-server initialize: version=0.139.0"))).toBe(true);
+    expect(logs.some((l) => l.includes("no parseable version"))).toBe(false);
+    // The pending-id bookkeeping is consumed.
+    expect(adapter.pendingInitializeProxyIds.has(200001)).toBe(false);
+  });
+
+  test("WARNs (once per distinct UA) when the initialize response has no parseable version", () => {
+    const adapter = createAdapter();
+    const logs: string[] = [];
+
+    // Missing userAgent entirely → version null, WARNING fires.
+    feedInitializeResponse(adapter, 200002, { platformOs: "linux" }, logs);
+    expect(adapter.capturedAppServerInfo.version).toBeNull();
+    const warns = logs.filter((l) => l.includes("no parseable version"));
+    expect(warns.length).toBe(1);
+
+    // A second initialize with the SAME (missing) UA must not re-warn.
+    feedInitializeResponse(adapter, 200003, { platformOs: "linux" }, logs);
+    expect(logs.filter((l) => l.includes("no parseable version")).length).toBe(1);
+
+    // A DIFFERENT unparseable UA warns again (distinct key).
+    feedInitializeResponse(adapter, 200004, { userAgent: "garbage-no-slash" }, logs);
+    expect(logs.filter((l) => l.includes("no parseable version")).length).toBe(2);
+  });
+
+  test("captures even when the response conn is stale (server identity is conn-independent)", () => {
+    const adapter = createAdapter();
+    const logs: string[] = [];
+    adapter.tuiConnId = 5; // current primary differs from the mapped conn
+    adapter.upstreamToClient.set(200005, { connId: 2, clientId: 1 });
+    adapter.pendingInitializeProxyIds.add(200005);
+    adapter.log = (m: string) => logs.push(m);
+
+    const forwarded = adapter.handleAppServerPayload(
+      JSON.stringify({ id: 200005, result: { userAgent: "codex_cli_rs/0.140.0 (x)" } }),
+    );
+
+    // Stale response is dropped (not forwarded) ...
+    expect(forwarded).toBeNull();
+    // ... but the version was still captured.
+    expect(adapter.capturedAppServerInfo.version).toBe("0.140.0");
+  });
+
+  test("patchResponse patches a STRUCTURED-code rate-limit error with no fragile warning", () => {
+    const adapter = createAdapter();
+    const logs: string[] = [];
+    adapter.log = (m: string) => logs.push(m);
+
+    const out = adapter.patchResponse(
+      {
+        jsonrpc: "2.0",
+        id: 7,
+        error: { code: -32603, message: "failed to fetch codex rate limits: timeout" },
+      },
+      "RAW",
+    );
+
+    const parsed = JSON.parse(out);
+    expect(parsed.id).toBe(7);
+    expect(parsed.result.rateLimits).toBeDefined();
+    expect(parsed.result.rateLimitsByLimitId).toBeNull();
+    expect(logs.some((l) => l.includes("via structured code -32603"))).toBe(true);
+    expect(logs.some((l) => l.includes("fragile-match"))).toBe(false);
+  });
+
+  test("patchResponse still patches a TEXT-only legacy rate-limit error via fallback + fragile WARNING", () => {
+    const adapter = createAdapter();
+    const logs: string[] = [];
+    adapter.log = (m: string) => logs.push(m);
+
+    // Unrecognized code (not in the rate-limit set) but legacy text matches.
+    const out = adapter.patchResponse(
+      {
+        jsonrpc: "2.0",
+        id: 8,
+        error: { code: -32099, message: "could not read rate limits right now" },
+      },
+      "RAW",
+    );
+
+    const parsed = JSON.parse(out);
+    expect(parsed.id).toBe(8);
+    expect(parsed.result.rateLimits).toBeDefined(); // behavior preserved
+    const fragile = logs.filter((l) => l.includes("fragile-match"));
+    expect(fragile.length).toBe(1);
+    expect(logs.some((l) => l.includes("via fragile text fallback"))).toBe(true);
+
+    // Same message again → no second fragile warning (once per distinct message).
+    adapter.patchResponse(
+      {
+        jsonrpc: "2.0",
+        id: 9,
+        error: { code: -32099, message: "could not read rate limits right now" },
+      },
+      "RAW",
+    );
+    expect(logs.filter((l) => l.includes("fragile-match")).length).toBe(1);
+  });
+
+  test("patchResponse leaves a non-rate-limit error untouched", () => {
+    const adapter = createAdapter();
+    const logs: string[] = [];
+    adapter.log = (m: string) => logs.push(m);
+
+    const RAW = JSON.stringify({ id: 10, error: { code: -32603, message: "disk full" } });
+    const out = adapter.patchResponse(
+      { jsonrpc: "2.0", id: 10, error: { code: -32603, message: "disk full" } },
+      RAW,
+    );
+
+    expect(out).toBe(RAW); // unchanged
+    expect(logs.some((l) => l.includes("Patching rateLimits"))).toBe(false);
+  });
+
+  test("clearTransientResponseTrackingState drops pending initialize ids but keeps captured info", () => {
+    const adapter = createAdapter();
+    const logs: string[] = [];
+    feedInitializeResponse(adapter, 200010, { userAgent: "codex_cli_rs/0.141.0 (x)" }, logs);
+    expect(adapter.capturedAppServerInfo.version).toBe("0.141.0");
+
+    adapter.pendingInitializeProxyIds.add(999999);
+    adapter.clearTransientResponseTrackingState();
+    expect(adapter.pendingInitializeProxyIds.size).toBe(0);
+    // Captured info is a fact about the server — it persists across the reset.
+    expect(adapter.capturedAppServerInfo.version).toBe("0.141.0");
+  });
+});
+
 describe("CodexAdapter.forceKillAppServerSync", () => {
   test("synchronously SIGKILLs the retained app-server pid", async () => {
     const adapter = createAdapter();

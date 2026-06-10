@@ -132,6 +132,76 @@ export interface TurnStartResponse {
   [key: string]: unknown;
 }
 
+/**
+ * `initialize` response (codex-rs app-server-protocol v1 InitializeResponse).
+ *
+ * Verified against codex-rs at
+ * codex-rs/app-server-protocol/src/protocol/v1.rs:61-71 (camelCase on the wire
+ * via `#[serde(rename_all = "camelCase")]`) and its construction site
+ * codex-rs/app-server/src/request_processors/initialize_processor.rs:141-146.
+ *
+ * The app-server does NOT expose a dedicated top-level `version` field or a
+ * server-side `capabilities` object; the version is embedded in `userAgent`
+ * (built by get_codex_user_agent — codex-rs/login/src/auth/default_client.rs:133,
+ * format `"{originator}/{version} ({OsType} {os_version}; {arch}) {ua}"`).
+ *
+ * All fields are typed optional here so a future protocol that drops one
+ * surfaces as a captured-null (a drift signal) rather than a crash.
+ */
+export interface AppServerInitializeResponse {
+  /** e.g. "codex_cli_rs/0.139.0 (Mac OS 15.1; arm64) ...". Carries the version. */
+  userAgent?: string;
+  /** Absolute path to the server's $CODEX_HOME directory. */
+  codexHome?: string;
+  /** Platform family, e.g. "unix" / "windows". */
+  platformFamily?: string;
+  /** Operating system, e.g. "macos" / "linux" / "windows". */
+  platformOs?: string;
+  [key: string]: unknown;
+}
+
+/**
+ * Captured app-server identity, derived from the `initialize` response. Exposed
+ * on DaemonStatus so `abg doctor` / /healthz can show which app-server build the
+ * proxy is actually coupled to, and the adapter can WARN when it drifts from the
+ * assumptions baked into the intercept points (see codex-adapter.ts).
+ */
+export interface AppServerInfo {
+  /** Version token parsed out of `userAgent` (e.g. "0.139.0"); null if unparseable. */
+  version: string | null;
+  /** Raw `userAgent` string as received. */
+  userAgent: string | null;
+  /** Platform family ("unix" / "windows" / …) if present. */
+  platformFamily: string | null;
+  /** Operating system ("macos" / "linux" / "windows" / …) if present. */
+  platformOs: string | null;
+}
+
+/**
+ * Parse the version token out of an app-server `userAgent`. The wire format is
+ * `"{originator}/{version} (…)"` — the version is the run of characters after
+ * the FIRST "/" up to the first whitespace. Returns null when the string does
+ * not match that shape (a drift signal worth a WARNING at the call site).
+ */
+export function parseAppServerVersion(userAgent: string | null | undefined): string | null {
+  if (typeof userAgent !== "string") return null;
+  const match = userAgent.match(/\/([^\s]+)/);
+  return match ? match[1] : null;
+}
+
+/**
+ * JSON-RPC error codes the app-server's rate-limits read path is known to use
+ * (codex-rs/app-server/src/error_code.rs + account_processor.rs:967-990). These
+ * are GENERIC codes (not rate-limit-specific), so they alone do not identify a
+ * rate-limit error — patchResponse pairs them with the message text. Modeling
+ * them as a named set documents the structured signal we DO have and gives the
+ * fragile-text fallback a clear "structured-recognized vs not" boundary.
+ */
+export const APP_SERVER_RATE_LIMIT_ERROR_CODES: ReadonlySet<number> = new Set([
+  -32603, // INTERNAL_ERROR_CODE — "failed to fetch codex rate limits: …"
+  -32600, // INVALID_REQUEST_ERROR_CODE — "chatgpt authentication required to read rate limits"
+]);
+
 export interface AppServerRequest<M extends string = string, P = unknown> {
   jsonrpc?: "2.0";
   id: AppServerJsonRpcId;

@@ -18,7 +18,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("5840cb3", "source"),
+  commit: defineString("eec6018", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -363,6 +363,16 @@ var APP_SERVER_NOTIFICATION_METHODS = [
 var TRACKED_REQUEST_METHOD_SET = new Set(APP_SERVER_TRACKED_REQUEST_METHODS);
 var SERVER_REQUEST_METHOD_SET = new Set(APP_SERVER_SERVER_REQUEST_METHODS);
 var NOTIFICATION_METHOD_SET = new Set(APP_SERVER_NOTIFICATION_METHODS);
+function parseAppServerVersion(userAgent) {
+  if (typeof userAgent !== "string")
+    return null;
+  const match = userAgent.match(/\/([^\s]+)/);
+  return match ? match[1] : null;
+}
+var APP_SERVER_RATE_LIMIT_ERROR_CODES = new Set([
+  -32603,
+  -32600
+]);
 function isObjectRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
 }
@@ -715,6 +725,10 @@ class CodexAdapter extends EventEmitter {
   static OUTAGE_TIMEOUT_MS = 1e4;
   lastInitializeRaw = null;
   lastInitializedRaw = null;
+  pendingInitializeProxyIds = new Set;
+  appServerInfo = null;
+  warnedAppServerVersions = new Set;
+  warnedFragileRateLimitMessages = new Set;
   sessionRestoreInProgress = false;
   replayPending = new Map;
   static SESSION_REPLAY_TIMEOUT_MS = 5000;
@@ -733,6 +747,9 @@ class CodexAdapter extends EventEmitter {
   }
   get activeThreadId() {
     return this.threadId;
+  }
+  get capturedAppServerInfo() {
+    return this.appServerInfo;
   }
   async start() {
     this.intentionalDisconnect = false;
@@ -1549,6 +1566,9 @@ class CodexAdapter extends EventEmitter {
         const proxyId = this.nextProxyId++;
         this.upstreamToClient.set(proxyId, { connId, clientId: parsed.id });
         this.trackPendingRequest(parsed, connId, proxyId);
+        if (parsed.method === "initialize") {
+          this.pendingInitializeProxyIds.add(proxyId);
+        }
         parsed.id = proxyId;
         forwarded = JSON.stringify(parsed);
       } else {
@@ -1701,6 +1721,9 @@ class CodexAdapter extends EventEmitter {
     const mapping = !isNaN(numericId) ? this.upstreamToClient.get(numericId) : undefined;
     if (mapping) {
       this.upstreamToClient.delete(numericId);
+      if (!isNaN(numericId) && this.pendingInitializeProxyIds.delete(numericId)) {
+        this.captureAppServerInfo(parsed.result);
+      }
       if (mapping.connId !== this.tuiConnId) {
         this.log(`Dropping stale response (upstream id ${responseId}, from conn #${mapping.connId}, current #${this.tuiConnId})`);
         return null;
@@ -1751,11 +1774,40 @@ class CodexAdapter extends EventEmitter {
     this.log(`Dropping unmatched app-server response id ${String(responseId)}`);
     return null;
   }
+  captureAppServerInfo(result) {
+    const init = typeof result === "object" && result !== null ? result : {};
+    const userAgent = typeof init.userAgent === "string" ? init.userAgent : null;
+    const version = parseAppServerVersion(userAgent);
+    const info = {
+      version,
+      userAgent,
+      platformFamily: typeof init.platformFamily === "string" ? init.platformFamily : null,
+      platformOs: typeof init.platformOs === "string" ? init.platformOs : null
+    };
+    this.appServerInfo = info;
+    this.log(`Captured app-server initialize: version=${version ?? "unknown"} ` + `userAgent=${userAgent ?? "none"} platform=${info.platformOs ?? "?"}/${info.platformFamily ?? "?"}`);
+    if (version === null) {
+      const dedupKey = userAgent ?? "<missing-userAgent>";
+      if (!this.warnedAppServerVersions.has(dedupKey)) {
+        this.warnedAppServerVersions.add(dedupKey);
+        this.log(`WARNING: app-server initialize response carried no parseable version ` + `(userAgent=${userAgent ?? "missing"}). The proxy's intercept points assume a ` + `known protocol snapshot \u2014 verify the version-coupling checklist if Codex was upgraded.`);
+      }
+    }
+  }
   patchResponse(parsed, raw) {
     if (isAppServerResponseMessage(parsed) && parsed.error && parsed.id !== undefined) {
       const errMsg = parsed.error.message ?? "";
-      if (errMsg.includes("rate limits") || errMsg.includes("rateLimits")) {
-        this.log(`Patching rateLimits error \u2192 mock success (id: ${parsed.id})`);
+      const errCode = parsed.error.code;
+      const textMatchesRateLimit = errMsg.includes("rate limits") || errMsg.includes("rateLimits");
+      const codeRecognized = typeof errCode === "number" && APP_SERVER_RATE_LIMIT_ERROR_CODES.has(errCode);
+      const structuredMatch = codeRecognized && textMatchesRateLimit;
+      if (structuredMatch || textMatchesRateLimit) {
+        if (structuredMatch) {
+          this.log(`Patching rateLimits error \u2192 mock success via structured code ${errCode} (id: ${parsed.id})`);
+        } else {
+          this.warnFragileRateLimitMatch(errMsg, errCode);
+          this.log(`Patching rateLimits error \u2192 mock success via fragile text fallback (id: ${parsed.id})`);
+        }
         return JSON.stringify({
           id: parsed.id,
           result: {
@@ -1773,6 +1825,12 @@ class CodexAdapter extends EventEmitter {
       }
     }
     return raw;
+  }
+  warnFragileRateLimitMatch(errMsg, errCode) {
+    if (this.warnedFragileRateLimitMessages.has(errMsg))
+      return;
+    this.warnedFragileRateLimitMessages.add(errMsg);
+    this.log(`WARNING: fragile-match \u2014 patched a rate-limit error by human-readable text ` + `(code=${errCode ?? "none"} not in the recognized set). If Codex changed the ` + `error wording or code, update patchResponse / APP_SERVER_RATE_LIMIT_ERROR_CODES. ` + `Message: ${errMsg.slice(0, 120)}`);
   }
   interceptServerMessage(msg, connId) {
     this.handleTrackedResponse(msg, connId);
@@ -2136,6 +2194,7 @@ class CodexAdapter extends EventEmitter {
   clearTransientResponseTrackingState() {
     this.pendingRequests.clear();
     this.upstreamToClient.clear();
+    this.pendingInitializeProxyIds.clear();
     for (const timer of this.staleProxyIds.values()) {
       clearTimeout(timer);
     }
@@ -5312,7 +5371,8 @@ function currentStatus() {
     budget: budgetCoordinator?.getSnapshot() ?? undefined,
     turnInProgress: codex.turnInProgress,
     turnPhase: codex.turnPhase,
-    attentionWindowActive: inAttentionWindow
+    attentionWindowActive: inAttentionWindow,
+    appServerInfo: codex.capturedAppServerInfo
   };
 }
 function currentWaitingMessage() {
@@ -5357,7 +5417,8 @@ function writeStatusFile() {
     build: daemonStatusBuildInfo(),
     turnInProgress: codex.turnInProgress,
     turnPhase: codex.turnPhase,
-    attentionWindowActive: inAttentionWindow
+    attentionWindowActive: inAttentionWindow,
+    appServerInfo: codex.capturedAppServerInfo
   });
 }
 function removeStatusFile() {

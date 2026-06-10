@@ -92,6 +92,7 @@ describe("doctor command", () => {
         "config.json",
         "daemon health",
         "daemon readiness",
+        "codex app-server",
         "build drift",
         "artifact alignment",
         "current thread",

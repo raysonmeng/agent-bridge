@@ -1460,6 +1460,9 @@ function currentStatus(): DaemonStatus {
     turnInProgress: codex.turnInProgress,
     turnPhase: codex.turnPhase,
     attentionWindowActive: inAttentionWindow,
+    // P1 #5: captured Codex app-server identity (version/platform) so /healthz +
+    // `abg doctor` can surface protocol drift. null until the first initialize.
+    appServerInfo: codex.capturedAppServerInfo,
   };
 }
 
@@ -1523,6 +1526,9 @@ function writeStatusFile() {
     // drift (protocol v2 PR A). Attention transitions also refresh this file.
     turnPhase: codex.turnPhase,
     attentionWindowActive: inAttentionWindow,
+    // P1 #5: keep app-server identity in step with /healthz so status.json and
+    // the control status stream cannot drift on this field either.
+    appServerInfo: codex.capturedAppServerInfo,
   });
 }
 
