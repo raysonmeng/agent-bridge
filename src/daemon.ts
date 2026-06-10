@@ -59,9 +59,11 @@ interface ControlSocketData {
 
 const stateDir = new StateDirResolver();
 stateDir.ensure();
-const configService = new ConfigService();
-const config = configService.loadOrDefault();
 const processLogger = createProcessLogger({ component: "AgentBridgeDaemon", logFile: stateDir.logFile });
+const configService = new ConfigService();
+// Thread the daemon logger so a corrupt config.json fails loud (to log + stderr)
+// instead of silently reverting custom budget/idle thresholds to defaults.
+const config = configService.loadOrDefault(processLogger.log);
 
 const CODEX_APP_PORT = parseInt(process.env.CODEX_WS_PORT ?? String(config.codex.appPort), 10);
 const CODEX_PROXY_PORT = parseInt(process.env.CODEX_PROXY_PORT ?? String(config.codex.proxyPort), 10);

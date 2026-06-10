@@ -2,6 +2,7 @@ import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "n
 import { join } from "node:path";
 import { pluginCacheRoot } from "./plugin-cache";
 import { BUILD_INFO, formatBuildInfo, sameRuntimeContract } from "../build-info";
+import { ConfigService } from "../config-service";
 import { fetchDaemonStatus } from "../daemon-status";
 import { inspectAgentBridgeEnv } from "../env-guard";
 import {
@@ -204,6 +205,7 @@ async function buildDoctorReport(pair: PairResolution, registered: boolean): Pro
       ? undefined
       : "环境变量与当前目录不匹配：请在正确的项目目录里重新运行 `agentbridge claude`，不要复用其他目录的会话环境。",
   });
+  checks.push(configParseabilityCheck(cwd));
   checks.push({
     name: "daemon health",
     status: health ? "ok" : "warn",
@@ -404,6 +406,40 @@ function extractBundleCommit(path: string): string | null {
   } catch {
     return null;
   }
+}
+
+/**
+ * Config parseability + whether custom values are actually in effect. A corrupt
+ * config.json silently reverts the user's custom budget/idle thresholds to
+ * defaults at startup (P1); surface that loudly here so doctor — run by someone
+ * already stuck — can see it instead of chasing why their thresholds "don't work".
+ */
+function configParseabilityCheck(cwd: string): DoctorCheck {
+  const desc = new ConfigService(cwd).describeConfig();
+  if (desc.state === "absent") {
+    return {
+      name: "config.json",
+      status: "ok",
+      detail: `no project config at ${desc.path} — built-in defaults in effect`,
+    };
+  }
+  if (desc.state === "corrupt") {
+    return {
+      name: "config.json",
+      status: "warn",
+      detail: `unparseable at ${desc.path} (${desc.reason}) — custom thresholds NOT in effect, using defaults`,
+      hint:
+        "config.json 损坏或字段类型错误：bridge 已回退到默认阈值，你的自定义 budget/idle 设置未生效。" +
+        "修正该文件的 JSON 语法/字段类型后重启 `agentbridge claude` 即可重新生效。",
+    };
+  }
+  return {
+    name: "config.json",
+    status: "ok",
+    detail: desc.customValues
+      ? `parsed at ${desc.path} — custom values in effect`
+      : `parsed at ${desc.path} — all values match defaults`,
+  };
 }
 
 function logCheck(name: string, path: string): DoctorCheck {

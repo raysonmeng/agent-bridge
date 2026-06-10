@@ -55,6 +55,41 @@ const DEFAULT_CONFIG: AgentBridgeConfig = {
 const CONFIG_DIR = ".agentbridge";
 const CONFIG_FILE = "config.json";
 
+/**
+ * Discriminated result of {@link ConfigService.load}. Distinguishes the three
+ * states that the old `AgentBridgeConfig | null` conflated:
+ *  - `parsed`  — a valid config was read and normalized.
+ *  - `absent`  — the file does not exist (ENOENT); the normal, non-error case.
+ *  - `corrupt` — the file exists but is unparseable JSON or shape-invalid; the
+ *                caller falls back to defaults but MUST surface a warning, since
+ *                the user's custom thresholds are silently NOT in effect.
+ */
+export type ConfigLoadResult =
+  | { state: "parsed"; config: AgentBridgeConfig }
+  | { state: "absent" }
+  | { state: "corrupt"; reason: string };
+
+/** Diagnostic summary of config parseability, surfaced by `abg doctor`. */
+export interface ConfigDescription {
+  state: ConfigLoadResult["state"];
+  /** Resolved path to the config file (whether or not it exists). */
+  path: string;
+  /** True only when a parsed config sets a decision-grade value away from defaults. */
+  customValues: boolean;
+  /** Present only when state is "corrupt". */
+  reason?: string;
+}
+
+/**
+ * Minimal logger surface threaded through {@link ConfigService.loadOrDefault}
+ * so daemon/CLI can surface a corrupt-config warning in their own channel
+ * (daemon: processLogger; CLI: stderr). A no-op default keeps existing call
+ * sites working unchanged.
+ */
+export type ConfigWarnLogger = (message: string) => void;
+
+const NOOP_LOGGER: ConfigWarnLogger = () => {};
+
 interface LegacyAgentBridgeConfig {
   version?: unknown;
   daemon?: {
@@ -74,6 +109,85 @@ interface LegacyAgentBridgeConfig {
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+/**
+ * True when a value is a finite number OR a string that parses to one. Mirrors
+ * `normalizeInteger`'s coercion so the shape check accepts exactly the inputs
+ * normalize accepts (env-style string-numbers, out-of-range numbers) — a value
+ * is "shape invalid" only when it is genuinely uncoercible (e.g. "ninety").
+ */
+function isCoercibleNumber(value: unknown): boolean {
+  if (typeof value === "number") return Number.isFinite(value);
+  if (typeof value === "string") return Number.isFinite(Number(value));
+  return false;
+}
+
+/**
+ * Decision-grade fields whose PRESENCE-with-garbage must fail loud (config is
+ * "shape invalid"), instead of silently reverting to defaults. We only flag a
+ * field that is PRESENT but uncoercible: an ABSENT field is a legacy/partial
+ * config and is normalized to defaults as before. Scope is deliberately the
+ * numeric thresholds the P1 proposal calls out (budget thresholds, idle
+ * shutdown) — booleans and tier-override sub-objects keep their lenient
+ * normalize-to-default behavior so a typo in those is not startup-affecting.
+ *
+ * Returns a human-readable reason string when invalid, else null.
+ */
+function findShapeViolation(raw: Record<string, unknown>): string | null {
+  if ("idleShutdownSeconds" in raw && !isCoercibleNumber(raw.idleShutdownSeconds)) {
+    return "idleShutdownSeconds is present but not a number";
+  }
+  if ("budget" in raw) {
+    const budget = raw.budget;
+    if (!isRecord(budget)) {
+      return "budget is present but not an object";
+    }
+    const numericKeys = ["pauseAt", "resumeBelow", "pollSeconds", "syncDriftPct"] as const;
+    for (const key of numericKeys) {
+      if (key in budget && !isCoercibleNumber(budget[key])) {
+        return `budget.${key} is present but not a number`;
+      }
+    }
+    if ("parallel" in budget) {
+      const parallel = budget.parallel;
+      if (!isRecord(parallel)) {
+        return "budget.parallel is present but not an object";
+      }
+      for (const key of ["minRemainingPct", "timeWindowSec"] as const) {
+        if (key in parallel && !isCoercibleNumber(parallel[key])) {
+          return `budget.parallel.${key} is present but not a number`;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * True when a parsed config sets any decision-grade field away from the
+ * defaults. Used only for the doctor diagnostic — lets the user confirm their
+ * custom thresholds are actually live (vs. a config that exists but matches
+ * defaults, in which case "custom values" is honestly false).
+ */
+function hasCustomDecisionValues(config: AgentBridgeConfig): boolean {
+  const d = DEFAULT_CONFIG;
+  const b = config.budget;
+  const db = d.budget;
+  return (
+    config.idleShutdownSeconds !== d.idleShutdownSeconds ||
+    config.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds ||
+    config.codex.appPort !== d.codex.appPort ||
+    config.codex.proxyPort !== d.codex.proxyPort ||
+    b.enabled !== db.enabled ||
+    b.pollSeconds !== db.pollSeconds ||
+    b.pauseAt !== db.pauseAt ||
+    b.resumeBelow !== db.resumeBelow ||
+    b.syncDriftPct !== db.syncDriftPct ||
+    b.parallel.minRemainingPct !== db.parallel.minRemainingPct ||
+    b.parallel.timeWindowSec !== db.parallel.timeWindowSec ||
+    b.codexTierControl !== db.codexTierControl
+  );
 }
 
 function normalizeInteger(value: unknown, fallback: number): number {
@@ -271,19 +385,94 @@ export class ConfigService {
     return existsSync(this.configPath);
   }
 
-  /** Load project config, returns null if not found. */
-  load(): AgentBridgeConfig | null {
+  /**
+   * Load project config as a discriminated result distinguishing absence
+   * (ENOENT, normal) from corruption (unparseable JSON or shape-invalid).
+   * Unlike the old `null`-for-everything contract, a corrupt config is reported
+   * as such so {@link loadOrDefault} can fail loud instead of silently
+   * reverting the user's custom thresholds to defaults.
+   */
+  load(): ConfigLoadResult {
+    let raw: string;
     try {
-      const raw = readFileSync(this.configPath, "utf-8");
-      return normalizeConfig(JSON.parse(raw));
-    } catch {
-      return null;
+      raw = readFileSync(this.configPath, "utf-8");
+    } catch (err) {
+      // ENOENT is the normal "no project config" case; any other read error
+      // (permissions, etc.) is reported as corrupt so it is not silently
+      // mistaken for "absent" and masked behind defaults.
+      if ((err as NodeJS.ErrnoException)?.code === "ENOENT") {
+        return { state: "absent" };
+      }
+      return { state: "corrupt", reason: `config.json is unreadable: ${(err as Error).message}` };
     }
+
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      return {
+        state: "corrupt",
+        reason: `config.json is not valid JSON: ${(err as Error).message}`,
+      };
+    }
+
+    if (!isRecord(parsed)) {
+      return { state: "corrupt", reason: "config.json is not a JSON object" };
+    }
+
+    const violation = findShapeViolation(parsed);
+    if (violation) {
+      return { state: "corrupt", reason: `config.json is shape-invalid: ${violation}` };
+    }
+
+    const config = normalizeConfig(parsed);
+    if (!config) {
+      // Defensive: normalizeConfig only returns null for a non-record, already
+      // handled above. Treat any residual null as corrupt rather than absent.
+      return { state: "corrupt", reason: "config.json could not be normalized" };
+    }
+    return { state: "parsed", config };
   }
 
-  /** Load project config, falling back to defaults. */
-  loadOrDefault(): AgentBridgeConfig {
-    return this.load() ?? structuredClone(DEFAULT_CONFIG);
+  /**
+   * Load project config, falling back to defaults. On a CORRUPT config (not on
+   * normal absence), emits exactly one clear warning via the injected logger so
+   * the user knows their custom thresholds are NOT in effect — the bridge must
+   * never silently drift to defaults, but a corrupt config must also never
+   * wedge startup, so this still returns defaults.
+   */
+  loadOrDefault(log: ConfigWarnLogger = NOOP_LOGGER): AgentBridgeConfig {
+    const result = this.load();
+    if (result.state === "parsed") return result.config;
+    if (result.state === "corrupt") {
+      log(
+        `config.json at ${this.configPath} is unusable (${result.reason}); ` +
+          "falling back to defaults — your custom budget thresholds / idle-shutdown settings are NOT in effect. " +
+          "Fix the file and restart to re-apply them.",
+      );
+    }
+    return structuredClone(DEFAULT_CONFIG);
+  }
+
+  /**
+   * Diagnostic summary of config parseability for `abg doctor`. Reports the
+   * load state and, for a parsed config, whether any decision-grade value
+   * differs from the defaults (so the user can confirm their custom thresholds
+   * are actually in effect, the exact thing a silent corrupt-fallback hides).
+   */
+  describeConfig(): ConfigDescription {
+    const result = this.load();
+    if (result.state === "absent") {
+      return { state: "absent", path: this.configPath, customValues: false };
+    }
+    if (result.state === "corrupt") {
+      return { state: "corrupt", path: this.configPath, reason: result.reason, customValues: false };
+    }
+    return {
+      state: "parsed",
+      path: this.configPath,
+      customValues: hasCustomDecisionValues(result.config),
+    };
   }
 
   /** Save project config. */

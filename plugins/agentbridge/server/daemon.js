@@ -18,7 +18,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.11", "0.0.0-source"),
-  commit: defineString("5d6cb0f", "source"),
+  commit: defineString("b0c8a46", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -2861,8 +2861,51 @@ var DEFAULT_CONFIG = {
 };
 var CONFIG_DIR = ".agentbridge";
 var CONFIG_FILE = "config.json";
+var NOOP_LOGGER = () => {};
 function isRecord(value) {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+function isCoercibleNumber(value) {
+  if (typeof value === "number")
+    return Number.isFinite(value);
+  if (typeof value === "string")
+    return Number.isFinite(Number(value));
+  return false;
+}
+function findShapeViolation(raw) {
+  if ("idleShutdownSeconds" in raw && !isCoercibleNumber(raw.idleShutdownSeconds)) {
+    return "idleShutdownSeconds is present but not a number";
+  }
+  if ("budget" in raw) {
+    const budget = raw.budget;
+    if (!isRecord(budget)) {
+      return "budget is present but not an object";
+    }
+    const numericKeys = ["pauseAt", "resumeBelow", "pollSeconds", "syncDriftPct"];
+    for (const key of numericKeys) {
+      if (key in budget && !isCoercibleNumber(budget[key])) {
+        return `budget.${key} is present but not a number`;
+      }
+    }
+    if ("parallel" in budget) {
+      const parallel = budget.parallel;
+      if (!isRecord(parallel)) {
+        return "budget.parallel is present but not an object";
+      }
+      for (const key of ["minRemainingPct", "timeWindowSec"]) {
+        if (key in parallel && !isCoercibleNumber(parallel[key])) {
+          return `budget.parallel.${key} is present but not a number`;
+        }
+      }
+    }
+  }
+  return null;
+}
+function hasCustomDecisionValues(config) {
+  const d = DEFAULT_CONFIG;
+  const b = config.budget;
+  const db = d.budget;
+  return config.idleShutdownSeconds !== d.idleShutdownSeconds || config.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config.codex.appPort !== d.codex.appPort || config.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl;
 }
 function normalizeInteger(value, fallback) {
   if (typeof value === "number" && Number.isFinite(value))
@@ -2980,15 +3023,59 @@ class ConfigService {
     return existsSync4(this.configPath);
   }
   load() {
+    let raw;
     try {
-      const raw = readFileSync2(this.configPath, "utf-8");
-      return normalizeConfig(JSON.parse(raw));
-    } catch {
-      return null;
+      raw = readFileSync2(this.configPath, "utf-8");
+    } catch (err) {
+      if (err?.code === "ENOENT") {
+        return { state: "absent" };
+      }
+      return { state: "corrupt", reason: `config.json is unreadable: ${err.message}` };
     }
+    let parsed;
+    try {
+      parsed = JSON.parse(raw);
+    } catch (err) {
+      return {
+        state: "corrupt",
+        reason: `config.json is not valid JSON: ${err.message}`
+      };
+    }
+    if (!isRecord(parsed)) {
+      return { state: "corrupt", reason: "config.json is not a JSON object" };
+    }
+    const violation = findShapeViolation(parsed);
+    if (violation) {
+      return { state: "corrupt", reason: `config.json is shape-invalid: ${violation}` };
+    }
+    const config = normalizeConfig(parsed);
+    if (!config) {
+      return { state: "corrupt", reason: "config.json could not be normalized" };
+    }
+    return { state: "parsed", config };
   }
-  loadOrDefault() {
-    return this.load() ?? structuredClone(DEFAULT_CONFIG);
+  loadOrDefault(log = NOOP_LOGGER) {
+    const result = this.load();
+    if (result.state === "parsed")
+      return result.config;
+    if (result.state === "corrupt") {
+      log(`config.json at ${this.configPath} is unusable (${result.reason}); ` + "falling back to defaults \u2014 your custom budget thresholds / idle-shutdown settings are NOT in effect. " + "Fix the file and restart to re-apply them.");
+    }
+    return structuredClone(DEFAULT_CONFIG);
+  }
+  describeConfig() {
+    const result = this.load();
+    if (result.state === "absent") {
+      return { state: "absent", path: this.configPath, customValues: false };
+    }
+    if (result.state === "corrupt") {
+      return { state: "corrupt", path: this.configPath, reason: result.reason, customValues: false };
+    }
+    return {
+      state: "parsed",
+      path: this.configPath,
+      customValues: hasCustomDecisionValues(result.config)
+    };
   }
   save(config) {
     this.ensureConfigDir();
@@ -4320,9 +4407,9 @@ async function probeLiveness(target, options) {
 // src/daemon.ts
 var stateDir = new StateDirResolver;
 stateDir.ensure();
-var configService = new ConfigService;
-var config = configService.loadOrDefault();
 var processLogger = createProcessLogger({ component: "AgentBridgeDaemon", logFile: stateDir.logFile });
+var configService = new ConfigService;
+var config = configService.loadOrDefault(processLogger.log);
 var CODEX_APP_PORT = parseInt(process.env.CODEX_WS_PORT ?? String(config.codex.appPort), 10);
 var CODEX_PROXY_PORT = parseInt(process.env.CODEX_PROXY_PORT ?? String(config.codex.proxyPort), 10);
 var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);

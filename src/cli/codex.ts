@@ -351,7 +351,15 @@ export async function runCodex(args: string[]) {
     // CODEX_PROXY_PORT (set by applyPairEnv in pair mode; user-set in manual mode)
     // else the project config. This is correct for BOTH multi-pair (env carries
     // the slot's port) and manual/legacy mode (config may be a custom port).
-    const fallbackProxyPort = process.env.CODEX_PROXY_PORT ?? String(new ConfigService().loadOrDefault().codex.proxyPort);
+    // Thread a stderr logger so a corrupt config.json warns the user here too,
+    // matching this command's existing `console.error("[agentbridge] …")` style,
+    // instead of silently using the default proxy port.
+    const fallbackProxyPort =
+      process.env.CODEX_PROXY_PORT ??
+      String(
+        new ConfigService().loadOrDefault((msg) => console.error(`[agentbridge] ${msg}`)).codex
+          .proxyPort,
+      );
     proxyUrl = `ws://127.0.0.1:${fallbackProxyPort}`;
     console.error(`[agentbridge] No daemon status found, using fallback proxy port: ${proxyUrl}`);
   }

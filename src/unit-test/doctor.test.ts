@@ -89,6 +89,7 @@ describe("doctor command", () => {
       expect(report.checks.map((check: { name: string }) => check.name)).toEqual([
         "pair registration",
         "env",
+        "config.json",
         "daemon health",
         "daemon readiness",
         "build drift",
@@ -148,6 +149,72 @@ describe("doctor command", () => {
 
       expect(daemonLog.status).toBe("warn");
       expect(daemonLog.detail).toContain("oversized");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("config.json check is OK and reports default-in-effect when no config exists", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agentbridge-doctor-"));
+    const base = mkdtempSync(join(tmpdir(), "agentbridge-doctor-base-"));
+    try {
+      process.chdir(root);
+      process.env.AGENTBRIDGE_BASE_DIR = base;
+      seedPair(root, base);
+
+      const report = await runDoctorJson(["--pair", "main"]);
+      const cfg = report.checks.find((c: { name: string }) => c.name === "config.json");
+
+      expect(cfg.status).toBe("ok");
+      expect(cfg.detail).toContain("no project config");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("config.json check is OK and reports custom-values-in-effect for a good custom config", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agentbridge-doctor-"));
+    const base = mkdtempSync(join(tmpdir(), "agentbridge-doctor-base-"));
+    try {
+      process.chdir(root);
+      process.env.AGENTBRIDGE_BASE_DIR = base;
+      seedPair(root, base);
+      mkdirSync(join(root, ".agentbridge"), { recursive: true });
+      writeFileSync(
+        join(root, ".agentbridge", "config.json"),
+        JSON.stringify({ budget: { pauseAt: 85, resumeBelow: 20 } }),
+        "utf-8",
+      );
+
+      const report = await runDoctorJson(["--pair", "main"]);
+      const cfg = report.checks.find((c: { name: string }) => c.name === "config.json");
+
+      expect(cfg.status).toBe("ok");
+      expect(cfg.detail).toContain("custom values in effect");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(base, { recursive: true, force: true });
+    }
+  });
+
+  test("config.json check WARNs on a corrupt config", async () => {
+    const root = mkdtempSync(join(tmpdir(), "agentbridge-doctor-"));
+    const base = mkdtempSync(join(tmpdir(), "agentbridge-doctor-base-"));
+    try {
+      process.chdir(root);
+      process.env.AGENTBRIDGE_BASE_DIR = base;
+      seedPair(root, base);
+      mkdirSync(join(root, ".agentbridge"), { recursive: true });
+      writeFileSync(join(root, ".agentbridge", "config.json"), "{ broken json", "utf-8");
+
+      const report = await runDoctorJson(["--pair", "main"]);
+      const cfg = report.checks.find((c: { name: string }) => c.name === "config.json");
+
+      expect(cfg.status).toBe("warn");
+      expect(cfg.detail).toContain("NOT in effect");
+      expect(cfg.hint).toBeDefined();
     } finally {
       rmSync(root, { recursive: true, force: true });
       rmSync(base, { recursive: true, force: true });

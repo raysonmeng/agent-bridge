@@ -32,11 +32,13 @@ const envGuardResult = guardAgentBridgeEnv({
 
 const stateDir = new StateDirResolver();
 stateDir.ensure();
+const processLogger = createProcessLogger({ component: "AgentBridgeFrontend", logFile: stateDir.logFile });
 const configService = new ConfigService();
-const config = configService.loadOrDefault();
+// Thread the frontend logger so a corrupt config.json fails loud (to log +
+// stderr) instead of silently reverting custom thresholds to defaults.
+const config = configService.loadOrDefault(processLogger.log);
 
 const CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
-const processLogger = createProcessLogger({ component: "AgentBridgeFrontend", logFile: stateDir.logFile });
 const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 const CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 
