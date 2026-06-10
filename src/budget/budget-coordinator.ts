@@ -54,6 +54,7 @@ export interface BudgetCoordinatorOptions {
   config: BudgetConfig;
   emit: (id: string, content: string) => void;
   onPauseChange: (paused: boolean) => void;
+  onSnapshot?: (snapshot: BudgetSnapshot | null) => void;
   now?: () => number;
   scheduler?: BudgetPollScheduler;
   log?: (message: string) => void;
@@ -150,6 +151,7 @@ export class BudgetCoordinator {
   private readonly config: BudgetConfig;
   private readonly emit: (id: string, content: string) => void;
   private readonly onPauseChange: (paused: boolean) => void;
+  private readonly onSnapshot: (snapshot: BudgetSnapshot | null) => void;
   private readonly now: () => number;
   private readonly scheduler: BudgetPollScheduler;
   private readonly log: (message: string) => void;
@@ -172,6 +174,7 @@ export class BudgetCoordinator {
     this.config = options.config;
     this.emit = options.emit;
     this.onPauseChange = options.onPauseChange;
+    this.onSnapshot = options.onSnapshot ?? (() => {});
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
     this.scheduler = options.scheduler ?? REAL_BUDGET_POLL_SCHEDULER;
     this.log = options.log ?? (() => {});
@@ -264,7 +267,7 @@ export class BudgetCoordinator {
     }
 
     if (!usage) {
-      if (!this.isPaused()) this.latestSnapshot = null;
+      if (!this.isPaused()) this.setSnapshot(null);
       return;
     }
 
@@ -275,7 +278,12 @@ export class BudgetCoordinator {
     const state = computeBudgetState(usage.claude, usage.codex, this.config, this.now());
     this.updatePendingOverrides(state.effort.codexTier);
     this.applyState(state);
-    this.latestSnapshot = this.toSnapshot(state);
+    this.setSnapshot(this.toSnapshot(state));
+  }
+
+  private setSnapshot(snapshot: BudgetSnapshot | null): void {
+    this.latestSnapshot = snapshot;
+    this.onSnapshot(snapshot);
   }
 
   private applyState(state: BudgetState): void {

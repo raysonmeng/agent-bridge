@@ -154,7 +154,6 @@ const bufferedMessages: BridgeMessage[] = [];
 // The coordinator owns polling/dedup/pause-hysteresis; the daemon owns the
 // claude_to_codex pause gate and snapshot exposure via DaemonStatus.budget.
 let budgetCoordinator: BudgetCoordinator | null = null;
-let budgetStatusTimer: ReturnType<typeof setInterval> | null = null;
 
 function ensureBudgetCoordinatorStarted() {
   if (!BUDGET_CONFIG.enabled) return;
@@ -175,10 +174,6 @@ function ensureBudgetCoordinatorStarted() {
       config: BUDGET_CONFIG,
       emit: (id, content) => {
         emitToClaude(systemMessage(id, content));
-        // Defer one microtask: the coordinator writes latestSnapshot AFTER its
-        // applyState() callbacks return, so an immediate broadcast would push
-        // the previous poll's snapshot on directive edges.
-        queueMicrotask(() => broadcastStatus());
       },
       onPauseChange: (paused) => {
         // v2.4: paused = R4 intervention active (handoff OR pause); the reply
@@ -187,26 +182,16 @@ function ensureBudgetCoordinatorStarted() {
           `Budget intervention ${paused ? "ACTIVE" : "CLEARED"} ` +
           `(gate ${budgetCoordinator?.isGateClosed() ? "CLOSED" : "OPEN"})`,
         );
-        queueMicrotask(() => broadcastStatus());
       },
+      onSnapshot: () => broadcastStatus(),
       log,
     });
   }
   void budgetCoordinator.start();
-  // Keep DaemonStatus.budget (and the bridge's get_budget cache) fresh between
-  // directives: snapshots change every poll even when no directive fires.
-  if (!budgetStatusTimer) {
-    budgetStatusTimer = setInterval(() => broadcastStatus(), BUDGET_CONFIG.pollSeconds * 1000);
-    budgetStatusTimer.unref?.();
-  }
 }
 
 function stopBudgetCoordinator() {
   budgetCoordinator?.stop();
-  if (budgetStatusTimer) {
-    clearInterval(budgetStatusTimer);
-    budgetStatusTimer = null;
-  }
 }
 
 function budgetPauseGateError(): string {

@@ -18,7 +18,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("eec6018", "source"),
+  commit: defineString("c817916", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -3522,6 +3522,7 @@ class BudgetCoordinator {
   config;
   emit;
   onPauseChange;
+  onSnapshot;
   now;
   scheduler;
   log;
@@ -3542,6 +3543,7 @@ class BudgetCoordinator {
     this.config = options.config;
     this.emit = options.emit;
     this.onPauseChange = options.onPauseChange;
+    this.onSnapshot = options.onSnapshot ?? (() => {});
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
     this.scheduler = options.scheduler ?? REAL_BUDGET_POLL_SCHEDULER;
     this.log = options.log ?? (() => {});
@@ -3619,7 +3621,7 @@ class BudgetCoordinator {
     }
     if (!usage) {
       if (!this.isPaused())
-        this.latestSnapshot = null;
+        this.setSnapshot(null);
       return;
     }
     if (!this.running) {
@@ -3628,7 +3630,11 @@ class BudgetCoordinator {
     const state = computeBudgetState(usage.claude, usage.codex, this.config, this.now());
     this.updatePendingOverrides(state.effort.codexTier);
     this.applyState(state);
-    this.latestSnapshot = this.toSnapshot(state);
+    this.setSnapshot(this.toSnapshot(state));
+  }
+  setSnapshot(snapshot) {
+    this.latestSnapshot = snapshot;
+    this.onSnapshot(snapshot);
   }
   applyState(state) {
     const previousSide = this.pauseSide();
@@ -4549,7 +4555,6 @@ var LIVENESS_PROBE_POLL_MS = 50;
 var challengeInProgress = false;
 var bufferedMessages = [];
 var budgetCoordinator = null;
-var budgetStatusTimer = null;
 function ensureBudgetCoordinatorStarted() {
   if (!BUDGET_CONFIG.enabled)
     return;
@@ -4560,27 +4565,18 @@ function ensureBudgetCoordinatorStarted() {
       config: BUDGET_CONFIG,
       emit: (id, content) => {
         emitToClaude(systemMessage(id, content));
-        queueMicrotask(() => broadcastStatus());
       },
       onPauseChange: (paused) => {
         log(`Budget intervention ${paused ? "ACTIVE" : "CLEARED"} ` + `(gate ${budgetCoordinator?.isGateClosed() ? "CLOSED" : "OPEN"})`);
-        queueMicrotask(() => broadcastStatus());
       },
+      onSnapshot: () => broadcastStatus(),
       log
     });
   }
   budgetCoordinator.start();
-  if (!budgetStatusTimer) {
-    budgetStatusTimer = setInterval(() => broadcastStatus(), BUDGET_CONFIG.pollSeconds * 1000);
-    budgetStatusTimer.unref?.();
-  }
 }
 function stopBudgetCoordinator() {
   budgetCoordinator?.stop();
-  if (budgetStatusTimer) {
-    clearInterval(budgetStatusTimer);
-    budgetStatusTimer = null;
-  }
 }
 function budgetPauseGateError() {
   const snapshot = budgetCoordinator?.getSnapshot() ?? null;
