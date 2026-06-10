@@ -12,7 +12,7 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createServer } from "node:net";
+import { createServer, connect, type Socket } from "node:net";
 import type { BridgeMessage } from "../types";
 import type { ControlServerMessage, DaemonStatus } from "../control-protocol";
 import { portsForSlot, type PairPorts } from "../pair-registry";
@@ -57,6 +57,32 @@ describe("daemon wiring", () => {
       await harness.close();
     }
   });
+
+  test("CSWSH guard: a WS upgrade carrying an Origin header is 403'd on BOTH the control and proxy ports, while no-Origin clients still connect", async () => {
+    const harness = await startHarness({ pairId: "main-cswshabcd", pairName: "main" });
+
+    // The no-Origin legit path must still work: attachClaude uses the Bun global
+    // WebSocket (control /ws) and connectTui uses it against the proxy. Both send
+    // no Origin and must succeed through the guard.
+    await harness.attachClaude();
+    await harness.connectTui();
+    expect(harness.controlWs?.readyState).toBe(WebSocket.OPEN);
+
+    // A browser-style upgrade (Origin present) must be rejected with 403 — never
+    // upgraded — on the control port (CSWSH against turn injection + readback)…
+    const controlStatus = await rawUpgradeStatus(harness.controlPort, "/ws", "http://evil.example");
+    expect(controlStatus).toContain("403");
+    expect(controlStatus).not.toContain("101");
+
+    // …and on the Codex proxy port (CSWSH against the Codex TUI relay).
+    const proxyStatus = await rawUpgradeStatus(harness.proxyPort, "/", "http://evil.example");
+    expect(proxyStatus).toContain("403");
+    expect(proxyStatus).not.toContain("101");
+
+    // /healthz is a plain GET, not an upgrade — the guard must not break it.
+    const healthz = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+    expect(healthz.status).toBe(200);
+  }, 25000);
 
   test("waiting notice uses pair-aware waiting message formatting", async () => {
     const harness = await startHarness({ pairId: "main-testabcd", pairName: "main" });
@@ -698,6 +724,45 @@ async function startHarness(opts: {
   });
 
   return harness;
+}
+
+/**
+ * Drive a raw HTTP WS-upgrade handshake against a port with an explicit Origin
+ * header and return the response status line. A raw socket is the only way to
+ * attach an arbitrary Origin to the upgrade — the JS WebSocket constructor does
+ * not let us set it, but a browser always sends one.
+ */
+function rawUpgradeStatus(port: number, path: string, origin: string): Promise<string> {
+  const handshake =
+    `GET ${path} HTTP/1.1\r\n` +
+    "Host: 127.0.0.1\r\n" +
+    "Upgrade: websocket\r\n" +
+    "Connection: Upgrade\r\n" +
+    "Sec-WebSocket-Version: 13\r\n" +
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n" +
+    `Origin: ${origin}\r\n` +
+    "\r\n";
+  return new Promise((resolve, reject) => {
+    const sock: Socket = connect(port, "127.0.0.1", () => sock.write(handshake));
+    let buf = "";
+    const timer = setTimeout(() => {
+      sock.destroy();
+      reject(new Error("raw upgrade timeout"));
+    }, 5000);
+    sock.on("data", (d: Buffer) => {
+      buf += d.toString("utf8");
+      const nl = buf.indexOf("\r\n");
+      if (nl !== -1) {
+        clearTimeout(timer);
+        sock.destroy();
+        resolve(buf.slice(0, nl));
+      }
+    });
+    sock.on("error", (e) => {
+      clearTimeout(timer);
+      reject(e);
+    });
+  });
 }
 
 function fakeCodexScript(): string {

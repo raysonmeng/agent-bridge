@@ -47,6 +47,7 @@ import {
   ADAPTER_DISCONNECT_REASON,
   APP_SERVER_RECONNECT_NEW_TUI_REASON,
 } from "./turn-notices";
+import { isAllowedWsUpgrade, wsOriginRejectedResponse } from "./ws-origin-guard";
 
 interface TuiSocketData {
   connId: number;
@@ -920,6 +921,15 @@ export class CodexAdapter extends EventEmitter {
             return new Response(up ? "ok" : "upstream not connected", { status: up ? 200 : 503 });
           }
           return fetch(`http://127.0.0.1:${self.appPort}${url.pathname}`);
+        }
+        // CSWSH guard: reject any WS upgrade carrying an Origin header (browser
+        // page) before upgrading. The legitimate Codex TUI proxy client uses the
+        // Bun global WebSocket and sends no Origin — empirically verified, see
+        // ws-origin-guard.ts. The /healthz and /readyz GET endpoints above are
+        // not gated (they are plain HTTP, not upgrades).
+        if (isUpgrade && !isAllowedWsUpgrade(req)) {
+          self.log("Rejected WS upgrade on proxy port: Origin header present (possible CSWSH)");
+          return wsOriginRejectedResponse();
         }
         if (server.upgrade(req, { data: { connId: 0 } })) return undefined;
         self.log(`WARNING: non-upgrade HTTP request not handled: ${req.method} ${url.pathname}`);

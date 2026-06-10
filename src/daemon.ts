@@ -22,6 +22,7 @@ import {
   CLOSE_CODE_PROBE_IN_PROGRESS,
 } from "./control-protocol";
 import { parsePositiveIntEnv } from "./env-utils";
+import { isAllowedWsUpgrade, wsOriginRejectedResponse } from "./ws-origin-guard";
 import { ReplyRequiredTracker } from "./reply-required-tracker";
 import { persistCurrentThreadWithRolloutRetry } from "./thread-state";
 import { createProcessLogger } from "./process-log";
@@ -471,8 +472,18 @@ function startControlServer() {
         return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
       }
 
-      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now(), pongCount: 0, pendingBackpressure: [] } })) {
-        return undefined;
+      if (url.pathname === "/ws") {
+        // CSWSH guard: reject any WS upgrade carrying an Origin header (browser
+        // page) before upgrading. The legitimate CLI client (daemon-client.ts)
+        // uses the Bun global WebSocket and sends no Origin — empirically
+        // verified, see ws-origin-guard.ts. GET endpoints above are not gated.
+        if (!isAllowedWsUpgrade(req)) {
+          log("Rejected WS upgrade on control port: Origin header present (possible CSWSH)");
+          return wsOriginRejectedResponse();
+        }
+        if (server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now(), pongCount: 0, pendingBackpressure: [] } })) {
+          return undefined;
+        }
       }
 
       return new Response("AgentBridge daemon");

@@ -18,7 +18,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.11", "0.0.0-source"),
-  commit: defineString("bbdc792", "source"),
+  commit: defineString("a2eb5fa", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -625,6 +625,25 @@ function buildTurnAbortedNotice(reason, replyWasRequired) {
   return `\u26A0\uFE0F Codex's current turn ended without completing (${reason}). ` + "This usually means Codex hit an error (e.g. a rate limit / 429), the app-server connection dropped, or the turn was interrupted." + tail;
 }
 
+// src/ws-origin-guard.ts
+var ALLOWED_ORIGINS_ENV = "AGENTBRIDGE_WS_ALLOWED_ORIGINS";
+function parseAllowedWsOrigins(env = process.env) {
+  const raw = env[ALLOWED_ORIGINS_ENV];
+  if (raw == null || raw === "")
+    return new Set;
+  const origins = raw.split(",").map((entry) => entry.trim()).filter((entry) => entry.length > 0);
+  return new Set(origins);
+}
+function isAllowedWsUpgrade(req, allowedOrigins = parseAllowedWsOrigins()) {
+  const origin = req.headers.get("origin");
+  if (origin == null || origin === "")
+    return true;
+  return allowedOrigins.has(origin);
+}
+function wsOriginRejectedResponse() {
+  return new Response("Forbidden: WebSocket Origin not allowed", { status: 403 });
+}
+
 // src/codex-adapter.ts
 class CodexAdapter extends EventEmitter {
   static RESPONSE_TRACKING_TTL_MS = 30000;
@@ -1173,6 +1192,10 @@ class CodexAdapter extends EventEmitter {
             return new Response(up ? "ok" : "upstream not connected", { status: up ? 200 : 503 });
           }
           return fetch(`http://127.0.0.1:${self.appPort}${url.pathname}`);
+        }
+        if (isUpgrade && !isAllowedWsUpgrade(req)) {
+          self.log("Rejected WS upgrade on proxy port: Origin header present (possible CSWSH)");
+          return wsOriginRejectedResponse();
         }
         if (server.upgrade(req, { data: { connId: 0 } }))
           return;
@@ -4297,8 +4320,14 @@ function startControlServer() {
       if (url.pathname === "/readyz") {
         return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
       }
-      if (url.pathname === "/ws" && server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now(), pongCount: 0, pendingBackpressure: [] } })) {
-        return;
+      if (url.pathname === "/ws") {
+        if (!isAllowedWsUpgrade(req)) {
+          log("Rejected WS upgrade on control port: Origin header present (possible CSWSH)");
+          return wsOriginRejectedResponse();
+        }
+        if (server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now(), pongCount: 0, pendingBackpressure: [] } })) {
+          return;
+        }
       }
       return new Response("AgentBridge daemon");
     },
