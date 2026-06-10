@@ -16,11 +16,11 @@ export const MARKETPLACE_NAME = "agentbridge";
 export const PLUGIN_NAME = "agentbridge";
 
 /** Commands that print an update notice. claude/codex/resume also trigger the daily refresh. */
-const REFRESH_COMMANDS = new Set(["claude", "codex", "resume"]);
-const NOTIFY_COMMANDS = new Set(["claude", "codex", "init", "dev", "resume"]);
+export const REFRESH_COMMANDS = new Set(["claude", "codex", "resume"]);
+export const NOTIFY_COMMANDS = new Set(["claude", "codex", "init", "dev", "resume"]);
 
 /** Subcommands that accept a `--pair <name>` selector. */
-const PAIR_AWARE_COMMANDS = new Set(["claude", "codex", "kill", "doctor", "budget", "resume"]);
+export const PAIR_AWARE_COMMANDS = new Set(["claude", "codex", "kill", "doctor", "budget", "resume", "logs"]);
 
 /**
  * Split argv into the subcommand and its args, allowing a leading `--pair <name>`
@@ -112,6 +112,10 @@ async function main(command: string | undefined, restArgs: string[]) {
       const { runBudget } = await import("./cli/budget");
       await runBudget(restArgs);
       break;
+    case "logs":
+      const { runLogs } = await import("./cli/logs");
+      await runLogs(restArgs);
+      break;
     case "--help":
     case "-h":
     case undefined:
@@ -151,6 +155,9 @@ Commands:
   doctor [--json]    Diagnose env, daemon, build drift, logs, and current thread
   doctor resume-pollution [--apply]  Find/fix old AgentBridge kickoff metadata
   budget [--json]    Show both agents' subscription quota snapshot (5h/weekly, drift, pause state)
+  logs [--codex] [-f] [-n N]
+                     Tail this pair's daemon log (or the codex wrapper log with
+                     --codex). -n N: last N lines (default 100). -f: follow/stream.
   kill [all | --all | --pair <name|id>]
                      Stop this directory's pairs (default), every pair (all/--all), or one (--pair)
 
@@ -189,6 +196,10 @@ Examples:
   abg pairs                    # List all pairs and their ports/status
   abg pairs --threads          # Include current thread mapping
   abg doctor --json            # Emit a structured diagnostics report
+  abg logs                     # Tail the last 100 lines of this pair's daemon log
+  abg logs -f -n 200           # Follow the log, starting from the last 200 lines
+  abg logs --codex             # Tail the codex wrapper log instead
+  abg --pair work logs         # Tail the "work" pair's daemon log
   abg pairs rm work            # Stop this directory's "work" pair and free its slot
   abg pairs rm work-1a2b3c4d   # ...or by its full id (from that pair's directory)
   abg pairs prune --dry-run    # Preview orphan pair dirs (no registry entry, not live)
