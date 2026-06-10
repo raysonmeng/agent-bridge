@@ -33,24 +33,6 @@ async function withTurnWatchdogMs<T>(ms: number, fn: () => Promise<T>): Promise<
   }
 }
 
-function sleep(ms: number) {
-  return new Promise((resolve) => setTimeout(resolve, ms));
-}
-
-async function withTurnWatchdogMs<T>(ms: number, fn: () => Promise<T>): Promise<T> {
-  const previous = process.env.AGENTBRIDGE_TURN_WATCHDOG_MS;
-  process.env.AGENTBRIDGE_TURN_WATCHDOG_MS = String(ms);
-  try {
-    return await fn();
-  } finally {
-    if (previous === undefined) {
-      delete process.env.AGENTBRIDGE_TURN_WATCHDOG_MS;
-    } else {
-      process.env.AGENTBRIDGE_TURN_WATCHDOG_MS = previous;
-    }
-  }
-}
-
 describe("CodexAdapter app-server response handling", () => {
   test("forwards active mapped responses back to the current TUI id", () => {
     const adapter = createAdapter();

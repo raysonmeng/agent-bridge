@@ -51,9 +51,6 @@ let daemonDisabledReason: BridgeDisabledReason | null = null;
 let hasSeenTuiConnect = false;
 let previousTuiConnected = false;
 
-// --- Budget pause pull-mode warning (once per process) ---
-let pullModePauseWarned = false;
-
 // --- Notification throttling for reconnect loops ---
 const RECONNECT_NOTIFY_COOLDOWN_MS = 30_000; // Only notify once per 30s window
 const DISABLED_RECOVERY_INTERVAL_MS = 5_000;

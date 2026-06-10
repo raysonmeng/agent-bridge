@@ -15383,7 +15383,6 @@ var daemonDisabled = false;
 var daemonDisabledReason = null;
 var hasSeenTuiConnect = false;
 var previousTuiConnected = false;
-var pullModePauseWarned = false;
 var RECONNECT_NOTIFY_COOLDOWN_MS = 30000;
 var DISABLED_RECOVERY_INTERVAL_MS = 5000;
 var lastDisconnectNotifyTs = 0;
