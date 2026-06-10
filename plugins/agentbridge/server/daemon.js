@@ -18,7 +18,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.11", "0.0.0-source"),
-  commit: defineString("63c4412", "source"),
+  commit: defineString("bbdc792", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -209,13 +209,14 @@ import { appendFileSync, existsSync as existsSync2, renameSync, statSync, unlink
 import { dirname } from "path";
 var DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
 var DEFAULT_KEEP = 3;
-function appendRotatingLog(path, content, options = {}) {
+var REAL_FS_OPS = { statSync, renameSync, unlinkSync, appendFileSync, existsSync: existsSync2 };
+function appendRotatingLog(path, content, options = {}, fsOps = REAL_FS_OPS) {
   const maxBytes = options.maxBytes ?? positiveIntFromEnv("AGENTBRIDGE_LOG_MAX_BYTES", DEFAULT_MAX_BYTES);
   const keep = options.keep ?? positiveIntFromEnv("AGENTBRIDGE_LOG_ROTATE_KEEP", DEFAULT_KEEP);
-  if (!existsSync2(dirname(path)))
+  if (!fsOps.existsSync(dirname(path)))
     return;
-  rotateIfNeeded(path, Buffer.byteLength(content), maxBytes, keep);
-  appendFileSync(path, content, "utf-8");
+  rotateIfNeeded(path, Buffer.byteLength(content), maxBytes, keep, fsOps);
+  fsOps.appendFileSync(path, content, "utf-8");
 }
 function positiveIntFromEnv(name, fallback) {
   const value = process.env[name];
@@ -224,26 +225,48 @@ function positiveIntFromEnv(name, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
-function rotateIfNeeded(path, incomingBytes, maxBytes, keep) {
+function isEnoent(error) {
+  return !!error && error.code === "ENOENT";
+}
+function renameIfPresent(from, to, fsOps) {
+  try {
+    fsOps.renameSync(from, to);
+  } catch (error) {
+    if (!isEnoent(error))
+      throw error;
+  }
+}
+function unlinkIfPresent(path, fsOps) {
+  try {
+    fsOps.unlinkSync(path);
+  } catch (error) {
+    if (!isEnoent(error))
+      throw error;
+  }
+}
+function rotateIfNeeded(path, incomingBytes, maxBytes, keep, fsOps) {
   if (!Number.isFinite(maxBytes) || maxBytes <= 0 || keep <= 0)
     return;
-  if (!existsSync2(path))
-    return;
-  const size = statSync(path).size;
+  let size;
+  try {
+    size = fsOps.statSync(path).size;
+  } catch (error) {
+    if (isEnoent(error))
+      return;
+    throw error;
+  }
   if (size + incomingBytes <= maxBytes)
     return;
   for (let index = keep;index >= 1; index--) {
     const current = `${path}.${index}`;
     const next = `${path}.${index + 1}`;
-    if (!existsSync2(current))
-      continue;
     if (index === keep) {
-      unlinkSync(current);
+      unlinkIfPresent(current, fsOps);
     } else {
-      renameSync(current, next);
+      renameIfPresent(current, next, fsOps);
     }
   }
-  renameSync(path, `${path}.1`);
+  renameIfPresent(path, `${path}.1`, fsOps);
 }
 
 // src/process-log.ts

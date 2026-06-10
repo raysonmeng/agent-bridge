@@ -1,5 +1,9 @@
-import { appendFileSync, mkdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, statSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
+
+/** Trace files older than this (by mtime) are pruned when a new day's file is created. */
+export const TRACE_RETENTION_DAYS = 7;
+const TRACE_FILE_RE = /^trace-\d{4}-\d{2}-\d{2}\.jsonl$/;
 
 const SECRET_KEY_RE = /(token|secret|password|passwd|api[_-]?key|auth|cookie|session)/i;
 const SECRET_ARG_RE = /^--?(?:token|secret|password|passwd|apikey|api-key|api_key|auth|cookie|session)(?:=.*)?$/i;
@@ -86,9 +90,49 @@ export function appendTraceEvent(input: TraceEventInput): string {
     ...(input.data ? { data: redactData(input.data) } : {}),
   };
 
-  mkdirSync(join(input.cwd, ".agentbridge", "logs"), { recursive: true });
+  const logsDir = join(input.cwd, ".agentbridge", "logs");
+  // Built-in retention: trace-<day>.jsonl files have no maxBytes and accumulate
+  // one per day forever. We prune only when a NEW day's file is about to be
+  // created (a cheap, self-limiting trigger that runs at most once per UTC day
+  // per process), deleting same-dir trace files whose mtime predates the
+  // retention window. `now` is derived from the event timestamp so callers can
+  // drive deterministic tests.
+  const isNewDayFile = !existsSync(path);
+  mkdirSync(logsDir, { recursive: true });
+  if (isNewDayFile) {
+    pruneOldTraceLogs(logsDir, path, Date.parse(timestamp));
+  }
   appendFileSync(path, JSON.stringify(event) + "\n", "utf-8");
   return path;
+}
+
+/**
+ * Delete trace-*.jsonl files in `logsDir` whose mtime is older than
+ * TRACE_RETENTION_DAYS relative to `nowMs`. Best-effort: never throws (it runs
+ * inside the best-effort logging path). The just-created file (`keepPath`) and
+ * any non-trace file are always left untouched.
+ */
+function pruneOldTraceLogs(logsDir: string, keepPath: string, nowMs: number): void {
+  if (!Number.isFinite(nowMs)) return;
+  const cutoff = nowMs - TRACE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  let entries: string[];
+  try {
+    entries = readdirSync(logsDir);
+  } catch {
+    return;
+  }
+  for (const name of entries) {
+    if (!TRACE_FILE_RE.test(name)) continue;
+    const filePath = join(logsDir, name);
+    if (filePath === keepPath) continue;
+    try {
+      if (statSync(filePath).mtimeMs < cutoff) {
+        unlinkSync(filePath);
+      }
+    } catch {
+      // A peer process may have removed it first, or stat raced — ignore.
+    }
+  }
 }
 
 /** A `data` field that is an env snapshot (key ends in "env", value is a plain object). */

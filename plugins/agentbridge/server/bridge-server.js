@@ -6518,7 +6518,7 @@ var require_dist = __commonJS((exports, module) => {
 });
 
 // src/bridge.ts
-import { existsSync as existsSync6 } from "fs";
+import { existsSync as existsSync7 } from "fs";
 
 // node_modules/zod/v4/core/core.js
 var NEVER = Object.freeze({
@@ -13668,13 +13668,14 @@ import { appendFileSync, existsSync, renameSync, statSync, unlinkSync } from "fs
 import { dirname } from "path";
 var DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
 var DEFAULT_KEEP = 3;
-function appendRotatingLog(path, content, options = {}) {
+var REAL_FS_OPS = { statSync, renameSync, unlinkSync, appendFileSync, existsSync };
+function appendRotatingLog(path, content, options = {}, fsOps = REAL_FS_OPS) {
   const maxBytes = options.maxBytes ?? positiveIntFromEnv("AGENTBRIDGE_LOG_MAX_BYTES", DEFAULT_MAX_BYTES);
   const keep = options.keep ?? positiveIntFromEnv("AGENTBRIDGE_LOG_ROTATE_KEEP", DEFAULT_KEEP);
-  if (!existsSync(dirname(path)))
+  if (!fsOps.existsSync(dirname(path)))
     return;
-  rotateIfNeeded(path, Buffer.byteLength(content), maxBytes, keep);
-  appendFileSync(path, content, "utf-8");
+  rotateIfNeeded(path, Buffer.byteLength(content), maxBytes, keep, fsOps);
+  fsOps.appendFileSync(path, content, "utf-8");
 }
 function positiveIntFromEnv(name, fallback) {
   const value = process.env[name];
@@ -13683,26 +13684,48 @@ function positiveIntFromEnv(name, fallback) {
   const parsed = Number(value);
   return Number.isFinite(parsed) && parsed > 0 ? Math.floor(parsed) : fallback;
 }
-function rotateIfNeeded(path, incomingBytes, maxBytes, keep) {
+function isEnoent(error2) {
+  return !!error2 && error2.code === "ENOENT";
+}
+function renameIfPresent(from, to, fsOps) {
+  try {
+    fsOps.renameSync(from, to);
+  } catch (error2) {
+    if (!isEnoent(error2))
+      throw error2;
+  }
+}
+function unlinkIfPresent(path, fsOps) {
+  try {
+    fsOps.unlinkSync(path);
+  } catch (error2) {
+    if (!isEnoent(error2))
+      throw error2;
+  }
+}
+function rotateIfNeeded(path, incomingBytes, maxBytes, keep, fsOps) {
   if (!Number.isFinite(maxBytes) || maxBytes <= 0 || keep <= 0)
     return;
-  if (!existsSync(path))
-    return;
-  const size = statSync(path).size;
+  let size;
+  try {
+    size = fsOps.statSync(path).size;
+  } catch (error2) {
+    if (isEnoent(error2))
+      return;
+    throw error2;
+  }
   if (size + incomingBytes <= maxBytes)
     return;
   for (let index = keep;index >= 1; index--) {
     const current = `${path}.${index}`;
     const next = `${path}.${index + 1}`;
-    if (!existsSync(current))
-      continue;
     if (index === keep) {
-      unlinkSync(current);
+      unlinkIfPresent(current, fsOps);
     } else {
-      renameSync(current, next);
+      renameIfPresent(current, next, fsOps);
     }
   }
-  renameSync(path, `${path}.1`);
+  renameIfPresent(path, `${path}.1`, fsOps);
 }
 
 // src/process-log.ts
@@ -14231,7 +14254,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.11", "0.0.0-source"),
-  commit: defineString("63c4412", "source"),
+  commit: defineString("bbdc792", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -15309,8 +15332,10 @@ function nonEmpty(value) {
 }
 
 // src/trace-log.ts
-import { appendFileSync as appendFileSync2, mkdirSync as mkdirSync4 } from "fs";
+import { appendFileSync as appendFileSync2, existsSync as existsSync6, mkdirSync as mkdirSync4, readdirSync as readdirSync2, statSync as statSync4, unlinkSync as unlinkSync4 } from "fs";
 import { join as join4 } from "path";
+var TRACE_RETENTION_DAYS = 7;
+var TRACE_FILE_RE = /^trace-\d{4}-\d{2}-\d{2}\.jsonl$/;
 var SECRET_KEY_RE = /(token|secret|password|passwd|api[_-]?key|auth|cookie|session)/i;
 var SECRET_ARG_RE = /^--?(?:token|secret|password|passwd|apikey|api-key|api_key|auth|cookie|session)(?:=.*)?$/i;
 var RELEVANT_ENV_RE = /^(AGENTBRIDGE_|CODEX_)/;
@@ -15362,10 +15387,38 @@ function appendTraceEvent(input) {
     ...input.env ? { env: pickRelevantEnv(input.env) } : {},
     ...input.data ? { data: redactData(input.data) } : {}
   };
-  mkdirSync4(join4(input.cwd, ".agentbridge", "logs"), { recursive: true });
+  const logsDir = join4(input.cwd, ".agentbridge", "logs");
+  const isNewDayFile = !existsSync6(path);
+  mkdirSync4(logsDir, { recursive: true });
+  if (isNewDayFile) {
+    pruneOldTraceLogs(logsDir, path, Date.parse(timestamp));
+  }
   appendFileSync2(path, JSON.stringify(event) + `
 `, "utf-8");
   return path;
+}
+function pruneOldTraceLogs(logsDir, keepPath, nowMs) {
+  if (!Number.isFinite(nowMs))
+    return;
+  const cutoff = nowMs - TRACE_RETENTION_DAYS * 24 * 60 * 60 * 1000;
+  let entries;
+  try {
+    entries = readdirSync2(logsDir);
+  } catch {
+    return;
+  }
+  for (const name of entries) {
+    if (!TRACE_FILE_RE.test(name))
+      continue;
+    const filePath = join4(logsDir, name);
+    if (filePath === keepPath)
+      continue;
+    try {
+      if (statSync4(filePath).mtimeMs < cutoff) {
+        unlinkSync4(filePath);
+      }
+    } catch {}
+  }
 }
 function isEnvSnapshot(key, value) {
   return /env$/i.test(key) && !!value && typeof value === "object" && !Array.isArray(value);
@@ -15601,7 +15654,7 @@ async function notifyIfDaemonKilled(logMessage) {
   return true;
 }
 async function notifyIfPairRemoved(logMessage) {
-  if (existsSync6(stateDir.dir))
+  if (existsSync7(stateDir.dir))
     return false;
   await enterDisabledState(logMessage, `\u26D4 This pair's state directory was removed (\`abg pairs rm\` / \`prune\`). Bridge is staying idle. Start fresh with \`${pairScopedCommand("claude")}\` if you still need this pair. \u8BE5 pair \u7684\u72B6\u6001\u76EE\u5F55\u5DF2\u88AB\u5220\u9664\uFF08pairs rm / prune\uFF09\uFF0C\u6865\u63A5\u4FDD\u6301\u5F85\u673A\uFF1B\u5982\u4ECD\u9700\u8981\u8BF7\u7528 \`${pairScopedCommand("claude")}\` \u91CD\u65B0\u542F\u52A8\u3002`);
   return true;
