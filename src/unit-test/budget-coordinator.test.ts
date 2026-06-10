@@ -37,6 +37,7 @@ function usage(overrides: Partial<AgentUsage> = {}): AgentUsage {
     remaining: 100 - gateUtil,
     rateLimitedUntil: 0,
     fetchedAt: NOW,
+    parsedVia: "id-match",
     ...overrides,
   };
 }

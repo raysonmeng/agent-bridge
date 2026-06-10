@@ -29,6 +29,9 @@ function formatAgent(name: string, usage: AgentUsage | null, snapshotAt: number)
   if (usage.rateLimitedUntil > 0) {
     parts.push(`限流至 ${formatEpoch(usage.rateLimitedUntil)}`);
   }
+  if (usage.parsedVia === "positional") {
+    parts.push("⚠️ 窗口识别使用位置兜底");
+  }
   // Data age, not poll age: a stale probe cache served at poll time carries a
   // fresh-looking snapshot timestamp over hours-old numbers.
   const ageSec = usage.fetchedAt > 0 ? snapshotAt - usage.fetchedAt : 0;

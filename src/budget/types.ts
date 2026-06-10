@@ -24,6 +24,9 @@ export interface BudgetWindow {
   resetEpoch: number;
 }
 
+/** How confidently AgentBridge mapped raw probe buckets to known quota windows. */
+export type ProbeParsedVia = "id-match" | "positional" | "top-level";
+
 /**
  * Normalized per-agent usage from an agent-quota-guard probe.
  *
@@ -55,6 +58,8 @@ export interface AgentUsage {
   rateLimitedUntil: number;
   /** Unix seconds the underlying data was fetched. */
   fetchedAt: number;
+  /** Probe bucket parsing path; positional means AgentBridge used a heuristic fallback. */
+  parsedVia: ProbeParsedVia;
 }
 
 export type AgentName = "claude" | "codex";

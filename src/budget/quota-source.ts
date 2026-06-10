@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
-import type { AgentName, AgentUsage, BudgetWindow } from "./types";
+import type { AgentName, AgentUsage, BudgetWindow, ProbeParsedVia } from "./types";
 
 export interface ProbeRunOptions {
   env: Record<string, string | undefined>;
@@ -171,6 +171,7 @@ function pickHighestUtil(buckets: RawBucket[]): RawBucket | null {
 function identifyWindows(buckets: RawBucket[]): {
   fiveHour: BudgetWindow | null;
   weekly: BudgetWindow | null;
+  parsedVia: Exclude<ProbeParsedVia, "top-level">;
 } {
   const fiveHourMatches = buckets.filter((bucket) =>
     bucket.id.includes("five_hour") || bucket.id.includes("primary_window")
@@ -181,24 +182,30 @@ function identifyWindows(buckets: RawBucket[]): {
 
   let fiveHour = toWindow(pickHighestUtil(fiveHourMatches));
   let weekly = toWindow(pickHighestUtil(weeklyMatches));
+  let parsedVia: Exclude<ProbeParsedVia, "top-level"> = "id-match";
 
   const sorted = [...buckets].sort((a, b) => bucketSortKey(a) - bucketSortKey(b));
   if (!fiveHour && sorted.length > 0) {
     fiveHour = toWindow(sorted[0]);
+    parsedVia = "positional";
   }
   if (!weekly && sorted.length > 1) {
     const latestDistinct = [...sorted].reverse().find((bucket) => !sameBucketWindow(bucket, fiveHour));
     weekly = toWindow(latestDistinct);
+    if (latestDistinct) parsedVia = "positional";
   }
 
-  return { fiveHour, weekly };
+  return { fiveHour, weekly, parsedVia };
 }
 
-/** Normalize one raw agent-quota-guard probe JSON object into AgentBridge's internal shape. */
-export function normalizeProbeResult(raw: unknown): AgentUsage | null {
-  const record = asRecord(raw);
-  if (!record) return null;
+interface ProbeNormalization {
+  usage: AgentUsage | null;
+  unknownSchemaVersion: string | null;
+}
 
+type ProbeParser = (record: Record<string, unknown>) => AgentUsage | null;
+
+function normalizeTolerantProbeRecord(record: Record<string, unknown>): AgentUsage | null {
   const fetchedAt = numberOr(record.fetched_at ?? record.fetchedAt ?? record.now_epoch ?? record.nowEpoch, 0);
   // Information floor: a record that carries no actual util reading at all
   // (e.g. a transient `{ok:true}` shell) must stay a probe miss — its
@@ -212,9 +219,13 @@ export function normalizeProbeResult(raw: unknown): AgentUsage | null {
   const buckets = rawBuckets
     .map((bucket) => normalizeBucket(bucket, fetchedAt))
     .filter((bucket): bucket is RawBucket => bucket !== null);
+  let parsedVia: ProbeParsedVia = "id-match";
   if (buckets.length === 0 && hasFiniteUtil) {
     const topLevelBucket = normalizeTopLevelBucket(record, gateUtil, fetchedAt);
-    if (topLevelBucket) buckets.push(topLevelBucket);
+    if (topLevelBucket) {
+      buckets.push(topLevelBucket);
+      parsedVia = "top-level";
+    }
   }
   const rateLimitedUntil = Math.max(
     0,
@@ -224,13 +235,14 @@ export function normalizeProbeResult(raw: unknown): AgentUsage | null {
 
   if (!ok && rateLimitedUntil <= 0 && buckets.length === 0) return null;
 
-  const { fiveHour, weekly } = identifyWindows(buckets);
+  const { fiveHour, weekly, parsedVia: bucketParsedVia } = identifyWindows(buckets);
   // Truly unusable = no windows, no rate-limit gate AND no actual util
   // reading. Degraded-but-usable records (stale cache during a 429 gate,
   // unknown-reset buckets) flow through for DISPLAY — the decision layer
   // (isDecisionGrade) independently rejects anything without a fresh window,
   // so accepting them here cannot flip interventions. (agent-bridge#103)
   if (!fiveHour && !weekly && rateLimitedUntil === 0 && !hasFiniteUtil) return null;
+  if (parsedVia !== "top-level") parsedVia = bucketParsedVia;
 
   return {
     ok,
@@ -242,7 +254,41 @@ export function normalizeProbeResult(raw: unknown): AgentUsage | null {
     remaining: clamp(100 - gateUtil, 0, 100),
     rateLimitedUntil,
     fetchedAt,
+    parsedVia,
   };
+}
+
+const PROBE_SCHEMA_PARSERS: Record<string, ProbeParser> = {
+  "1": normalizeTolerantProbeRecord,
+};
+
+function schemaVersionKey(record: Record<string, unknown>): string | null {
+  const value = record.schema_version ?? record.schemaVersion;
+  if (typeof value === "number" && Number.isFinite(value)) return String(value);
+  if (typeof value === "string" && value.trim() !== "") return value.trim();
+  return null;
+}
+
+function normalizeProbeResultWithDiagnostics(raw: unknown): ProbeNormalization {
+  const record = asRecord(raw);
+  if (!record) return { usage: null, unknownSchemaVersion: null };
+
+  const schemaVersion = schemaVersionKey(record);
+  if (schemaVersion) {
+    const parser = PROBE_SCHEMA_PARSERS[schemaVersion];
+    if (parser) return { usage: parser(record), unknownSchemaVersion: null };
+    return {
+      usage: normalizeTolerantProbeRecord(record),
+      unknownSchemaVersion: schemaVersion,
+    };
+  }
+
+  return { usage: normalizeTolerantProbeRecord(record), unknownSchemaVersion: null };
+}
+
+/** Normalize one raw agent-quota-guard probe JSON object into AgentBridge's internal shape. */
+export function normalizeProbeResult(raw: unknown): AgentUsage | null {
+  return normalizeProbeResultWithDiagnostics(raw).usage;
 }
 
 function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
@@ -278,6 +324,8 @@ export class QuotaSource {
   /** Last degraded-state per agent — degradation is logged on TRANSITIONS only
    *  (a stale period spans many 60s polls; per-poll lines are log spam). */
   private readonly degradedLogged = new Map<AgentName, boolean>();
+  private positionalFallbackLogged = false;
+  private readonly unknownSchemaVersionsLogged = new Set<string>();
 
   constructor(options: QuotaSourceOptions = {}) {
     this.env = options.env ?? process.env;
@@ -347,7 +395,9 @@ export class QuotaSource {
           this.log(`budget probe output unparseable for ${agent}: ${candidate.command} — raw: ${text.slice(0, 200)}`);
           continue;
         }
-        const usage = normalizeProbeResult(parsed);
+        const normalized = normalizeProbeResultWithDiagnostics(parsed);
+        this.noteParserDiagnostics(agent, normalized);
+        const usage = normalized.usage;
         if (usage) {
           this.noteDegradation(agent, usage);
           return usage;
@@ -364,6 +414,21 @@ export class QuotaSource {
       }
     }
     return null;
+  }
+
+  private noteParserDiagnostics(agent: AgentName, normalized: ProbeNormalization): void {
+    if (normalized.unknownSchemaVersion && !this.unknownSchemaVersionsLogged.has(normalized.unknownSchemaVersion)) {
+      this.unknownSchemaVersionsLogged.add(normalized.unknownSchemaVersion);
+      this.log(
+        `unknown budget probe schema_version ${normalized.unknownSchemaVersion} for ${agent}; using tolerant legacy parser`,
+      );
+    }
+    if (normalized.usage?.parsedVia === "positional" && !this.positionalFallbackLogged) {
+      this.positionalFallbackLogged = true;
+      this.log(
+        `budget probe positional bucket fallback for ${agent}: bucket ids did not identify quota windows; check probe schema_version/bucket ids`,
+      );
+    }
   }
 
   private noteDegradation(agent: AgentName, usage: AgentUsage): void {

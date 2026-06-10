@@ -13,6 +13,7 @@ function usage(overrides: Partial<AgentUsage> = {}): AgentUsage {
     remaining: 58,
     rateLimitedUntil: 0,
     fetchedAt: 1_780_711_639,
+    parsedVia: "id-match",
     ...overrides,
   };
 }
@@ -118,6 +119,12 @@ describe("renderBudgetSnapshot", () => {
     );
     expect(text).toContain("限流至");
     expect(text).toContain("（缓存数据）");
+  });
+
+  test("marks positional quota parsing as heuristic", () => {
+    const text = renderBudgetSnapshot(snapshot({ claude: usage({ parsedVia: "positional" }) }));
+    expect(text).toContain("⚠️");
+    expect(text).toContain("位置兜底");
   });
 
   test("shows parallel recommendation and non-full codex tier", () => {

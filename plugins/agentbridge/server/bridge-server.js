@@ -13859,6 +13859,9 @@ function formatAgent(name, usage, snapshotAt) {
   if (usage.rateLimitedUntil > 0) {
     parts.push(`\u9650\u6D41\u81F3 ${formatEpoch(usage.rateLimitedUntil)}`);
   }
+  if (usage.parsedVia === "positional") {
+    parts.push("\u26A0\uFE0F \u7A97\u53E3\u8BC6\u522B\u4F7F\u7528\u4F4D\u7F6E\u515C\u5E95");
+  }
   const ageSec = usage.fetchedAt > 0 ? snapshotAt - usage.fetchedAt : 0;
   if (ageSec > 300) {
     parts.push(`\u26A0\uFE0F \u6570\u636E\u91C7\u96C6\u4E8E ${Math.round(ageSec / 60)} \u5206\u949F\u524D`);

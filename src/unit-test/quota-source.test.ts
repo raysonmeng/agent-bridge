@@ -29,6 +29,7 @@ describe("quota-source normalization", () => {
     expect(usage!.remaining).toBe(58);
     expect(usage!.fiveHour).toEqual({ util: 42, resetEpoch: NOW + 1200 });
     expect(usage!.weekly).toEqual({ util: 31, resetEpoch: NOW + 86_400 });
+    expect(usage!.parsedVia).toBe("id-match");
   });
 
   test("normalizes node probe.mjs shape without hard_util", () => {
@@ -169,6 +170,7 @@ describe("quota-source normalization", () => {
     expect(usage).not.toBeNull();
     expect(usage!.fiveHour).toEqual({ util: 19, resetEpoch: NOW + 1800 });
     expect(usage!.weekly).toEqual({ util: 35, resetEpoch: NOW + 500_000 });
+    expect(usage!.parsedVia).toBe("positional");
   });
 
   test("uses top-level reset fields when bucket details are absent", () => {
@@ -187,6 +189,24 @@ describe("quota-source normalization", () => {
     expect(usage!.gateUtil).toBe(55);
     expect(usage!.fiveHour).toEqual({ util: 55, resetEpoch: NOW + 2400 });
     expect(usage!.weekly).toBeNull();
+    expect(usage!.parsedVia).toBe("top-level");
+  });
+
+  test("normalizes schema_version 1 through the versioned parser", () => {
+    const usage = normalizeProbeResult({
+      schema_version: 1,
+      ok: true,
+      util: 30,
+      warn_util: 30,
+      fetched_at: NOW,
+      buckets: [
+        { id: "five_hour", util: 30, reset_epoch: NOW + 1200 },
+        { id: "seven_day", util: 30, reset_epoch: NOW + 400_000 },
+      ],
+    });
+
+    expect(usage).not.toBeNull();
+    expect(usage!.parsedVia).toBe("id-match");
   });
 });
 
@@ -318,6 +338,61 @@ describe("QuotaSource", () => {
     const recoveredLines = logs.filter((l) => l.includes("recovered to fresh data"));
     expect(recoveredLines.length).toBe(2);
     expect(logs.filter((l) => l.includes("degraded data accepted")).length).toBe(2);
+  });
+
+  test("positional bucket fallback logs a once-per-daemon warning", async () => {
+    const logs: string[] = [];
+    const source = new QuotaSource({
+      env: { AGENTBRIDGE_QUOTA_PROBE: "/tmp/fake-budget-probe" },
+      homeDir: "/unused",
+      log: (m) => logs.push(m),
+      runner: async () => ({
+        stdout: JSON.stringify({
+          ok: true,
+          util: 19,
+          warn_util: 35,
+          fetched_at: NOW,
+          buckets: [
+            { id: "opaque-long", util: 35, reset_epoch: NOW + 500_000, reset_after_seconds: 500_000 },
+            { id: "opaque-short", util: 19, reset_epoch: NOW + 1800, reset_after_seconds: 1800 },
+          ],
+        }),
+      }),
+    });
+
+    await source.fetchBoth();
+    await source.fetchBoth();
+
+    const positionalLines = logs.filter((l) => l.includes("positional bucket fallback"));
+    expect(positionalLines).toHaveLength(1);
+    expect(positionalLines[0]).toContain("bucket ids did not identify quota windows");
+  });
+
+  test("unknown schema_version logs and falls back to tolerant parsing", async () => {
+    const logs: string[] = [];
+    const source = new QuotaSource({
+      env: { AGENTBRIDGE_QUOTA_PROBE: "/tmp/fake-budget-probe" },
+      homeDir: "/unused",
+      log: (m) => logs.push(m),
+      runner: async () => ({
+        stdout: JSON.stringify({
+          schema_version: 999,
+          ok: true,
+          util: 30,
+          warn_util: 30,
+          fetched_at: NOW,
+          buckets: [{ id: "five_hour", util: 30, reset_epoch: NOW + 1200 }],
+        }),
+      }),
+    });
+
+    const result = await source.fetchBoth();
+
+    expect(result?.claude?.gateUtil).toBe(30);
+    expect(result?.codex?.gateUtil).toBe(30);
+    const unknownVersionLines = logs.filter((l) => l.includes("unknown budget probe schema_version"));
+    expect(unknownVersionLines).toHaveLength(1);
+    expect(unknownVersionLines[0]).toContain("999");
   });
 
   test("uses installed budget-probe when env probes are unset", async () => {

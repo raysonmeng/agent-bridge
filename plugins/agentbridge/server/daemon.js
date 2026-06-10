@@ -3553,38 +3553,44 @@ function identifyWindows(buckets) {
   const weeklyMatches = buckets.filter((bucket) => bucket.id.includes("seven_day") || bucket.id.includes("secondary_window"));
   let fiveHour = toWindow(pickHighestUtil(fiveHourMatches));
   let weekly = toWindow(pickHighestUtil(weeklyMatches));
+  let parsedVia = "id-match";
   const sorted = [...buckets].sort((a, b) => bucketSortKey(a) - bucketSortKey(b));
   if (!fiveHour && sorted.length > 0) {
     fiveHour = toWindow(sorted[0]);
+    parsedVia = "positional";
   }
   if (!weekly && sorted.length > 1) {
     const latestDistinct = [...sorted].reverse().find((bucket) => !sameBucketWindow(bucket, fiveHour));
     weekly = toWindow(latestDistinct);
+    if (latestDistinct)
+      parsedVia = "positional";
   }
-  return { fiveHour, weekly };
+  return { fiveHour, weekly, parsedVia };
 }
-function normalizeProbeResult(raw) {
-  const record = asRecord(raw);
-  if (!record)
-    return null;
+function normalizeTolerantProbeRecord(record) {
   const fetchedAt = numberOr(record.fetched_at ?? record.fetchedAt ?? record.now_epoch ?? record.nowEpoch, 0);
   const hasFiniteUtil = asFiniteNumber(record.util ?? record.hard_util ?? record.hardUtil) !== null || asFiniteNumber(record.warn_util ?? record.warnUtil) !== null;
   const gateUtil = clamp(numberOr(record.util ?? record.hard_util ?? record.hardUtil, 0), 0, 100);
   const warnUtil = clamp(numberOr(record.warn_util ?? record.warnUtil, gateUtil), 0, 100);
   const rawBuckets = Array.isArray(record.buckets) ? record.buckets : [];
   const buckets = rawBuckets.map((bucket) => normalizeBucket(bucket, fetchedAt)).filter((bucket) => bucket !== null);
+  let parsedVia = "id-match";
   if (buckets.length === 0 && hasFiniteUtil) {
     const topLevelBucket = normalizeTopLevelBucket(record, gateUtil, fetchedAt);
-    if (topLevelBucket)
+    if (topLevelBucket) {
       buckets.push(topLevelBucket);
+      parsedVia = "top-level";
+    }
   }
   const rateLimitedUntil = Math.max(0, numberOr(record.rate_limited_until ?? record.rateLimitedUntil, 0));
   const ok = record.ok === true;
   if (!ok && rateLimitedUntil <= 0 && buckets.length === 0)
     return null;
-  const { fiveHour, weekly } = identifyWindows(buckets);
+  const { fiveHour, weekly, parsedVia: bucketParsedVia } = identifyWindows(buckets);
   if (!fiveHour && !weekly && rateLimitedUntil === 0 && !hasFiniteUtil)
     return null;
+  if (parsedVia !== "top-level")
+    parsedVia = bucketParsedVia;
   return {
     ok,
     stale: record.stale === true,
@@ -3594,8 +3600,36 @@ function normalizeProbeResult(raw) {
     weekly,
     remaining: clamp(100 - gateUtil, 0, 100),
     rateLimitedUntil,
-    fetchedAt
+    fetchedAt,
+    parsedVia
   };
+}
+var PROBE_SCHEMA_PARSERS = {
+  "1": normalizeTolerantProbeRecord
+};
+function schemaVersionKey(record) {
+  const value = record.schema_version ?? record.schemaVersion;
+  if (typeof value === "number" && Number.isFinite(value))
+    return String(value);
+  if (typeof value === "string" && value.trim() !== "")
+    return value.trim();
+  return null;
+}
+function normalizeProbeResultWithDiagnostics(raw) {
+  const record = asRecord(raw);
+  if (!record)
+    return { usage: null, unknownSchemaVersion: null };
+  const schemaVersion = schemaVersionKey(record);
+  if (schemaVersion) {
+    const parser = PROBE_SCHEMA_PARSERS[schemaVersion];
+    if (parser)
+      return { usage: parser(record), unknownSchemaVersion: null };
+    return {
+      usage: normalizeTolerantProbeRecord(record),
+      unknownSchemaVersion: schemaVersion
+    };
+  }
+  return { usage: normalizeTolerantProbeRecord(record), unknownSchemaVersion: null };
 }
 function withTimeout(promise, timeoutMs) {
   let timer = null;
@@ -3622,6 +3656,8 @@ class QuotaSource {
   log;
   now;
   degradedLogged = new Map;
+  positionalFallbackLogged = false;
+  unknownSchemaVersionsLogged = new Set;
   constructor(options = {}) {
     this.env = options.env ?? process.env;
     this.homeDir = options.homeDir ?? homedir2();
@@ -3683,7 +3719,9 @@ class QuotaSource {
           this.log(`budget probe output unparseable for ${agent}: ${candidate.command} \u2014 raw: ${text.slice(0, 200)}`);
           continue;
         }
-        const usage = normalizeProbeResult(parsed);
+        const normalized = normalizeProbeResultWithDiagnostics(parsed);
+        this.noteParserDiagnostics(agent, normalized);
+        const usage = normalized.usage;
         if (usage) {
           this.noteDegradation(agent, usage);
           return usage;
@@ -3694,6 +3732,16 @@ class QuotaSource {
       }
     }
     return null;
+  }
+  noteParserDiagnostics(agent, normalized) {
+    if (normalized.unknownSchemaVersion && !this.unknownSchemaVersionsLogged.has(normalized.unknownSchemaVersion)) {
+      this.unknownSchemaVersionsLogged.add(normalized.unknownSchemaVersion);
+      this.log(`unknown budget probe schema_version ${normalized.unknownSchemaVersion} for ${agent}; using tolerant legacy parser`);
+    }
+    if (normalized.usage?.parsedVia === "positional" && !this.positionalFallbackLogged) {
+      this.positionalFallbackLogged = true;
+      this.log(`budget probe positional bucket fallback for ${agent}: bucket ids did not identify quota windows; check probe schema_version/bucket ids`);
+    }
   }
   noteDegradation(agent, usage) {
     const degraded = isDegradedUsage(usage, this.now());
