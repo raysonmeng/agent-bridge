@@ -1,6 +1,9 @@
 #!/usr/bin/env bun
 // @bun
 
+// src/daemon.ts
+import { rmSync as rmSync2 } from "fs";
+
 // src/contract-version.ts
 var CONTRACT_VERSION = 1;
 
@@ -18,7 +21,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("ccd2875", "source"),
+  commit: defineString("c8dba20", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -2247,9 +2250,98 @@ var CLOSE_CODE_REPLACED = 4001;
 var CLOSE_CODE_EVICTED_STALE = 4002;
 var CLOSE_CODE_PROBE_IN_PROGRESS = 4003;
 var CLOSE_CODE_PAIR_MISMATCH = 4004;
+var CLOSE_CODE_TOKEN_MISMATCH = 4005;
+
+// src/control-token.ts
+import { chmodSync as chmodSync2, readFileSync } from "fs";
+import { join as join3 } from "path";
+import { randomUUID as randomUUID2 } from "crypto";
+
+// src/atomic-json.ts
+import * as fs from "fs";
+import { randomUUID } from "crypto";
+import { dirname as dirname2 } from "path";
+function tmpPathFor(targetPath) {
+  return `${targetPath}.tmp.${process.pid}.${randomUUID()}`;
+}
+function atomicWriteText(path, content, options = {}) {
+  fs.mkdirSync(dirname2(path), { recursive: true });
+  const tmp = tmpPathFor(path);
+  let renamed = false;
+  const fd = fs.openSync(tmp, "w", options.mode ?? 438);
+  try {
+    try {
+      fs.writeFileSync(fd, content, "utf-8");
+      if (options.fsync)
+        fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmp, path);
+    renamed = true;
+  } finally {
+    if (!renamed) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {}
+    }
+  }
+}
+function atomicWriteJson(path, value, options = {}) {
+  atomicWriteText(path, JSON.stringify(value, null, 2) + `
+`, options);
+}
+
+// src/control-token.ts
+var CONTROL_TOKEN_FILENAME = "control-token";
+function resolveControlTokenPath(stateDir) {
+  return join3(stateDir, CONTROL_TOKEN_FILENAME);
+}
+function generateControlToken() {
+  return randomUUID2();
+}
+function writeControlToken(path, token) {
+  atomicWriteText(path, token, { mode: 384 });
+  chmodSync2(path, 384);
+}
+function validateControlToken(input) {
+  const { expectedToken } = input;
+  if (expectedToken == null || expectedToken.length === 0) {
+    return { ok: true };
+  }
+  const provided = input.providedToken;
+  if (provided == null || provided.length === 0) {
+    return { ok: false, reason: "missing control token" };
+  }
+  if (!constantTimeEquals(provided, expectedToken)) {
+    return { ok: false, reason: "control token mismatch" };
+  }
+  return { ok: true };
+}
+function constantTimeEquals(a, b) {
+  const len = Math.max(a.length, b.length);
+  let diff = a.length ^ b.length;
+  for (let i = 0;i < len; i++) {
+    diff |= (a.charCodeAt(i) || 0) ^ (b.charCodeAt(i) || 0);
+  }
+  return diff === 0;
+}
 
 // src/daemon-identity.ts
 function validateClaudeClientIdentity(input) {
+  if (input.expectedControlToken && input.identity) {
+    const tokenResult = validateControlToken({
+      expectedToken: input.expectedControlToken,
+      providedToken: input.identity.controlToken
+    });
+    if (!tokenResult.ok) {
+      return {
+        ok: false,
+        closeCode: CLOSE_CODE_TOKEN_MISMATCH,
+        reason: tokenResult.reason
+      };
+    }
+  }
   if (!input.expectedPairId)
     return { ok: true };
   if (!input.identity) {
@@ -2270,6 +2362,16 @@ function validateClaudeClientIdentity(input) {
     };
   }
   return { ok: true };
+}
+function evaluateInjectionAttachGuard(attachedSocket, requestingSocket) {
+  if (attachedSocket != null && attachedSocket === requestingSocket) {
+    return { allowed: true };
+  }
+  return {
+    allowed: false,
+    code: "not_attached",
+    reason: "This socket is not the attached Claude session. Send `claude_connect` " + "(with a valid control token) and win the attach slot before injecting a turn."
+  };
 }
 
 // src/message-filter.ts
@@ -2454,43 +2556,8 @@ class TuiConnectionState {
 
 // src/daemon-lifecycle.ts
 import { spawn as spawn2 } from "child_process";
-import { existsSync as existsSync3, readFileSync, statSync as statSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2, openSync as openSync2, closeSync as closeSync2, constants } from "fs";
+import { existsSync as existsSync3, readFileSync as readFileSync2, statSync as statSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2, openSync as openSync2, closeSync as closeSync2, constants } from "fs";
 import { fileURLToPath } from "url";
-
-// src/atomic-json.ts
-import * as fs from "fs";
-import { randomUUID } from "crypto";
-import { dirname as dirname2 } from "path";
-function tmpPathFor(targetPath) {
-  return `${targetPath}.tmp.${process.pid}.${randomUUID()}`;
-}
-function atomicWriteText(path, content, options = {}) {
-  fs.mkdirSync(dirname2(path), { recursive: true });
-  const tmp = tmpPathFor(path);
-  let renamed = false;
-  const fd = fs.openSync(tmp, "w");
-  try {
-    try {
-      fs.writeFileSync(fd, content, "utf-8");
-      if (options.fsync)
-        fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-    fs.renameSync(tmp, path);
-    renamed = true;
-  } finally {
-    if (!renamed) {
-      try {
-        fs.unlinkSync(tmp);
-      } catch {}
-    }
-  }
-}
-function atomicWriteJson(path, value, options = {}) {
-  atomicWriteText(path, JSON.stringify(value, null, 2) + `
-`, options);
-}
 
 // src/process-lifecycle.ts
 import { execFileSync as execFileSync2 } from "child_process";
@@ -2757,7 +2824,7 @@ class DaemonLifecycle {
   }
   readStatus() {
     try {
-      const raw = readFileSync(this.stateDir.statusFile, "utf-8");
+      const raw = readFileSync2(this.stateDir.statusFile, "utf-8");
       return JSON.parse(raw);
     } catch {
       return null;
@@ -2768,7 +2835,7 @@ class DaemonLifecycle {
   }
   readPid() {
     try {
-      const raw = readFileSync(this.stateDir.pidFile, "utf-8").trim();
+      const raw = readFileSync2(this.stateDir.pidFile, "utf-8").trim();
       if (!raw)
         return null;
       const pid = Number.parseInt(raw, 10);
@@ -2881,7 +2948,7 @@ class DaemonLifecycle {
         if (reclaimed)
           return false;
         try {
-          const holderPid = Number.parseInt(readFileSync(this.stateDir.lockFile, "utf-8").trim(), 10);
+          const holderPid = Number.parseInt(readFileSync2(this.stateDir.lockFile, "utf-8").trim(), 10);
           if (Number.isFinite(holderPid) && !isProcessAlive(holderPid)) {
             this.log(`Stale startup lock from dead process ${holderPid}, reclaiming`);
             this.releaseLock();
@@ -2969,8 +3036,8 @@ async function fetchWithTimeout(url, timeoutMs = HEALTH_FETCH_TIMEOUT_MS) {
 }
 
 // src/config-service.ts
-import { readFileSync as readFileSync2, mkdirSync as mkdirSync4, existsSync as existsSync4 } from "fs";
-import { join as join3 } from "path";
+import { readFileSync as readFileSync3, mkdirSync as mkdirSync4, existsSync as existsSync4 } from "fs";
+import { join as join4 } from "path";
 var DEFAULT_BUDGET_CONFIG = {
   enabled: true,
   pollSeconds: 300,
@@ -3157,8 +3224,8 @@ class ConfigService {
   configPath;
   constructor(projectRoot) {
     const root = projectRoot ?? process.cwd();
-    this.configDir = join3(root, CONFIG_DIR);
-    this.configPath = join3(this.configDir, CONFIG_FILE);
+    this.configDir = join4(root, CONFIG_DIR);
+    this.configPath = join4(this.configDir, CONFIG_FILE);
   }
   hasConfig() {
     return existsSync4(this.configPath);
@@ -3166,7 +3233,7 @@ class ConfigService {
   load() {
     let raw;
     try {
-      raw = readFileSync2(this.configPath, "utf-8");
+      raw = readFileSync3(this.configPath, "utf-8");
     } catch (err) {
       if (err?.code === "ENOENT") {
         return { state: "absent" };
@@ -3909,7 +3976,7 @@ class BudgetCoordinator {
 import { execFile } from "child_process";
 import { existsSync as existsSync5 } from "fs";
 import { homedir as homedir2 } from "os";
-import { basename, join as join4 } from "path";
+import { basename, join as join5 } from "path";
 var DEFAULT_TIMEOUT_MS = 1e4;
 var MAX_BUFFER = 1024 * 1024;
 function defaultRunner(command, args, options) {
@@ -4157,11 +4224,11 @@ class QuotaSource {
       add(command, commandKind(command));
       return candidates;
     }
-    const binDir = join4(this.homeDir, ".budget-guard/bin");
-    const installedBudgetProbe = join4(binDir, "budget-probe");
+    const binDir = join5(this.homeDir, ".budget-guard/bin");
+    const installedBudgetProbe = join5(binDir, "budget-probe");
     if (existsSync5(installedBudgetProbe))
       add(installedBudgetProbe, "budget-probe");
-    const installedProbeMjs = join4(binDir, "probe.mjs");
+    const installedProbeMjs = join5(binDir, "probe.mjs");
     if (existsSync5(installedProbeMjs))
       add(installedProbeMjs, "probe-mjs");
     return candidates;
@@ -4375,10 +4442,10 @@ class ReplyRequiredTracker {
 import {
   existsSync as existsSync6,
   readdirSync,
-  readFileSync as readFileSync3
+  readFileSync as readFileSync4
 } from "fs";
 import { homedir as homedir3 } from "os";
-import { basename as basename2, join as join5 } from "path";
+import { basename as basename2, join as join6 } from "path";
 function nowIso() {
   return new Date().toISOString();
 }
@@ -4387,11 +4454,11 @@ function threadTag(identity) {
   return `abg:${name}:${identity.cwd}`;
 }
 function codexHome(env = process.env) {
-  return env.CODEX_HOME && env.CODEX_HOME.length > 0 ? env.CODEX_HOME : join5(homedir3(), ".codex");
+  return env.CODEX_HOME && env.CODEX_HOME.length > 0 ? env.CODEX_HOME : join6(homedir3(), ".codex");
 }
 function readRawCurrentThread(stateDir) {
   try {
-    const parsed = JSON.parse(readFileSync3(stateDir.currentThreadFile, "utf-8"));
+    const parsed = JSON.parse(readFileSync4(stateDir.currentThreadFile, "utf-8"));
     if (parsed?.version === 1 && typeof parsed.threadId === "string" && parsed.threadId.length > 0 && (parsed.status === "pending" || parsed.status === "current") && typeof parsed.cwd === "string") {
       return parsed;
     }
@@ -4399,7 +4466,7 @@ function readRawCurrentThread(stateDir) {
   return null;
 }
 function findCodexRolloutFile(threadId, env = process.env, maxEntries = 20000) {
-  const sessionsDir = join5(codexHome(env), "sessions");
+  const sessionsDir = join6(codexHome(env), "sessions");
   if (!threadId || !existsSync6(sessionsDir))
     return null;
   const exactName = `rollout-${threadId}.jsonl`;
@@ -4415,7 +4482,7 @@ function findCodexRolloutFile(threadId, env = process.env, maxEntries = 20000) {
     }
     for (const entry of entries) {
       visited++;
-      const path = join5(dir, entry.name);
+      const path = join6(dir, entry.name);
       if (entry.isDirectory()) {
         stack.push(path);
         continue;
@@ -4585,6 +4652,15 @@ class BoundedMessageBuffer {
 var stateDir = new StateDirResolver;
 stateDir.ensure();
 var processLogger = createProcessLogger({ component: "AgentBridgeDaemon", logFile: stateDir.logFile });
+var controlTokenPath = resolveControlTokenPath(stateDir.dir);
+var controlToken = null;
+try {
+  controlToken = generateControlToken();
+  writeControlToken(controlTokenPath, controlToken);
+} catch (err) {
+  controlToken = null;
+  processLogger.log(`Failed to write control token (${controlTokenPath}): ${err?.message ?? err} \u2014 ` + `token layer DISABLED for this daemon (attach guard + Origin guard still active)`);
+}
 var configService = new ConfigService;
 var config = configService.loadOrDefault(processLogger.log);
 var CODEX_APP_PORT = parseInt(process.env.CODEX_WS_PORT ?? String(config.codex.appPort), 10);
@@ -4943,7 +5019,8 @@ function handleControlMessage(ws, raw) {
         expectedPairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
         daemonCwd: process.cwd(),
         identity: message.identity,
-        allowIdentityless: ALLOW_IDENTITYLESS_CLIENT
+        allowIdentityless: ALLOW_IDENTITYLESS_CLIENT,
+        expectedControlToken: controlToken
       });
       if (!admission.ok) {
         log(`Rejecting Claude frontend #${ws.data.clientId}: ${admission.reason}`);
@@ -5022,6 +5099,16 @@ function waitForInterruptOutcome(turnIds) {
   });
 }
 async function handleClaudeToCodex(ws, message) {
+  const attachGuard = evaluateInjectionAttachGuard(attachedClaude, ws);
+  if (!attachGuard.allowed) {
+    log(`Rejecting claude_to_codex from non-attached socket #${ws.data.clientId} ` + `(request ${message.requestId}, attached=${attachedClaude ? "#" + attachedClaude.data.clientId : "none"})`);
+    sendClaudeToCodexResult(ws, message.requestId, {
+      success: false,
+      code: attachGuard.code,
+      error: attachGuard.reason
+    });
+    return;
+  }
   if (message.message.source !== "claude") {
     sendClaudeToCodexResult(ws, message.requestId, {
       success: false,
@@ -5559,7 +5646,13 @@ function shutdown(reason, exitCode = 0) {
   codex.stop();
   removePidFile();
   removeStatusFile();
+  removeControlToken();
   process.exit(exitCode);
+}
+function removeControlToken() {
+  try {
+    rmSync2(controlTokenPath, { force: true });
+  } catch {}
 }
 process.on("SIGINT", () => shutdown("SIGINT"));
 process.on("SIGTERM", () => shutdown("SIGTERM"));
@@ -5567,6 +5660,7 @@ process.on("exit", () => {
   codex.forceKillAppServerSync();
   removePidFile();
   removeStatusFile();
+  removeControlToken();
 });
 process.on("uncaughtException", (err) => {
   processLogger.fatal("UNCAUGHT EXCEPTION", err);

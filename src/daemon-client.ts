@@ -5,6 +5,7 @@ import {
   CLOSE_CODE_EVICTED_STALE,
   CLOSE_CODE_PROBE_IN_PROGRESS,
   CLOSE_CODE_PAIR_MISMATCH,
+  CLOSE_CODE_TOKEN_MISMATCH,
 } from "./control-protocol";
 import type { ControlClientIdentity, ControlClientMessage, ControlServerMessage, DaemonStatus, TurnPhase } from "./control-protocol";
 import { CLIENT_REPLY_TIMEOUT_MS } from "./interrupt-timing";
@@ -35,7 +36,15 @@ interface DaemonClientEvents {
 let nextSocketId = 0;
 
 export interface DaemonClientOptions {
-  identity?: ControlClientIdentity;
+  /**
+   * Client identity sent in `claude_connect`. Either a fixed object or a
+   * resolver evaluated on EACH attach. A resolver is required for the
+   * capability token (arch-review P1 #283): the token file is written by the
+   * daemon and may not exist when the client is constructed, so it must be read
+   * lazily at attach time, AND re-read on reconnect after a daemon restart
+   * rotates the token.
+   */
+  identity?: ControlClientIdentity | (() => ControlClientIdentity);
 }
 
 export class DaemonClient extends EventEmitter<DaemonClientEvents> {
@@ -98,10 +107,22 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   }
 
   attachClaude() {
+    const identity = this.resolveIdentity();
     this.send({
       type: "claude_connect",
-      ...(this.options.identity ? { identity: this.options.identity } : {}),
+      ...(identity ? { identity } : {}),
     });
+  }
+
+  /**
+   * Resolve the identity for this attach. A function option is evaluated NOW
+   * (lazily, per attach) so the capability token is read fresh from disk —
+   * critical because the daemon may not have written the token when this client
+   * was constructed, and a daemon restart rotates it (arch-review P1 #283).
+   */
+  private resolveIdentity(): ControlClientIdentity | undefined {
+    const opt = this.options.identity;
+    return typeof opt === "function" ? opt() : opt;
   }
 
   async attachClaudeAndWaitForStatus(timeoutMs = 1000): Promise<DaemonStatus | null> {
@@ -306,7 +327,8 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
           event.code === CLOSE_CODE_REPLACED ||
           event.code === CLOSE_CODE_EVICTED_STALE ||
           event.code === CLOSE_CODE_PROBE_IN_PROGRESS ||
-          event.code === CLOSE_CODE_PAIR_MISMATCH
+          event.code === CLOSE_CODE_PAIR_MISMATCH ||
+          event.code === CLOSE_CODE_TOKEN_MISMATCH
         ) {
           this.emit("rejected", event.code);
         } else {

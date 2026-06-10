@@ -16,6 +16,7 @@ import { createServer, connect, type Socket } from "node:net";
 import type { BridgeMessage } from "../types";
 import type { ControlServerMessage, DaemonStatus } from "../control-protocol";
 import { portsForSlot, type PairPorts } from "../pair-registry";
+import { readControlToken, resolveControlTokenPath } from "../control-token";
 
 const DAEMON_PATH = join(process.cwd(), "src", "daemon.ts");
 const DEFAULT_TEST_SLOT_START = 2500 + (process.pid % 500);
@@ -893,6 +894,152 @@ describe("daemon wiring", () => {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
   }, 60000);
+
+  // --- Security: attach-convergence guard + capability token (arch-review P1 #283) ---
+
+  test("attach guard: a NON-attached socket's claude_to_codex is rejected with not_attached, even with a valid token", async () => {
+    const harness = await startHarness({ pairId: "main-attachgrd", pairName: "main" });
+
+    // Legit frontend attaches + a ready thread exists, so the ONLY thing that can
+    // reject the second socket below is the attach guard (not no_thread/busy).
+    await harness.attachClaude();
+    await harness.connectTui();
+
+    // A SECOND control socket that connects to /ws but never wins the attach slot.
+    // It even presents the correct capability token (so token admission would
+    // pass) — proving the attach guard is an INDEPENDENT second layer: passing
+    // the token gate is not sufficient to inject; you must also hold the slot.
+    const intruder = await connectControlSocket(harness.controlPort);
+    const intruderResults: ControlServerMessage[] = [];
+    intruder.onmessage = (event) => {
+      const raw = typeof event.data === "string" ? event.data : event.data.toString();
+      intruderResults.push(JSON.parse(raw) as ControlServerMessage);
+    };
+
+    // Deliberately do NOT send claude_connect on the intruder — it is an
+    // unattached socket trying to inject a turn straight into Codex.
+    intruder.send(JSON.stringify({
+      type: "claude_to_codex",
+      requestId: "req-intruder-1",
+      message: { id: "req-intruder-1", source: "claude", content: "inject without attaching", timestamp: Date.now() },
+    }));
+
+    await waitFor(
+      () => intruderResults.some(
+        (m) => m.type === "claude_to_codex_result" && m.requestId === "req-intruder-1",
+      ),
+      "claude_to_codex_result for the intruder socket",
+    );
+    const rejected = intruderResults.find(
+      (m) => m.type === "claude_to_codex_result" && m.requestId === "req-intruder-1",
+    ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
+    expect(rejected.success).toBe(false);
+    expect(rejected.code).toBe("not_attached");
+    expect(rejected.error).toContain("not the attached Claude session");
+
+    // The attached frontend's own reply on the SAME pair still works — the guard
+    // does not misfire on the legitimate path (attachedClaude === its socket).
+    harness.sendClaudeToCodex("req-legit-1", "legitimate reply from the attached session");
+    await waitFor(
+      () => harness.statusMessages.some(
+        (m) => m.type === "claude_to_codex_result" && m.requestId === "req-legit-1",
+      ),
+      "claude_to_codex_result for the attached session's reply",
+    );
+    const accepted = harness.statusMessages.find(
+      (m) => m.type === "claude_to_codex_result" && m.requestId === "req-legit-1",
+    ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
+    expect(accepted.success).toBe(true);
+
+    try { intruder.close(); } catch {}
+  }, 30000);
+
+  test("token gate: claude_connect with a WRONG control token is rejected and the socket is closed (4005)", async () => {
+    const harness = await startHarness({ pairId: "main-tokengate", pairName: "main" });
+
+    const ws = await connectControlSocket(harness.controlPort);
+    const closed = new Promise<{ code: number; reason: string }>((resolve) => {
+      ws.onclose = (event) => resolve({ code: event.code, reason: event.reason });
+    });
+
+    // Present a SYNTACTICALLY valid identity (correct pair/cwd) but a bogus token —
+    // a browser/foreign socket that cannot read the 0600 token file.
+    ws.send(JSON.stringify({
+      type: "claude_connect",
+      identity: {
+        pairId: "main-tokengate",
+        pairName: "main",
+        cwd: harness.cwd,
+        stateDir: harness.stateDir,
+        clientPid: process.pid,
+        contractVersion: 1,
+        controlToken: "totally-wrong-token",
+      },
+    }));
+
+    const result = await Promise.race([
+      closed,
+      sleep(4000).then(() => null),
+    ]);
+    expect(result).not.toBeNull();
+    expect(result!.code).toBe(4005); // CLOSE_CODE_TOKEN_MISMATCH
+    expect(result!.reason).toContain("token");
+
+    // The daemon did NOT attach this socket: a follow-up status request from a
+    // fresh, properly-tokened socket still reports no live frontend interference.
+    // (The wrong-token socket is closed, so it cannot have become attachedClaude.)
+    const healthz = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+    expect(healthz.ok).toBe(true);
+  }, 30000);
+
+  test("token gate: claude_connect MISSING the control token is rejected (4005)", async () => {
+    const harness = await startHarness({ pairId: "main-tokenmiss", pairName: "main" });
+
+    const ws = await connectControlSocket(harness.controlPort);
+    const closed = new Promise<{ code: number; reason: string }>((resolve) => {
+      ws.onclose = (event) => resolve({ code: event.code, reason: event.reason });
+    });
+
+    // Correct pair/cwd but NO token at all (a pre-token client, or an attacker
+    // who never read the file). The token-aware daemon rejects it.
+    ws.send(JSON.stringify({
+      type: "claude_connect",
+      identity: {
+        pairId: "main-tokenmiss",
+        pairName: "main",
+        cwd: harness.cwd,
+        stateDir: harness.stateDir,
+        clientPid: process.pid,
+        contractVersion: 1,
+      },
+    }));
+
+    const result = await Promise.race([closed, sleep(4000).then(() => null)]);
+    expect(result).not.toBeNull();
+    expect(result!.code).toBe(4005);
+    expect(result!.reason).toContain("missing control token");
+  }, 30000);
+
+  test("token gate: a correctly-tokened claude_connect attaches and can inject (end-to-end happy path)", async () => {
+    const harness = await startHarness({ pairId: "main-tokenok12", pairName: "main" });
+
+    // harness.attachClaude() reads the real token from the state dir and presents
+    // it — the daemon admits it. Then a reply must flow through to a ready thread.
+    await harness.attachClaude();
+    await harness.connectTui();
+
+    harness.sendClaudeToCodex("req-ok-1", "hello with a valid token");
+    await waitFor(
+      () => harness.statusMessages.some(
+        (m) => m.type === "claude_to_codex_result" && m.requestId === "req-ok-1",
+      ),
+      "claude_to_codex_result for the tokened reply",
+    );
+    const accepted = harness.statusMessages.find(
+      (m) => m.type === "claude_to_codex_result" && m.requestId === "req-ok-1",
+    ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
+    expect(accepted.success).toBe(true);
+  }, 30000);
 });
 
 async function startHarness(opts: {
@@ -992,6 +1139,10 @@ async function startHarness(opts: {
           harness.messages.push(message.message);
         }
       };
+      // Mirror the real frontend (bridge.ts): read the daemon's capability token
+      // from the pair state dir and echo it in the identity (arch-review P1 #283).
+      // The daemon is readyz-200 here, so the token file already exists.
+      const controlToken = readControlToken(resolveControlTokenPath(stateDir));
       ws.send(JSON.stringify({
         type: "claude_connect",
         identity: {
@@ -1001,6 +1152,7 @@ async function startHarness(opts: {
           stateDir,
           clientPid: process.pid,
           contractVersion: 1,
+          ...(controlToken ? { controlToken } : {}),
         },
       }));
     },

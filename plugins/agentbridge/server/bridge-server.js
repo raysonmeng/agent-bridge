@@ -14341,7 +14341,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("ccd2875", "source"),
+  commit: defineString("c8dba20", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -14369,6 +14369,7 @@ var CLOSE_CODE_REPLACED = 4001;
 var CLOSE_CODE_EVICTED_STALE = 4002;
 var CLOSE_CODE_PROBE_IN_PROGRESS = 4003;
 var CLOSE_CODE_PAIR_MISMATCH = 4004;
+var CLOSE_CODE_TOKEN_MISMATCH = 4005;
 
 // src/interrupt-timing.ts
 var CLIENT_REPLY_TIMEOUT_MS = 15000;
@@ -14430,10 +14431,15 @@ class DaemonClient extends EventEmitter2 {
     });
   }
   attachClaude() {
+    const identity = this.resolveIdentity();
     this.send({
       type: "claude_connect",
-      ...this.options.identity ? { identity: this.options.identity } : {}
+      ...identity ? { identity } : {}
     });
+  }
+  resolveIdentity() {
+    const opt = this.options.identity;
+    return typeof opt === "function" ? opt() : opt;
   }
   async attachClaudeAndWaitForStatus(timeoutMs = 1000) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
@@ -14589,7 +14595,7 @@ class DaemonClient extends EventEmitter2 {
       if (isCurrent) {
         this.ws = null;
         this.rejectPendingReplies("AgentBridge daemon disconnected.");
-        if (event.code === CLOSE_CODE_REPLACED || event.code === CLOSE_CODE_EVICTED_STALE || event.code === CLOSE_CODE_PROBE_IN_PROGRESS || event.code === CLOSE_CODE_PAIR_MISMATCH) {
+        if (event.code === CLOSE_CODE_REPLACED || event.code === CLOSE_CODE_EVICTED_STALE || event.code === CLOSE_CODE_PROBE_IN_PROGRESS || event.code === CLOSE_CODE_PAIR_MISMATCH || event.code === CLOSE_CODE_TOKEN_MISMATCH) {
           this.emit("rejected", event.code);
         } else {
           this.emit("disconnect");
@@ -14633,7 +14639,7 @@ function atomicWriteText(path, content, options = {}) {
   fs.mkdirSync(dirname2(path), { recursive: true });
   const tmp = tmpPathFor(path);
   let renamed = false;
-  const fd = fs.openSync(tmp, "w");
+  const fd = fs.openSync(tmp, "w", options.mode ?? 438);
   try {
     try {
       fs.writeFileSync(fd, content, "utf-8");
@@ -15620,9 +15626,25 @@ function nonEmpty(value) {
   return value && value.length > 0 ? value : null;
 }
 
+// src/control-token.ts
+import { chmodSync, readFileSync as readFileSync4 } from "fs";
+import { join as join4 } from "path";
+var CONTROL_TOKEN_FILENAME = "control-token";
+function resolveControlTokenPath(stateDir) {
+  return join4(stateDir, CONTROL_TOKEN_FILENAME);
+}
+function readControlToken(path) {
+  try {
+    const raw = readFileSync4(path, "utf-8").trim();
+    return raw.length > 0 ? raw : null;
+  } catch {
+    return null;
+  }
+}
+
 // src/trace-log.ts
 import { appendFileSync as appendFileSync2, existsSync as existsSync6, mkdirSync as mkdirSync5, readdirSync as readdirSync2, statSync as statSync4, unlinkSync as unlinkSync5 } from "fs";
-import { join as join4 } from "path";
+import { join as join5 } from "path";
 var TRACE_RETENTION_DAYS = 7;
 var TRACE_FILE_RE = /^trace-\d{4}-\d{2}-\d{2}\.jsonl$/;
 var SECRET_KEY_RE = /(token|secret|password|passwd|api[_-]?key|auth|cookie|session)/i;
@@ -15662,7 +15684,7 @@ function redactArgv(argv) {
 }
 function traceLogPath(cwd, timestamp) {
   const day = timestamp.slice(0, 10);
-  return join4(cwd, ".agentbridge", "logs", `trace-${day}.jsonl`);
+  return join5(cwd, ".agentbridge", "logs", `trace-${day}.jsonl`);
 }
 function appendTraceEvent(input) {
   const timestamp = input.timestamp ?? new Date().toISOString();
@@ -15676,7 +15698,7 @@ function appendTraceEvent(input) {
     ...input.env ? { env: pickRelevantEnv(input.env) } : {},
     ...input.data ? { data: redactData(input.data) } : {}
   };
-  const logsDir = join4(input.cwd, ".agentbridge", "logs");
+  const logsDir = join5(input.cwd, ".agentbridge", "logs");
   const isNewDayFile = !existsSync6(path);
   mkdirSync5(logsDir, { recursive: true });
   if (isNewDayFile) {
@@ -15699,7 +15721,7 @@ function pruneOldTraceLogs(logsDir, keepPath, nowMs) {
   for (const name of entries) {
     if (!TRACE_FILE_RE.test(name))
       continue;
-    const filePath = join4(logsDir, name);
+    const filePath = join5(logsDir, name);
     if (filePath === keepPath)
       continue;
     try {
@@ -15754,7 +15776,7 @@ var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 var CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 var claude = new ClaudeAdapter(stateDir.logFile);
-var daemonClient = new DaemonClient(CONTROL_WS_URL, { identity: currentClientIdentity() });
+var daemonClient = new DaemonClient(CONTROL_WS_URL, { identity: currentClientIdentity });
 var shuttingDown = false;
 var daemonDisabled = false;
 var daemonDisabledReason = null;
@@ -15860,6 +15882,11 @@ daemonClient.on("rejected", async (code) => {
       reason = "rejected";
       notificationId = "system_bridge_pair_mismatch";
       notificationContent = `\u26A0\uFE0F AgentBridge daemon rejected this session \u2014 pair/cwd identity mismatch (this daemon belongs to a different pair or directory). Do NOT kill it; start Claude Code from the pair's own directory, or pick another pair name with \`agentbridge --pair <name> claude\`. AgentBridge \u62D2\u7EDD\u4E86\u6B64\u4F1A\u8BDD\u2014\u2014pair/\u76EE\u5F55\u8EAB\u4EFD\u4E0D\u5339\u914D\uFF08\u8BE5 daemon \u5C5E\u4E8E\u5176\u4ED6 pair \u6216\u76EE\u5F55\uFF09\u3002\u65E0\u9700 kill\uFF1B\u8BF7\u5230\u5BF9\u5E94\u76EE\u5F55\u542F\u52A8\uFF0C\u6216\u6362\u4E00\u4E2A pair \u540D\uFF1A\`agentbridge --pair <\u540D\u5B57> claude\`\u3002`;
+      break;
+    case CLOSE_CODE_TOKEN_MISMATCH:
+      reason = "rejected";
+      notificationId = "system_bridge_token_mismatch";
+      notificationContent = `\u26A0\uFE0F AgentBridge daemon rejected this session \u2014 control token mismatch (the daemon likely restarted and rotated its token). Start a fresh session with \`${pairScopedCommand("claude")}\` to pick up the current token. AgentBridge \u62D2\u7EDD\u4E86\u6B64\u4F1A\u8BDD\u2014\u2014\u63A7\u5236\u4EE4\u724C\u4E0D\u5339\u914D\uFF08daemon \u53EF\u80FD\u5DF2\u91CD\u542F\u5E76\u8F6E\u6362\u4EE4\u724C\uFF09\u3002\u8BF7\u7528 \`${pairScopedCommand("claude")}\` \u91CD\u65B0\u542F\u52A8\u4EE5\u83B7\u53D6\u6700\u65B0\u4EE4\u724C\u3002`;
       break;
     default:
       reason = "rejected";
@@ -16104,6 +16131,7 @@ function systemMessage(idPrefix, content) {
   };
 }
 function currentClientIdentity() {
+  const controlToken = readControlToken(resolveControlTokenPath(stateDir.dir));
   return {
     pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
     pairName: process.env.AGENTBRIDGE_PAIR_NAME ?? null,
@@ -16111,7 +16139,8 @@ function currentClientIdentity() {
     baseDir: process.env.AGENTBRIDGE_BASE_DIR ?? null,
     stateDir: stateDir.dir,
     clientPid: process.pid,
-    contractVersion: BUILD_INFO.contractVersion
+    contractVersion: BUILD_INFO.contractVersion,
+    ...controlToken ? { controlToken } : {}
   };
 }
 function shutdown(reason) {

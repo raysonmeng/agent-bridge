@@ -84,6 +84,21 @@ describe("atomic-json", () => {
     }
   });
 
+  test("mode option creates the file owner-only with no world/group window (CWE-732)", () => {
+    const dir = tempDir();
+    const path = join(dir, "secret-token");
+
+    atomicWriteText(path, "s3cr3t", { mode: 0o600 });
+
+    const mode = fs.statSync(path).mode & 0o777;
+    // The security-relevant property: no group/other permission bits are ever set,
+    // so the secret is never world/group readable — not even for the temp-file
+    // instant before a post-rename chmod would run.
+    expect(mode & 0o077).toBe(0);
+    expect(mode & 0o400).toBe(0o400); // owner can still read it
+    expect(readFileSync(path, "utf-8")).toBe("s3cr3t");
+  });
+
   test("a failed rename leaves the previous target intact", () => {
     const dir = tempDir();
     const path = join(dir, "status.json");

@@ -10,12 +10,14 @@ import { ConfigService } from "./config-service";
 import { disabledReplyError, type BridgeDisabledReason } from "./bridge-disabled-state";
 import { guardAgentBridgeEnv, normalizeEnvGuardMode } from "./env-guard";
 import { pairScopedCommand } from "./pair-command";
+import { readControlToken, resolveControlTokenPath } from "./control-token";
 import { appendTraceEvent, pickRelevantEnv } from "./trace-log";
 import { createProcessLogger } from "./process-log";
 import {
   CLOSE_CODE_EVICTED_STALE,
   CLOSE_CODE_PAIR_MISMATCH,
   CLOSE_CODE_PROBE_IN_PROGRESS,
+  CLOSE_CODE_TOKEN_MISMATCH,
 } from "./control-protocol";
 import type { ControlClientIdentity } from "./control-protocol";
 import type { BridgeMessage } from "./types";
@@ -43,7 +45,10 @@ const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_POR
 const CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 
 const claude = new ClaudeAdapter(stateDir.logFile);
-const daemonClient = new DaemonClient(CONTROL_WS_URL, { identity: currentClientIdentity() });
+// Pass the identity RESOLVER (not a snapshot) so the control token is read from
+// disk on each attach: the daemon may not have written it when bridge.ts starts,
+// and a daemon restart rotates the token (arch-review P1 #283).
+const daemonClient = new DaemonClient(CONTROL_WS_URL, { identity: currentClientIdentity });
 
 let shuttingDown = false;
 let daemonDisabled = false;
@@ -199,6 +204,15 @@ daemonClient.on("rejected", async (code: number) => {
       reason = "rejected";
       notificationId = "system_bridge_pair_mismatch";
       notificationContent = `⚠️ AgentBridge daemon rejected this session — pair/cwd identity mismatch (this daemon belongs to a different pair or directory). Do NOT kill it; start Claude Code from the pair's own directory, or pick another pair name with \`agentbridge --pair <name> claude\`. AgentBridge 拒绝了此会话——pair/目录身份不匹配（该 daemon 属于其他 pair 或目录）。无需 kill；请到对应目录启动，或换一个 pair 名：\`agentbridge --pair <名字> claude\`。`;
+      break;
+    case CLOSE_CODE_TOKEN_MISMATCH:
+      // The control token we presented was missing/stale — almost always the
+      // daemon restarted and rotated its token while this session held an old
+      // one. A fresh launch re-reads the current token and recovers. Distinct
+      // message so the user does not chase a phantom "another session" conflict.
+      reason = "rejected";
+      notificationId = "system_bridge_token_mismatch";
+      notificationContent = `⚠️ AgentBridge daemon rejected this session — control token mismatch (the daemon likely restarted and rotated its token). Start a fresh session with \`${pairScopedCommand("claude")}\` to pick up the current token. AgentBridge 拒绝了此会话——控制令牌不匹配（daemon 可能已重启并轮换令牌）。请用 \`${pairScopedCommand("claude")}\` 重新启动以获取最新令牌。`;
       break;
     default:
       reason = "rejected";
@@ -549,6 +563,10 @@ function systemMessage(idPrefix: string, content: string): BridgeMessage {
 }
 
 function currentClientIdentity(): ControlClientIdentity {
+  // Read the control token fresh on every attach (arch-review P1 #283). null
+  // when the daemon hasn't written it yet or wrote it with the token layer
+  // disabled — the daemon then admits us on pair/cwd alone (compat-degraded).
+  const controlToken = readControlToken(resolveControlTokenPath(stateDir.dir));
   return {
     pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
     pairName: process.env.AGENTBRIDGE_PAIR_NAME ?? null,
@@ -557,6 +575,7 @@ function currentClientIdentity(): ControlClientIdentity {
     stateDir: stateDir.dir,
     clientPid: process.pid,
     contractVersion: BUILD_INFO.contractVersion,
+    ...(controlToken ? { controlToken } : {}),
   };
 }
 

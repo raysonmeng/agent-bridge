@@ -11,6 +11,14 @@ export interface ControlClientIdentity {
   stateDir?: string | null;
   clientPid?: number;
   contractVersion?: number;
+  /**
+   * Capability token (arch-review P1 #283). The daemon writes a random token to
+   * `<stateDir>/control-token` (0600) at startup; a legitimate same-machine
+   * frontend reads it and echoes it here. The daemon enforces it at
+   * `claude_connect` (see control-token.ts). Absent against an older client or
+   * when the daemon has no token loaded (compat-degraded).
+   */
+  controlToken?: string | null;
 }
 
 /**
@@ -159,3 +167,12 @@ export const CLOSE_CODE_PROBE_IN_PROGRESS = 4003;
 
 /** WebSocket close code reserved for pair/cwd identity mismatch enforcement. */
 export const CLOSE_CODE_PAIR_MISMATCH = 4004;
+
+/**
+ * WebSocket close code sent when a Claude frontend's `claude_connect` carries a
+ * missing/incorrect control-port capability token (arch-review P1 #283). Distinct
+ * from CLOSE_CODE_PAIR_MISMATCH so the frontend can tell "wrong directory" apart
+ * from "stale/absent token" — the latter usually means a daemon restarted and
+ * rotated its token, and a fresh `claude` launch (re-reading the token) recovers.
+ */
+export const CLOSE_CODE_TOKEN_MISMATCH = 4005;

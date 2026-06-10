@@ -9,6 +9,14 @@ export interface AtomicWriteOptions {
    * can use the default tmp+rename path.
    */
   fsync?: boolean;
+  /**
+   * Permission mode for the temp file (and therefore the renamed target). When
+   * set, the temp file is created with this mode FROM THE START, closing the
+   * brief world-readable window a post-rename chmod would otherwise leave open
+   * (CWE-732). e.g. pass 0o600 for secrets. Subject to the process umask, which
+   * can only further restrict — never widen — these bits. Defaults to 0o666.
+   */
+  mode?: number;
 }
 
 function tmpPathFor(targetPath: string): string {
@@ -19,7 +27,7 @@ export function atomicWriteText(path: string, content: string, options: AtomicWr
   fs.mkdirSync(dirname(path), { recursive: true });
   const tmp = tmpPathFor(path);
   let renamed = false;
-  const fd = fs.openSync(tmp, "w");
+  const fd = fs.openSync(tmp, "w", options.mode ?? 0o666);
   try {
     try {
       fs.writeFileSync(fd, content, "utf-8");

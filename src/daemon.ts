@@ -1,9 +1,10 @@
 #!/usr/bin/env bun
 
 import type { ServerWebSocket } from "bun";
+import { rmSync } from "node:fs";
 import { daemonStatusBuildInfo } from "./build-info";
 import { CodexAdapter } from "./codex-adapter";
-import { validateClaudeClientIdentity } from "./daemon-identity";
+import { validateClaudeClientIdentity, evaluateInjectionAttachGuard } from "./daemon-identity";
 import {
   REPLY_REQUIRED_INSTRUCTION,
   StatusBuffer,
@@ -23,6 +24,11 @@ import {
 } from "./control-protocol";
 import { parsePositiveIntEnv } from "./env-utils";
 import { isAllowedWsUpgrade, wsOriginRejectedResponse } from "./ws-origin-guard";
+import {
+  generateControlToken,
+  resolveControlTokenPath,
+  writeControlToken,
+} from "./control-token";
 import { IdempotencyTracker, type IdempotencyDuplicate } from "./idempotency-tracker";
 import { ReplyRequiredTracker } from "./reply-required-tracker";
 import { persistCurrentThreadWithRolloutRetry } from "./thread-state";
@@ -61,6 +67,26 @@ interface ControlSocketData {
 const stateDir = new StateDirResolver();
 stateDir.ensure();
 const processLogger = createProcessLogger({ component: "AgentBridgeDaemon", logFile: stateDir.logFile });
+
+// Control-port capability token (arch-review P1 #283). Generated fresh on every
+// daemon start and written 0600 to the pair's state dir BEFORE the control server
+// accepts any socket, so a legitimate same-machine frontend can read it and echo
+// it in `claude_connect`. A write/chmod failure degrades the token layer to OFF
+// (null) — the attach-convergence guard + Origin guard still apply — rather than
+// bricking the daemon. Per-pair isolation is automatic: each pair has its own
+// state dir, hence its own token.
+const controlTokenPath = resolveControlTokenPath(stateDir.dir);
+let controlToken: string | null = null;
+try {
+  controlToken = generateControlToken();
+  writeControlToken(controlTokenPath, controlToken);
+} catch (err: any) {
+  controlToken = null;
+  processLogger.log(
+    `Failed to write control token (${controlTokenPath}): ${err?.message ?? err} — ` +
+    `token layer DISABLED for this daemon (attach guard + Origin guard still active)`,
+  );
+}
 const configService = new ConfigService();
 // Thread the daemon logger so a corrupt config.json fails loud (to log + stderr)
 // instead of silently reverting custom budget/idle thresholds to defaults.
@@ -684,6 +710,7 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
         daemonCwd: process.cwd(),
         identity: message.identity,
         allowIdentityless: ALLOW_IDENTITYLESS_CLIENT,
+        expectedControlToken: controlToken,
       });
       if (!admission.ok) {
         log(`Rejecting Claude frontend #${ws.data.clientId}: ${admission.reason}`);
@@ -803,6 +830,31 @@ async function handleClaudeToCodex(
   ws: ServerWebSocket<ControlSocketData>,
   message: Extract<ControlClientMessage, { type: "claude_to_codex" }>,
 ): Promise<void> {
+  // Attach-convergence guard (arch-review P1 #283, defense layer 1). ONLY the
+  // socket that passed `claude_connect` admission (and thus the pair/cwd + token
+  // gate) and currently holds the attach slot may inject a turn into Codex. A
+  // socket that connected to /ws but never attached — or one that lost the slot
+  // to a newer session — is rejected here, BEFORE any thread/budget reasoning.
+  // This cannot misfire on the normal reply path: the bridge sends every
+  // claude_to_codex over the same socket it attached with, so attachedClaude===ws
+  // holds for every legitimate reply (verified against the attach/detach
+  // lifecycle: attachClaude sets attachedClaude=ws, detachClaude/eviction clear
+  // it, and a replaced socket is closed). Decision extracted to a pure helper so
+  // it is unit-testable without a live WebSocket.
+  const attachGuard = evaluateInjectionAttachGuard(attachedClaude, ws);
+  if (!attachGuard.allowed) {
+    log(
+      `Rejecting claude_to_codex from non-attached socket #${ws.data.clientId} ` +
+      `(request ${message.requestId}, attached=${attachedClaude ? "#" + attachedClaude.data.clientId : "none"})`,
+    );
+    sendClaudeToCodexResult(ws, message.requestId, {
+      success: false,
+      code: attachGuard.code,
+      error: attachGuard.reason,
+    });
+    return;
+  }
+
   if (message.message.source !== "claude") {
     sendClaudeToCodexResult(ws, message.requestId, {
       success: false,
@@ -1635,7 +1687,20 @@ function shutdown(reason: string, exitCode = 0) {
   codex.stop();
   removePidFile();
   removeStatusFile();
+  removeControlToken();
   process.exit(exitCode);
+}
+
+/**
+ * Best-effort removal of the control-token file. The token is a per-start
+ * secret; leaving a stale file behind would let a NEXT daemon's pre-write window
+ * (or a crashed daemon) expose an old token, and a same-version restart writes a
+ * fresh one anyway. Never throws — removal failure must not block shutdown.
+ */
+function removeControlToken() {
+  try {
+    rmSync(controlTokenPath, { force: true });
+  } catch {}
 }
 
 process.on("SIGINT", () => shutdown("SIGINT"));
@@ -1649,6 +1714,7 @@ process.on("exit", () => {
   codex.forceKillAppServerSync();
   removePidFile();
   removeStatusFile();
+  removeControlToken();
 });
 process.on("uncaughtException", (err) => {
   processLogger.fatal("UNCAUGHT EXCEPTION", err);
