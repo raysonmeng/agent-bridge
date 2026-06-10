@@ -118,6 +118,33 @@ async function waitFor(condition: () => boolean, timeoutMs = 250): Promise<void>
 }
 
 describe("BudgetCoordinator", () => {
+  test("calls onSnapshot after latestSnapshot is updated", async () => {
+    const source = new FakeSource([{ claude: usage(), codex: usage({ gateUtil: 25, warnUtil: 25 }) }]);
+    let coordinator: BudgetCoordinator;
+    const snapshots: Array<{
+      snapshot: ReturnType<BudgetCoordinator["getSnapshot"]>;
+      current: ReturnType<BudgetCoordinator["getSnapshot"]>;
+    }> = [];
+    coordinator = new BudgetCoordinator({
+      source,
+      config: CONFIG,
+      emit: () => {},
+      onPauseChange: () => {},
+      now: () => NOW,
+      onSnapshot: (snapshot) => {
+        snapshots.push({ snapshot, current: coordinator.getSnapshot() });
+      },
+    });
+
+    await coordinator.start();
+    coordinator.stop();
+
+    expect(snapshots).toHaveLength(1);
+    expect(snapshots[0]!.snapshot).toBe(coordinator.getSnapshot());
+    expect(snapshots[0]!.current).toBe(snapshots[0]!.snapshot);
+    expect(snapshots[0]!.snapshot).toMatchObject({ codex: { gateUtil: 25 } });
+  });
+
   test("adaptive poll delay uses longer intervals far from thresholds", () => {
     const config = longPollConfig();
 

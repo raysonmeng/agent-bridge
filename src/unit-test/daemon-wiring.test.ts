@@ -482,6 +482,84 @@ describe("daemon wiring", () => {
     }
   }, 60000);
 
+  test("budget status broadcasts follow coordinator snapshot polls, not the daemon interval", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-budget-snapshot-fixture-"));
+    const probePath = join(fixtureRoot, "probe.sh");
+    const writeUsage = (agent: "claude" | "codex", gateUtil: number, resetOffsetSec: number) => {
+      writeFileSync(
+        join(fixtureRoot, `usage-${agent}.json`),
+        JSON.stringify({
+          ok: true,
+          util: gateUtil,
+          warn_util: gateUtil,
+          fetched_at: Math.floor(Date.now() / 1000),
+          buckets: [
+            {
+              id: "five_hour",
+              util: gateUtil,
+              reset_epoch: Math.floor(Date.now() / 1000) + resetOffsetSec,
+            },
+          ],
+        }),
+      );
+    };
+    const writeBoth = (gateUtil: number, resetOffsetSec: number) => {
+      writeUsage("claude", gateUtil, resetOffsetSec);
+      writeUsage("codex", gateUtil, resetOffsetSec);
+    };
+    writeBoth(10, 1);
+    writeFileSync(probePath, `#!/bin/sh\ncat "${fixtureRoot}/usage-$2.json"\n`, "utf-8");
+    chmodSync(probePath, 0o755);
+
+    try {
+      const harness = await startHarness({
+        pairId: "main-budsnap1",
+        pairName: "main",
+        projectConfig: {
+          version: "1.0",
+          budget: {
+            codexTierControl: true,
+            codexTiers: { full: { effort: "high" } },
+          },
+        },
+        extraEnv: {
+          AGENTBRIDGE_BUDGET_ENABLED: "1",
+          AGENTBRIDGE_QUOTA_PROBE: probePath,
+          AGENTBRIDGE_BUDGET_POLL_SECONDS: "300",
+        },
+      });
+
+      await harness.attachClaude();
+      await harness.connectTui();
+
+      await waitFor(async () => {
+        try {
+          const res = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+          if (!res.ok) return false;
+          const status = (await res.json()) as DaemonStatus;
+          return status.budget?.codexTier === "full";
+        } catch {
+          return false;
+        }
+      }, "initial full budget snapshot", 100, 100);
+
+      const statusCount = harness.statusMessages.length;
+      writeBoth(85, 3600);
+
+      await waitFor(
+        () =>
+          harness.statusMessages
+            .slice(statusCount)
+            .some((message) => message.type === "status" && message.status.budget?.codexTier === "eco"),
+        "budget status broadcast from coordinator snapshot callback",
+        140,
+        100,
+      );
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 30000);
+
   test("on_busy=steer feeds the message into a running turn via turn/steer (protocol v2 B0)", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-steer-fixture-"));
     const steerLog = join(fixtureRoot, "turnsteer.jsonl");
