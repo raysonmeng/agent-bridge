@@ -4,7 +4,7 @@ import { createServer } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { StateDirResolver } from "../state-dir";
-import { classifyDaemon, DaemonLifecycle, isProcessAlive } from "../daemon-lifecycle";
+import { classifyDaemon, DaemonLifecycle, isProcessAlive, resolveTiming } from "../daemon-lifecycle";
 import { BUILD_INFO, type AgentBridgeBuildInfo } from "../build-info";
 import type { DaemonStatus } from "../control-protocol";
 
@@ -345,4 +345,33 @@ describe("DaemonLifecycle", () => {
     expect(killed).toBe(false);
     expect(launched).toBe(false);
   }, 15000);
+});
+
+// Lock-down test for arch-review P1 #435: the timing injection seam must default to
+// the EXACT historical production cadence. Hard-coded literals (not the module
+// constants) so a future edit that lowers the shipped reuse/wait window — e.g. a
+// test-tuning value leaking into resolveTiming's fallback — fails here loudly.
+describe("resolveTiming production defaults (injection seam guard)", () => {
+  // NOTE: REUSE_READY_RETRIES is captured ONCE from AGENTBRIDGE_REUSE_READY_RETRIES at
+  // module load — the 12 below is the shipped default observed with that env unset (the
+  // normal case for the test runner and CI). If a future env-leak ever set that var at
+  // load time, this assertion would surface it as a failure, which is the intent: it
+  // pins what the daemon actually ships, not what a runtime mutation could fake.
+  test("undefined timing yields the historical hardcoded cadence", () => {
+    expect(resolveTiming(undefined)).toEqual({
+      reuseReadyRetries: 12, // REUSE_READY_RETRIES default → ~3s reuse window (12×250ms)
+      reuseReadyDelayMs: 250, // REUSE_READY_DELAY_MS
+      waitReadyRetries: 40, // WAIT_READY_RETRIES → ~10s full wait (40×250ms)
+      waitReadyDelayMs: 250, // WAIT_READY_DELAY_MS
+    });
+  });
+
+  test("partial timing overrides only the supplied fields, rest fall back to prod defaults", () => {
+    expect(resolveTiming({ reuseReadyDelayMs: 10, waitReadyRetries: 3 })).toEqual({
+      reuseReadyRetries: 12, // untouched → prod default
+      reuseReadyDelayMs: 10, // overridden
+      waitReadyRetries: 3, // overridden
+      waitReadyDelayMs: 250, // untouched → prod default
+    });
+  });
 });

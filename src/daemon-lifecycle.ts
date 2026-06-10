@@ -22,6 +22,11 @@ const DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
 // healthz-OK/readyz-503 zombie so we replace it instead of hanging the full ~10s.
 const REUSE_READY_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_REUSE_READY_RETRIES", 12);
 const REUSE_READY_DELAY_MS = 250;
+// Full readiness wait (fresh launch + contended-lock branches). ~10s (40×250ms):
+// the historical waitForReady() / waitForReadyAndOurs() signature defaults, now
+// named so DaemonLifecycleTiming can override them without touching the prod path.
+const WAIT_READY_RETRIES = 40;
+const WAIT_READY_DELAY_MS = 250;
 const HEALTH_FETCH_TIMEOUT_MS = 500;
 // A legitimate startup-lock hold lasts seconds (launch + waitForReady, plus a
 // 3s graceful kill during a replace). Only locks far older than that get the
@@ -93,10 +98,52 @@ export function classifyDaemon(
   return { verdict: "reuse", reason: "daemon pair and runtime contract match" };
 }
 
+/**
+ * Polling cadence for the readiness loops. Injectable so tests can drive the
+ * self-heal contract at 10-20ms instead of paying the real ~3s reuse window /
+ * ~10s wait. PRODUCTION DEFAULTS (resolveTiming below) must stay bit-for-bit
+ * identical to the historical hardcoded constants — daemon-lifecycle.test pins
+ * them so the injection seam can never silently drift the shipped cadence.
+ */
+export interface DaemonLifecycleTiming {
+  /** Retries for the reuse-validation readiness window (REUSE_READY_RETRIES). */
+  reuseReadyRetries?: number;
+  /** Delay between reuse-validation probes (REUSE_READY_DELAY_MS). */
+  reuseReadyDelayMs?: number;
+  /** Retries for the full waitForReady / waitForReadyAndOurs loops. */
+  waitReadyRetries?: number;
+  /** Delay between full readiness probes. */
+  waitReadyDelayMs?: number;
+}
+
+export interface ResolvedTiming {
+  reuseReadyRetries: number;
+  reuseReadyDelayMs: number;
+  waitReadyRetries: number;
+  waitReadyDelayMs: number;
+}
+
+/**
+ * Resolve the timing knobs, falling back to the historical production constants
+ * for any field left undefined. Keep these fallbacks in lockstep with the
+ * module-level constants — they are the shipped daemon cadence. Exported so a
+ * lock-down test can pin the production defaults against the injection seam.
+ */
+export function resolveTiming(timing?: DaemonLifecycleTiming): ResolvedTiming {
+  return {
+    reuseReadyRetries: timing?.reuseReadyRetries ?? REUSE_READY_RETRIES,
+    reuseReadyDelayMs: timing?.reuseReadyDelayMs ?? REUSE_READY_DELAY_MS,
+    waitReadyRetries: timing?.waitReadyRetries ?? WAIT_READY_RETRIES,
+    waitReadyDelayMs: timing?.waitReadyDelayMs ?? WAIT_READY_DELAY_MS,
+  };
+}
+
 export interface DaemonLifecycleOptions {
   stateDir: StateDirResolver;
   controlPort: number;
   log: (msg: string) => void;
+  /** Optional polling cadence override; defaults to production constants. */
+  timing?: DaemonLifecycleTiming;
 }
 
 /**
@@ -107,11 +154,13 @@ export class DaemonLifecycle {
   private readonly stateDir: StateDirResolver;
   private readonly controlPort: number;
   private readonly log: (msg: string) => void;
+  private readonly timing: ResolvedTiming;
 
   constructor(opts: DaemonLifecycleOptions) {
     this.stateDir = opts.stateDir;
     this.controlPort = opts.controlPort;
     this.log = opts.log;
+    this.timing = resolveTiming(opts.timing);
   }
 
   get healthUrl(): string {
@@ -199,7 +248,7 @@ export class DaemonLifecycle {
       }
       try {
         // Short window: a sane daemon (or a legit slow boot) reports ready within ~3s.
-        await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
+        await this.waitForReady(this.timing.reuseReadyRetries, this.timing.reuseReadyDelayMs);
         return; // healthy + ready → reuse
       } catch {
         // healthz-OK but never ready within the reuse window → bad/zombie daemon
@@ -219,7 +268,7 @@ export class DaemonLifecycle {
         // Verify the live process is actually our daemon, not an OS-reused PID
         if (isAgentBridgeDaemon(existingPid)) {
           try {
-            await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
+            await this.waitForReady(this.timing.reuseReadyRetries, this.timing.reuseReadyDelayMs);
             return;
           } catch {
             // Live daemon process but control port never became ready → replace it
@@ -257,7 +306,7 @@ export class DaemonLifecycle {
           await this.kill(3000, status?.pid);
         } else {
           try {
-            await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
+            await this.waitForReady(this.timing.reuseReadyRetries, this.timing.reuseReadyDelayMs);
             return;
           } catch {
             this.log(
@@ -268,7 +317,7 @@ export class DaemonLifecycle {
         }
       }
       this.launch();
-      await this.waitForReady();
+      await this.waitForReady(this.timing.waitReadyRetries, this.timing.waitReadyDelayMs);
     });
   }
 
@@ -302,7 +351,7 @@ export class DaemonLifecycle {
   }
 
   /** Wait for daemon to become ready. */
-  async waitForReady(maxRetries = 40, delayMs = 250): Promise<void> {
+  async waitForReady(maxRetries = WAIT_READY_RETRIES, delayMs = WAIT_READY_DELAY_MS): Promise<void> {
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       if (await this.isReady()) return;
       await new Promise((resolve) => setTimeout(resolve, delayMs));
@@ -317,7 +366,7 @@ export class DaemonLifecycle {
    * other pair repairing their own daemon). In manual mode (no expected pairId) this
    * is equivalent to waitForReady.
    */
-  async waitForReadyAndOurs(maxRetries = 40, delayMs = 250): Promise<void> {
+  async waitForReadyAndOurs(maxRetries = WAIT_READY_RETRIES, delayMs = WAIT_READY_DELAY_MS): Promise<void> {
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       if (await this.isReady()) {
         const status = await this.fetchStatus();
@@ -449,7 +498,7 @@ export class DaemonLifecycle {
         }
         if (isReuseVerdict(classification.verdict)) {
           try {
-            await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
+            await this.waitForReady(this.timing.reuseReadyRetries, this.timing.reuseReadyDelayMs);
             return; // someone else already fixed it — don't kill
           } catch {
             // still not ready → fall through to kill + relaunch
@@ -459,7 +508,7 @@ export class DaemonLifecycle {
       this.log(`Killing unhealthy daemon on control port ${this.controlPort} and relaunching`);
       await this.kill(3000, statusPid);
       this.launch();
-      await this.waitForReady();
+      await this.waitForReady(this.timing.waitReadyRetries, this.timing.waitReadyDelayMs);
     });
   }
 
@@ -470,7 +519,7 @@ export class DaemonLifecycle {
     // that is BOTH ready AND ours — a foreign daemon becoming ready behind the
     // lock holder is the other pair repairing their own daemon; adopting it
     // would squat the wrong pair.
-    await this.waitForReadyAndOurs();
+    await this.waitForReadyAndOurs(this.timing.waitReadyRetries, this.timing.waitReadyDelayMs);
   }
 
   /**

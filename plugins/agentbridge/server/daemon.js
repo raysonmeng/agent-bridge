@@ -18,7 +18,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("ef0c291", "source"),
+  commit: defineString("20991c3", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -2533,6 +2533,8 @@ var DAEMON_ENTRY = process.env.AGENTBRIDGE_DAEMON_ENTRY || DEFAULT_DAEMON_ENTRY;
 var DAEMON_PATH = fileURLToPath(new URL(DAEMON_ENTRY, import.meta.url));
 var REUSE_READY_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_REUSE_READY_RETRIES", 12);
 var REUSE_READY_DELAY_MS = 250;
+var WAIT_READY_RETRIES = 40;
+var WAIT_READY_DELAY_MS = 250;
 var HEALTH_FETCH_TIMEOUT_MS = 500;
 var LOCK_IDENTITY_GRACE_MS = parsePositiveIntEnv("AGENTBRIDGE_LOCK_IDENTITY_GRACE_MS", 120000);
 function isReuseVerdict(verdict) {
@@ -2577,15 +2579,25 @@ function classifyDaemon(expectedPairId, status, buildInfo) {
   }
   return { verdict: "reuse", reason: "daemon pair and runtime contract match" };
 }
+function resolveTiming(timing) {
+  return {
+    reuseReadyRetries: timing?.reuseReadyRetries ?? REUSE_READY_RETRIES,
+    reuseReadyDelayMs: timing?.reuseReadyDelayMs ?? REUSE_READY_DELAY_MS,
+    waitReadyRetries: timing?.waitReadyRetries ?? WAIT_READY_RETRIES,
+    waitReadyDelayMs: timing?.waitReadyDelayMs ?? WAIT_READY_DELAY_MS
+  };
+}
 
 class DaemonLifecycle {
   stateDir;
   controlPort;
   log;
+  timing;
   constructor(opts) {
     this.stateDir = opts.stateDir;
     this.controlPort = opts.controlPort;
     this.log = opts.log;
+    this.timing = resolveTiming(opts.timing);
   }
   get healthUrl() {
     return `http://127.0.0.1:${this.controlPort}/healthz`;
@@ -2642,7 +2654,7 @@ class DaemonLifecycle {
           break;
       }
       try {
-        await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
+        await this.waitForReady(this.timing.reuseReadyRetries, this.timing.reuseReadyDelayMs);
         return;
       } catch {
         this.log(`Daemon on control port ${this.controlPort} is healthy but not ready within reuse window \u2014 replacing`);
@@ -2655,7 +2667,7 @@ class DaemonLifecycle {
       if (isProcessAlive(existingPid)) {
         if (isAgentBridgeDaemon(existingPid)) {
           try {
-            await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
+            await this.waitForReady(this.timing.reuseReadyRetries, this.timing.reuseReadyDelayMs);
             return;
           } catch {
             this.log(`Existing daemon process ${existingPid} never became ready \u2014 replacing`);
@@ -2683,7 +2695,7 @@ class DaemonLifecycle {
           await this.kill(3000, status?.pid);
         } else {
           try {
-            await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
+            await this.waitForReady(this.timing.reuseReadyRetries, this.timing.reuseReadyDelayMs);
             return;
           } catch {
             this.log(`Daemon on control port ${this.controlPort} is healthy but not ready under startup lock \u2014 replacing`);
@@ -2692,7 +2704,7 @@ class DaemonLifecycle {
         }
       }
       this.launch();
-      await this.waitForReady();
+      await this.waitForReady(this.timing.waitReadyRetries, this.timing.waitReadyDelayMs);
     });
   }
   async isHealthy() {
@@ -2719,7 +2731,7 @@ class DaemonLifecycle {
       return false;
     }
   }
-  async waitForReady(maxRetries = 40, delayMs = 250) {
+  async waitForReady(maxRetries = WAIT_READY_RETRIES, delayMs = WAIT_READY_DELAY_MS) {
     for (let attempt = 0;attempt < maxRetries; attempt++) {
       if (await this.isReady())
         return;
@@ -2727,7 +2739,7 @@ class DaemonLifecycle {
     }
     throw new Error(`Timed out waiting for AgentBridge daemon readiness on ${this.readyUrl}`);
   }
-  async waitForReadyAndOurs(maxRetries = 40, delayMs = 250) {
+  async waitForReadyAndOurs(maxRetries = WAIT_READY_RETRIES, delayMs = WAIT_READY_DELAY_MS) {
     for (let attempt = 0;attempt < maxRetries; attempt++) {
       if (await this.isReady()) {
         const status = await this.fetchStatus();
@@ -2825,7 +2837,7 @@ class DaemonLifecycle {
         }
         if (isReuseVerdict(classification.verdict)) {
           try {
-            await this.waitForReady(REUSE_READY_RETRIES, REUSE_READY_DELAY_MS);
+            await this.waitForReady(this.timing.reuseReadyRetries, this.timing.reuseReadyDelayMs);
             return;
           } catch {}
         }
@@ -2833,12 +2845,12 @@ class DaemonLifecycle {
       this.log(`Killing unhealthy daemon on control port ${this.controlPort} and relaunching`);
       await this.kill(3000, statusPid);
       this.launch();
-      await this.waitForReady();
+      await this.waitForReady(this.timing.waitReadyRetries, this.timing.waitReadyDelayMs);
     });
   }
   async waitForContendedStartupLock() {
     this.log("Another process holds the startup lock, waiting for readiness+identity...");
-    await this.waitForReadyAndOurs();
+    await this.waitForReadyAndOurs(this.timing.waitReadyRetries, this.timing.waitReadyDelayMs);
   }
   async withStartupLockStrict(fn) {
     const locked = this.acquireLockStrict();

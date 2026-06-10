@@ -67,8 +67,22 @@ describe("DaemonLifecycle self-heal (zombie / foreign daemon replacement)", () =
     rmSync(tempDir, { recursive: true, force: true });
   });
 
-  // Fake control server with a mutable readyz status + reported pairId.
-  function fakeDaemon(port: number, state: { readyzStatus: number; pairId: string | null; pid?: number }) {
+  // Fake control server with a mutable readyz status + reported pairId. `state.readyzHits`
+  // (when present) counts every /readyz probe — lets tests assert "we actually polled N
+  // times" against the fake server instead of a flaky wall-clock elapsed-ms threshold.
+  function fakeDaemon(
+    port: number,
+    state: {
+      readyzStatus: number;
+      pairId: string | null;
+      pid?: number;
+      readyzHits?: number;
+      // When set, /readyz returns 200 starting from this probe count (1-based) — a
+      // deterministic "slow boot" that becomes ready after N polls, independent of the
+      // wall clock (no setTimeout race against the polling cadence).
+      readyAtHit?: number;
+    },
+  ) {
     const s = Bun.serve({
       port,
       hostname: "127.0.0.1",
@@ -86,7 +100,12 @@ describe("DaemonLifecycle self-heal (zombie / foreign daemon replacement)", () =
           build: BUILD_INFO,
         };
         if (u.pathname === "/healthz") return Response.json(body);
-        if (u.pathname === "/readyz") return Response.json(body, { status: state.readyzStatus });
+        if (u.pathname === "/readyz") {
+          state.readyzHits = (state.readyzHits ?? 0) + 1;
+          const status =
+            state.readyAtHit != null && state.readyzHits >= state.readyAtHit ? 200 : state.readyzStatus;
+          return Response.json(body, { status });
+        }
         return new Response("ok");
       },
     });
@@ -94,8 +113,20 @@ describe("DaemonLifecycle self-heal (zombie / foreign daemon replacement)", () =
     return s;
   }
 
+  // Fast polling cadence so the self-heal contract is exercised in ms, not the real
+  // ~3s reuse window / ~10s full wait. Production defaults are pinned separately in
+  // daemon-lifecycle.test.ts ("resolveTiming production defaults"). Retry counts are
+  // kept generous (timeouts are reached by exhausting retries × tiny delay, not by
+  // shortening the budget) so the "we actually waited / polled" assertions stay valid.
+  const FAST_TIMING = {
+    reuseReadyRetries: 12,
+    reuseReadyDelayMs: 10,
+    waitReadyRetries: 40,
+    waitReadyDelayMs: 10,
+  };
+
   function lifecycle(port: number) {
-    return new DaemonLifecycle({ stateDir, controlPort: port, log: () => {} });
+    return new DaemonLifecycle({ stateDir, controlPort: port, log: () => {}, timing: FAST_TIMING });
   }
 
   test("reuses a healthy, ready, matching-pair daemon (no kill, no launch)", async () => {
@@ -342,16 +373,15 @@ describe("DaemonLifecycle self-heal (zombie / foreign daemon replacement)", () =
     await lc.ensureRunning();
     expect(killed).toBe(true);
     expect(launched).toBe(true);
-  }, 15000);
+  }, 5000);
 
   test("does NOT kill a healthy daemon that is merely slow to become ready", async () => {
     const port = await freePort();
-    const state = { readyzStatus: 503, pairId: null as string | null };
+    // Becomes ready on the 3rd /readyz probe — comfortably inside the reuseReadyRetries
+    // budget (12), so it's a legit slow boot, not a zombie. Probe-count based (not a
+    // setTimeout) so the "slow" window can't lose a race against the polling cadence.
+    const state = { readyzStatus: 503, pairId: null as string | null, readyAtHit: 3, readyzHits: 0 };
     fakeDaemon(port, state);
-    // Flip to ready well within the ~3s reuse window — a legit slow boot, not a zombie.
-    setTimeout(() => {
-      state.readyzStatus = 200;
-    }, 600);
     const lc = lifecycle(port);
     let killed = false;
     let launched = false;
@@ -365,7 +395,9 @@ describe("DaemonLifecycle self-heal (zombie / foreign daemon replacement)", () =
     await lc.ensureRunning();
     expect(killed).toBe(false);
     expect(launched).toBe(false);
-  }, 15000);
+    // Confirms reuse came from a late-readying probe, not an instant 200.
+    expect(state.readyzHits).toBeGreaterThanOrEqual(3);
+  }, 5000);
 
   test("acquireLockStrict returns false when a LIVE process holds the lock (no bypass)", () => {
     const lc = lifecycle(20001);
@@ -419,7 +451,7 @@ describe("DaemonLifecycle self-heal (zombie / foreign daemon replacement)", () =
     (lcB as any).launch = mockLaunch;
     await Promise.all([lcA.ensureRunning(), lcB.ensureRunning()]);
     expect(launchCount).toBe(1); // strict lock → only one launcher replaces; the other waits
-  }, 25000);
+  }, 5000);
 
   // Regression guard for cross-review HIGH-1: in a contended-lock branch the launcher
   // losing the race must wait for ready+OURS, not just ready. A foreign-pair daemon
@@ -432,27 +464,30 @@ describe("DaemonLifecycle self-heal (zombie / foreign daemon replacement)", () =
     process.env.AGENTBRIDGE_PAIR_ID = "mine-aaaa0000";
     const port = await freePort();
     // Foreign daemon: ready 200 from the start, but reports a DIFFERENT pairId.
-    fakeDaemon(port, { readyzStatus: 200, pairId: "other-bbbb1111", pid: 99999 });
+    const state = { readyzStatus: 200, pairId: "other-bbbb1111" as string | null, pid: 99999, readyzHits: 0 };
+    fakeDaemon(port, state);
     // Pin the lock file from outside so acquireLockStrict returns false → ensureRunning
     // takes the `locked=false` branch inside withStartupLockStrict → waitForReadyAndOurs.
     writeFileSync(stateDir.lockFile, `${process.pid}\n`); // this test process holds the lock
     const lc = lifecycle(port);
     (lc as any).kill = async () => true;
     (lc as any).launch = () => {};
-    const start = Date.now();
     let rejected: Error | null = null;
     try {
       await lc.ensureRunning();
     } catch (err: any) {
       rejected = err;
     }
-    const elapsed = Date.now() - start;
-    // Must reject (timed out waiting for ready+identity) and must have ACTUALLY waited,
-    // not short-circuited because the foreign daemon is "ready".
+    // Must reject (timed out waiting for ready+identity) and must have ACTUALLY polled
+    // the full retry budget, not short-circuited because the foreign daemon is "ready".
+    // Counting real /readyz probes against the fake server is exact and flake-free —
+    // unlike the old wall-clock `elapsed >= 5000` threshold.
     expect(rejected).not.toBeNull();
     expect(rejected!.message).toMatch(/Timed out waiting for AgentBridge daemon readiness\+identity/);
-    expect(elapsed).toBeGreaterThanOrEqual(5000); // waitForReadyAndOurs default = 40×250ms=10s, ≥5s confirms we waited
-  }, 20000);
+    // waitForReadyAndOurs polls /readyz once per retry; a foreign daemon never matches
+    // identity, so the loop exhausts the full waitReadyRetries budget before timing out.
+    expect(state.readyzHits).toBe(FAST_TIMING.waitReadyRetries);
+  }, 5000);
 
   // Regression guard for cross-review HIGH-2: in pair mode, a missing/null reported
   // pairId is treated as FOREIGN (a hard-paired pair must not adopt a manual/old
@@ -476,5 +511,5 @@ describe("DaemonLifecycle self-heal (zombie / foreign daemon replacement)", () =
     await lc.ensureRunning();
     expect(killed).toBe(true);
     expect(launched).toBe(true);
-  }, 15000);
+  }, 5000);
 });
