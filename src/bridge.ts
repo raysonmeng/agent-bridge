@@ -119,17 +119,6 @@ daemonClient.on("status", (status) => {
   // Cache the latest budget snapshot for the get_budget tool (absent = sensing unavailable).
   claude.setBudgetSnapshot(status.budget ?? null);
 
-  // R4 auto-wake relies on push delivery: in pull mode the RESUME notice only
-  // queues until Claude polls get_messages, so an idle session will not wake.
-  // Warn once per process so the limitation is visible in the log.
-  if (status.budget?.paused && claude.getDeliveryMode() === "pull" && !pullModePauseWarned) {
-    pullModePauseWarned = true;
-    log(
-      "Budget pause active while delivery mode is pull — the RESUME notice cannot wake an idle Claude session; " +
-      "rely on get_messages polling or the (P5) watchdog to resume.",
-    );
-  }
-
   // Kickoff message on first TUI connect transition (not reconnects)
   if (!hasSeenTuiConnect && status.tuiConnected && !previousTuiConnected) {
     hasSeenTuiConnect = true;
@@ -206,7 +195,7 @@ daemonClient.on("rejected", async (code: number) => {
 });
 
 claude.on("ready", async () => {
-  log(`MCP server ready (delivery mode: ${claude.getDeliveryMode()}) — ensuring AgentBridge daemon...`);
+  log("MCP server ready (push delivery) — ensuring AgentBridge daemon...");
   if (daemonLifecycle.wasKilled()) {
     await enterDisabledState(
       "Killed sentinel found — bridge staying idle",

@@ -250,7 +250,6 @@ agent_bridge/
 | `AGENTBRIDGE_TURN_WATCHDOG_MS` | `300000` | 单 turn 非活动看门狗：app-server 静默超过该毫秒数后强制完成该 turn，避免丢失 `turn/completed` 永久锁死注入（issue #69） |
 | `AGENTBRIDGE_CODEX_TRANSPORT` | `auto` | daemon 连接 Codex app-server 的方式：`auto`（探测 `codex app-server --help`，支持 `ws://` 则用 ws，否则经透明中继回退到 `unix://` socket）、`ws`（强制 ws）、`unix`（强制 unix socket + 中继）。用于去掉 `ws://` listen 支持的 Codex 版本（issue #85） |
 | `AGENTBRIDGE_STATE_DIR` | 平台默认 | 状态目录（pid、status、日志）。macOS: `~/Library/Application Support/agentbridge/`，Linux: `$XDG_STATE_HOME/agentbridge/` |
-| `AGENTBRIDGE_MODE` | `push` | 消息投递模式（`push` 用于 channel，`pull` 用于 API key 模式） |
 | `AGENTBRIDGE_DAEMON_ENTRY` | `./daemon.ts` | 覆盖 daemon 入口（插件包使用） |
 | `NO_UPDATE_NOTIFIER` | 未设置 | 设为任意值即关闭「有新版本」提示（生态通用 opt-out） |
 | `AGENTBRIDGE_NO_UPDATE_NOTIFIER` | 未设置 | 命名空间化的关闭开关（效果同 `NO_UPDATE_NOTIFIER`） |

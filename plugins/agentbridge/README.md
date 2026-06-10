@@ -1,6 +1,6 @@
 # AgentBridge Plugin
 
-Claude Code plugin for AgentBridge. This plugin packages the AgentBridge MCP frontend, dual-mode Claude transport (push channel delivery plus pull-mode `get_messages`), the `/agentbridge:init` command, and a non-blocking SessionStart health check.
+Claude Code plugin for AgentBridge. This plugin packages the AgentBridge MCP frontend with push channel delivery (a failed push falls back to an in-memory queue drained by `get_messages`), the `/agentbridge:init` command, and a non-blocking SessionStart health check.
 
 ## Structure
 
@@ -38,6 +38,6 @@ This creates self-contained bundles at:
 ## Notes
 
 - The plugin frontend launches the sibling daemon bundle via `AGENTBRIDGE_DAEMON_ENTRY=./daemon.js`.
-- Claude delivery supports both push notifications and pull-mode polling via `get_messages`, depending on the runtime mode.
+- Claude delivery is always push notifications. If a push fails, the message is queued and can be drained via `get_messages` (per-message fallback — the legacy `AGENTBRIDGE_MODE=pull` mode was removed and the env var is ignored with a one-time warning).
 - The SessionStart hook is informational only. It never starts or stops the daemon.
 - The command at `/agentbridge:init` edits project-local `.agentbridge/` files only; plugin installation and marketplace registration remain terminal-side tasks (`agentbridge init` / `agentbridge dev`).

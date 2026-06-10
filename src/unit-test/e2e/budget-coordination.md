@@ -174,8 +174,10 @@ v2.3 per-agent fallback.
 ---
 
 Notes:
-- Tests 2–4 cover plan risk #5/#6 (pull-mode limitation is documented, not tested
-  here: R4 auto-wake is push-mode only; pull mode logs a warning).
+- Tests 2–4 cover plan risk #6. The former pull-mode limitation (risk #5) was
+  eradicated by removing the configurable pull mode entirely — push delivery is
+  unconditional; a failed push still degrades to the get_messages fallback queue
+  (transport failure, not a mode).
 - Unit-level coverage (dual probe shapes, gateUtil vs warnUtil gating,
   rate-limit-only pause, config boundary protection, stop() timer cleanup) lives in
   `budget-state.test.ts` / `quota-source.test.ts` / `budget-coordinator.test.ts` /

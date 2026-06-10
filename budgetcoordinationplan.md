@@ -18,7 +18,7 @@ AgentBridge 的 daemon 是机器上**唯一同时看到 Claude 与 Codex 两侧*
 - **Codex 侧可强制 per-turn 切模型/effort**：`~/repo/codex/codex-rs/app-server-protocol/src/protocol/v2/turn.rs:85-99` —— `TurnStartParams` 含 `model: Option<String>` 与 `effort: Option<ReasoningEffort>`，注释明确 *"this turn and **subsequent turns**"*（**sticky 语义**）。本机 codex-cli 0.137.0。**【v2.1】但 `TurnStartedNotification` 只含 `thread_id` + `turn`（turn.rs:312-315；bespoke_event_handling.rs:171-177），无法从中观测 applied model/effort**。
 - **Claude 主会话不可外控**：`set_model`（claude-code `controlSchemas.ts:140`）仅对 SDK 宿主有效；交互 TUI 下只有用户能 `/model` `/effort`。Claude 侧真实强杆 = **Task 工具 per-call model 参数**（subagent 分层 haiku/sonnet/opus）。
 - **模型分层真省额度**：Claude 订阅 usage API 存在独立 `seven_day_sonnet` 桶（本机 usage_claude.json 亲见）。
-- **唤醒链（push 模式）可行**：daemon `emitToClaude` push 通道可唤醒空闲 Claude 轮次（本会话实证）。**【v2.1 实证】pull 模式（`AGENTBRIDGE_MODE=pull`，claude-adapter.ts:156-158）只入队不唤醒** → R4 自动唤醒**依赖 push 模式（默认）**；pull 模式下 RESUME 静默入队、依赖 Claude 主动 `get_messages` 或 P5 watchdog。daemon 消息缓冲（100 条）不跨重启持久化。
+- **唤醒链（push 模式）可行**：daemon `emitToClaude` push 通道可唤醒空闲 Claude 轮次（本会话实证）。**【v2.1 实证→v2.5 根除】** 旧 pull 模式只入队不唤醒、会静默破坏 RESUME 链 → **配置型 pull 模式已整体删除**（AGENTBRIDGE_MODE 被忽略+一次性警告），push 为唯一投递路径；push 失败仍逐条落 fallback 队列由 `get_messages` 读取（这是传输失败降级，不是模式，亦不承诺自动唤醒）。daemon 消息缓冲（100 条）不跨重启持久化。
 
 ## 诚实的能力边界
 
@@ -27,7 +27,7 @@ AgentBridge 的 daemon 是机器上**唯一同时看到 Claude 与 Codex 两侧*
 | 1 额度同步 | 探测双方 → 算漂移 → 下发「你 A%，对方 B%」指令 | 数据真实，执行建议性 |
 | 2 动态并行 | 高剩余 + 临近结算 → 下发「拆更多 sub-agent 并行」 | 建议性（bridge 不能替 agent spawn） |
 | 3 负载均衡 | effective util 漂移 → 下发「多分给 lighter 一侧」 | 建议性，Claude 委派时据此路由 |
-| 4 耗尽暂停/唤醒 | **bridge 层强制**：暂停闸门 + STOP/RESUME + 唤醒轮询，叠加 quota-guard 单边 hook（backstop） | **强制（最强项）**；自动唤醒依赖 push 模式 |
+| 4 耗尽暂停/唤醒 | **bridge 层强制**：暂停闸门 + STOP/RESUME + 唤醒轮询，叠加 quota-guard 单边 hook（backstop） | **强制（最强项）**；自动唤醒无条件（v2.5 起 push 为唯一投递路径） |
 | 5 模型/effort 分级 | **Codex 侧：turn/start 带 `model`/`effort`，可强制**（sticky，策略期管理 + 接受性探测 + `codexTierControl` 默认关）；Claude 侧：subagent 分层建议 + 用户手动 /model /effort + watchdog 重启级 `--model --effort` | Codex 强制 / Claude 建议（**诚实非对称**） |
 
 > bridge 无法强行更改运行中 Claude 主会话的模型、也无法替任一 agent spawn sub-agent。诉求 4 是真正可强制的闭环；诉求 5 在 Codex 侧可强制、Claude 侧建议性。
@@ -101,7 +101,7 @@ flowchart TD
 2. **`src/budget/budget-state.ts`** — `computeBudgetState(claude, codex, cfg, now): BudgetState` 纯函数（零 I/O、`now` 入参）。输出 `{ phase, now, perAgent, drift:{pct,heavier,lighter}, pause:{active,side,reason,resumeBelow,resetEpochs}, parallel:{recommended,reason}, effort:{claudeAdvice, codexTier}, directiveToClaude: string|null }`。指令文案中文，含具体百分比与 reset 时刻、标注「账号级额度」。`rate_limited` 判定一律 `rate_limited_until > now`。
 3. **`src/budget/budget-coordinator.ts`** — 有状态编排器，注入式依赖（`{ source, config, emit, onPauseChange, now, log }`）：
    - `start()`：**立即执行首轮探测**（消除启动到首 tick 间的 fail-open 窗口），随后每 `pollSeconds` 轮询 → `computeBudgetState` → phase/材料变化才 `emit(systemMessage("system_budget_*", directive))`，去重仿 `fingerprint.mjs`（key=phase+heavier+bucketReset；**仅内存**，重启后允许单次重发）；每 tick 更新快照并触发 `DaemonStatus.budget` 广播。
-   - 暂停生命周期：进入 `paused` → `onPauseChange(true)` + 向 Claude 发 STOP 指令（**只要求：写 checkpoint + 停止委派/收尾**；不要求转达 Codex）→ 唤醒轮询（各自 reset 过点强制重探）→ **双方** `gateUtil < resumeBelow` 且无 rate-limit → `onPauseChange(false)` + RESUME 指令（push 模式唤醒空闲 Claude；**pull 模式只入队并记 warning 日志**）→ Claude 首条 reply 自然唤醒 Codex。
+   - 暂停生命周期：进入 `paused` → `onPauseChange(true)` + 向 Claude 发 STOP 指令（**只要求：写 checkpoint + 停止委派/收尾**；不要求转达 Codex）→ 唤醒轮询（各自 reset 过点强制重探）→ **双方** `gateUtil < resumeBelow` 且无 rate-limit → `onPauseChange(false)` + RESUME 指令（push 唤醒空闲 Claude；v2.5 起 push 为唯一模式）→ Claude 首条 reply 自然唤醒 Codex。
    - R5 策略：`codexTier`（`full|balanced|eco` → model/effort 档位映射，phase 驱动），暴露 `getCodexTurnOverrides(): {model?, effort?} | null`；**sticky 管理**：档位变化进入「策略期」、恢复 `full` 时显式带恢复参数发一次；**接受性探测（v2.1 降级措辞）：以 `turn/start` 无 JSON-RPC error 判定参数被接受并记日志——`turn/started` 通知不含 model/effort，无法确认 applied 值**。
    - `isPaused()` / `getSnapshot()` / `stop()`。
 
@@ -125,7 +125,7 @@ flowchart TD
 | **P2 均衡+同步（R1/R3）** | warnUtil drift 计算 + 倾斜指令 + fingerprint 去重 | 40/20、20/40 fixture 正确倾斜且重复 tick 不刷屏 |
 | **P3 动态并行（R2）** | parallel 推荐 + 指令；与 balance 并发时合并文案 | 边界 fixture（59%/61% × 59min/61min）触发正确；drift+parallel 同时成立 → 单条合并指令 |
 | **P4 模型/effort（R5）** | codex-adapter overrides + 协议文本分层规则 + 接受性探测 | 单测：overrides 正确序列化进 `turn/start` params、档位变化只发一次、恢复 full 显式下发；真机（0.137.0）：注入无 error + 人工经 Codex TUI `/status` 确认模型变化；`codexTierControl` 关闭/老版本零影响 |
-| **P5 无人值守（跨仓库，单独 PR 到 agent-quota-guard）** | pending payload 加 `pair_id/state_dir/thread`；watchdog pair-aware（同 pair 串行恢复：先 daemon/Codex 后 Claude）；`abg resume`；**兼顾 pull 模式的唤醒兜底** | tmux E2E：睡前任务→双侧 park→刷新→watchdog 拉起 pair 续跑 |
+| **P5 无人值守（跨仓库，单独 PR 到 agent-quota-guard）** | pending payload 加 `pair_id/state_dir/thread`；watchdog pair-aware（同 pair 串行恢复：先 daemon/Codex 后 Claude）；`abg resume` | tmux E2E：睡前任务→双侧 park→刷新→watchdog 拉起 pair 续跑 |
 
 > P0–P4 = agent_bridge 仓库一个 PR（`feat/budget-aware-coordination`）。P5 = agent-quota-guard 仓库独立 PR，本 PR 合并后做。
 
@@ -151,7 +151,7 @@ flowchart TD
 2. **探针不可用 / 形状漂移**：fail-open→null + 双形状归一化回退；绝不阻断既有协作。
 3. **额度是账号级不是 pair 级**：指令文案如实标注，不做虚假精确。
 4. **双侧 reset_epoch 不一致**：解除需双方达标（保守换一致性，防协作状态分叉）。
-5. **pull 模式自动唤醒失效**：R4 自动唤醒依赖 push（默认）；pull 模式记 warning 日志 + 文档声明 + P5 watchdog 兜底。
+5. **【已根除·v2.5】配置型 pull 模式导致的自动唤醒例外**：pull 模式已删除，push 无条件生效。注意限定：真实 push 传输失败仍会逐条退化到 fallback 队列（get_messages 读取）——这不是 pull 模式，也不应被描述为保证自动唤醒；进程级失效由 P5 watchdog 兜底。
 6. **指令刷屏 / 重启重复 STOP**：内存去重 + 材料变化才发；重启允许单次幂等重发（文档化 + 测试覆盖）。
 7. **版本偏移**：当前版 `TurnStartParams` 无 `deny_unknown_fields`（turn.rs 实证），**但「老版本未知字段静默忽略」是合理推断而非跨版本实证** → 无 JSON-RPC error 仅记为 *transport accepted*（不承诺 applied）+ 日志；`codexTierControl` 默认关。不报错不阻断。**【P4 gate 备案的 v1 已知限制】**若 turn/start 在 transport 接受后仍以 JSON-RPC error 失败，`lastAppliedTier` 会乐观记账（认为已投递而实际未应用）——错误意味着 turn 未启动、override 同样未生效，偏差只造成「少省一次额度」，并在下一次 tier 切换时自愈；不引入回滚记账复杂度。
 8. **与 guard 阈值耦合**：bridge `pauseAt=90` 刻意先于 guard 硬线 92（收尾预算），guard 是逃逸 backstop；两套阈值独立配置、文档写明关系。

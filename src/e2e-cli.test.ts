@@ -151,7 +151,6 @@ class CliE2EHarness {
       AGENTBRIDGE_STATE_DIR: stateDir,
       AGENTBRIDGE_CONTROL_PORT: String(controlPort),
       AGENTBRIDGE_DAEMON_ENTRY: fakeDaemonPath,
-      AGENTBRIDGE_MODE: "pull",
       AGENTBRIDGE_FAKE_DAEMON_LAUNCH_LOG: fakeDaemonLaunchLog,
       AGENTBRIDGE_FAKE_DAEMON_DELAY_MS: String(options.daemonDelayMs ?? 0),
       AGENTBRIDGE_SHIM_LOG_DIR: shimLogDir,

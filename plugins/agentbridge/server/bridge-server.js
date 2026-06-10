@@ -13913,9 +13913,8 @@ var CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
   "",
   "## Message delivery",
-  "Messages from Codex may arrive in two ways depending on the connection mode:",
-  '- As <channel source="agentbridge" chat_id="..." user="Codex" ...> tags (push mode)',
-  "- Via the get_messages tool (pull mode)",
+  'Messages from Codex arrive as <channel source="agentbridge" chat_id="..." user="Codex" ...> tags (push).',
+  "If a push fails, the message is queued \u2014 call get_messages to drain the fallback queue.",
   "",
   "## Collaboration roles",
   "Default roles in this setup:",
@@ -13957,8 +13956,6 @@ class ClaudeAdapter extends EventEmitter {
   replySender = null;
   logFile;
   logger;
-  configuredMode;
-  resolvedMode = null;
   pendingMessages = [];
   maxBufferedMessages;
   droppedMessageCount = 0;
@@ -13971,8 +13968,9 @@ class ClaudeAdapter extends EventEmitter {
     this.sessionId = `codex_${Date.now()}`;
     this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 12);
     this.log(`ClaudeAdapter created (instance=${this.instanceId})`);
-    const envMode = process.env.AGENTBRIDGE_MODE;
-    this.configuredMode = envMode && ["push", "pull", "auto"].includes(envMode) ? envMode : "auto";
+    if (process.env.AGENTBRIDGE_MODE) {
+      this.log(`AGENTBRIDGE_MODE="${process.env.AGENTBRIDGE_MODE}" is no longer supported \u2014 ` + "pull mode was removed; push delivery (with per-message fallback queue) is always used.");
+    }
     this.maxBufferedMessages = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
     this.server = new Server({ name: "agentbridge", version: "0.1.0" }, {
       capabilities: {
@@ -13985,16 +13983,12 @@ class ClaudeAdapter extends EventEmitter {
   }
   async start() {
     const transport = new StdioServerTransport;
-    this.resolveMode();
     await this.server.connect(transport);
-    this.log(`MCP server connected (mode: ${this.resolvedMode})`);
+    this.log("MCP server connected (push delivery)");
     this.emit("ready");
   }
   setReplySender(sender) {
     this.replySender = sender;
-  }
-  getDeliveryMode() {
-    return this.resolvedMode ?? "pull";
   }
   getPendingMessageCount() {
     return this.pendingMessages.length;
@@ -14002,24 +13996,9 @@ class ClaudeAdapter extends EventEmitter {
   setBudgetSnapshot(snapshot) {
     this.budgetSnapshot = snapshot;
   }
-  resolveMode() {
-    if (this.resolvedMode)
-      return;
-    if (this.configuredMode === "push" || this.configuredMode === "pull") {
-      this.resolvedMode = this.configuredMode;
-      this.log(`Delivery mode set by AGENTBRIDGE_MODE: ${this.resolvedMode}`);
-    } else {
-      this.resolvedMode = "push";
-      this.log("Delivery mode defaulting to push (set AGENTBRIDGE_MODE=pull to use polling instead)");
-    }
-  }
   async pushNotification(message) {
-    this.log(`pushNotification (instance=${this.instanceId}, mode=${this.resolvedMode}, msgId=${message.id}, len=${message.content.length})`);
-    if (this.resolvedMode === "push") {
-      await this.pushViaChannel(message);
-    } else {
-      this.queueForPull(message);
-    }
+    this.log(`pushNotification (instance=${this.instanceId}, msgId=${message.id}, len=${message.content.length})`);
+    await this.pushViaChannel(message);
   }
   async pushViaChannel(message) {
     const msgId = `codex_msg_${this.notificationIdPrefix}_${++this.notificationSeq}`;
@@ -14042,17 +14021,17 @@ class ClaudeAdapter extends EventEmitter {
       this.log(`Pushed notification: ${msgId}`);
     } catch (e) {
       this.log(`Push notification failed: ${e.message}`);
-      this.queueForPull(message);
+      this.queueFallbackMessage(message);
     }
   }
-  queueForPull(message) {
+  queueFallbackMessage(message) {
     if (this.pendingMessages.length >= this.maxBufferedMessages) {
       this.pendingMessages.shift();
       this.droppedMessageCount++;
-      this.log(`Message queue full, dropped oldest message (total dropped: ${this.droppedMessageCount})`);
+      this.log(`Fallback queue full, dropped oldest message (total dropped: ${this.droppedMessageCount})`);
     }
     this.pendingMessages.push(message);
-    this.log(`Queued message for pull (${this.pendingMessages.length} pending, instance=${this.instanceId})`);
+    this.log(`Queued fallback message (${this.pendingMessages.length} pending, instance=${this.instanceId})`);
   }
   drainMessages() {
     this.log(`get_messages called (instance=${this.instanceId}, pending=${this.pendingMessages.length}, dropped=${this.droppedMessageCount})`);
@@ -14219,7 +14198,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.6", "0.0.0-source"),
-  commit: defineString("8e4ca6a", "source"),
+  commit: defineString("7395ae5", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, 1)
 });
@@ -15397,10 +15376,6 @@ daemonClient.on("codexMessage", (message) => {
 daemonClient.on("status", (status) => {
   log(`Daemon status: ready=${status.bridgeReady} tui=${status.tuiConnected} thread=${status.threadId ?? "none"} queued=${status.queuedMessageCount}`);
   claude.setBudgetSnapshot(status.budget ?? null);
-  if (status.budget?.paused && claude.getDeliveryMode() === "pull" && !pullModePauseWarned) {
-    pullModePauseWarned = true;
-    log("Budget pause active while delivery mode is pull \u2014 the RESUME notice cannot wake an idle Claude session; " + "rely on get_messages polling or the (P5) watchdog to resume.");
-  }
   if (!hasSeenTuiConnect && status.tuiConnected && !previousTuiConnected) {
     hasSeenTuiConnect = true;
     log("First TUI connect detected \u2014 sending kickoff message to Claude");
@@ -15461,7 +15436,7 @@ daemonClient.on("rejected", async (code) => {
   }
 });
 claude.on("ready", async () => {
-  log(`MCP server ready (delivery mode: ${claude.getDeliveryMode()}) \u2014 ensuring AgentBridge daemon...`);
+  log("MCP server ready (push delivery) \u2014 ensuring AgentBridge daemon...");
   if (daemonLifecycle.wasKilled()) {
     await enterDisabledState("Killed sentinel found \u2014 bridge staying idle", `\u26D4 AgentBridge was stopped by \`agentbridge kill\`. Bridge is staying idle. Restart Claude Code (\`${pairScopedCommand("claude")}\`), switch to a new conversation, or run \`/resume\` to reconnect.`);
     return;

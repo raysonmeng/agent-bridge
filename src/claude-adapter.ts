@@ -1,14 +1,14 @@
 /**
- * Claude Code MCP Server — Dual-Mode Message Transport
+ * Claude Code MCP Server — Push Message Transport
  *
- * Supports two delivery modes:
- *   - Push mode (OAuth): real-time via notifications/claude/channel
- *   - Pull mode (API key): message queue + get_messages tool
- *
- * Mode defaults to push in auto mode, or set explicitly via AGENTBRIDGE_MODE env var.
+ * Delivery is always push (real-time notifications/claude/channel). When a
+ * push fails, the message falls back to an in-memory queue drained by the
+ * get_messages tool — a per-message fallback, not a configurable mode.
+ * (The old AGENTBRIDGE_MODE=pull delivery mode was removed: it could not wake
+ * an idle session, which silently broke the budget RESUME chain.)
  *
  * Emits:
- *   - "ready"   ()                   — MCP connected, mode resolved
+ *   - "ready"   ()                   — MCP connected
  *   - "reply"   (msg: BridgeMessage) — Claude used the reply tool
  */
 
@@ -27,15 +27,13 @@ import type { BudgetSnapshot } from "./budget/types";
 import { renderBudgetSnapshot, BUDGET_UNAVAILABLE_TEXT } from "./budget/render";
 
 export type ReplySender = (msg: BridgeMessage, requireReply?: boolean) => Promise<{ success: boolean; error?: string }>;
-export type DeliveryMode = "push" | "pull" | "auto";
 
 export const CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
   "",
   "## Message delivery",
-  "Messages from Codex may arrive in two ways depending on the connection mode:",
-  "- As <channel source=\"agentbridge\" chat_id=\"...\" user=\"Codex\" ...> tags (push mode)",
-  "- Via the get_messages tool (pull mode)",
+  "Messages from Codex arrive as <channel source=\"agentbridge\" chat_id=\"...\" user=\"Codex\" ...> tags (push).",
+  "If a push fails, the message is queued — call get_messages to drain the fallback queue.",
   "",
   "## Collaboration roles",
   "Default roles in this setup:",
@@ -77,9 +75,7 @@ export class ClaudeAdapter extends EventEmitter {
   private readonly logFile: string;
   private readonly logger: ProcessLogger;
 
-  // Dual-mode transport
-  private readonly configuredMode: DeliveryMode;
-  private resolvedMode: "push" | "pull" | null = null;
+  // Push transport with a per-message fallback queue (drained by get_messages).
   private pendingMessages: BridgeMessage[] = [];
   private readonly maxBufferedMessages: number;
   private droppedMessageCount = 0;
@@ -96,8 +92,14 @@ export class ClaudeAdapter extends EventEmitter {
     this.notificationIdPrefix = randomUUID().replace(/-/g, "").slice(0, 12);
     this.log(`ClaudeAdapter created (instance=${this.instanceId})`);
 
-    const envMode = process.env.AGENTBRIDGE_MODE as DeliveryMode | undefined;
-    this.configuredMode = envMode && ["push", "pull", "auto"].includes(envMode) ? envMode : "auto";
+    // Legacy compat: AGENTBRIDGE_MODE no longer selects a delivery mode.
+    // Warn ONCE at construction (never per message) and ignore the value.
+    if (process.env.AGENTBRIDGE_MODE) {
+      this.log(
+        `AGENTBRIDGE_MODE="${process.env.AGENTBRIDGE_MODE}" is no longer supported — ` +
+        "pull mode was removed; push delivery (with per-message fallback queue) is always used.",
+      );
+    }
     this.maxBufferedMessages = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
 
     this.server = new Server(
@@ -118,9 +120,8 @@ export class ClaudeAdapter extends EventEmitter {
 
   async start() {
     const transport = new StdioServerTransport();
-    this.resolveMode();
     await this.server.connect(transport);
-    this.log(`MCP server connected (mode: ${this.resolvedMode})`);
+    this.log("MCP server connected (push delivery)");
     this.emit("ready");
   }
 
@@ -129,12 +130,7 @@ export class ClaudeAdapter extends EventEmitter {
     this.replySender = sender;
   }
 
-  /** Returns the resolved delivery mode. */
-  getDeliveryMode(): "push" | "pull" {
-    return this.resolvedMode ?? "pull";
-  }
-
-  /** Returns the number of messages waiting in the pull queue. */
+  /** Returns the number of messages waiting in the fallback queue. */
   getPendingMessageCount(): number {
     return this.pendingMessages.length;
   }
@@ -144,33 +140,11 @@ export class ClaudeAdapter extends EventEmitter {
     this.budgetSnapshot = snapshot;
   }
 
-  // ── Mode Detection ─────────────────────────────────────────
-
-  private resolveMode(): void {
-    if (this.resolvedMode) return;
-
-    if (this.configuredMode === "push" || this.configuredMode === "pull") {
-      this.resolvedMode = this.configuredMode;
-      this.log(`Delivery mode set by AGENTBRIDGE_MODE: ${this.resolvedMode}`);
-    } else {
-      // Default to push — AgentBridge always runs as a Claude Code plugin
-      // with --dangerously-load-development-channels, so channel delivery
-      // is available. If push fails, pushViaChannel already falls back to
-      // queueForPull per-message.
-      this.resolvedMode = "push";
-      this.log("Delivery mode defaulting to push (set AGENTBRIDGE_MODE=pull to use polling instead)");
-    }
-  }
-
   // ── Message Delivery ───────────────────────────────────────
 
   async pushNotification(message: BridgeMessage) {
-    this.log(`pushNotification (instance=${this.instanceId}, mode=${this.resolvedMode}, msgId=${message.id}, len=${message.content.length})`);
-    if (this.resolvedMode === "push") {
-      await this.pushViaChannel(message);
-    } else {
-      this.queueForPull(message);
-    }
+    this.log(`pushNotification (instance=${this.instanceId}, msgId=${message.id}, len=${message.content.length})`);
+    await this.pushViaChannel(message);
   }
 
   private async pushViaChannel(message: BridgeMessage) {
@@ -195,18 +169,19 @@ export class ClaudeAdapter extends EventEmitter {
       this.log(`Pushed notification: ${msgId}`);
     } catch (e: any) {
       this.log(`Push notification failed: ${e.message}`);
-      this.queueForPull(message);
+      this.queueFallbackMessage(message);
     }
   }
 
-  private queueForPull(message: BridgeMessage) {
+  /** Per-message fallback when a push fails; drained by the get_messages tool. */
+  private queueFallbackMessage(message: BridgeMessage) {
     if (this.pendingMessages.length >= this.maxBufferedMessages) {
       this.pendingMessages.shift();
       this.droppedMessageCount++;
-      this.log(`Message queue full, dropped oldest message (total dropped: ${this.droppedMessageCount})`);
+      this.log(`Fallback queue full, dropped oldest message (total dropped: ${this.droppedMessageCount})`);
     }
     this.pendingMessages.push(message);
-    this.log(`Queued message for pull (${this.pendingMessages.length} pending, instance=${this.instanceId})`);
+    this.log(`Queued fallback message (${this.pendingMessages.length} pending, instance=${this.instanceId})`);
   }
 
   // ── get_messages ───────────────────────────────────────────

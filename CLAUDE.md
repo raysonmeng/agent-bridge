@@ -64,7 +64,7 @@ Claude Code ── MCP stdio ──▶ bridge.ts (foreground)
 ### Data flow invariants
 
 - Every `BridgeMessage` carries a `source: "claude" | "codex"` — the bridge **never forwards a message back to its origin** (loop prevention).
-- Delivery mode is env-controlled by `AGENTBRIDGE_MODE` (`push` for channel notifications, `pull` for `get_messages`). Default is `push`.
+- Message delivery is always push (channel notifications). A failed push falls back to an in-memory queue drained by `get_messages`. (The legacy `AGENTBRIDGE_MODE=pull` mode was removed; the env var is ignored with a one-time warning.)
 - Ports are fixed: `CODEX_WS_PORT=4500`, `CODEX_PROXY_PORT=4501`, `AGENTBRIDGE_CONTROL_PORT=4502`. One AgentBridge instance per machine (multi-project support is post-v1).
 - All state lives in the platform state dir (`AGENTBRIDGE_STATE_DIR`, default `~/Library/Application Support/AgentBridge/` on macOS, `$XDG_STATE_HOME/agentbridge/` on Linux). The daemon uses `startup.lock` + `killed` sentinel to coordinate startup and explicit-kill-don't-restart semantics.
 
@@ -73,7 +73,7 @@ Claude Code ── MCP stdio ──▶ bridge.ts (foreground)
 - Unit tests: `src/unit-test/*.test.ts` (one file per module, e.g. `daemon-lifecycle.test.ts`, `codex-adapter.test.ts`, `marker-section.test.ts`).
 - CLI integration: `src/e2e-cli.test.ts` + `src/unit-test/cli.test.ts`.
 - Reconnect E2E: `src/unit-test/e2e-reconnect.test.ts` and `src/unit-test/e2e/`.
-- `dual-mode.test.ts` covers push vs. pull delivery.
+- `message-delivery.test.ts` covers push delivery and the fallback queue.
 - Every PR must ship both unit tests and an E2E test plan before merge.
 
 ## Git Workflow

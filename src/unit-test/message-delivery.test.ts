@@ -38,74 +38,78 @@ function makeBridgeMessage(content: string, ts?: number) {
   };
 }
 
-describe("Dual-mode transport: mode resolution", () => {
-  test("configuredMode defaults to 'auto' when AGENTBRIDGE_MODE is not set", () => {
+describe("Push-only delivery: AGENTBRIDGE_MODE is ignored", () => {
+  // Pull mode was removed (it could not wake an idle session and silently
+  // broke the budget RESUME chain). Any legacy env value must be ignored.
+  function withMockedChannel(adapter: any) {
+    const notifications: any[] = [];
+    adapter.server = {
+      notification: async (payload: any) => {
+        notifications.push(payload);
+      },
+    };
+    return notifications;
+  }
+
+  test("delivers via channel when AGENTBRIDGE_MODE is unset", async () => {
     const adapter = createAdapter();
-    expect(adapter.configuredMode).toBe("auto");
+    const notifications = withMockedChannel(adapter);
+    await adapter.pushNotification(makeBridgeMessage("normal push"));
+    expect(notifications).toHaveLength(1);
+    expect(adapter.pendingMessages).toHaveLength(0);
   });
 
-  test("configuredMode respects AGENTBRIDGE_MODE=push", () => {
-    const adapter = createAdapter("push");
-    expect(adapter.configuredMode).toBe("push");
-  });
-
-  test("configuredMode respects AGENTBRIDGE_MODE=pull", () => {
+  test('legacy AGENTBRIDGE_MODE="pull" still delivers via channel', async () => {
     const adapter = createAdapter("pull");
-    expect(adapter.configuredMode).toBe("pull");
+    const notifications = withMockedChannel(adapter);
+    await adapter.pushNotification(makeBridgeMessage("ignored pull env"));
+    expect(notifications).toHaveLength(1);
+    expect(adapter.pendingMessages).toHaveLength(0);
   });
 
-  test("invalid AGENTBRIDGE_MODE falls back to 'auto'", () => {
-    const adapter = createAdapter("invalid");
-    expect(adapter.configuredMode).toBe("auto");
+  test("any other AGENTBRIDGE_MODE value is equally ignored", async () => {
+    const adapter = createAdapter("auto");
+    const notifications = withMockedChannel(adapter);
+    await adapter.pushNotification(makeBridgeMessage("ignored auto env"));
+    expect(notifications).toHaveLength(1);
+    expect(adapter.pendingMessages).toHaveLength(0);
   });
 
-  test("auto mode defaults to push", () => {
-    const adapter = createAdapter();
-    adapter.resolveMode();
-    expect(adapter.resolvedMode).toBe("push");
-    expect(adapter.getDeliveryMode()).toBe("push");
-  });
-
-  test("resolveMode sets 'push' when configuredMode is 'push'", () => {
-    const adapter = createAdapter("push");
-    adapter.resolveMode();
-    expect(adapter.resolvedMode).toBe("push");
-    expect(adapter.getDeliveryMode()).toBe("push");
-  });
-
-  test("resolveMode sets 'pull' when configuredMode is 'pull'", () => {
+  test("legacy warning is construction-time only — never per message", async () => {
     const adapter = createAdapter("pull");
-    adapter.resolveMode();
-    expect(adapter.resolvedMode).toBe("pull");
-    expect(adapter.getDeliveryMode()).toBe("pull");
+    // Swap the logger AFTER construction: the one-time legacy warning has
+    // already fired, so message delivery must not produce another one.
+    const logs: string[] = [];
+    adapter.logger = { log: (msg: string) => logs.push(msg) };
+    withMockedChannel(adapter);
+    await adapter.pushNotification(makeBridgeMessage("m1"));
+    await adapter.pushNotification(makeBridgeMessage("m2"));
+    expect(logs.filter((line) => line.includes("no longer supported"))).toHaveLength(0);
   });
 });
 
-describe("Dual-mode transport: pull mode message queue", () => {
-  test("queueForPull adds message to pendingMessages", () => {
-    const adapter = createAdapter("pull");
-    adapter.resolveMode();
+describe("Message delivery: fallback queue", () => {
+  test("queueFallbackMessage adds message to pendingMessages", () => {
+    const adapter = createAdapter();
 
     const msg = makeBridgeMessage("hello from codex");
-    adapter.queueForPull(msg);
+    adapter.queueFallbackMessage(msg);
 
     expect(adapter.pendingMessages).toHaveLength(1);
     expect(adapter.pendingMessages[0].content).toBe("hello from codex");
     expect(adapter.getPendingMessageCount()).toBe(1);
   });
 
-  test("queueForPull drops oldest when queue is full", () => {
+  test("queueFallbackMessage drops oldest when queue is full", () => {
     const orig = process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES;
     process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES = "3";
-    const adapter = createAdapter("pull");
+    const adapter = createAdapter();
     process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES = orig;
 
-    adapter.resolveMode();
-
-    adapter.queueForPull(makeBridgeMessage("msg1"));
-    adapter.queueForPull(makeBridgeMessage("msg2"));
-    adapter.queueForPull(makeBridgeMessage("msg3"));
-    adapter.queueForPull(makeBridgeMessage("msg4"));
+    adapter.queueFallbackMessage(makeBridgeMessage("msg1"));
+    adapter.queueFallbackMessage(makeBridgeMessage("msg2"));
+    adapter.queueFallbackMessage(makeBridgeMessage("msg3"));
+    adapter.queueFallbackMessage(makeBridgeMessage("msg4"));
 
     expect(adapter.pendingMessages).toHaveLength(3);
     expect(adapter.pendingMessages[0].content).toBe("msg2");
@@ -113,17 +117,8 @@ describe("Dual-mode transport: pull mode message queue", () => {
     expect(adapter.droppedMessageCount).toBe(1);
   });
 
-  test("pushNotification queues in pull mode", async () => {
-    const adapter = createAdapter("pull");
-    adapter.resolveMode();
-    await adapter.pushNotification(makeBridgeMessage("pull msg"));
-    expect(adapter.pendingMessages).toHaveLength(1);
-    expect(adapter.pendingMessages[0].content).toBe("pull msg");
-  });
-
-  test("push mode message ids include a session-unique prefix", async () => {
-    const adapter = createAdapter("push");
-    adapter.resolveMode();
+  test("push message ids include a session-unique prefix", async () => {
+    const adapter = createAdapter();
 
     const notifications: any[] = [];
     adapter.server = {
@@ -146,9 +141,8 @@ describe("Dual-mode transport: pull mode message queue", () => {
     expect(firstId).not.toBe("codex_msg_1");
   });
 
-  test("pushNotification falls back to the pull queue when push delivery throws", async () => {
-    const adapter = createAdapter("push");
-    adapter.resolveMode();
+  test("pushNotification falls back to the queue when push delivery throws", async () => {
+    const adapter = createAdapter();
 
     adapter.server = {
       notification: async () => {
@@ -163,22 +157,20 @@ describe("Dual-mode transport: pull mode message queue", () => {
   });
 });
 
-describe("Dual-mode transport: drainMessages (get_messages)", () => {
+describe("Message delivery: drainMessages (get_messages)", () => {
   test("returns 'no new messages' when queue is empty", () => {
-    const adapter = createAdapter("pull");
-    adapter.resolveMode();
+    const adapter = createAdapter();
 
     const result = adapter.drainMessages();
     expect(result.content[0].text).toBe("No new messages from Codex.");
   });
 
   test("returns formatted messages and clears queue", () => {
-    const adapter = createAdapter("pull");
-    adapter.resolveMode();
+    const adapter = createAdapter();
 
     const ts = 1705312200000; // fixed timestamp for deterministic output
-    adapter.queueForPull(makeBridgeMessage("first message", ts));
-    adapter.queueForPull(makeBridgeMessage("second message", ts + 5000));
+    adapter.queueFallbackMessage(makeBridgeMessage("first message", ts));
+    adapter.queueFallbackMessage(makeBridgeMessage("second message", ts + 5000));
 
     const result = adapter.drainMessages();
     const text = result.content[0].text;
@@ -198,13 +190,12 @@ describe("Dual-mode transport: drainMessages (get_messages)", () => {
   test("includes dropped count when messages were lost", () => {
     const orig = process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES;
     process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES = "2";
-    const adapter = createAdapter("pull");
+    const adapter = createAdapter();
     process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES = orig;
-    adapter.resolveMode();
 
-    adapter.queueForPull(makeBridgeMessage("a"));
-    adapter.queueForPull(makeBridgeMessage("b"));
-    adapter.queueForPull(makeBridgeMessage("c")); // drops "a"
+    adapter.queueFallbackMessage(makeBridgeMessage("a"));
+    adapter.queueFallbackMessage(makeBridgeMessage("b"));
+    adapter.queueFallbackMessage(makeBridgeMessage("c")); // drops "a"
 
     const result = adapter.drainMessages();
     const text = result.content[0].text;
@@ -214,24 +205,22 @@ describe("Dual-mode transport: drainMessages (get_messages)", () => {
   });
 
   test("singular message uses correct grammar", () => {
-    const adapter = createAdapter("pull");
-    adapter.resolveMode();
+    const adapter = createAdapter();
 
-    adapter.queueForPull(makeBridgeMessage("only one"));
+    adapter.queueFallbackMessage(makeBridgeMessage("only one"));
 
     const result = adapter.drainMessages();
     expect(result.content[0].text).toContain("[1 new message from Codex]");
   });
 });
 
-describe("Dual-mode transport: reply pending hint", () => {
+describe("Message delivery: reply pending hint", () => {
   test("handleReply includes pending message hint when queue is non-empty", async () => {
-    const adapter = createAdapter("pull");
-    adapter.resolveMode();
+    const adapter = createAdapter();
 
     adapter.replySender = async () => ({ success: true });
-    adapter.queueForPull(makeBridgeMessage("waiting msg 1"));
-    adapter.queueForPull(makeBridgeMessage("waiting msg 2"));
+    adapter.queueFallbackMessage(makeBridgeMessage("waiting msg 1"));
+    adapter.queueFallbackMessage(makeBridgeMessage("waiting msg 2"));
 
     const result = await adapter.handleReply({ chat_id: "test", text: "hello codex" });
     const text = result.content[0].text;
@@ -242,8 +231,7 @@ describe("Dual-mode transport: reply pending hint", () => {
   });
 
   test("handleReply has no hint when queue is empty", async () => {
-    const adapter = createAdapter("pull");
-    adapter.resolveMode();
+    const adapter = createAdapter();
 
     adapter.replySender = async () => ({ success: true });
 
@@ -252,8 +240,7 @@ describe("Dual-mode transport: reply pending hint", () => {
   });
 
   test("handleReply returns error when text is missing", async () => {
-    const adapter = createAdapter("pull");
-    adapter.resolveMode();
+    const adapter = createAdapter();
 
     const result = await adapter.handleReply({});
     expect(result.isError).toBe(true);
@@ -261,8 +248,7 @@ describe("Dual-mode transport: reply pending hint", () => {
   });
 
   test("handleReply returns error when replySender is not set", async () => {
-    const adapter = createAdapter("pull");
-    adapter.resolveMode();
+    const adapter = createAdapter();
 
     const result = await adapter.handleReply({ text: "hello" });
     expect(result.isError).toBe(true);
