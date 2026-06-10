@@ -12,10 +12,42 @@ import type { QuotaSource } from "./quota-source";
 
 type QuotaSourceLike = Pick<QuotaSource, "fetchBoth">;
 type PauseSide = BudgetSnapshot["pauseSide"];
+type BudgetPollTimer = unknown;
+type BudgetPollCallback = () => void | Promise<void>;
+
+export interface BudgetPollScheduler {
+  setTimeout(callback: BudgetPollCallback, delayMs: number): BudgetPollTimer;
+  clearTimeout(timer: BudgetPollTimer): void;
+}
+
+export interface BudgetPollDelayInput {
+  config: Pick<BudgetConfig, "pollSeconds" | "pauseAt">;
+  usage: { claude: AgentUsage | null; codex: AgentUsage | null } | null;
+  now: number;
+  paused: boolean;
+}
 
 // Directive-fingerprint quantum for reset epochs. Must absorb probe jitter
 // (seconds) while still distinguishing a genuine window reset (hours).
 const RESET_FINGERPRINT_BUCKET_SEC = 600;
+const LOW_UTIL_PCT = 50;
+const NEAR_PAUSE_MARGIN_PCT = 10;
+const NEAR_WARN_UTIL_PCT = 75;
+const NEAR_THRESHOLD_POLL_MS = 60_000;
+const PAUSED_POLL_MS = 15_000;
+const RESET_WAKE_AFTER_SEC = 5;
+const RESET_RECENTLY_PASSED_WINDOW_SEC = 120;
+
+const REAL_BUDGET_POLL_SCHEDULER: BudgetPollScheduler = {
+  setTimeout(callback, delayMs) {
+    return setTimeout(() => {
+      void callback();
+    }, delayMs);
+  },
+  clearTimeout(timer) {
+    clearTimeout(timer as ReturnType<typeof setTimeout>);
+  },
+};
 
 export interface BudgetCoordinatorOptions {
   source: QuotaSourceLike;
@@ -23,6 +55,7 @@ export interface BudgetCoordinatorOptions {
   emit: (id: string, content: string) => void;
   onPauseChange: (paused: boolean) => void;
   now?: () => number;
+  scheduler?: BudgetPollScheduler;
   log?: (message: string) => void;
 }
 
@@ -52,15 +85,76 @@ function matchingGateReset(usage: AgentUsage | null): number {
   return Math.min(...candidates.map((window) => window.resetEpoch));
 }
 
+function maxPollDelayMs(config: Pick<BudgetConfig, "pollSeconds">): number {
+  return Math.max(0, config.pollSeconds * 1000);
+}
+
+function capDelay(delayMs: number, maxDelayMs: number): number {
+  if (maxDelayMs <= 0) return 0;
+  return Math.min(delayMs, maxDelayMs);
+}
+
+function usagePressure(usage: { claude: AgentUsage | null; codex: AgentUsage | null } | null): number | null {
+  const readings = [usage?.claude, usage?.codex]
+    .filter((agentUsage): agentUsage is AgentUsage => agentUsage !== null && agentUsage !== undefined)
+    .flatMap((agentUsage) => [agentUsage.gateUtil, agentUsage.warnUtil]);
+  if (readings.length === 0) return null;
+  return Math.max(...readings);
+}
+
+function usageResetEpochs(usage: { claude: AgentUsage | null; codex: AgentUsage | null } | null): number[] {
+  return [usage?.claude, usage?.codex]
+    .filter((agentUsage): agentUsage is AgentUsage => agentUsage !== null && agentUsage !== undefined)
+    .flatMap((agentUsage) => [agentUsage.fiveHour?.resetEpoch ?? 0, agentUsage.weekly?.resetEpoch ?? 0])
+    .filter((epoch) => epoch > 0);
+}
+
+function adaptiveBudgetPollDelayMs(input: BudgetPollDelayInput): number {
+  const maxDelayMs = maxPollDelayMs(input.config);
+  if (input.paused) return capDelay(PAUSED_POLL_MS, maxDelayMs);
+
+  const pressure = usagePressure(input.usage);
+  if (pressure === null || pressure < LOW_UTIL_PCT) return maxDelayMs;
+
+  const nearPauseAt = Math.max(0, input.config.pauseAt - NEAR_PAUSE_MARGIN_PCT);
+  if (pressure >= nearPauseAt || pressure >= NEAR_WARN_UTIL_PCT) {
+    return capDelay(NEAR_THRESHOLD_POLL_MS, maxDelayMs);
+  }
+
+  return capDelay(maxDelayMs / 2, maxDelayMs);
+}
+
+function resetAlignedDelayMs(input: BudgetPollDelayInput, adaptiveDelayMs: number): number | null {
+  const epochs = usageResetEpochs(input.usage);
+  if (epochs.length === 0) return null;
+
+  const candidates = epochs
+    .map((epoch) => {
+      if (epoch >= input.now) return (epoch - input.now + RESET_WAKE_AFTER_SEC) * 1000;
+      if (input.now - epoch <= RESET_RECENTLY_PASSED_WINDOW_SEC) return RESET_WAKE_AFTER_SEC * 1000;
+      return null;
+    })
+    .filter((delayMs): delayMs is number => delayMs !== null && delayMs >= 0 && delayMs <= adaptiveDelayMs);
+
+  if (candidates.length === 0) return null;
+  return Math.min(...candidates);
+}
+
+export function nextBudgetPollDelayMs(input: BudgetPollDelayInput): number {
+  const adaptiveDelayMs = adaptiveBudgetPollDelayMs(input);
+  return resetAlignedDelayMs(input, adaptiveDelayMs) ?? adaptiveDelayMs;
+}
+
 export class BudgetCoordinator {
   private readonly source: QuotaSourceLike;
   private readonly config: BudgetConfig;
   private readonly emit: (id: string, content: string) => void;
   private readonly onPauseChange: (paused: boolean) => void;
   private readonly now: () => number;
+  private readonly scheduler: BudgetPollScheduler;
   private readonly log: (message: string) => void;
 
-  private timer: ReturnType<typeof setTimeout> | null = null;
+  private timer: BudgetPollTimer | null = null;
   private running = false;
   private readonly activeSides = new Set<AgentName>();
   private lastDirectiveFingerprint: string | null = null;
@@ -79,6 +173,7 @@ export class BudgetCoordinator {
     this.emit = options.emit;
     this.onPauseChange = options.onPauseChange;
     this.now = options.now ?? (() => Math.floor(Date.now() / 1000));
+    this.scheduler = options.scheduler ?? REAL_BUDGET_POLL_SCHEDULER;
     this.log = options.log ?? (() => {});
   }
 
@@ -92,7 +187,7 @@ export class BudgetCoordinator {
   stop(): void {
     this.running = false;
     if (this.timer) {
-      clearTimeout(this.timer);
+      this.scheduler.clearTimeout(this.timer);
       this.timer = null;
     }
   }
@@ -138,11 +233,19 @@ export class BudgetCoordinator {
     if (!this.running) return;
     // Defensive: never fork a second polling chain if a timer is already armed
     // (e.g. a future stop()→start() reentry pattern).
-    if (this.timer) clearTimeout(this.timer);
-    const delayMs = Math.max(0, this.config.pollSeconds * 1000);
-    this.timer = setTimeout(() => {
+    if (this.timer) this.scheduler.clearTimeout(this.timer);
+    const snapshotUsage = this.latestSnapshot
+      ? { claude: this.latestSnapshot.claude, codex: this.latestSnapshot.codex }
+      : null;
+    const delayMs = nextBudgetPollDelayMs({
+      config: this.config,
+      usage: snapshotUsage,
+      now: this.now(),
+      paused: this.isPaused(),
+    });
+    this.timer = this.scheduler.setTimeout(() => {
       this.timer = null;
-      void this.pollAndReschedule();
+      return this.pollAndReschedule();
     }, delayMs);
   }
 
