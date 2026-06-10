@@ -247,6 +247,24 @@ codex.on("turnPhaseChanged", ({ phase, previous }: { phase: string; previous: st
   broadcastStatus();
 });
 
+// A steer is transport-accepted at send time; a later JSON-RPC rejection
+// (Review/Plan turns are not steerable; the turn may have ended in the race
+// window) means Claude's mid-turn message did NOT reach Codex — say so
+// explicitly instead of letting Claude assume it landed.
+codex.on("steerFailed", (reason: string) => {
+  log(`Steer rejected by app-server: ${reason}`);
+  emitToClaude(
+    systemMessage(
+      "system_steer_failed",
+      `⚠️ Your steer message did NOT reach Codex (${reason}). The original turn continues unaffected — wait for it to finish, or resend as a normal reply.`,
+    ),
+  );
+});
+
+codex.on("steerAccepted", () => {
+  log("Steer accepted by app-server");
+});
+
 codex.on("turnStarted", () => {
   log("Codex turn started");
   emitToClaude(
@@ -589,10 +607,52 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
       const tierOverrides = BUDGET_CONFIG.codexTierControl
         ? budgetCoordinator?.getCodexTurnOverrides() ?? undefined
         : undefined;
+      // Busy-turn policy (protocol v2 B0): when a turn is running and the
+      // caller opted into "steer", feed the message INTO the running turn via
+      // turn/steer instead of rejecting — Codex integrates it mid-turn without
+      // losing work. Framed explicitly so Codex can distinguish it from the
+      // original task instructions (design consensus with Codex).
+      if (codex.turnInProgress && message.onBusy === "steer") {
+        if (requireReply) {
+          // B0 limitation (explicit, not silent): require_reply semantics for
+          // steer ("a NEW agentMessage after steer-accept, before terminal")
+          // need the PR B state machine. Reject loudly instead of mis-arming
+          // the tracker on the already-running turn.
+          sendProtocolMessage(ws, {
+            type: "claude_to_codex_result",
+            requestId: message.requestId,
+            success: false,
+            error: "require_reply is not supported together with on_busy=\"steer\" yet. Send the steer without require_reply, or wait for the turn to finish.",
+          });
+          return;
+        }
+        const steerContent =
+          "[STEER from Claude]\n" +
+          "Mid-turn update for the current Codex turn. Integrate if relevant; do not restart work unless explicitly requested.\n\n" +
+          message.message.content;
+        const steered = codex.steerMessage(steerContent);
+        log(`Steer ${steered ? "transport-accepted" : "failed"} (${message.message.content.length} chars)`);
+        if (steered) {
+          // An IMPORTANT message forwarded mid-turn opens an attention window;
+          // a steer is exactly Claude responding to it — close the window like
+          // the inject path does, so status buffering resumes promptly.
+          clearAttentionWindow();
+        }
+        sendProtocolMessage(ws, {
+          type: "claude_to_codex_result",
+          requestId: message.requestId,
+          success: steered,
+          error: steered
+            ? undefined
+            : "Steer failed: the turn may have just ended or the connection dropped — retry as a normal reply.",
+        });
+        return;
+      }
+
       const injected = codex.injectMessage(contentToSend, tierOverrides);
       if (!injected) {
         const reason = codex.turnInProgress
-          ? "Codex is busy executing a turn. Wait for it to finish before sending another message."
+          ? "Codex is busy executing a turn. Options: wait for it to finish, or retry with on_busy=\"steer\" to feed this message into the running turn without interrupting it."
           : "Injection failed: no active thread or WebSocket not connected.";
         log(`Injection rejected: ${reason}`);
         sendProtocolMessage(ws, {

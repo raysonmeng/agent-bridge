@@ -58,7 +58,19 @@ export interface DaemonStatus {
 export type ControlClientMessage =
   | { type: "claude_connect"; identity?: ControlClientIdentity }
   | { type: "claude_disconnect" }
-  | { type: "claude_to_codex"; requestId: string; message: BridgeMessage; requireReply?: boolean }
+  | {
+      type: "claude_to_codex";
+      requestId: string;
+      message: BridgeMessage;
+      requireReply?: boolean;
+      /**
+       * Busy-turn policy (protocol v2 B0). "reject" (default): fail with the
+       * busy error when a Codex turn is running. "steer": feed the message
+       * into the RUNNING turn via turn/steer — Codex sees it mid-turn without
+       * losing work. ("interrupt" lands with PR B's ACK/idempotency machinery.)
+       */
+      onBusy?: "reject" | "steer";
+    }
   | { type: "status" }
   // Non-attaching probe: ask the daemon whether it already has a LIVE Claude
   // frontend attached, WITHOUT contesting/attaching this socket. Used by the

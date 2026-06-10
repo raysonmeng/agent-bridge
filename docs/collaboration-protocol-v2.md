@@ -36,6 +36,25 @@ observable, correlatable contract.
   control `status` 三个 payload 字段一致；turn 转移与 attention 转移
   都会刷新 status.json（经 tryWriteStatusFile，观测写失败不阻断核心路径）。
 
+### PR B0 — busy 转向注入 / steer-on-busy（已实施）
+
+- `reply` 工具新增 `on_busy: "reject" | "steer"`，**默认 `reject`，旧调用行为
+  不变**；`steer` 仅在 Codex turn 运行中生效，经 app-server `turn/steer`
+  把消息喂进**当前 turn**（不新开 turn、不打断、不丢已有工作）。
+- daemon 侧统一加 `[STEER from Claude]` 前缀 framing，让 Codex 能区分
+  mid-turn 更新与原始任务指令。
+- steer 被 app-server 拒绝（`ActiveTurnNotSteerable`（Review/Plan turn）、
+  `NoActiveTurn` race 等）**不是 turn 终结**：不发 `turnAborted`、不改
+  `turnPhase`；以 `system_steer_failed` 系统消息显式告知 Claude
+  「消息没送进去，原 turn 不受影响」。
+- `require_reply × steer` 在 B0 **显式不支持**（tool 层 + daemon 层双重
+  loud reject）——steer 加入的是正在运行的 turn，reply 追踪语义需要
+  PR B 的幂等状态机（"steer-accept 之后、terminal 之前的新 agentMessage"）。
+- race 退化：发送时 turn 已结束 → 自动退化为普通 `turn/start` 注入
+  （无 `[STEER]` 前缀）；caller 侧的判别能力由 PR B 的
+  `turn_started` ACK 补足。
+- `turn/interrupt`（打断入口）**不在 B0**，与 ACK/幂等机制一起进 PR B。
+
 ### PR B — 核心协议：ACK + 幂等 / core protocol: ACK + idempotency（未实施）
 
 - `claude_to_codex_result` 维持即时返回，语义收窄为 **accepted** =

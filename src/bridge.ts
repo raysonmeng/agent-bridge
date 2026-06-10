@@ -90,7 +90,7 @@ if (process.env.AGENTBRIDGE_TRACE === "1") {
   }
 }
 
-claude.setReplySender(async (msg: BridgeMessage, requireReply?: boolean) => {
+claude.setReplySender(async (msg: BridgeMessage, requireReply?: boolean, onBusy?: "reject" | "steer") => {
   if (msg.source !== "claude") {
     return { success: false, error: "Invalid message source" };
   }
@@ -102,7 +102,7 @@ claude.setReplySender(async (msg: BridgeMessage, requireReply?: boolean) => {
     };
   }
 
-  return daemonClient.sendReply(msg, requireReply);
+  return daemonClient.sendReply(msg, requireReply, onBusy);
 });
 
 daemonClient.on("codexMessage", (message) => {

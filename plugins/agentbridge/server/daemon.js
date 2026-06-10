@@ -18,7 +18,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.7", "0.0.0-source"),
-  commit: defineString("ec1ab68", "source"),
+  commit: defineString("1df8b91", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -639,6 +639,7 @@ class CodexAdapter extends EventEmitter {
   pendingServerResponses = new Map;
   staleProxyIds = new Map;
   bridgeRequestIds = new Map;
+  bridgeRequestKinds = new Map;
   intentionalDisconnect = false;
   pendingTuiMessages = [];
   reconnectingForNewSession = false;
@@ -794,6 +795,36 @@ class CodexAdapter extends EventEmitter {
     } catch (err) {
       this.untrackBridgeRequestId(requestId);
       this.log(`Injection send failed: ${err.message}`);
+      return false;
+    }
+  }
+  steerMessage(text) {
+    if (!this.threadId) {
+      this.log("Cannot steer: no active thread");
+      return false;
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      this.log("Cannot steer: app-server WebSocket not connected");
+      return false;
+    }
+    if (!this.turnInProgress) {
+      this.log("Cannot steer: no turn in progress (use injectMessage)");
+      return false;
+    }
+    this.log(`Steering message into active Codex turn (${text.length} chars)`);
+    const requestId = this.nextInjectionId--;
+    this.trackBridgeRequestId(requestId, "steer");
+    const params = { threadId: this.threadId, input: [{ type: "text", text }] };
+    try {
+      this.appServerWs.send(JSON.stringify({
+        method: "turn/steer",
+        id: requestId,
+        params
+      }));
+      return true;
+    } catch (err) {
+      this.untrackBridgeRequestId(requestId);
+      this.log(`Steer send failed: ${err.message}`);
       return false;
     }
   }
@@ -1519,14 +1550,22 @@ class CodexAdapter extends EventEmitter {
       this.interceptServerMessage(parsed, mapping.connId);
       return forwarded;
     }
-    if (!isNaN(numericId) && this.consumeBridgeRequestId(numericId)) {
+    const bridgeKind = !isNaN(numericId) ? this.consumeBridgeRequestId(numericId) : null;
+    if (bridgeKind) {
       if (parsed.error) {
-        this.log(`Bridge-originated request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
-        this.lastTurnEndedAbnormally = true;
-        this.emit("turnAborted", `injected turn/start rejected: ${parsed.error.message ?? "unknown error"}`);
-        this.notifyPhaseIfChanged();
+        this.log(`Bridge-originated ${bridgeKind} request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
+        if (bridgeKind === "steer") {
+          this.emit("steerFailed", parsed.error.message ?? "unknown error");
+        } else {
+          this.lastTurnEndedAbnormally = true;
+          this.emit("turnAborted", `injected turn/start rejected: ${parsed.error.message ?? "unknown error"}`);
+          this.notifyPhaseIfChanged();
+        }
       } else {
-        this.log(`Bridge-originated request completed (id ${responseId})`);
+        this.log(`Bridge-originated ${bridgeKind} request completed (id ${responseId})`);
+        if (bridgeKind === "steer") {
+          this.emit("steerAccepted");
+        }
       }
       return null;
     }
@@ -1877,18 +1916,23 @@ class CodexAdapter extends EventEmitter {
   consumeStaleProxyId(proxyId) {
     return this.clearTrackedId(this.staleProxyIds, proxyId);
   }
-  trackBridgeRequestId(requestId) {
+  trackBridgeRequestId(requestId, kind = "turn-start") {
     this.clearTrackedId(this.bridgeRequestIds, requestId);
     const timer = setTimeout(() => {
       this.bridgeRequestIds.delete(requestId);
+      this.bridgeRequestKinds.delete(requestId);
     }, CodexAdapter.RESPONSE_TRACKING_TTL_MS);
     timer.unref?.();
     this.bridgeRequestIds.set(requestId, timer);
+    this.bridgeRequestKinds.set(requestId, kind);
   }
   consumeBridgeRequestId(requestId) {
-    return this.clearTrackedId(this.bridgeRequestIds, requestId);
+    const kind = this.bridgeRequestKinds.get(requestId) ?? "turn-start";
+    this.bridgeRequestKinds.delete(requestId);
+    return this.clearTrackedId(this.bridgeRequestIds, requestId) ? kind : null;
   }
   untrackBridgeRequestId(requestId) {
+    this.bridgeRequestKinds.delete(requestId);
     this.clearTrackedId(this.bridgeRequestIds, requestId);
   }
   clearTrackedId(store, id) {
@@ -1910,6 +1954,7 @@ class CodexAdapter extends EventEmitter {
       clearTimeout(timer);
     }
     this.bridgeRequestIds.clear();
+    this.bridgeRequestKinds.clear();
   }
   clearResponseTrackingState() {
     this.clearTransientResponseTrackingState();
@@ -3947,6 +3992,13 @@ codex.on("turnPhaseChanged", ({ phase, previous }) => {
   tryWriteStatusFile(`turnPhase:${phase}`);
   broadcastStatus();
 });
+codex.on("steerFailed", (reason) => {
+  log(`Steer rejected by app-server: ${reason}`);
+  emitToClaude(systemMessage("system_steer_failed", `\u26A0\uFE0F Your steer message did NOT reach Codex (${reason}). The original turn continues unaffected \u2014 wait for it to finish, or resend as a normal reply.`));
+});
+codex.on("steerAccepted", () => {
+  log("Steer accepted by app-server");
+});
 codex.on("turnStarted", () => {
   log("Codex turn started");
   emitToClaude(systemMessage("system_turn_started", "\u23F3 Codex is working on the current task. Wait for completion before sending a reply."));
@@ -4184,9 +4236,36 @@ function handleControlMessage(ws, raw) {
       }
       log(`Forwarding Claude \u2192 Codex (${message.message.content.length} chars, requireReply=${requireReply})`);
       const tierOverrides = BUDGET_CONFIG.codexTierControl ? budgetCoordinator?.getCodexTurnOverrides() ?? undefined : undefined;
+      if (codex.turnInProgress && message.onBusy === "steer") {
+        if (requireReply) {
+          sendProtocolMessage(ws, {
+            type: "claude_to_codex_result",
+            requestId: message.requestId,
+            success: false,
+            error: 'require_reply is not supported together with on_busy="steer" yet. Send the steer without require_reply, or wait for the turn to finish.'
+          });
+          return;
+        }
+        const steerContent = `[STEER from Claude]
+` + `Mid-turn update for the current Codex turn. Integrate if relevant; do not restart work unless explicitly requested.
+
+` + message.message.content;
+        const steered = codex.steerMessage(steerContent);
+        log(`Steer ${steered ? "transport-accepted" : "failed"} (${message.message.content.length} chars)`);
+        if (steered) {
+          clearAttentionWindow();
+        }
+        sendProtocolMessage(ws, {
+          type: "claude_to_codex_result",
+          requestId: message.requestId,
+          success: steered,
+          error: steered ? undefined : "Steer failed: the turn may have just ended or the connection dropped \u2014 retry as a normal reply."
+        });
+        return;
+      }
       const injected = codex.injectMessage(contentToSend, tierOverrides);
       if (!injected) {
-        const reason = codex.turnInProgress ? "Codex is busy executing a turn. Wait for it to finish before sending another message." : "Injection failed: no active thread or WebSocket not connected.";
+        const reason = codex.turnInProgress ? 'Codex is busy executing a turn. Options: wait for it to finish, or retry with on_busy="steer" to feed this message into the running turn without interrupting it.' : "Injection failed: no active thread or WebSocket not connected.";
         log(`Injection rejected: ${reason}`);
         sendProtocolMessage(ws, {
           type: "claude_to_codex_result",

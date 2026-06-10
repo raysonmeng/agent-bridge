@@ -41,7 +41,11 @@ interface Harness {
   controlWs: WebSocket | null;
   /** Connect a fake Codex TUI to the proxy and complete the thread/start handshake. */
   connectTui: () => Promise<void>;
-  sendClaudeToCodex: (requestId: string, text: string) => void;
+  sendClaudeToCodex: (
+    requestId: string,
+    text: string,
+    opts?: { onBusy?: "reject" | "steer"; requireReply?: boolean },
+  ) => void;
 }
 
 const harnesses: Harness[] = [];
@@ -451,6 +455,81 @@ describe("daemon wiring", () => {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
   }, 60000);
+
+  test("on_busy=steer feeds the message into a running turn via turn/steer (protocol v2 B0)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-steer-fixture-"));
+    const steerLog = join(fixtureRoot, "turnsteer.jsonl");
+    const readSteers = (): Array<{ threadId: string; input: Array<{ type: string; text: string }> }> =>
+      existsSync(steerLog)
+        ? readFileSync(steerLog, "utf-8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
+        : [];
+    const resultFor = (requestId: string) =>
+      harness.statusMessages.find(
+        (m) => m.type === "claude_to_codex_result" && m.requestId === requestId,
+      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }> | undefined;
+    const waitForResult = async (requestId: string) => {
+      await waitFor(() => resultFor(requestId) !== undefined, `claude_to_codex_result for ${requestId}`);
+      return resultFor(requestId)!;
+    };
+
+    const harness = await startHarness({
+      pairId: "main-steerabcd",
+      pairName: "main",
+      extraEnv: { FAKE_APP_TURNSTEER_LOG: steerLog },
+    });
+
+    try {
+      await harness.attachClaude();
+      await harness.connectTui();
+
+      // Drive the adapter into a running turn so the busy path is active.
+      harness.sendAppCommand("start-turn");
+      await waitForMessage(
+        harness.messages,
+        (message) => message.id.startsWith("system_turn_started"),
+        "system_turn_started",
+      );
+
+      // Default policy unchanged: a plain reply during the turn is rejected,
+      // and the busy error now advertises the steer escape hatch.
+      harness.sendClaudeToCodex("req-steer-0", "plain message during turn");
+      const rejected = await waitForResult("req-steer-0");
+      expect(rejected.success).toBe(false);
+      expect(rejected.error).toContain('on_busy="steer"');
+
+      // B0 limitation is loud, not silent: require_reply×steer is refused.
+      harness.sendClaudeToCodex("req-steer-rr", "needs ack", { onBusy: "steer", requireReply: true });
+      const refused = await waitForResult("req-steer-rr");
+      expect(refused.success).toBe(false);
+      expect(refused.error).toContain("require_reply is not supported");
+
+      // The steer path: message reaches the app-server as turn/steer with the
+      // explicit [STEER from Claude] framing, on the live thread.
+      harness.sendClaudeToCodex("req-steer-1", "course correction: use approach B", { onBusy: "steer" });
+      const accepted = await waitForResult("req-steer-1");
+      expect(accepted.success).toBe(true);
+      await waitFor(() => readSteers().length >= 1, "recorded turn/steer", 100, 100);
+      const steer = readSteers()[0]!;
+      expect(steer.threadId).toBe("thread-fake-1");
+      expect(steer.input[0]!.type).toBe("text");
+      expect(steer.input[0]!.text.startsWith("[STEER from Claude]\n")).toBe(true);
+      expect(steer.input[0]!.text).toContain("course correction: use approach B");
+
+      // An app-server rejection after transport-accept surfaces as
+      // system_steer_failed (the original turn is NOT reported aborted).
+      harness.sendClaudeToCodex("req-steer-2", "[force-steer-error] doomed", { onBusy: "steer" });
+      const failedNotice = await waitForMessage(
+        harness.messages,
+        (message) => message.id.startsWith("system_steer_failed"),
+        "system_steer_failed",
+      );
+      expect(failedNotice.content).toContain("did NOT reach Codex");
+      expect(failedNotice.content).toContain("ActiveTurnNotSteerable");
+      expect(harness.messages.some((m) => m.id.startsWith("system_turn_aborted"))).toBe(false);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 60000);
 });
 
 async function startHarness(opts: {
@@ -592,11 +671,13 @@ async function startHarness(opts: {
         }
       }, "bridge ready after TUI handshake", 100, 100);
     },
-    sendClaudeToCodex: (requestId: string, text: string) => {
+    sendClaudeToCodex: (requestId: string, text: string, sendOpts?: { onBusy?: "reject" | "steer"; requireReply?: boolean }) => {
       harness.controlWs?.send(JSON.stringify({
         type: "claude_to_codex",
         requestId,
         message: { id: requestId, source: "claude", content: text, timestamp: Date.now() },
+        ...(sendOpts?.requireReply ? { requireReply: true } : {}),
+        ...(sendOpts?.onBusy && sendOpts.onBusy !== "reject" ? { onBusy: sendOpts.onBusy } : {}),
       }));
     },
   };
@@ -660,6 +741,19 @@ const server = Bun.serve({
         // Record received turn/start params (tier-override assertions).
         if (msg.method === "turn/start" && process.env.FAKE_APP_TURNSTART_LOG) {
           appendFileSync(process.env.FAKE_APP_TURNSTART_LOG, JSON.stringify(msg.params) + "\\n");
+        }
+        // turn/steer: record params, then ack — or reject when the text carries
+        // the [force-steer-error] marker (drives the steerFailed wiring test).
+        if (msg.method === "turn/steer") {
+          if (process.env.FAKE_APP_TURNSTEER_LOG) {
+            appendFileSync(process.env.FAKE_APP_TURNSTEER_LOG, JSON.stringify(msg.params) + "\\n");
+          }
+          const steerText = msg.params?.input?.[0]?.text ?? "";
+          if (steerText.includes("[force-steer-error]")) {
+            ws.send(JSON.stringify({ id: msg.id, error: { message: "ActiveTurnNotSteerable" } }));
+          } else {
+            ws.send(JSON.stringify({ id: msg.id, result: {} }));
+          }
         }
       } catch {}
     },

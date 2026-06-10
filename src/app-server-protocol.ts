@@ -6,6 +6,7 @@ const APP_SERVER_REQUEST_METHODS = [
   "thread/list",
   "review/start",
   "turn/start",
+  "turn/steer",
   "turn/interrupt",
 ] as const;
 
@@ -71,6 +72,18 @@ export type AppServerUserInput =
   | { type: string; [key: string]: unknown };
 
 export interface TurnStartParams {
+  threadId: string;
+  input: AppServerUserInput[];
+  [key: string]: unknown;
+}
+
+/**
+ * turn/steer — feed additional input into the CURRENTLY RUNNING turn without
+ * interrupting it (available since codex app-server v0.100; the TUI uses it
+ * when the user types mid-turn). Fails with NoActiveTurn / ExpectedTurnMismatch
+ * / ActiveTurnNotSteerable (Review/Plan turns) / EmptyInput.
+ */
+export interface TurnSteerParams {
   threadId: string;
   input: AppServerUserInput[];
   [key: string]: unknown;

@@ -256,6 +256,77 @@ describe("Message delivery: reply pending hint", () => {
   });
 });
 
+describe("Reply on_busy option (protocol v2 B0)", () => {
+  function withCapturingSender(adapter: any) {
+    const calls: Array<{ content: string; requireReply?: boolean; onBusy?: string }> = [];
+    adapter.replySender = async (msg: any, requireReply?: boolean, onBusy?: string) => {
+      calls.push({ content: msg.content, requireReply, onBusy });
+      return { success: true };
+    };
+    return calls;
+  }
+
+  test("on_busy defaults to reject when omitted", async () => {
+    const adapter = createAdapter();
+    const calls = withCapturingSender(adapter);
+
+    const result = await adapter.handleReply({ text: "hello codex" });
+
+    expect(result.isError).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].onBusy).toBe("reject");
+    expect(result.content[0].text).toBe("Reply sent to Codex.");
+  });
+
+  test("on_busy=steer is passed through and the result text says so", async () => {
+    const adapter = createAdapter();
+    const calls = withCapturingSender(adapter);
+
+    const result = await adapter.handleReply({ text: "mid-course fix", on_busy: "steer" });
+
+    expect(result.isError).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].onBusy).toBe("steer");
+    expect(result.content[0].text).toContain("steered into the running turn");
+    expect(result.content[0].text).toContain("system_steer_failed");
+  });
+
+  test("invalid on_busy value errors before sending anything", async () => {
+    const adapter = createAdapter();
+    const calls = withCapturingSender(adapter);
+
+    const result = await adapter.handleReply({ text: "hello", on_busy: "interrupt" });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("invalid on_busy value");
+    expect(result.content[0].text).toContain('"interrupt"');
+    expect(calls).toHaveLength(0);
+  });
+
+  test("on_busy=steer combined with require_reply errors before sending (B0 limitation)", async () => {
+    const adapter = createAdapter();
+    const calls = withCapturingSender(adapter);
+
+    const result = await adapter.handleReply({ text: "hello", on_busy: "steer", require_reply: true });
+
+    expect(result.isError).toBe(true);
+    expect(result.content[0].text).toContain("require_reply cannot be combined");
+    expect(calls).toHaveLength(0);
+  });
+
+  test("on_busy=reject explicit value behaves like the default", async () => {
+    const adapter = createAdapter();
+    const calls = withCapturingSender(adapter);
+
+    const result = await adapter.handleReply({ text: "hello", on_busy: "reject", require_reply: true });
+
+    expect(result.isError).toBeUndefined();
+    expect(calls).toHaveLength(1);
+    expect(calls[0].onBusy).toBe("reject");
+    expect(calls[0].requireReply).toBe(true);
+  });
+});
+
 describe("get_budget tool (handleGetBudget)", () => {
   const snapshot = {
     phase: "normal" as const,

@@ -26,7 +26,7 @@ import type { BridgeMessage } from "./types";
 import type { BudgetSnapshot } from "./budget/types";
 import { renderBudgetSnapshot, BUDGET_UNAVAILABLE_TEXT } from "./budget/render";
 
-export type ReplySender = (msg: BridgeMessage, requireReply?: boolean) => Promise<{ success: boolean; error?: string }>;
+export type ReplySender = (msg: BridgeMessage, requireReply?: boolean, onBusy?: "reject" | "steer") => Promise<{ success: boolean; error?: string }>;
 
 export const CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
@@ -58,7 +58,7 @@ export const CLAUDE_INSTRUCTIONS = [
   "## Turn coordination",
   "- When you see '⏳ Codex is working', do NOT call the reply tool — wait for '✅ Codex finished'.",
   "- After Codex finishes a turn, you have an attention window to review and respond before new messages arrive.",
-  "- If the reply tool returns a busy error, Codex is still executing — wait and try again later.",
+  "- If the reply tool returns a busy error, Codex is still executing. You decide: wait and retry later, or resend with on_busy=\"steer\" to feed the message INTO the running turn (good for mid-course corrections; it does not interrupt or restart the work).",
   "",
   "## Budget awareness",
   "- Use the get_budget tool to check both agents' subscription quota (5h/weekly windows, drift, pause state).",
@@ -249,6 +249,11 @@ export class ClaudeAdapter extends EventEmitter {
                 type: "boolean",
                 description: "When true, Codex is required to send a reply. All Codex messages from this turn will be forwarded immediately (bypassing STATUS buffering). Use this when you need a direct answer from Codex.",
               },
+              on_busy: {
+                type: "string",
+                enum: ["reject", "steer"],
+                description: "What to do when Codex is mid-turn. \"reject\" (default): fail with a busy error — wait and retry. \"steer\": feed this message INTO the running turn — Codex sees it immediately and integrates it without losing work. Use steer for mid-course corrections, added constraints, or updated acceptance criteria; it does NOT start a new turn, so don't combine it with require_reply. If you need Codex to STOP and do something else, wait for the turn to finish (interrupt support is coming separately).",
+              },
             },
             required: ["text"],
           },
@@ -318,6 +323,20 @@ export class ClaudeAdapter extends EventEmitter {
     }
 
     const requireReply = args?.require_reply === true;
+    const onBusyRaw = args?.on_busy;
+    const onBusy: "reject" | "steer" = onBusyRaw === "steer" ? "steer" : "reject";
+    if (onBusyRaw !== undefined && onBusyRaw !== "reject" && onBusyRaw !== "steer") {
+      return {
+        content: [{ type: "text" as const, text: `Error: invalid on_busy value ${JSON.stringify(onBusyRaw)} — use "reject" or "steer".` }],
+        isError: true,
+      };
+    }
+    if (onBusy === "steer" && requireReply) {
+      return {
+        content: [{ type: "text" as const, text: "Error: require_reply cannot be combined with on_busy=\"steer\" yet — a steer joins the RUNNING turn instead of starting a new one, so reply tracking would mis-arm. Send the steer without require_reply." }],
+        isError: true,
+      };
+    }
 
     const bridgeMsg: BridgeMessage = {
       id: (args?.chat_id as string) ?? `reply_${Date.now()}`,
@@ -334,7 +353,7 @@ export class ClaudeAdapter extends EventEmitter {
       };
     }
 
-    const result = await this.replySender(bridgeMsg, requireReply);
+    const result = await this.replySender(bridgeMsg, requireReply, onBusy);
     if (!result.success) {
       this.log(`Reply delivery failed: ${result.error}`);
       return {
@@ -345,7 +364,9 @@ export class ClaudeAdapter extends EventEmitter {
 
     // Include pending message hint
     const pending = this.pendingMessages.length;
-    let responseText = "Reply sent to Codex.";
+    let responseText = onBusy === "steer"
+      ? "Reply sent to Codex (will be steered into the running turn if one is active; watch for a system_steer_failed notice if the app-server rejects it)."
+      : "Reply sent to Codex.";
     if (pending > 0) {
       responseText += ` Note: ${pending} unread Codex message${pending > 1 ? "s" : ""} already waiting \u2014 call get_messages to read them.`;
     }

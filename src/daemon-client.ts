@@ -195,7 +195,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     this.rejectPendingReplies("Daemon connection closed");
   }
 
-  async sendReply(message: BridgeMessage, requireReply?: boolean): Promise<{ success: boolean; error?: string }> {
+  async sendReply(message: BridgeMessage, requireReply?: boolean, onBusy?: "reject" | "steer"): Promise<{ success: boolean; error?: string }> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return { success: false, error: "AgentBridge daemon is not connected." };
     }
@@ -213,6 +213,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
         requestId,
         message,
         ...(requireReply ? { requireReply: true } : {}),
+        ...(onBusy && onBusy !== "reject" ? { onBusy } : {}),
       });
     });
   }

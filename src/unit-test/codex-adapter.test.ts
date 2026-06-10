@@ -2269,3 +2269,159 @@ describe("CodexAdapter.forceKillAppServerSync", () => {
     expect(() => adapter.forceKillAppServerSync()).not.toThrow();
   });
 });
+
+describe("CodexAdapter turn/steer (protocol v2 B0)", () => {
+  function createSteerableAdapter() {
+    const adapter = createAdapter();
+    const appSent: string[] = [];
+    adapter.threadId = "thread-steer";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: (data: string) => appSent.push(data) } as any;
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    return { adapter, appSent };
+  }
+
+  test("steerMessage rejects when no thread is active", () => {
+    const adapter = createAdapter();
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    expect(adapter.steerMessage("hello")).toBe(false);
+  });
+
+  test("steerMessage rejects when the app-server WebSocket is not connected", () => {
+    const adapter = createAdapter();
+    adapter.threadId = "thread-steer";
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    adapter.appServerWs = null;
+    expect(adapter.steerMessage("hello")).toBe(false);
+  });
+
+  test("steerMessage rejects when NO turn is in progress (injectMessage territory)", () => {
+    const adapter = createAdapter();
+    adapter.threadId = "thread-steer";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+    expect(adapter.turnInProgress).toBe(false);
+    expect(adapter.steerMessage("hello")).toBe(false);
+  });
+
+  test("steerMessage sends turn/steer with a tracked negative id and text input", () => {
+    const { adapter, appSent } = createSteerableAdapter();
+
+    expect(adapter.steerMessage("mid-turn correction")).toBe(true);
+    expect(appSent).toHaveLength(1);
+
+    const sent = JSON.parse(appSent[0]);
+    expect(sent.method).toBe("turn/steer");
+    expect(typeof sent.id).toBe("number");
+    expect(sent.id).toBeLessThan(0);
+    expect(sent.params).toEqual({
+      threadId: "thread-steer",
+      input: [{ type: "text", text: "mid-turn correction" }],
+    });
+    expect(adapter.bridgeRequestIds.has(sent.id)).toBe(true);
+    expect(adapter.bridgeRequestKinds.get(sent.id)).toBe("steer");
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("a rejected steer emits steerFailed, NOT turnAborted, and leaves the turn running", () => {
+    // Core B0 invariant: ActiveTurnNotSteerable / NoActiveTurn-race rejections
+    // must not be confused with a turn abort — the ORIGINAL turn is untouched.
+    const { adapter, appSent } = createSteerableAdapter();
+    const failures: string[] = [];
+    const aborts: string[] = [];
+    adapter.on("steerFailed", (reason: string) => failures.push(reason));
+    adapter.on("turnAborted", (reason: string) => aborts.push(reason));
+
+    adapter.steerMessage("mid-turn correction");
+    const steerId = JSON.parse(appSent[0]).id;
+
+    const forwarded = adapter.handleAppServerPayload(JSON.stringify({
+      id: steerId,
+      error: { message: "ActiveTurnNotSteerable" },
+    }));
+
+    expect(forwarded).toBeNull(); // swallowed, never forwarded to the TUI
+    expect(failures).toEqual(["ActiveTurnNotSteerable"]);
+    expect(aborts).toEqual([]);
+    expect(adapter.turnInProgress).toBe(true);
+    expect(adapter.turnPhase).toBe("running");
+    expect(adapter.bridgeRequestIds.has(steerId)).toBe(false); // consumed
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("an accepted steer emits steerAccepted and nothing else", () => {
+    const { adapter, appSent } = createSteerableAdapter();
+    const events: string[] = [];
+    adapter.on("steerAccepted", () => events.push("accepted"));
+    adapter.on("steerFailed", () => events.push("failed"));
+    adapter.on("turnAborted", () => events.push("aborted"));
+
+    adapter.steerMessage("mid-turn correction");
+    const steerId = JSON.parse(appSent[0]).id;
+
+    adapter.handleAppServerPayload(JSON.stringify({ id: steerId, result: {} }));
+
+    expect(events).toEqual(["accepted"]);
+    expect(adapter.turnInProgress).toBe(true);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("a rejected injected turn/start still emits turnAborted (kind default unchanged)", () => {
+    // Regression guard for the kind-aware tracking refactor: the pre-existing
+    // turn-start error path must keep its abort semantics.
+    const { adapter } = createSteerableAdapter();
+    const aborts: string[] = [];
+    const failures: string[] = [];
+    adapter.on("turnAborted", (reason: string) => aborts.push(reason));
+    adapter.on("steerFailed", (reason: string) => failures.push(reason));
+
+    adapter.trackBridgeRequestId(-77); // default kind: "turn-start"
+    adapter.handleAppServerPayload(JSON.stringify({
+      id: -77,
+      error: { message: "turn/start rejected" },
+    }));
+
+    expect(aborts).toHaveLength(1);
+    expect(aborts[0]).toContain("turn/start rejected");
+    expect(failures).toEqual([]);
+
+    adapter.clearResponseTrackingState();
+  });
+
+  test("clearResponseTrackingState clears in-flight steer kinds (no leak across reconnects)", () => {
+    // Regression: clearTransientResponseTrackingState cancelled the TTL timers
+    // (the only other deletion path for bridgeRequestKinds) but cleared only
+    // bridgeRequestIds — every in-flight request at an app-server disconnect
+    // leaked its kind entry forever.
+    const { adapter } = createSteerableAdapter();
+
+    adapter.steerMessage("in flight at disconnect");
+    adapter.trackBridgeRequestId(-88); // an in-flight turn-start, same lifecycle
+    expect(adapter.bridgeRequestIds.size).toBe(2);
+    expect(adapter.bridgeRequestKinds.size).toBe(2);
+
+    adapter.clearResponseTrackingState();
+
+    expect(adapter.bridgeRequestIds.size).toBe(0);
+    expect(adapter.bridgeRequestKinds.size).toBe(0);
+  });
+
+  test("a failed send untracks the steer id so a late response is unmatched", () => {
+    const { adapter } = createSteerableAdapter();
+    adapter.appServerWs = {
+      readyState: WebSocket.OPEN,
+      send: () => { throw new Error("socket write failed"); },
+    } as any;
+    const failures: string[] = [];
+    adapter.on("steerFailed", (reason: string) => failures.push(reason));
+
+    expect(adapter.steerMessage("doomed")).toBe(false);
+    expect(adapter.bridgeRequestIds.size).toBe(0);
+    expect(adapter.bridgeRequestKinds.size).toBe(0);
+    expect(failures).toEqual([]); // send failure is the return value's job, not the event's
+
+    adapter.clearResponseTrackingState();
+  });
+});

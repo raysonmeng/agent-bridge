@@ -29,6 +29,7 @@ import {
   type AppServerServerRequestMethod,
   type AppServerTrackedRequestMethod,
   type TurnStartParams,
+  type TurnSteerParams,
 } from "./app-server-protocol";
 import {
   CODEX_TRANSPORT_ENV,
@@ -164,6 +165,11 @@ export class CodexAdapter extends EventEmitter {
   private pendingServerResponses = new Map<number, PendingServerResponse>();
   private staleProxyIds = new Map<number, ReturnType<typeof setTimeout>>();
   private bridgeRequestIds = new Map<number, ReturnType<typeof setTimeout>>();
+  // What each bridge-originated request was (turn/start injection vs
+  // turn/steer) — error handling differs: a rejected injection emits
+  // turnAborted, a rejected steer must NOT (the original turn is still
+  // running) and surfaces steerFailed instead.
+  private bridgeRequestKinds = new Map<number, "turn-start" | "steer">();
   private intentionalDisconnect = false;
   // Fresh-session reconnection: buffer TUI messages while reconnecting app-server
   private pendingTuiMessages: string[] = [];
@@ -405,6 +411,44 @@ export class CodexAdapter extends EventEmitter {
     } catch (err: any) {
       this.untrackBridgeRequestId(requestId);
       this.log(`Injection send failed: ${err.message}`);
+      return false;
+    }
+  }
+
+  /**
+   * Feed additional input into the CURRENTLY RUNNING turn via turn/steer —
+   * Codex sees it mid-turn and adjusts without losing work (protocol v2 B0,
+   * design consensus: explicit [STEER] framing is the CALLER's job).
+   * Returns true when transport-accepted; a later JSON-RPC error surfaces as
+   * a "steerFailed" event (NOT turnAborted — the original turn keeps running).
+   */
+  steerMessage(text: string): boolean {
+    if (!this.threadId) {
+      this.log("Cannot steer: no active thread");
+      return false;
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      this.log("Cannot steer: app-server WebSocket not connected");
+      return false;
+    }
+    if (!this.turnInProgress) {
+      this.log("Cannot steer: no turn in progress (use injectMessage)");
+      return false;
+    }
+    this.log(`Steering message into active Codex turn (${text.length} chars)`);
+    const requestId = this.nextInjectionId--;
+    this.trackBridgeRequestId(requestId, "steer");
+    const params: TurnSteerParams = { threadId: this.threadId, input: [{ type: "text", text }] };
+    try {
+      this.appServerWs.send(JSON.stringify({
+        method: "turn/steer",
+        id: requestId,
+        params,
+      } satisfies AppServerRequest<"turn/steer", TurnSteerParams>));
+      return true;
+    } catch (err: any) {
+      this.untrackBridgeRequestId(requestId);
+      this.log(`Steer send failed: ${err.message}`);
       return false;
     }
   }
@@ -1443,23 +1487,33 @@ export class CodexAdapter extends EventEmitter {
       return forwarded;
     }
 
-    if (!isNaN(numericId) && this.consumeBridgeRequestId(numericId)) {
+    const bridgeKind = !isNaN(numericId) ? this.consumeBridgeRequestId(numericId) : null;
+    if (bridgeKind) {
       if (parsed.error) {
-        this.log(`Bridge-originated request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
-        // A bridge-originated request is always an injected turn/start. If Codex
-        // REJECTS it (error response) before any turn/started, no turn ever goes
-        // in-progress, so resetTurnState's wasInProgress-gated turnAborted never
-        // fires. Signal the abort here so daemon-level per-turn state (the
-        // require_reply tracker) is not stranded on a turn that never started.
-        // turnPhase must agree with the emitted event: an observer seeing
-        // turnAborted while the phase reads "idle" violates the PR A contract
-        // ("aborted" = the last turn ended abnormally, no new turn since).
-        // The richer "rejected" terminal classification is PR B territory.
-        this.lastTurnEndedAbnormally = true;
-        this.emit("turnAborted", `injected turn/start rejected: ${parsed.error.message ?? "unknown error"}`);
-        this.notifyPhaseIfChanged();
+        this.log(`Bridge-originated ${bridgeKind} request failed (id ${responseId}): ${parsed.error.message ?? "unknown error"}`);
+        if (bridgeKind === "steer") {
+          // A rejected steer leaves the ORIGINAL turn running untouched —
+          // no abort, no phase change. Surface it so the daemon can tell
+          // Claude the mid-turn message did NOT reach Codex (e.g.
+          // ActiveTurnNotSteerable on Review/Plan turns, or the turn ended
+          // in the NoActiveTurn race window).
+          this.emit("steerFailed", parsed.error.message ?? "unknown error");
+        } else {
+          // An injected turn/start was REJECTED before any turn/started — no
+          // turn ever goes in-progress, so resetTurnState's wasInProgress-gated
+          // turnAborted never fires. Signal the abort here so daemon-level
+          // per-turn state (the require_reply tracker) is not stranded.
+          // turnPhase must agree with the emitted event (PR A contract); the
+          // richer "rejected" terminal classification is PR B territory.
+          this.lastTurnEndedAbnormally = true;
+          this.emit("turnAborted", `injected turn/start rejected: ${parsed.error.message ?? "unknown error"}`);
+          this.notifyPhaseIfChanged();
+        }
       } else {
-        this.log(`Bridge-originated request completed (id ${responseId})`);
+        this.log(`Bridge-originated ${bridgeKind} request completed (id ${responseId})`);
+        if (bridgeKind === "steer") {
+          this.emit("steerAccepted");
+        }
       }
       return null;
     }
@@ -1923,21 +1977,27 @@ export class CodexAdapter extends EventEmitter {
     return this.clearTrackedId(this.staleProxyIds, proxyId);
   }
 
-  private trackBridgeRequestId(requestId: number) {
+  private trackBridgeRequestId(requestId: number, kind: "turn-start" | "steer" = "turn-start") {
     this.clearTrackedId(this.bridgeRequestIds, requestId);
 
     const timer = setTimeout(() => {
       this.bridgeRequestIds.delete(requestId);
+      this.bridgeRequestKinds.delete(requestId);
     }, CodexAdapter.RESPONSE_TRACKING_TTL_MS);
     timer.unref?.();
     this.bridgeRequestIds.set(requestId, timer);
+    this.bridgeRequestKinds.set(requestId, kind);
   }
 
-  private consumeBridgeRequestId(requestId: number) {
-    return this.clearTrackedId(this.bridgeRequestIds, requestId);
+  /** Returns the request kind when this id was bridge-originated, else null. */
+  private consumeBridgeRequestId(requestId: number): "turn-start" | "steer" | null {
+    const kind = this.bridgeRequestKinds.get(requestId) ?? "turn-start";
+    this.bridgeRequestKinds.delete(requestId);
+    return this.clearTrackedId(this.bridgeRequestIds, requestId) ? kind : null;
   }
 
   private untrackBridgeRequestId(requestId: number) {
+    this.bridgeRequestKinds.delete(requestId);
     this.clearTrackedId(this.bridgeRequestIds, requestId);
   }
 
@@ -1962,6 +2022,10 @@ export class CodexAdapter extends EventEmitter {
       clearTimeout(timer);
     }
     this.bridgeRequestIds.clear();
+    // The kinds map shares its lifecycle with bridgeRequestIds — clearing one
+    // without the other leaks kind entries forever, because the TTL timer that
+    // would have deleted them was just cancelled above.
+    this.bridgeRequestKinds.clear();
   }
 
   private clearResponseTrackingState() {

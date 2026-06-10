@@ -13947,7 +13947,7 @@ var CLAUDE_INSTRUCTIONS = [
   "## Turn coordination",
   "- When you see '\u23F3 Codex is working', do NOT call the reply tool \u2014 wait for '\u2705 Codex finished'.",
   "- After Codex finishes a turn, you have an attention window to review and respond before new messages arrive.",
-  "- If the reply tool returns a busy error, Codex is still executing \u2014 wait and try again later.",
+  '- If the reply tool returns a busy error, Codex is still executing. You decide: wait and retry later, or resend with on_busy="steer" to feed the message INTO the running turn (good for mid-course corrections; it does not interrupt or restart the work).',
   "",
   "## Budget awareness",
   "- Use the get_budget tool to check both agents' subscription quota (5h/weekly windows, drift, pause state).",
@@ -14099,6 +14099,11 @@ ${formatted}`
               require_reply: {
                 type: "boolean",
                 description: "When true, Codex is required to send a reply. All Codex messages from this turn will be forwarded immediately (bypassing STATUS buffering). Use this when you need a direct answer from Codex."
+              },
+              on_busy: {
+                type: "string",
+                enum: ["reject", "steer"],
+                description: `What to do when Codex is mid-turn. "reject" (default): fail with a busy error \u2014 wait and retry. "steer": feed this message INTO the running turn \u2014 Codex sees it immediately and integrates it without losing work. Use steer for mid-course corrections, added constraints, or updated acceptance criteria; it does NOT start a new turn, so don't combine it with require_reply. If you need Codex to STOP and do something else, wait for the turn to finish (interrupt support is coming separately).`
               }
             },
             required: ["text"]
@@ -14157,6 +14162,20 @@ ${formatted}`
       };
     }
     const requireReply = args?.require_reply === true;
+    const onBusyRaw = args?.on_busy;
+    const onBusy = onBusyRaw === "steer" ? "steer" : "reject";
+    if (onBusyRaw !== undefined && onBusyRaw !== "reject" && onBusyRaw !== "steer") {
+      return {
+        content: [{ type: "text", text: `Error: invalid on_busy value ${JSON.stringify(onBusyRaw)} \u2014 use "reject" or "steer".` }],
+        isError: true
+      };
+    }
+    if (onBusy === "steer" && requireReply) {
+      return {
+        content: [{ type: "text", text: 'Error: require_reply cannot be combined with on_busy="steer" yet \u2014 a steer joins the RUNNING turn instead of starting a new one, so reply tracking would mis-arm. Send the steer without require_reply.' }],
+        isError: true
+      };
+    }
     const bridgeMsg = {
       id: args?.chat_id ?? `reply_${Date.now()}`,
       source: "claude",
@@ -14170,7 +14189,7 @@ ${formatted}`
         isError: true
       };
     }
-    const result = await this.replySender(bridgeMsg, requireReply);
+    const result = await this.replySender(bridgeMsg, requireReply, onBusy);
     if (!result.success) {
       this.log(`Reply delivery failed: ${result.error}`);
       return {
@@ -14179,7 +14198,7 @@ ${formatted}`
       };
     }
     const pending = this.pendingMessages.length;
-    let responseText = "Reply sent to Codex.";
+    let responseText = onBusy === "steer" ? "Reply sent to Codex (will be steered into the running turn if one is active; watch for a system_steer_failed notice if the app-server rejects it)." : "Reply sent to Codex.";
     if (pending > 0) {
       responseText += ` Note: ${pending} unread Codex message${pending > 1 ? "s" : ""} already waiting \u2014 call get_messages to read them.`;
     }
@@ -14209,7 +14228,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.7", "0.0.0-source"),
-  commit: defineString("ec1ab68", "source"),
+  commit: defineString("1df8b91", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -14381,7 +14400,7 @@ class DaemonClient extends EventEmitter2 {
     this.ws = null;
     this.rejectPendingReplies("Daemon connection closed");
   }
-  async sendReply(message, requireReply) {
+  async sendReply(message, requireReply, onBusy) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return { success: false, error: "AgentBridge daemon is not connected." };
     }
@@ -14396,7 +14415,8 @@ class DaemonClient extends EventEmitter2 {
         type: "claude_to_codex",
         requestId,
         message,
-        ...requireReply ? { requireReply: true } : {}
+        ...requireReply ? { requireReply: true } : {},
+        ...onBusy && onBusy !== "reject" ? { onBusy } : {}
       });
     });
   }
@@ -15416,7 +15436,7 @@ if (process.env.AGENTBRIDGE_TRACE === "1") {
     });
   } catch {}
 }
-claude.setReplySender(async (msg, requireReply) => {
+claude.setReplySender(async (msg, requireReply, onBusy) => {
   if (msg.source !== "claude") {
     return { success: false, error: "Invalid message source" };
   }
@@ -15426,7 +15446,7 @@ claude.setReplySender(async (msg, requireReply) => {
       error: disabledReplyError(daemonDisabledReason ?? "killed")
     };
   }
-  return daemonClient.sendReply(msg, requireReply);
+  return daemonClient.sendReply(msg, requireReply, onBusy);
 });
 daemonClient.on("codexMessage", (message) => {
   log(`Forwarding daemon \u2192 Claude (${message.content.length} chars)`);
