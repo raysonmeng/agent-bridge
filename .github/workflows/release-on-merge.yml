@@ -118,9 +118,17 @@ jobs:
             bun install --frozen-lockfile
             bun run check
             NEW="$(node scripts/bump-version.mjs patch)"
+            # The plugin bundles embed BUILD_INFO.version — a bump that does
+            # not rebuild them ships bundles contradicting the manifests.
+            # Commit stamp pinned to the tracked value (verify-plugin-sync
+            # strategy) so the only byte change is the version itself.
+            BUNDLE_COMMIT="$(node scripts/bundle-commit.cjs)"
+            AGENTBRIDGE_BUILD_COMMIT_OVERRIDE="$BUNDLE_COMMIT" bun run build:plugin
             git add package.json \
               plugins/agentbridge/.claude-plugin/plugin.json \
-              .claude-plugin/marketplace.json
+              .claude-plugin/marketplace.json \
+              plugins/agentbridge/server/bridge-server.js \
+              plugins/agentbridge/server/daemon.js
             git commit -m "chore(release): v${NEW}"
             if git push origin HEAD:master; then
               echo "Released v${NEW} (attempt ${attempt})"

@@ -58,15 +58,15 @@ Claude Code ── MCP stdio ──▶ bridge.ts (foreground)
 - **`src/daemon-lifecycle.ts`** — shared `ensureRunning` / `kill` / startup-lock logic; both the CLI and `bridge.ts` call into this.
 - **`src/daemon-client.ts`** — typed WS client used by `bridge.ts` to talk to the daemon control port.
 - **`src/config-service.ts`** + **`src/state-dir.ts`** — read/write `.agentbridge/config.json` and resolve the platform state dir (`daemon.pid`, `status.json`, `agentbridge.log`, `killed` sentinel, `startup.lock`).
-- **`src/cli.ts` + `src/cli/*.ts`** — `abg` / `agentbridge` command router (`init`, `claude`, `codex`, `kill`, `dev`).
-- **`src/marker-section.ts` + `src/collaboration-content.ts`** — idempotent marker-based injection of the `<!-- AgentBridge:start/end -->` block into `CLAUDE.md` / `AGENTS.md` / `GEMINI.md` / `.cursorrules` / `.windsurfrules` / `.kiro/` / `.cursor/` etc. during `abg init`.
+- **`src/cli.ts` + `src/cli/*.ts`** — `abg` / `agentbridge` command router (`init`, `claude`, `codex`, `pairs`, `doctor`, `budget`, `kill`, `dev`).
+- **`src/marker-section.ts` + `src/collaboration-content.ts`** — idempotent marker-based injection of the `<!-- AgentBridge:start/end -->` block into `CLAUDE.md` and `AGENTS.md` during `abg init`. (Other agent config files — GEMINI.md / .cursorrules / .kiro etc. — are NOT injected today; backlog, not shipped behavior.)
 - **`src/bridge-disabled-state.ts` + `src/tui-connection-state.ts`** — disabled-reason and TUI-connect state machines used by the kickoff + reconnect UX.
 
 ### Data flow invariants
 
 - Every `BridgeMessage` carries a `source: "claude" | "codex"` — the bridge **never forwards a message back to its origin** (loop prevention).
 - Message delivery is always push (channel notifications). A failed push falls back to an in-memory queue drained by `get_messages`. (The legacy `AGENTBRIDGE_MODE=pull` mode was removed; the env var is ignored with a one-time warning.)
-- Ports are fixed: `CODEX_WS_PORT=4500`, `CODEX_PROXY_PORT=4501`, `AGENTBRIDGE_CONTROL_PORT=4502`. One AgentBridge instance per machine (multi-project support is post-v1).
+- Ports are allocated per pair from a registry (slot-based, +10 strides from the base 4500/4501/4502); the legacy fixed defaults remain the slot-0 values. Multiple pairs run side-by-side, one per project directory.
 - All state lives in the platform state dir (`AGENTBRIDGE_STATE_DIR`, default `~/Library/Application Support/AgentBridge/` on macOS, `$XDG_STATE_HOME/agentbridge/` on Linux). The daemon uses `startup.lock` + `killed` sentinel to coordinate startup and explicit-kill-don't-restart semantics.
 
 ### Tests

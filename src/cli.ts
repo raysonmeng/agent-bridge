@@ -137,6 +137,7 @@ Commands:
   dev                Register local marketplace + install plugin (for local dev)
   claude [args...]   Start Claude Code with push channel enabled
   codex [args...]    Start Codex TUI connected to AgentBridge daemon
+                     (bare command auto-resumes the last thread; --new starts fresh)
   pairs [rm <name|id> | prune [--dry-run]]
                      List pairs; remove one (rm), or delete orphan state dirs (prune)
   doctor [--json]    Diagnose env, daemon, build drift, logs, and current thread

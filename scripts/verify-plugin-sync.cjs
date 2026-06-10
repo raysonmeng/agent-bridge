@@ -4,6 +4,7 @@ const { mkdtempSync, readFileSync, existsSync, rmSync } = require("node:fs");
 const { tmpdir } = require("node:os");
 const { join, relative, resolve } = require("node:path");
 const { spawnSync } = require("node:child_process");
+const { extractBuildCommit } = require("./bundle-commit.cjs");
 
 const repoRoot = resolve(__dirname, "..");
 const pluginBundles = [
@@ -42,15 +43,8 @@ function run(command, args, options = {}) {
   }
 }
 
-function extractBuildCommit(snapshot) {
-  if (!snapshot) return null;
-
-  const match = snapshot
-    .toString("utf-8")
-    .match(/commit:\s*defineString\("([^"]+)",\s*"source"\)/);
-
-  return match ? match[1] : null;
-}
+// extractBuildCommit moved to scripts/bundle-commit.cjs (shared with
+// smoke-pack and the release bump rebuild).
 
 const tempDir = mkdtempSync(join(tmpdir(), "agentbridge-plugin-sync-"));
 

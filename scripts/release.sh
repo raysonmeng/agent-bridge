@@ -151,7 +151,15 @@ bump_version_in_file "package.json" "$CURRENT_VERSION" "$NEW_VERSION"
 bump_version_in_file "plugins/agentbridge/.claude-plugin/plugin.json" "$CURRENT_VERSION" "$NEW_VERSION"
 bump_version_in_file ".claude-plugin/marketplace.json" "$CURRENT_VERSION" "$NEW_VERSION"
 
-echo "Updated package.json, plugin.json, marketplace.json → $NEW_VERSION"
+# The plugin bundles embed the package version (BUILD_INFO.version). A bump
+# that does not rebuild them ships bundles whose version stamp contradicts the
+# manifests — broken until the next unrelated bundle rebuild. Rebuild with the
+# commit stamp the tracked bundles already carry (same override strategy as
+# verify-plugin-sync) so the only byte change is the version itself.
+BUNDLE_COMMIT="$(node scripts/bundle-commit.cjs)"
+AGENTBRIDGE_BUILD_COMMIT_OVERRIDE="$BUNDLE_COMMIT" bun run build:plugin
+
+echo "Updated package.json, plugin.json, marketplace.json + plugin bundles → $NEW_VERSION"
 
 # ── Step 2: Verify ────────────────────────────────────────
 
@@ -171,7 +179,8 @@ echo "All checks passed."
 echo ""
 echo "=== Step 3: Commit + PR + merge ==="
 
-git add package.json plugins/agentbridge/.claude-plugin/plugin.json .claude-plugin/marketplace.json
+git add package.json plugins/agentbridge/.claude-plugin/plugin.json .claude-plugin/marketplace.json \
+  plugins/agentbridge/server/bridge-server.js plugins/agentbridge/server/daemon.js
 git commit -m "chore: bump version to $NEW_VERSION"
 git push -u origin "$BRANCH_NAME"
 
