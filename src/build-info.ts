@@ -1,3 +1,5 @@
+import { CONTRACT_VERSION } from "./contract-version";
+
 declare const __AGENTBRIDGE_BUILD_VERSION__: string | undefined;
 declare const __AGENTBRIDGE_BUILD_COMMIT__: string | undefined;
 declare const __AGENTBRIDGE_BUILD_BUNDLE__: "source" | "dist" | "plugin" | undefined;
@@ -37,9 +39,13 @@ export const BUILD_INFO: AgentBridgeBuildInfo = Object.freeze({
   bundle: defineBundle(
     typeof __AGENTBRIDGE_BUILD_BUNDLE__ === "string" ? __AGENTBRIDGE_BUILD_BUNDLE__ : undefined,
   ),
+  // Fallback imports the single source (src/contract-version.ts) — the build
+  // define and this fallback previously hardcoded "1" independently, so a
+  // contract bump touching only one side split source-mode and bundled builds
+  // into mutually "incompatible" contracts.
   contractVersion: defineNumber(
     typeof __AGENTBRIDGE_CONTRACT_VERSION__ === "number" ? __AGENTBRIDGE_CONTRACT_VERSION__ : undefined,
-    1,
+    CONTRACT_VERSION,
   ),
 });
 

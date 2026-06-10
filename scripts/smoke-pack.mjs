@@ -24,10 +24,12 @@
 
 import { execFileSync } from "node:child_process";
 import { existsSync, statSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
+const { trackedBundleCommit } = createRequire(import.meta.url)("./bundle-commit.cjs");
 
 function fail(message, details = []) {
   console.error(`\nsmoke-pack FAILED: ${message}`);
@@ -43,10 +45,27 @@ function readJson(path) {
 
 function build() {
   console.log("smoke-pack: building dist/ + plugin bundles ...");
+  // The plugin bundles are TRACKED files. Rebuilding them with the current
+  // HEAD stamp rewrites their embedded commit and dirties the working tree on
+  // every smoke run (breaking the "side-effect-free on the repo" promise
+  // above). Same strategy as verify-plugin-sync: rebuild with the stamp the
+  // tracked file already carries, so identical source produces identical
+  // bytes. dist/ is untracked — no override needed there.
+  const trackedCommit = trackedBundleCommit();
+  if (!trackedCommit) {
+    // Without a tracked stamp the rebuild would embed the real HEAD commit and
+    // dirty the tree — fail loud instead of silently breaking the
+    // side-effect-free promise (fresh clones must build bundles first anyway).
+    fail("no commit stamp found in tracked plugin bundles", [
+      "run `bun run build:plugin` and commit the bundles before smoke-pack",
+    ]);
+  }
+  const pluginEnv = { ...process.env, AGENTBRIDGE_BUILD_COMMIT_OVERRIDE: trackedCommit };
   for (const script of ["build:cli", "build:plugin"]) {
     execFileSync("bun", ["run", script], {
       cwd: repoRoot,
       stdio: "inherit",
+      env: script === "build:plugin" ? pluginEnv : process.env,
     });
   }
 }

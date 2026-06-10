@@ -156,11 +156,16 @@ After modifying AgentBridge source code, re-run `agentbridge dev` to sync change
 |---------|-------------|
 | `abg init` | Install plugin, check dependencies (bun/claude/codex), generate `.agentbridge/config.json` |
 | `abg claude [args...]` | Start Claude Code with push channel enabled. Clears any killed sentinel from a previous `kill`. Pass-through args are forwarded to `claude` |
-| `abg codex [args...]` | Start Codex TUI connected to AgentBridge daemon. Manages TUI process lifecycle (pid tracking, cleanup). Pass-through args forwarded to `codex` |
-| `abg kill` | Gracefully stop both daemon and managed Codex TUI, clean up state files, write killed sentinel |
+| `abg codex [args...]` | Start Codex TUI connected to AgentBridge daemon. **Bare `abg codex` auto-resumes the pair's last thread; use `abg codex --new` for a fresh thread.** Manages TUI process lifecycle (pid tracking, cleanup). Pass-through args forwarded to `codex` |
+| `abg pairs` | List registered pairs; `abg pairs rm <name\|id>` removes one, `abg pairs prune` deletes orphan state dirs |
+| `abg doctor [--json]` | Read-only diagnosis: env, daemon health/readiness, build drift, artifact alignment, TUI attachment, logs |
+| `abg budget [--json]` | Both agents' subscription quota snapshot (5h/weekly windows, drift, pause state) |
+| `abg kill` | Gracefully stop this pair's daemon and managed Codex TUI, write killed sentinel; `abg kill --all` stops every pair |
 | `abg dev` | (Dev only) Register local marketplace + force-sync plugin to cache |
 | `abg --help` | Show help |
 | `abg --version` | Show version |
+
+The pair-aware commands (`claude`, `codex`, `kill`, `doctor`, `budget`) accept `--pair <name>` to target a specific pair — one pair per project directory by default, with ports allocated per pair in +10 strides from 4500.
 
 ### Owned flags
 
@@ -226,7 +231,11 @@ agent_bridge/
 │       ├── init.ts                # agentbridge init
 │       ├── claude.ts              # agentbridge claude
 │       ├── codex.ts               # agentbridge codex
+│       ├── pairs.ts               # agentbridge pairs (list / rm / prune)
+│       ├── doctor.ts              # agentbridge doctor (read-only diagnosis)
+│       ├── budget.ts              # agentbridge budget (quota snapshot)
 │       ├── kill.ts                # agentbridge kill
+│       ├── pkg-root.ts            # package-root resolution helper
 │       └── dev.ts                 # agentbridge dev
 ├── CLAUDE.md                      # Project rules for AI agents
 ├── CODE_OF_CONDUCT.md
@@ -295,9 +304,9 @@ The bridge can enter several dormant states when it cannot accept new MCP replie
 ## Current Limitations
 
 - Only forwards `agentMessage` items, not intermediate `commandExecution`, `fileChange`, or similar events
-- Single Codex thread, no multi-session support yet
-- Single Claude foreground connection; a new Claude session replaces the previous one
-- Fixed ports mean only one AgentBridge instance per machine (multi-project support planned for post-v1)
+- Single Codex thread per pair, no multi-session support within a pair yet
+- Single Claude foreground connection per pair; a new Claude session replaces the previous one
+- Multiple pairs run side-by-side on one machine (one per project directory, per-pair port allocation); Windows is not an officially supported platform yet
 
 ### Codex git restrictions
 

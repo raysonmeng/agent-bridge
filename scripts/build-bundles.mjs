@@ -6,7 +6,23 @@ import { resolve } from "node:path";
 
 const repoRoot = resolve(new URL("..", import.meta.url).pathname);
 const pkg = JSON.parse(readFileSync(resolve(repoRoot, "package.json"), "utf-8"));
-const CONTRACT_VERSION = 1;
+
+/**
+ * Contract version is extracted from its single source (src/contract-version.ts)
+ * instead of a second hardcoded constant here — a bump touching only one of
+ * the two copies split source-mode and bundled builds into "incompatible"
+ * contracts. A unit test locks this extraction against the TS export.
+ */
+function readContractVersion() {
+  const source = readFileSync(resolve(repoRoot, "src/contract-version.ts"), "utf-8");
+  const match = source.match(/export const CONTRACT_VERSION = (\d+);/);
+  if (!match) {
+    console.error("build-bundles: cannot extract CONTRACT_VERSION from src/contract-version.ts");
+    process.exit(1);
+  }
+  return Number(match[1]);
+}
+const CONTRACT_VERSION = readContractVersion();
 
 const TARGETS = {
   cli: { source: "src/cli.ts", output: "dist/cli.js", bundle: "dist", executable: true },

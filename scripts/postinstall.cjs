@@ -16,6 +16,20 @@ const { stopRunningAgentBridge } = require("./install-safety.cjs");
 const PACKAGE_ROOT = path.resolve(__dirname, "..");
 const MARKETPLACE_NAME = "agentbridge";
 const PLUGIN_NAME = "agentbridge";
+// Every external command gets a hard timeout: postinstall runs inside the
+// user's `npm install`, and a hung `claude` CLI (auth prompt, broken update)
+// previously hung the whole install with it. Timeouts fall through to the
+// existing warn-and-continue paths (`abg init` is always the fallback).
+const VERSION_PROBE_TIMEOUT_MS = 10_000;
+const PLUGIN_STEP_TIMEOUT_MS = 30_000;
+
+/**
+ * Declarative opt-out of the marketplace/plugin registration steps (CI image
+ * builds, air-gapped installs) — symmetric with AGENTBRIDGE_POSTINSTALL_STOP.
+ */
+function skipPluginRegistration(env = process.env) {
+  return env.AGENTBRIDGE_POSTINSTALL_PLUGIN === "0";
+}
 /**
  * Decide whether postinstall should stop ALL running AgentBridge pairs.
  *
@@ -57,11 +71,16 @@ function runPostinstall() {
   // Step 1: Check Bun
   let bunOk = false;
   try {
-    const version = execFileSync("bun", ["--version"], { encoding: "utf-8" }).trim();
+    const version = execFileSync("bun", ["--version"], { encoding: "utf-8", timeout: VERSION_PROBE_TIMEOUT_MS }).trim();
     console.log(`\x1b[32m✔\x1b[0m AgentBridge: Bun ${version} detected.`);
     bunOk = true;
-  } catch {
-    console.warn(`
+  } catch (e) {
+    // A timeout means bun exists but hung — "install Bun" advice would be
+    // misleading there; tell the truth and point at the abg init fallback.
+    if (e && e.code === "ETIMEDOUT") {
+      console.warn(`\x1b[33m⚠\x1b[0m AgentBridge: \`bun --version\` timed out — run \`abg init\` after the install completes.`);
+    } else {
+      console.warn(`
 \x1b[33m⚠ AgentBridge requires Bun (v1.0+) as its runtime.\x1b[0m
 
 The CLI was installed, but it won't work without Bun.
@@ -73,10 +92,11 @@ Then restart your terminal and run:
 
   abg init
 `);
+    }
   }
 
   // Step 2: Register marketplace + install plugin (requires Claude Code)
-  if (bunOk) {
+  if (bunOk && !skipPluginRegistration()) {
     if (shouldStopRunningDaemons()) {
       try {
         stopRunningAgentBridge({ bestEffort: true });
@@ -88,7 +108,7 @@ Then restart your terminal and run:
     }
 
     try {
-      execFileSync("claude", ["--version"], { encoding: "utf-8" });
+      execFileSync("claude", ["--version"], { encoding: "utf-8", timeout: VERSION_PROBE_TIMEOUT_MS });
     } catch {
       console.log(`\x1b[33m⚠\x1b[0m AgentBridge: Claude Code not found — skipping plugin install.`);
       console.log(`  After installing Claude Code, run: abg init`);
@@ -98,6 +118,7 @@ Then restart your terminal and run:
     try {
       execFileSync("claude", ["plugin", "marketplace", "add", PACKAGE_ROOT], {
         stdio: "pipe",
+        timeout: PLUGIN_STEP_TIMEOUT_MS,
       });
       console.log(`\x1b[32m✔\x1b[0m AgentBridge: Marketplace registered.`);
     } catch (e) {
@@ -108,6 +129,7 @@ Then restart your terminal and run:
     try {
       execFileSync("claude", ["plugin", "install", `${PLUGIN_NAME}@${MARKETPLACE_NAME}`], {
         stdio: "pipe",
+        timeout: PLUGIN_STEP_TIMEOUT_MS,
       });
       console.log(`\x1b[32m✔\x1b[0m AgentBridge: Plugin installed. Run \`abg claude\` to start.`);
     } catch (e) {
@@ -116,7 +138,7 @@ Then restart your terminal and run:
   }
 }
 
-module.exports = { shouldStopRunningDaemons };
+module.exports = { shouldStopRunningDaemons, skipPluginRegistration };
 
 // Only run install side effects when invoked directly (not when require()'d
 // from a unit test).
