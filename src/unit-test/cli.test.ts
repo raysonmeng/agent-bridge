@@ -10,7 +10,10 @@ import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { StateDirResolver } from "../state-dir";
-import { promoteCurrentThreadIfRolloutExists } from "../thread-state";
+import {
+  promoteCurrentThreadIfRolloutExists,
+  writePendingCurrentThread,
+} from "../thread-state";
 
 describe("CLI: version comparison", () => {
   test("equal versions return 0", () => {
@@ -348,6 +351,100 @@ describe("CLI: AgentBridge Codex resume args", () => {
     } finally {
       process.chdir(previousCwd);
       rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("resume-current error surfaces a pending thread id with an explicit resume hint", () => {
+    const root = mkdtempSync(join(tmpdir(), "agentbridge-cli-resume-"));
+    const codexHome = mkdtempSync(join(tmpdir(), "agentbridge-codex-home-"));
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(root);
+      const pair = makePair(root);
+      const cwd = process.cwd();
+      // Pending record for THIS pair + cwd, but no rollout file anywhere:
+      // promotion cannot happen, yet the user deserves the threadId.
+      writePendingCurrentThread(
+        { stateDir: pair.stateDir, pairId: pair.pairId, pairName: pair.name, cwd },
+        "thread-pending-1",
+        "test",
+      );
+
+      const result = resolveCodexResumeArgs(
+        parseAgentBridgeCodexArgs(["resume-current"]),
+        pair,
+        { CODEX_HOME: codexHome } as NodeJS.ProcessEnv,
+      );
+      expect(result.mode).toBe("resume-current");
+      expect(result.error).toContain("No verified current Codex thread");
+      expect(result.error).toContain("thread-pending-1");
+      expect(result.error).toContain("abg codex resume thread-pending-1");
+      expect(result.error).toContain("abg codex --new");
+    } finally {
+      process.chdir(previousCwd);
+      rmSync(root, { recursive: true, force: true });
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  test("resume-current error omits the pending hint when the record belongs to another cwd", () => {
+    const root = mkdtempSync(join(tmpdir(), "agentbridge-cli-resume-"));
+    const codexHome = mkdtempSync(join(tmpdir(), "agentbridge-codex-home-"));
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(root);
+      const pair = makePair(root);
+      // Same pair, different cwd — hinting this threadId would cross-wire projects.
+      writePendingCurrentThread(
+        { stateDir: pair.stateDir, pairId: pair.pairId, pairName: pair.name, cwd: join(root, "elsewhere") },
+        "thread-foreign",
+        "test",
+      );
+
+      const result = resolveCodexResumeArgs(
+        parseAgentBridgeCodexArgs(["resume-current"]),
+        pair,
+        { CODEX_HOME: codexHome } as NodeJS.ProcessEnv,
+      );
+      expect(result.mode).toBe("resume-current");
+      expect(result.error).toContain("No verified current Codex thread");
+      expect(result.error).not.toContain("thread-foreign");
+    } finally {
+      process.chdir(previousCwd);
+      rmSync(root, { recursive: true, force: true });
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  test("resume-current promotes a pending thread whose rollout now exists", () => {
+    const root = mkdtempSync(join(tmpdir(), "agentbridge-cli-resume-"));
+    const codexHome = mkdtempSync(join(tmpdir(), "agentbridge-codex-home-"));
+    const previousCwd = process.cwd();
+    try {
+      process.chdir(root);
+      const pair = makePair(root);
+      const cwd = process.cwd();
+      writePendingCurrentThread(
+        { stateDir: pair.stateDir, pairId: pair.pairId, pairName: pair.name, cwd },
+        "thread-late-cli",
+        "test",
+      );
+      const sessionsDir = join(codexHome, "sessions", "2026", "06", "02");
+      mkdirSync(sessionsDir, { recursive: true });
+      writeFileSync(join(sessionsDir, "rollout-thread-late-cli.jsonl"), "{}\n", "utf-8");
+
+      const result = resolveCodexResumeArgs(
+        parseAgentBridgeCodexArgs(["resume-current"]),
+        pair,
+        { CODEX_HOME: codexHome } as NodeJS.ProcessEnv,
+      );
+      expect(result.mode).toBe("resume-current");
+      expect(result.error).toBeUndefined();
+      expect(result.rest).toEqual(["resume", "thread-late-cli"]);
+    } finally {
+      process.chdir(previousCwd);
+      rmSync(root, { recursive: true, force: true });
+      rmSync(codexHome, { recursive: true, force: true });
     }
   });
 });

@@ -27,6 +27,7 @@ import { appendRotatingLog } from "../rotating-log";
 import { applyPairEnv, parsePairFlag, type PairResolution } from "../pair-resolver";
 import { StderrRingBuffer } from "../stderr-ring-buffer";
 import {
+  readRawCurrentThread,
   readUsableCurrentThread,
   type CurrentThreadState,
 } from "../thread-state";
@@ -179,11 +180,21 @@ export function resolveCodexResumeArgs(
   const current = readUsableCurrentThread(identity, env);
   if (parsed.resumeCurrent) {
     if (!current) {
+      // Surface an identity-matched pending record so the user can act on it:
+      // the threadId is real, only its rollout file could not be verified.
+      // Records from another pair/cwd are NOT hinted — resuming them here
+      // would cross-wire projects.
+      const raw = readRawCurrentThread(identity.stateDir);
+      const pending =
+        raw && raw.status === "pending" && raw.pairId === identity.pairId && raw.cwd === identity.cwd
+          ? raw
+          : null;
       return {
         rest: parsed.rest,
         mode: "resume-current",
-        error:
-          "No verified current Codex thread for this pair. Start a new one with `abg codex --new`, or resume a specific thread with `abg codex resume <threadId>`.",
+        error: pending
+          ? `No verified current Codex thread for this pair. Found a pending (unverified) thread ${pending.threadId} — its Codex rollout file was not found. Try \`abg codex resume ${pending.threadId}\`, or start fresh with \`abg codex --new\`.`
+          : "No verified current Codex thread for this pair. Start a new one with `abg codex --new`, or resume a specific thread with `abg codex resume <threadId>`.",
       };
     }
     return {

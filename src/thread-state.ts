@@ -198,9 +198,34 @@ export function readUsableCurrentThread(
 ): CurrentThreadState | null {
   const state = readRawCurrentThread(identity.stateDir);
   if (!state) return null;
-  if (state.status !== "current") return null;
+  // Identity checks come FIRST: a record from another pair or cwd is never
+  // usable here and must never be promoted/repaired by this reader.
   if (state.pairId !== identity.pairId) return null;
   if (state.cwd !== identity.cwd) return null;
+
+  if (state.status === "pending") {
+    // The daemon's rollout-retry window is short (~5s); Codex often writes the
+    // rollout file later. Re-verify on the spot so a long-lived session is not
+    // permanently locked out of resume by a slow first flush.
+    const rolloutPath = findCodexRolloutFile(state.threadId, env);
+    if (!rolloutPath) return null;
+
+    const promoted: CurrentThreadState = {
+      ...state,
+      status: "current",
+      rolloutPath,
+      rolloutVerifiedAt: nowIso(),
+      updatedAt: nowIso(),
+    };
+    try {
+      atomicWriteJson(identity.stateDir.currentThreadFile, promoted);
+    } catch {
+      // Persisting the promotion is best-effort: the rollout file itself was
+      // just verified, so resume can proceed on the in-memory state — a disk
+      // hiccup must not break the resume path. Doctor can report it later.
+    }
+    return promoted;
+  }
 
   if (state.rolloutPath && existsSync(state.rolloutPath)) return state;
 

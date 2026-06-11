@@ -110,6 +110,129 @@ describe("thread-state", () => {
     }
   });
 
+  test("pending thread with an existing rollout is promoted to current on read", () => {
+    const root = tempDir("agentbridge-thread-state-");
+    const codexHome = tempDir("agentbridge-codex-home-");
+    try {
+      const id = identity(root, codexHome);
+      // Daemon gave up within its 5s retry window — state is left pending …
+      writePendingCurrentThread(id, "thread-late", "test");
+
+      // … but the rollout file shows up later (Codex kept running).
+      const sessionsDir = join(codexHome, "sessions", "2026", "06", "02");
+      mkdirSync(sessionsDir, { recursive: true });
+      const rolloutPath = join(sessionsDir, "rollout-thread-late.jsonl");
+      writeFileSync(rolloutPath, "{}\n", "utf-8");
+
+      const usable = readUsableCurrentThread(id, id.env);
+      expect(usable).not.toBeNull();
+      expect(usable?.status).toBe("current");
+      expect(usable?.threadId).toBe("thread-late");
+      expect(usable?.rolloutPath).toBe(rolloutPath);
+      expect(usable?.rolloutVerifiedAt).toBeTruthy();
+
+      // The promotion must be persisted (atomically) — re-read from disk.
+      const persisted = readRawCurrentThread(id.stateDir);
+      expect(persisted?.status).toBe("current");
+      expect(persisted?.rolloutPath).toBe(rolloutPath);
+      expect(persisted?.rolloutVerifiedAt).toBeTruthy();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  test("pending thread without a rollout stays pending on disk and unusable", () => {
+    const root = tempDir("agentbridge-thread-state-");
+    const codexHome = tempDir("agentbridge-codex-home-");
+    try {
+      const id = identity(root, codexHome);
+      writePendingCurrentThread(id, "thread-no-rollout", "test");
+
+      expect(readUsableCurrentThread(id, id.env)).toBeNull();
+
+      const persisted = readRawCurrentThread(id.stateDir);
+      expect(persisted?.status).toBe("pending");
+      expect(persisted?.threadId).toBe("thread-no-rollout");
+      expect(persisted?.rolloutPath).toBeUndefined();
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  test("pending thread with mismatched pairId is not promoted even when the rollout exists", () => {
+    const root = tempDir("agentbridge-thread-state-");
+    const codexHome = tempDir("agentbridge-codex-home-");
+    try {
+      const id = identity(root, codexHome);
+      writePendingCurrentThread(id, "thread-other-pair", "test");
+
+      const sessionsDir = join(codexHome, "sessions", "2026", "06", "02");
+      mkdirSync(sessionsDir, { recursive: true });
+      writeFileSync(join(sessionsDir, "rollout-thread-other-pair.jsonl"), "{}\n", "utf-8");
+
+      const otherPair = { ...id, pairId: "other-87654321" };
+      expect(readUsableCurrentThread(otherPair, id.env)).toBeNull();
+      // Identity check wins: the record must remain untouched (still pending).
+      expect(readRawCurrentThread(id.stateDir)?.status).toBe("pending");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  test("pending thread with mismatched cwd is not promoted even when the rollout exists", () => {
+    const root = tempDir("agentbridge-thread-state-");
+    const codexHome = tempDir("agentbridge-codex-home-");
+    try {
+      const id = identity(root, codexHome);
+      writePendingCurrentThread(id, "thread-other-cwd", "test");
+
+      const sessionsDir = join(codexHome, "sessions", "2026", "06", "02");
+      mkdirSync(sessionsDir, { recursive: true });
+      writeFileSync(join(sessionsDir, "rollout-thread-other-cwd.jsonl"), "{}\n", "utf-8");
+
+      const otherCwd = { ...id, cwd: join(root, "elsewhere") };
+      expect(readUsableCurrentThread(otherCwd, id.env)).toBeNull();
+      expect(readRawCurrentThread(id.stateDir)?.status).toBe("pending");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
+  test("current thread with a stale rolloutPath is repaired by re-finding the rollout", () => {
+    const root = tempDir("agentbridge-thread-state-");
+    const codexHome = tempDir("agentbridge-codex-home-");
+    try {
+      const sessionsDir = join(codexHome, "sessions", "2026", "06", "02");
+      mkdirSync(sessionsDir, { recursive: true });
+      const oldPath = join(sessionsDir, "rollout-thread-moved.jsonl");
+      writeFileSync(oldPath, "{}\n", "utf-8");
+
+      const id = identity(root, codexHome);
+      const state = promoteCurrentThreadIfRolloutExists(id, "thread-moved", "test", id.env);
+      expect(state.status).toBe("current");
+      expect(state.rolloutPath).toBe(oldPath);
+
+      // Codex relocated the rollout (e.g. archive layout change).
+      const newDir = join(codexHome, "sessions", "2026", "06", "03");
+      mkdirSync(newDir, { recursive: true });
+      const newPath = join(newDir, "rollout-thread-moved.jsonl");
+      writeFileSync(newPath, "{}\n", "utf-8");
+      rmSync(oldPath);
+
+      const usable = readUsableCurrentThread(id, id.env);
+      expect(usable?.status).toBe("current");
+      expect(usable?.rolloutPath).toBe(newPath);
+      expect(readRawCurrentThread(id.stateDir)?.rolloutPath).toBe(newPath);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+      rmSync(codexHome, { recursive: true, force: true });
+    }
+  });
+
   test("findCodexRolloutFile returns null when sessions are absent", () => {
     const codexHome = tempDir("agentbridge-codex-home-");
     try {
