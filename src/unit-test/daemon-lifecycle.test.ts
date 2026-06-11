@@ -49,6 +49,8 @@ describe("classifyDaemon", () => {
     name: string;
     expectedPairId: string | null;
     status: DaemonStatus | null;
+    /** Launcher-side build info; defaults to BUILD_INFO (the historical shape). */
+    launcher?: AgentBridgeBuildInfo;
     expectedVerdict:
       | "reuse"
       | "reuse-despite-drift"
@@ -123,15 +125,70 @@ describe("classifyDaemon", () => {
       status: status({ pairId: "mine", build: undefined, tuiConnected: true }),
       expectedVerdict: "replace-drifted",
     },
+    // ── codeHash identity (squash-merge stamp-lag fix) ──────────────────────
+    // The committed plugin bundle's stamp always lags the squash-merged master
+    // sha by one, so the LIVE incident was: launcher and daemon run byte-identical
+    // code, yet commit-stamp comparison kills the healthy daemon in a loop.
+    {
+      name: "squash-lagged commit stamp with identical codeHash reuses without a TUI",
+      expectedPairId: "mine",
+      status: status({
+        pairId: "mine",
+        build: build({ commit: "pr-branch-sha", codeHash: "feedfacecafe" }),
+        tuiConnected: false,
+      }),
+      launcher: build({ commit: "master-sha", codeHash: "feedfacecafe" }),
+      expectedVerdict: "reuse",
+    },
+    {
+      name: "identical commit stamp but different codeHash is real drift and replaced",
+      expectedPairId: "mine",
+      status: status({
+        pairId: "mine",
+        build: build({ commit: "same-sha", codeHash: "000000000000" }),
+        tuiConnected: false,
+      }),
+      launcher: build({ commit: "same-sha", codeHash: "feedfacecafe" }),
+      expectedVerdict: "replace-drifted",
+    },
+    {
+      name: "legacy daemon without codeHash still falls back to commit-stamp drift",
+      expectedPairId: "mine",
+      status: status({
+        pairId: "mine",
+        build: build({ commit: "old-build", codeHash: undefined }),
+        tuiConnected: false,
+      }),
+      launcher: build({ commit: "new-build", codeHash: "feedfacecafe" }),
+      expectedVerdict: "replace-drifted",
+    },
   ];
 
   for (const testCase of cases) {
     test(testCase.name, () => {
-      const result = classifyDaemon(testCase.expectedPairId, testCase.status, BUILD_INFO);
+      const result = classifyDaemon(testCase.expectedPairId, testCase.status, testCase.launcher ?? BUILD_INFO);
       expect(result.verdict).toBe(testCase.expectedVerdict);
       expect(result.reason.length).toBeGreaterThan(0);
     });
   }
+
+  test("replace-drifted reason names the comparison basis (codeHash vs commit stamp)", () => {
+    const codeHashDrift = classifyDaemon(
+      "mine",
+      status({ pairId: "mine", build: build({ commit: "same-sha", codeHash: "000000000000" }) }),
+      build({ commit: "same-sha", codeHash: "feedfacecafe" }),
+    );
+    expect(codeHashDrift.verdict).toBe("replace-drifted");
+    expect(codeHashDrift.reason).toContain("codeHash");
+
+    const stampDrift = classifyDaemon(
+      "mine",
+      status({ pairId: "mine", build: build({ commit: "old-build", codeHash: undefined }) }),
+      build({ commit: "new-build", codeHash: "feedfacecafe" }),
+    );
+    expect(stampDrift.verdict).toBe("replace-drifted");
+    expect(stampDrift.reason).toContain("commit stamp");
+  });
 
   test("matrix covers every daemon lifecycle verdict", () => {
     expect(new Set(cases.map((testCase) => testCase.expectedVerdict))).toEqual(new Set([

@@ -4,6 +4,7 @@ declare const __AGENTBRIDGE_BUILD_VERSION__: string | undefined;
 declare const __AGENTBRIDGE_BUILD_COMMIT__: string | undefined;
 declare const __AGENTBRIDGE_BUILD_BUNDLE__: "source" | "dist" | "plugin" | undefined;
 declare const __AGENTBRIDGE_CONTRACT_VERSION__: number | undefined;
+declare const __AGENTBRIDGE_BUILD_CODEHASH__: string | undefined;
 
 export type AgentBridgeBundleKind = "source" | "dist" | "plugin";
 
@@ -12,6 +13,24 @@ export interface AgentBridgeBuildInfo {
   commit: string;
   bundle: AgentBridgeBundleKind;
   contractVersion: number;
+  /**
+   * Deterministic hash of the BUILD-INPUT source tree (scripts/code-hash.cjs):
+   * sha256 over src non-test .ts files + package.json + bun.lock + bun version,
+   * truncated to 12 hex. Unlike the commit stamp it does not move when only the
+   * git sha moves (squash-merge re-stamps), so it is the authoritative code
+   * identity for drift detection. OPTIONAL because legacy daemons predate the
+   * field; "source" is the unstamped sentinel (dev/source mode).
+   */
+  codeHash?: string;
+}
+
+/** Sentinel for an unstamped (source-mode) build — never a valid code identity. */
+const CODE_HASH_SENTINEL = "source";
+
+/** A codeHash is a usable code identity only when present, non-empty and not the sentinel. */
+export function hasValidCodeHash(build: AgentBridgeBuildInfo | null | undefined): boolean {
+  const hash = build?.codeHash;
+  return typeof hash === "string" && hash.length > 0 && hash !== CODE_HASH_SENTINEL;
 }
 
 function defineString(value: string | undefined, fallback: string): string {
@@ -47,6 +66,15 @@ export const BUILD_INFO: AgentBridgeBuildInfo = Object.freeze({
     typeof __AGENTBRIDGE_CONTRACT_VERSION__ === "number" ? __AGENTBRIDGE_CONTRACT_VERSION__ : undefined,
     CONTRACT_VERSION,
   ),
+  // The fallback MUST be the literal "source" (== CODE_HASH_SENTINEL), not the
+  // constant: bundlers keep the literal inline, which preserves the extractable
+  // stamp shape `codeHash: defineString("<hash>", "source")` that doctor's
+  // artifact-alignment check (and the code-hash build test) regex out of
+  // bundles — exactly like the commit stamp's `defineString("<sha>", "source")`.
+  codeHash: defineString(
+    typeof __AGENTBRIDGE_BUILD_CODEHASH__ === "string" ? __AGENTBRIDGE_BUILD_CODEHASH__ : undefined,
+    "source",
+  ),
 });
 
 export function daemonStatusBuildInfo(): AgentBridgeBuildInfo {
@@ -59,7 +87,8 @@ export function sameBuildInfo(a: AgentBridgeBuildInfo | null | undefined, b: Age
     a.version === b.version &&
     a.commit === b.commit &&
     a.bundle === b.bundle &&
-    a.contractVersion === b.contractVersion
+    a.contractVersion === b.contractVersion &&
+    a.codeHash === b.codeHash
   );
 }
 
@@ -70,20 +99,48 @@ export function sameBuildInfo(a: AgentBridgeBuildInfo | null | undefined, b: Age
  * artifacts built from the same source for the same pair and same control port,
  * so a daemon launched by one must NOT be treated as "drifted" by the other —
  * otherwise the two launchers replace-war each other's daemon on every
- * `ensureRunning` and the Codex TUI can never stay up. Drift that actually
- * matters (a real code change) moves version/commit/contractVersion, which this
- * still detects.
+ * `ensureRunning` and the Codex TUI can never stay up.
+ *
+ * Code identity truth table (after version/contractVersion equality, which is
+ * always required):
+ *
+ *   | a.codeHash | b.codeHash | decided by              | result            |
+ *   |------------|------------|-------------------------|-------------------|
+ *   | valid      | valid      | codeHash (commit IGNORED)| codeHash equality |
+ *   | valid      | missing/sentinel | commit stamp (fallback) | commit equality |
+ *   | missing/sentinel | valid | commit stamp (fallback) | commit equality   |
+ *   | missing/sentinel | missing/sentinel | commit stamp (fallback) | commit equality |
+ *
+ * Why: the committed plugin bundle's commit stamp ALWAYS lags the squash-merged
+ * master sha by one (a bundle committed in X can only embed X's parent), so two
+ * byte-identical builds routinely carry different stamps — comparing stamps made
+ * launchers replace-war perfectly healthy daemons (live incident). The codeHash
+ * is a hash of the build-input source tree and is stable across re-stamps; when
+ * both sides have one it is authoritative. Legacy builds (no codeHash) keep the
+ * historical stamp comparison so old daemons stay classifiable.
  */
 export function sameRuntimeContract(
   a: AgentBridgeBuildInfo | null | undefined,
   b: AgentBridgeBuildInfo | null | undefined,
 ): boolean {
   if (!a || !b) return false;
-  return (
-    a.version === b.version &&
-    a.commit === b.commit &&
-    a.contractVersion === b.contractVersion
-  );
+  if (a.version !== b.version || a.contractVersion !== b.contractVersion) return false;
+  if (hasValidCodeHash(a) && hasValidCodeHash(b)) return a.codeHash === b.codeHash;
+  return a.commit === b.commit;
+}
+
+/**
+ * Which identity {@link sameRuntimeContract} used (or would use) for the code
+ * comparison — "codeHash" only when BOTH sides carry a valid one, otherwise the
+ * legacy "commit" stamp fallback. Surfaced in drift logs/doctor output so a
+ * verdict is auditable: a commit-basis drift on a legacy build may be a
+ * squash-lag false positive, a codeHash-basis drift never is.
+ */
+export function runtimeContractComparisonBasis(
+  a: AgentBridgeBuildInfo | null | undefined,
+  b: AgentBridgeBuildInfo | null | undefined,
+): "codeHash" | "commit" {
+  return hasValidCodeHash(a) && hasValidCodeHash(b) ? "codeHash" : "commit";
 }
 
 /**
@@ -104,5 +161,6 @@ export function compatibleContractVersion(
 
 export function formatBuildInfo(build: AgentBridgeBuildInfo | null | undefined): string {
   if (!build) return "<unknown>";
-  return `${build.version}/${build.commit}/${build.bundle}/contract-v${build.contractVersion}`;
+  const codeHash = hasValidCodeHash(build) ? `/code-${build.codeHash}` : "";
+  return `${build.version}/${build.commit}/${build.bundle}/contract-v${build.contractVersion}${codeHash}`;
 }

@@ -2,7 +2,13 @@ import { spawn } from "node:child_process";
 import { existsSync, readFileSync, statSync, unlinkSync, writeFileSync, openSync, closeSync, constants } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { atomicWriteJson, atomicWriteText } from "./atomic-json";
-import { BUILD_INFO, compatibleContractVersion, formatBuildInfo, sameRuntimeContract } from "./build-info";
+import {
+  BUILD_INFO,
+  compatibleContractVersion,
+  formatBuildInfo,
+  runtimeContractComparisonBasis,
+  sameRuntimeContract,
+} from "./build-info";
 import { StateDirResolver } from "./state-dir";
 import { parsePositiveIntEnv } from "./env-utils";
 import { isAgentBridgeDaemon, isAgentBridgeProcess, isProcessAlive } from "./process-lifecycle";
@@ -94,9 +100,18 @@ export function classifyDaemon(
         reason: "runtime build drift has a compatible contract and a live Codex TUI is attached",
       };
     }
+    // Surface WHICH identity decided the verdict: a codeHash-basis drift is a
+    // real code difference; a commit-stamp-basis drift on a legacy build (no
+    // codeHash on one side) may be the squash-merge stamp lag.
+    const basis =
+      runtimeContractComparisonBasis(status.build, buildInfo) === "codeHash"
+        ? "compared by codeHash"
+        : "compared by commit stamp; legacy build without codeHash";
     return {
       verdict: "replace-drifted",
-      reason: `runtime build ${formatBuildInfo(status.build)} does not match launcher ${formatBuildInfo(buildInfo)}`,
+      reason:
+        `runtime build ${formatBuildInfo(status.build)} does not match launcher ` +
+        `${formatBuildInfo(buildInfo)} (${basis})`,
     };
   }
 

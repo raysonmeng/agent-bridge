@@ -2,7 +2,11 @@
 
 import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, readFileSync } from "node:fs";
+import { createRequire } from "node:module";
 import { resolve } from "node:path";
+
+const require = createRequire(import.meta.url);
+const { computeCodeHash } = require("./code-hash.cjs");
 
 const repoRoot = resolve(new URL("..", import.meta.url).pathname);
 const pkg = JSON.parse(readFileSync(resolve(repoRoot, "package.json"), "utf-8"));
@@ -57,12 +61,25 @@ function gitCommit() {
   }
 }
 
+// Stamp-independent code identity (see scripts/code-hash.cjs): the SAME value
+// for every target of this build, and for any rebuild of identical source —
+// regardless of git sha or AGENTBRIDGE_BUILD_COMMIT_OVERRIDE. Computed once
+// per build invocation.
+let cachedCodeHash = null;
+function codeHash() {
+  if (cachedCodeHash === null) {
+    cachedCodeHash = computeCodeHash(repoRoot);
+  }
+  return cachedCodeHash;
+}
+
 function defineArgs(bundle) {
   const defines = {
     __AGENTBRIDGE_BUILD_VERSION__: pkg.version,
     __AGENTBRIDGE_BUILD_COMMIT__: gitCommit(),
     __AGENTBRIDGE_BUILD_BUNDLE__: bundle,
     __AGENTBRIDGE_CONTRACT_VERSION__: CONTRACT_VERSION,
+    __AGENTBRIDGE_BUILD_CODEHASH__: codeHash(),
   };
   return Object.entries(defines).flatMap(([key, value]) => [
     "--define",

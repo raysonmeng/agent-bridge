@@ -2,8 +2,9 @@ import { afterEach, beforeEach, describe, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, rmSync, truncateSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { runDoctor } from "../cli/doctor";
+import { describeBuildDrift, evaluateArtifactAlignment, runDoctor } from "../cli/doctor";
 import { derivePairId, writeRegistry } from "../pair-registry";
+import type { AgentBridgeBuildInfo } from "../build-info";
 
 const ENV_KEYS = [
   "AGENTBRIDGE_BASE_DIR",
@@ -280,5 +281,78 @@ describe("doctor command", () => {
       rmSync(root, { recursive: true, force: true });
       rmSync(base, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * Artifact alignment must use the same code-identity basis as the runtime
+ * drift detection (codeHash when available, commit stamp as legacy fallback) —
+ * otherwise doctor keeps reporting the squash-lag FAIL the runtime fix removed
+ * (observed live: repo-bundle=b53f10a FAIL on byte-identical code).
+ */
+describe("evaluateArtifactAlignment (codeHash basis)", () => {
+  test("aligned codeHash with DIFFERENT commit stamps is OK (squash stamp lag)", () => {
+    const check = evaluateArtifactAlignment([
+      { label: "launcher(dist)", commit: "aaa1111", codeHash: "feedfacecafe" },
+      { label: "repo-bundle", commit: "bbb2222", codeHash: "feedfacecafe" },
+    ]);
+    expect(check.status).toBe("ok");
+    expect(check.detail).toContain("feedfacecafe");
+  });
+
+  test("split codeHash FAILs even when commit stamps agree", () => {
+    const check = evaluateArtifactAlignment([
+      { label: "launcher(dist)", commit: "aaa1111", codeHash: "feedfacecafe" },
+      { label: "repo-bundle", commit: "aaa1111", codeHash: "000000000000" },
+    ]);
+    expect(check.status).toBe("fail");
+    expect(check.hint).toBeDefined();
+  });
+
+  test("legacy artifact without codeHash falls back to the stamp basis, annotated", () => {
+    const split = evaluateArtifactAlignment([
+      { label: "launcher(dist)", commit: "aaa1111", codeHash: "feedfacecafe" },
+      { label: "plugin-cache@0.1.0", commit: "bbb2222", codeHash: null },
+    ]);
+    expect(split.status).toBe("fail");
+    expect(split.detail).toContain("stamp"); // basis is visible in the output
+    expect(split.hint).toContain("squash"); // may be a stamp-lag false positive
+
+    const aligned = evaluateArtifactAlignment([
+      { label: "launcher(dist)", commit: "aaa1111", codeHash: "feedfacecafe" },
+      { label: "plugin-cache@0.1.0", commit: "aaa1111", codeHash: null },
+    ]);
+    expect(aligned.status).toBe("ok");
+  });
+
+  test("fewer than two stamped artifacts skips", () => {
+    expect(evaluateArtifactAlignment([]).status).toBe("skip");
+    expect(
+      evaluateArtifactAlignment([{ label: "launcher(dist)", commit: "aaa1111", codeHash: null }]).status,
+    ).toBe("skip");
+  });
+});
+
+describe("describeBuildDrift (basis annotation)", () => {
+  const launcher: AgentBridgeBuildInfo = {
+    version: "0.1.12",
+    commit: "master-sha",
+    bundle: "dist",
+    contractVersion: 1,
+    codeHash: "feedfacecafe",
+  };
+
+  test("codeHash-basis drift is annotated as a real code difference", () => {
+    const runtime = { ...launcher, codeHash: "000000000000" };
+    const described = describeBuildDrift(runtime, launcher);
+    expect(described.detail).toContain("codeHash");
+    expect(described.detail).not.toContain("stamp");
+  });
+
+  test("commit-stamp-basis drift (legacy daemon) is annotated as possibly squash-lag", () => {
+    const runtime = { ...launcher, commit: "pr-branch-sha", codeHash: undefined };
+    const described = describeBuildDrift(runtime, launcher);
+    expect(described.detail).toContain("stamp");
+    expect(described.hint).toContain("squash");
   });
 });

@@ -1,7 +1,14 @@
 import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { pluginCacheRoot } from "./plugin-cache";
-import { BUILD_INFO, formatBuildInfo, sameRuntimeContract } from "../build-info";
+import {
+  BUILD_INFO,
+  formatBuildInfo,
+  hasValidCodeHash,
+  runtimeContractComparisonBasis,
+  sameRuntimeContract,
+  type AgentBridgeBuildInfo,
+} from "../build-info";
 import { cliInvocationName } from "../cli-invocation";
 import { ConfigService } from "../config-service";
 import { fetchDaemonStatus } from "../daemon-status";
@@ -252,23 +259,19 @@ async function buildDoctorReport(pair: PairResolution, registered: boolean): Pro
         ? "app-server 未返回可解析的版本号（userAgent 异常）。若刚升级过 Codex，请核对 codex-adapter 的 version-coupling checklist。"
         : undefined,
   });
+  const drift = buildDrift === true ? describeBuildDrift(health?.build, BUILD_INFO, cli) : null;
   checks.push({
     name: "build drift",
     status: buildDrift === false ? "ok" : buildDrift === true ? "fail" : "skip",
     detail:
       buildDrift === false
         ? `runtime matches launcher ${formatBuildInfo(BUILD_INFO)}`
-        : buildDrift === true
-          ? `runtime ${formatBuildInfo(health?.build)} differs from launcher ${formatBuildInfo(BUILD_INFO)}`
+        : drift
+          ? drift.detail
           : launcherStamped
             ? "n/a — daemon not running"
             : "n/a — launcher running from source (unstamped)",
-    hint:
-      buildDrift === true
-        ? "daemon 运行的是旧构建（通常由旧版 CLI 或未重开的 Claude Code 窗口启动）。" +
-          `没有进行中的 Codex 会话时，运行 \`${cli} kill\` 后重新 \`${cli} claude\` 即可对齐；` +
-          "有活跃会话则等收尾后再重启——版本差异不会强杀活跃会话，可以继续用。"
-        : undefined,
+    hint: drift?.hint,
   });
   checks.push(artifactAlignmentCheck());
   checks.push({
@@ -364,40 +367,58 @@ async function buildDoctorReport(pair: PairResolution, registered: boolean): Pro
 }
 
 /**
- * Cross-artifact build alignment. Three deployables each embed a build commit
- * (global CLI dist, Claude Code plugin cache, this launcher); when they split,
- * launchers replace-war each other's daemons — the failure mode behind several
- * live incidents. None of the existing guards compared the artifacts directly;
- * this check makes a split visible BEFORE it costs a daemon.
+ * Drift annotation for the "build drift" check: surface WHICH identity decided
+ * the verdict (same basis as sameRuntimeContract). A codeHash-basis drift is a
+ * real code difference; a commit-stamp-basis drift involves a legacy build
+ * without codeHash, where the squash-merge stamp lag can produce a false
+ * positive on byte-identical code. Pure (no I/O) so the wording is testable.
  */
-function artifactAlignmentCheck(): DoctorCheck {
-  const stamps: Array<{ label: string; commit: string }> = [];
-  if (BUILD_INFO.commit !== "source") {
-    stamps.push({ label: `launcher(${BUILD_INFO.bundle})`, commit: BUILD_INFO.commit });
+export function describeBuildDrift(
+  runtime: AgentBridgeBuildInfo | null | undefined,
+  launcher: AgentBridgeBuildInfo,
+  cli = "abg",
+): { detail: string; hint: string } {
+  const basis = runtimeContractComparisonBasis(runtime, launcher);
+  const baseDetail = `runtime ${formatBuildInfo(runtime)} differs from launcher ${formatBuildInfo(launcher)}`;
+  const baseHint =
+    "daemon 运行的是旧构建（通常由旧版 CLI 或未重开的 Claude Code 窗口启动）。" +
+    `没有进行中的 Codex 会话时，运行 \`${cli} kill\` 后重新 \`${cli} claude\` 即可对齐；` +
+    "有活跃会话则等收尾后再重启——版本差异不会强杀活跃会话，可以继续用。";
+  if (basis === "codeHash") {
+    return { detail: `${baseDetail} [compared by codeHash — real code difference]`, hint: baseHint };
   }
-  const bin = Bun.which("agentbridge") ?? Bun.which("abg");
-  if (bin) {
-    try {
-      const commit = extractBundleCommit(realpathSync(bin));
-      if (commit) stamps.push({ label: "global-cli", commit });
-    } catch {}
-  }
-  const cacheRoot = pluginCacheRoot();
-  try {
-    for (const version of readdirSync(cacheRoot)) {
-      const commit = extractBundleCommit(join(cacheRoot, version, "server", "daemon.js"));
-      if (commit) stamps.push({ label: `plugin-cache@${version}`, commit });
-    }
-  } catch {}
-  // Inside a repo checkout, the committed bundle is a fourth artifact (the dev
-  // marketplace loads it directly). A repo ahead of the installed artifacts is
-  // the "forgot install:global" state — exactly what this check should expose.
-  const repoBundle = join(process.cwd(), "plugins", "agentbridge", "server", "daemon.js");
-  if (existsSync(repoBundle)) {
-    const commit = extractBundleCommit(repoBundle);
-    if (commit) stamps.push({ label: "repo-bundle", commit });
-  }
+  return {
+    detail: `${baseDetail} [compared by commit stamp — legacy build without codeHash]`,
+    hint:
+      baseHint +
+      "（注意：本判定基于 commit stamp 口径——有一侧是缺 codeHash 的旧构建；squash 合并会让 stamp 滞后一格，" +
+      "源码一致时也可能误报。升级两端到带 codeHash 的构建后将按代码内容判定。）",
+  };
+}
 
+/** One deployed artifact's embedded identity stamps. */
+export interface ArtifactStamp {
+  label: string;
+  commit: string;
+  /** null on legacy artifacts built before codeHash stamping. */
+  codeHash: string | null;
+}
+
+/** Usable code identity: present, non-empty, not the "source" sentinel. */
+function isUsableCodeHash(hash: string | null): hash is string {
+  return typeof hash === "string" && hash.length > 0 && hash !== "source";
+}
+
+/**
+ * Pure alignment verdict over collected artifact stamps — same code-identity
+ * basis as the runtime drift detection (sameRuntimeContract): when EVERY
+ * artifact carries a codeHash, compare codeHashes and ignore the commit stamps
+ * entirely (the stamps legitimately differ across squash-merge re-stamps of
+ * identical code — the live doctor false positive). Only when a legacy
+ * artifact lacks a codeHash do we fall back to the historical stamp
+ * comparison, annotated as such.
+ */
+export function evaluateArtifactAlignment(stamps: ArtifactStamp[]): DoctorCheck {
   if (stamps.length < 2) {
     return {
       name: "artifact alignment",
@@ -405,25 +426,98 @@ function artifactAlignmentCheck(): DoctorCheck {
       detail: "n/a — fewer than two stamped artifacts found",
     };
   }
-  const commits = new Set(stamps.map((s) => s.commit));
-  const rendered = stamps.map((s) => `${s.label}=${s.commit}`).join(", ");
-  if (commits.size === 1) {
-    return { name: "artifact alignment", status: "ok", detail: rendered };
+
+  if (stamps.every((stamp) => isUsableCodeHash(stamp.codeHash))) {
+    const rendered = stamps.map((stamp) => `${stamp.label}=${stamp.codeHash}`).join(", ");
+    if (new Set(stamps.map((stamp) => stamp.codeHash)).size === 1) {
+      return { name: "artifact alignment", status: "ok", detail: `codeHash basis: ${rendered}` };
+    }
+    return {
+      name: "artifact alignment",
+      status: "fail",
+      detail: `deployed artifacts contain DIFFERENT code (codeHash basis): ${rendered}`,
+      hint:
+        "部署物代码分裂会导致互相替换 daemon（杀掉活会话）。在仓库目录运行 `bun run install:global` " +
+        "一次性对齐全局 CLI 与插件缓存，然后关闭并重开仍在使用旧插件的 Claude Code 窗口。",
+    };
+  }
+
+  // Legacy fallback: at least one artifact predates codeHash stamping.
+  const rendered = stamps.map((stamp) => `${stamp.label}=${stamp.commit}`).join(", ");
+  if (new Set(stamps.map((stamp) => stamp.commit)).size === 1) {
+    return {
+      name: "artifact alignment",
+      status: "ok",
+      detail: `legacy commit-stamp basis: ${rendered}`,
+    };
   }
   return {
     name: "artifact alignment",
     status: "fail",
-    detail: `deployed artifacts are at DIFFERENT builds: ${rendered}`,
+    detail: `deployed artifacts are at DIFFERENT builds (legacy commit-stamp basis): ${rendered}`,
     hint:
+      "（stamp 口径：存在缺 codeHash 的旧部署物，且 squash 合并会让 stamp 滞后一格，源码一致时也可能误报。）" +
       "部署物版本分裂会导致互相替换 daemon（杀掉活会话）。在仓库目录运行 `bun run install:global` " +
-      "一次性对齐全局 CLI 与插件缓存，然后关闭并重开仍在使用旧插件的 Claude Code 窗口。",
+      "一次性对齐全局 CLI 与插件缓存并升级到带 codeHash 的构建，然后关闭并重开仍在使用旧插件的 Claude Code 窗口；" +
+      "对齐后此检查将按代码内容（codeHash）判定，stamp 滞后不再误报。",
   };
 }
 
-function extractBundleCommit(path: string): string | null {
+/**
+ * Cross-artifact build alignment. Three deployables each embed build identity
+ * stamps (global CLI dist, Claude Code plugin cache, this launcher); when they
+ * split, launchers replace-war each other's daemons — the failure mode behind
+ * several live incidents. Collection happens here (I/O); the verdict lives in
+ * the pure {@link evaluateArtifactAlignment}.
+ */
+function artifactAlignmentCheck(): DoctorCheck {
+  const stamps: ArtifactStamp[] = [];
+  if (BUILD_INFO.commit !== "source") {
+    stamps.push({
+      label: `launcher(${BUILD_INFO.bundle})`,
+      commit: BUILD_INFO.commit,
+      codeHash: hasValidCodeHash(BUILD_INFO) ? (BUILD_INFO.codeHash ?? null) : null,
+    });
+  }
+  const bin = Bun.which("agentbridge") ?? Bun.which("abg");
+  if (bin) {
+    try {
+      const stamp = extractBundleStamp(realpathSync(bin));
+      if (stamp) stamps.push({ label: "global-cli", ...stamp });
+    } catch {}
+  }
+  const cacheRoot = pluginCacheRoot();
   try {
-    const match = readFileSync(path, "utf-8").match(/commit:\s*defineString\("([^"]+)",\s*"source"\)/);
-    return match ? match[1]! : null;
+    for (const version of readdirSync(cacheRoot)) {
+      const stamp = extractBundleStamp(join(cacheRoot, version, "server", "daemon.js"));
+      if (stamp) stamps.push({ label: `plugin-cache@${version}`, ...stamp });
+    }
+  } catch {}
+  // Inside a repo checkout, the committed bundle is a fourth artifact (the dev
+  // marketplace loads it directly). A repo ahead of the installed artifacts is
+  // the "forgot install:global" state — exactly what this check should expose.
+  const repoBundle = join(process.cwd(), "plugins", "agentbridge", "server", "daemon.js");
+  if (existsSync(repoBundle)) {
+    const stamp = extractBundleStamp(repoBundle);
+    if (stamp) stamps.push({ label: "repo-bundle", ...stamp });
+  }
+
+  return evaluateArtifactAlignment(stamps);
+}
+
+/**
+ * Extract both embedded identity stamps from a built bundle. The commit stamp
+ * is required (its absence means "not a stamped AgentBridge bundle", matching
+ * the old extractBundleCommit contract); the codeHash stamp is null on legacy
+ * bundles built before codeHash stamping.
+ */
+function extractBundleStamp(path: string): { commit: string; codeHash: string | null } | null {
+  try {
+    const text = readFileSync(path, "utf-8");
+    const commit = text.match(/commit:\s*defineString\("([^"]+)",\s*"source"\)/)?.[1] ?? null;
+    if (!commit) return null;
+    const codeHash = text.match(/codeHash:\s*defineString\("([^"]+)",\s*"source"\)/)?.[1] ?? null;
+    return { commit, codeHash };
   } catch {
     return null;
   }

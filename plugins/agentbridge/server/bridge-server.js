@@ -14372,6 +14372,11 @@ function formatBytes(bytes) {
 var CONTRACT_VERSION = 1;
 
 // src/build-info.ts
+var CODE_HASH_SENTINEL = "source";
+function hasValidCodeHash(build) {
+  const hash = build?.codeHash;
+  return typeof hash === "string" && hash.length > 0 && hash !== CODE_HASH_SENTINEL;
+}
 function defineString(value, fallback) {
   return typeof value === "string" && value.length > 0 ? value : fallback;
 }
@@ -14385,14 +14390,22 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("b53f10a", "source"),
+  commit: defineString("956afd9", "source"),
   bundle: defineBundle("plugin"),
-  contractVersion: defineNumber(1, CONTRACT_VERSION)
+  contractVersion: defineNumber(1, CONTRACT_VERSION),
+  codeHash: defineString("6995f3d2a6ab", "source")
 });
 function sameRuntimeContract(a, b) {
   if (!a || !b)
     return false;
-  return a.version === b.version && a.commit === b.commit && a.contractVersion === b.contractVersion;
+  if (a.version !== b.version || a.contractVersion !== b.contractVersion)
+    return false;
+  if (hasValidCodeHash(a) && hasValidCodeHash(b))
+    return a.codeHash === b.codeHash;
+  return a.commit === b.commit;
+}
+function runtimeContractComparisonBasis(a, b) {
+  return hasValidCodeHash(a) && hasValidCodeHash(b) ? "codeHash" : "commit";
 }
 function compatibleContractVersion(a, b) {
   if (!a || !b)
@@ -14402,7 +14415,8 @@ function compatibleContractVersion(a, b) {
 function formatBuildInfo(build) {
   if (!build)
     return "<unknown>";
-  return `${build.version}/${build.commit}/${build.bundle}/contract-v${build.contractVersion}`;
+  const codeHash = hasValidCodeHash(build) ? `/code-${build.codeHash}` : "";
+  return `${build.version}/${build.commit}/${build.bundle}/contract-v${build.contractVersion}${codeHash}`;
 }
 
 // src/daemon-client.ts
@@ -14977,9 +14991,10 @@ function classifyDaemon(expectedPairId, status, buildInfo) {
         reason: "runtime build drift has a compatible contract and a live Codex TUI is attached"
       };
     }
+    const basis = runtimeContractComparisonBasis(status.build, buildInfo) === "codeHash" ? "compared by codeHash" : "compared by commit stamp; legacy build without codeHash";
     return {
       verdict: "replace-drifted",
-      reason: `runtime build ${formatBuildInfo(status.build)} does not match launcher ${formatBuildInfo(buildInfo)}`
+      reason: `runtime build ${formatBuildInfo(status.build)} does not match launcher ` + `${formatBuildInfo(buildInfo)} (${basis})`
     };
   }
   return { verdict: "reuse", reason: "daemon pair and runtime contract match" };
