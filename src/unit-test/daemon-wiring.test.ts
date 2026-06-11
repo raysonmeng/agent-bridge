@@ -813,6 +813,134 @@ describe("daemon wiring", () => {
     }
   }, 60000);
 
+  // --- Security: interrupt-path attach-convergence TOCTOU (HIGH fix) ---
+  //
+  // The top-of-handler attach guard (#283) only proves the socket held the slot
+  // at DISPATCH time. The interrupt path then awaits the terminal boundary; if
+  // the originating socket detaches and another attaches DURING that await, the
+  // post-wait re-check must reject — otherwise the detached socket's message is
+  // injected and turn_started is emitted to the NEW (innocent) session.
+  test("interrupt TOCTOU: if the originating socket loses the attach slot during the terminal-boundary wait, the message is NOT injected and reports not_attached", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-int-toctou-"));
+    const interruptLog = join(fixtureRoot, "turninterrupt.jsonl");
+    const turnStartLog = join(fixtureRoot, "turn-starts.jsonl");
+    const readJsonl = (path: string): Array<Record<string, any>> =>
+      existsSync(path)
+        ? readFileSync(path, "utf-8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
+        : [];
+
+    const harness = await startHarness({
+      pairId: "main-toctouabc",
+      pairName: "main",
+      extraEnv: {
+        FAKE_APP_TURNINTERRUPT_LOG: interruptLog,
+        FAKE_APP_TURNSTART_LOG: turnStartLog,
+        // Defer the interrupt terminal boundary so the daemon's await stays
+        // open while we detach socket A and attach socket B.
+        FAKE_APP_INTERRUPT_DELAY_MS: "500",
+      },
+    });
+
+    // Socket A: the legit attached frontend. Its onmessage (set by attachClaude)
+    // records into harness.statusMessages — we read A's result from there. A is
+    // only DETACHED (claude_disconnect), not closed, so it can still receive the
+    // daemon's rejection result.
+    const resultForA = (requestId: string) =>
+      harness.statusMessages.find(
+        (m) => m.type === "claude_to_codex_result" && m.requestId === requestId,
+      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }> | undefined;
+
+    // Socket B: a SEPARATE control socket that will steal the attach slot mid-wait.
+    const bMessages: ControlServerMessage[] = [];
+    let socketB: WebSocket | null = null;
+
+    try {
+      await harness.attachClaude();
+      await harness.connectTui();
+
+      // Drive into a running turn so the interrupt path is active.
+      harness.sendAppCommand("start-turn");
+      await waitForMessage(
+        harness.messages,
+        (message) => message.id.startsWith("system_turn_started"),
+        "system_turn_started",
+      );
+
+      // A issues interrupt+inject. The fake records turn/interrupt immediately
+      // but defers the terminal boundary by FAKE_APP_INTERRUPT_DELAY_MS, so the
+      // daemon is now parked inside waitForInterruptOutcome.
+      harness.sendClaudeToCodex("req-toctou-1", "message from the OLD session", {
+        onBusy: "interrupt",
+        idempotencyKey: "key-toctou-1",
+      });
+
+      // Confirm the daemon entered the await: the fake logged turn/interrupt.
+      await waitFor(() => readJsonl(interruptLog).length >= 1, "recorded turn/interrupt (await entered)", 100, 100);
+
+      // While the daemon is awaiting: A detaches (slot freed) ...
+      harness.controlWs!.send(JSON.stringify({ type: "claude_disconnect" }));
+
+      // ... and B connects + wins the attach slot, becoming attachedClaude.
+      socketB = await connectControlSocket(harness.controlPort);
+      socketB.onmessage = (event) => {
+        const raw = typeof event.data === "string" ? event.data : event.data.toString();
+        bMessages.push(JSON.parse(raw) as ControlServerMessage);
+      };
+      const controlToken = readControlToken(resolveControlTokenPath(harness.stateDir));
+      socketB.send(JSON.stringify({
+        type: "claude_connect",
+        identity: {
+          pairId: "main-toctouabc",
+          pairName: "main",
+          cwd: harness.cwd,
+          stateDir: harness.stateDir,
+          clientPid: process.pid,
+          contractVersion: 1,
+          ...(controlToken ? { controlToken } : {}),
+        },
+      }));
+      // Wait until B's attachClaude completed: attachClaude unconditionally
+      // sends a `status` message to the freshly-attached socket, so receiving
+      // one on B proves attachedClaude === B (the slot was stolen mid-wait).
+      await waitFor(
+        () => bMessages.some((m) => m.type === "status"),
+        "socket B became the attached frontend (received status)",
+        100,
+        50,
+      );
+
+      // Now let the deferred terminal boundary fire (delay is 500ms).
+      const result = await waitFor(
+        () => resultForA("req-toctou-1") !== undefined,
+        "claude_to_codex_result for req-toctou-1 (delivered to detached socket A)",
+        120,
+        50,
+      ).then(() => resultForA("req-toctou-1")!);
+
+      // GREEN: the detached origin socket is rejected, NOT injected.
+      expect(result.success).toBe(false);
+      expect(result.code).toBe("not_attached");
+      expect(result.error).toContain("disconnected");
+
+      // No turn/start ever reached the app-server for this interrupt+inject.
+      await sleep(300);
+      expect(readJsonl(turnStartLog)).toHaveLength(0);
+
+      // The new session (B) never received a turn_started for req-toctou-1 — the
+      // old session's message was never injected on its behalf.
+      expect(
+        bMessages.some((m) => m.type === "turn_started" && m.requestId === "req-toctou-1"),
+      ).toBe(false);
+      // ... and A (the origin) likewise never saw a turn_started.
+      expect(
+        harness.statusMessages.some((m) => m.type === "turn_started" && m.requestId === "req-toctou-1"),
+      ).toBe(false);
+    } finally {
+      try { socketB?.close(); } catch {}
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 60000);
+
   test("a rejected keyed steer RELEASES its idempotency key — a same-key retry is allowed (PR B REAL #2)", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-steerfail-fixture-"));
     const steerLog = join(fixtureRoot, "turnsteer.jsonl");
@@ -1485,9 +1613,23 @@ const server = Bun.serve({
           if (process.env.FAKE_APP_TURNINTERRUPT_LOG) {
             appendFileSync(process.env.FAKE_APP_TURNINTERRUPT_LOG, JSON.stringify(msg.params) + "\\n");
           }
-          ws.send(JSON.stringify({ id: msg.id, result: {} }));
-          ws.send(JSON.stringify({ method: "turn/completed", params: { turn: { id: msg.params.turnId, status: "interrupted" } } }));
-          if (lastStartedTurnId === msg.params.turnId) lastStartedTurnId = null;
+          // Harness-only switch (TOCTOU test): defer the terminal boundary so
+          // the daemon's waitForInterruptOutcome await stays open long enough
+          // for the originating control socket to detach and another to attach
+          // mid-wait. Real app-server defers the success response until
+          // TurnAborted, so deferring BOTH the {} response and the terminal
+          // turn/completed faithfully models a slow interrupt.
+          const interruptDelayMs = Number(process.env.FAKE_APP_INTERRUPT_DELAY_MS || 0);
+          const emitInterruptTerminal = () => {
+            ws.send(JSON.stringify({ id: msg.id, result: {} }));
+            ws.send(JSON.stringify({ method: "turn/completed", params: { turn: { id: msg.params.turnId, status: "interrupted" } } }));
+            if (lastStartedTurnId === msg.params.turnId) lastStartedTurnId = null;
+          };
+          if (interruptDelayMs > 0) {
+            setTimeout(emitInterruptTerminal, interruptDelayMs);
+          } else {
+            emitInterruptTerminal();
+          }
         }
         // turn/steer: record params, then ack — or reject when the text carries
         // the [force-steer-error] marker (drives the steerFailed wiring test).

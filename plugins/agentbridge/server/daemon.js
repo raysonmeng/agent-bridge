@@ -21,7 +21,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("3f988c0", "source"),
+  commit: defineString("392fac9", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -5318,6 +5318,17 @@ async function handleClaudeToCodex(ws, message) {
       return;
     }
     log("Interrupt reached terminal boundary \u2014 injecting the message as a new turn");
+    const postWaitAttachGuard = evaluateInjectionAttachGuard(attachedClaude, ws);
+    if (!postWaitAttachGuard.allowed) {
+      releaseInterruptKey();
+      log(`Rejecting interrupt-path injection from socket #${ws.data.clientId} that lost the attach ` + `slot during the terminal-boundary wait (request ${message.requestId}, ` + `attached=${attachedClaude ? "#" + attachedClaude.data.clientId : "none"})`);
+      sendClaudeToCodexResult(ws, message.requestId, {
+        success: false,
+        code: "not_attached",
+        error: "The original Claude session disconnected (or was replaced by a newer session) while " + "the interrupt was waiting to take effect. Your message was NOT injected \u2014 this avoids " + "delivering it into a different session's thread. Reconnect and resend if still needed."
+      });
+      return;
+    }
     if (interruptThreadId && codex.activeThreadId !== interruptThreadId) {
       releaseInterruptKey();
     }

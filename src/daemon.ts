@@ -1051,6 +1051,41 @@ async function handleClaudeToCodex(
       return;
     }
     log("Interrupt reached terminal boundary — injecting the message as a new turn");
+    // Attach-convergence re-check (TOCTOU fix). The attach guard at the top of
+    // this handler (#283 defense layer 1) only proves `ws` held the slot at
+    // DISPATCH time. The interrupt path then `await`s waitForInterruptOutcome
+    // for up to the terminal-boundary timeout, during which `ws` may
+    // `claude_disconnect` (clearing attachedClaude) and another socket may
+    // attach and become the new attachedClaude. Falling through to the shared
+    // injection block with the stale `ws` would inject this turn on behalf of a
+    // detached session and emit turn_started to the NEW session (which never
+    // asked for it). Re-evaluate the same pure guard against the CURRENT
+    // attachedClaude before injecting; reject (no injection, no turn/start, no
+    // turn_started) if `ws` lost the slot during the wait. steer has no such
+    // await and the normal reply/inject paths satisfy attachedClaude===ws by
+    // construction, so neither is affected.
+    const postWaitAttachGuard = evaluateInjectionAttachGuard(attachedClaude, ws);
+    if (!postWaitAttachGuard.allowed) {
+      // The upfront accept() (under interruptThreadId) must not strand. Release
+      // it — releaseInterruptKey is scoped to interruptThreadId and is a no-op
+      // if the thread-change branch (below, now skipped) would have released,
+      // so this neither leaks nor double-frees the key.
+      releaseInterruptKey();
+      log(
+        `Rejecting interrupt-path injection from socket #${ws.data.clientId} that lost the attach ` +
+        `slot during the terminal-boundary wait (request ${message.requestId}, ` +
+        `attached=${attachedClaude ? "#" + attachedClaude.data.clientId : "none"})`,
+      );
+      sendClaudeToCodexResult(ws, message.requestId, {
+        success: false,
+        code: "not_attached",
+        error:
+          "The original Claude session disconnected (or was replaced by a newer session) while " +
+          "the interrupt was waiting to take effect. Your message was NOT injected — this avoids " +
+          "delivering it into a different session's thread. Reconnect and resend if still needed.",
+      });
+      return;
+    }
     // Defensive: if the active thread changed during the wait, the upfront
     // accept() would strand under the old thread — release it; the shared
     // injection block re-registers under the thread it actually injects into.
