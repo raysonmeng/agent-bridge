@@ -308,9 +308,14 @@ export async function waitForUnixWsReady(
 function attemptUnixWsUpgrade(socketPath: string): Promise<boolean> {
   return new Promise((resolve) => {
     let settled = false;
+    // LOW-8: hold the timer handle so we can clear it on every settle path. An
+    // unstored, uncleared timer keeps the event loop alive (pins the process /
+    // test runner) and can fire AFTER the upgrade already resolved.
+    let timeout: ReturnType<typeof setTimeout> | undefined;
     const done = (ok: boolean) => {
-      if (settled) return;
+      if (settled) return; // settle exactly once (timer vs upgrade race)
       settled = true;
+      if (timeout !== undefined) clearTimeout(timeout);
       try { socket.destroy(); } catch { /* ignore */ }
       resolve(ok);
     };
@@ -329,6 +334,8 @@ function attemptUnixWsUpgrade(socketPath: string): Promise<boolean> {
     });
     socket.on("error", () => done(false));
     socket.on("close", () => done(false));
-    setTimeout(() => done(false), 1500);
+    timeout = setTimeout(() => done(false), 1500);
+    // Never keep the process / test runner alive on account of this probe timer.
+    timeout.unref?.();
   });
 }

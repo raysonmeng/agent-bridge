@@ -242,4 +242,48 @@ describe("waitForUnixWsReady", () => {
     const sock = tmpSocket(); // nothing listening here
     await expect(waitForUnixWsReady(sock, 3, 30)).rejects.toThrow(/did not become ready/);
   });
+
+  test("LOW-8: a successful upgrade clears & unrefs its 1.5s probe timer (no dangling handle)", async () => {
+    // Regression: attemptUnixWsUpgrade created a setTimeout(1500) whose handle was
+    // never stored, cleared, or unref'd — so it pinned the event loop and could
+    // fire after the upgrade already resolved. Spy on setTimeout/clearTimeout/unref
+    // to prove the probe timer is unref'd on creation and cleared on settle.
+    const sock = tmpSocket();
+    const { server } = await startFakeCodexUnix(sock);
+    cleanups.push(() => { server.close(); removeSocketFile(sock); });
+
+    const realSetTimeout = globalThis.setTimeout;
+    const realClearTimeout = globalThis.clearTimeout;
+    const probeTimers = new Set<ReturnType<typeof setTimeout>>();
+    const unreffed = new Set<ReturnType<typeof setTimeout>>();
+    const cleared = new Set<ReturnType<typeof setTimeout>>();
+
+    globalThis.setTimeout = ((fn: (...a: any[]) => void, ms?: number, ...rest: any[]) => {
+      const handle = realSetTimeout(fn, ms as number, ...rest);
+      if (ms === 1500) {
+        probeTimers.add(handle);
+        const origUnref = handle.unref?.bind(handle);
+        // Track that .unref() is actually invoked on the probe timer.
+        (handle as any).unref = () => { unreffed.add(handle); return origUnref?.(); };
+      }
+      return handle;
+    }) as typeof setTimeout;
+    globalThis.clearTimeout = ((handle: ReturnType<typeof setTimeout>) => {
+      if (probeTimers.has(handle)) cleared.add(handle);
+      return realClearTimeout(handle);
+    }) as typeof clearTimeout;
+
+    try {
+      await waitForUnixWsReady(sock, 10, 50); // resolves on the first attempt
+    } finally {
+      globalThis.setTimeout = realSetTimeout;
+      globalThis.clearTimeout = realClearTimeout;
+    }
+
+    // Exactly one probe timer was created, it was unref'd, and it was cleared on
+    // the success settle path (so nothing dangles past resolution).
+    expect(probeTimers.size).toBe(1);
+    expect(unreffed.size).toBe(1);
+    expect(cleared.size).toBe(1);
+  });
 });

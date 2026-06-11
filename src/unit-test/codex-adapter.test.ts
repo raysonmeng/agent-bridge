@@ -276,6 +276,68 @@ describe("CodexAdapter turn state machine", () => {
     expect(adapter.turnInProgress).toBe(false);
   });
 
+  test("LOW-7: started-without-id then completed-with-id leaves the map empty (no strand)", () => {
+    // Regression: turn/started arriving WITHOUT a turn id is keyed `unknown:<ts>`.
+    // The matching turn/completed arrives WITH a real id. markTurnCompleted evicts
+    // by the real id only — leaving the `unknown:` placeholder stranded, so
+    // turnInProgress stayed true forever and every later reply was busy-rejected.
+    const adapter = createAdapter();
+    const completedEvents: string[] = [];
+    adapter.on("turnCompleted", () => completedEvents.push("completed"));
+
+    // turn/started with no id → keyed `unknown:<timestamp>`
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: {} } });
+    expect(adapter.turnInProgress).toBe(true);
+    expect(adapter.activeTurnIds.size).toBe(1);
+    expect([...adapter.activeTurnIds][0].startsWith("unknown:")).toBe(true);
+
+    // turn/completed WITH a real id — the placeholder must also be evicted
+    adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "real-1" } } });
+
+    expect(adapter.activeTurnIds.size).toBe(0);
+    expect(adapter.turnInProgress).toBe(false);
+    expect(completedEvents).toEqual(["completed"]);
+
+    // A following reply must NOT be busy-rejected: injectMessage works again.
+    adapter.threadId = "thread-1";
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+    expect(adapter.injectMessage("hello after strand-free completion")).toBeLessThan(0);
+  });
+
+  test("LOW-7: a completed-with-id does NOT over-evict a legit concurrent real turn", () => {
+    // The placeholder eviction must be conservative: when a real-id turn is also
+    // in flight alongside the `unknown:` placeholder, completing a DIFFERENT real
+    // id must not clear the unrelated real turn (only the placeholder + matched id).
+    const adapter = createAdapter();
+
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "real-A" } } });
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: {} } }); // unknown placeholder
+    expect(adapter.activeTurnIds.size).toBe(2);
+
+    // Complete a real id NOT present (its start was the placeholder). The
+    // placeholder is reclaimed, but the legit real-A turn must survive.
+    adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "real-B" } } });
+
+    expect(adapter.activeTurnIds.has("real-A")).toBe(true);
+    expect([...adapter.activeTurnIds].some((id: string) => id.startsWith("unknown:"))).toBe(false);
+    expect(adapter.turnInProgress).toBe(true);
+  });
+
+  test("LOW-7: completed-with-id evicts only the matching id when no placeholder exists", () => {
+    // No `unknown:` placeholder present → behaviour is unchanged: only the
+    // matching real id is evicted, concurrent real turns are untouched.
+    const adapter = createAdapter();
+
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t2" } } });
+
+    adapter.handleServerNotification({ method: "turn/completed", params: { turn: { id: "t1" } } });
+
+    expect(adapter.activeTurnIds.has("t1")).toBe(false);
+    expect(adapter.activeTurnIds.has("t2")).toBe(true);
+    expect(adapter.turnInProgress).toBe(true);
+  });
+
   test("resetTurnState emits turnAborted (not turnCompleted) when a turn is interrupted", () => {
     // RB-1 regression: an app-server close / reconnect / stop resets turn state
     // with emitCompleted=false. The daemon's require_reply tracker only resets on

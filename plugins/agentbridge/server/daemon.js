@@ -22,7 +22,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("b00d7b8", "source"),
+  commit: defineString("2ea9d06", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -741,10 +741,13 @@ async function waitForUnixWsReady(socketPath, maxRetries = 40, delayMs = 250) {
 function attemptUnixWsUpgrade(socketPath) {
   return new Promise((resolve) => {
     let settled = false;
+    let timeout;
     const done = (ok) => {
       if (settled)
         return;
       settled = true;
+      if (timeout !== undefined)
+        clearTimeout(timeout);
       try {
         socket.destroy();
       } catch {}
@@ -769,7 +772,8 @@ Sec-WebSocket-Version: 13\r
     });
     socket.on("error", () => done(false));
     socket.on("close", () => done(false));
-    setTimeout(() => done(false), 1500);
+    timeout = setTimeout(() => done(false), 1500);
+    timeout.unref?.();
   });
 }
 
@@ -2238,10 +2242,21 @@ class CodexAdapter extends EventEmitter {
   markTurnCompleted(turnId) {
     const completedId = typeof turnId === "string" && turnId.length > 0 ? turnId : null;
     if (completedId !== null) {
+      const idWasTracked = this.activeTurnIds.has(completedId);
       this.activeTurnIds.delete(completedId);
       this.clearTurnWatchdog(completedId);
       this.stalledTurnIds.delete(completedId);
       this.currentlyStalledTurnIds.delete(completedId);
+      if (!idWasTracked) {
+        const placeholders = [...this.activeTurnIds].filter((id) => id.startsWith("unknown:"));
+        if (placeholders.length === 1) {
+          const placeholder = placeholders[0];
+          this.activeTurnIds.delete(placeholder);
+          this.clearTurnWatchdog(placeholder);
+          this.stalledTurnIds.delete(placeholder);
+          this.currentlyStalledTurnIds.delete(placeholder);
+        }
+      }
     } else {
       this.activeTurnIds.clear();
       this.clearAllTurnWatchdogs();
