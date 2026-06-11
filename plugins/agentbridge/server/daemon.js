@@ -22,7 +22,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("a9d6d9c", "source"),
+  commit: defineString("b53f10a", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -1003,13 +1003,34 @@ class CodexAdapter extends EventEmitter {
   async start() {
     this.intentionalDisconnect = false;
     await this.checkPorts();
-    this.resolveTransport();
-    const listen = codexListenArg(this.transport, this.appPort, this.socketPath ?? "");
-    if (this.transport === "unix" && this.socketPath) {
-      ensureSocketDir(this.socketPath);
-      removeSocketFile(this.socketPath);
+    try {
+      this.resolveTransport();
+      const listen = codexListenArg(this.transport, this.appPort, this.socketPath ?? "");
+      if (this.transport === "unix" && this.socketPath) {
+        ensureSocketDir(this.socketPath);
+        removeSocketFile(this.socketPath);
+      }
+      this.log(`Spawning codex app-server (transport=${this.transport}) --listen ${listen}`);
+      this.spawnAppServer(listen);
+      if (this.transport === "unix" && this.socketPath) {
+        await waitForUnixWsReady(this.socketPath);
+        this.relay = new TcpToUnixRelay("127.0.0.1", this.appPort, this.socketPath, (m) => this.log(`[relay] ${m}`));
+        await this.relay.start();
+        this.log(`Transport relay ready: ws://127.0.0.1:${this.appPort} \u2192 unix://${this.socketPath}`);
+      } else {
+        await this.waitForHealthy();
+      }
+      await this.connectToAppServer();
+      this.startProxy();
+      this.log(`Proxy ready on ${this.proxyUrl}`);
+    } catch (err) {
+      const m = err instanceof Error ? err.message : String(err);
+      this.log(`start() failed (${m}) \u2014 tearing down partial transport before rethrow`);
+      this.cleanupAfterFailedStart();
+      throw err;
     }
-    this.log(`Spawning codex app-server (transport=${this.transport}) --listen ${listen}`);
+  }
+  spawnAppServer(listen) {
     this.proc = spawn("codex", ["app-server", "--listen", listen], {
       stdio: ["pipe", "pipe", "pipe"]
     });
@@ -1023,17 +1044,25 @@ class CodexAdapter extends EventEmitter {
     stderrRl.on("line", (l) => this.log(`[codex-server] ${l}`));
     const stdoutRl = createInterface({ input: this.proc.stdout });
     stdoutRl.on("line", (l) => this.log(`[codex-stdout] ${l}`));
-    if (this.transport === "unix" && this.socketPath) {
-      await waitForUnixWsReady(this.socketPath);
-      this.relay = new TcpToUnixRelay("127.0.0.1", this.appPort, this.socketPath, (m) => this.log(`[relay] ${m}`));
-      await this.relay.start();
-      this.log(`Transport relay ready: ws://127.0.0.1:${this.appPort} \u2192 unix://${this.socketPath}`);
-    } else {
-      await this.waitForHealthy();
+  }
+  teardownTransport() {
+    this.proxyServer?.stop();
+    this.proxyServer = null;
+    if (this.relay) {
+      this.relay.stop();
+      this.relay = null;
     }
-    await this.connectToAppServer();
-    this.startProxy();
-    this.log(`Proxy ready on ${this.proxyUrl}`);
+    if (this.socketPath)
+      removeSocketFile(this.socketPath);
+  }
+  cleanupAfterFailedStart() {
+    try {
+      this.teardownTransport();
+    } catch (e) {
+      this.log(`cleanupAfterFailedStart: teardownTransport error: ${e.message}`);
+    }
+    this.forceKillAppServerSync();
+    this.proc = null;
   }
   resolveTransport() {
     const mode = parseTransportMode(process.env[CODEX_TRANSPORT_ENV]);
@@ -1057,14 +1086,7 @@ class CodexAdapter extends EventEmitter {
       } catch {}
       this.secondaryConnections.delete(id);
     }
-    this.proxyServer?.stop();
-    this.proxyServer = null;
-    if (this.relay) {
-      this.relay.stop();
-      this.relay = null;
-    }
-    if (this.socketPath)
-      removeSocketFile(this.socketPath);
+    this.teardownTransport();
     this.clearResponseTrackingState();
     this.resetTurnState(ADAPTER_DISCONNECT_REASON);
   }
@@ -5293,6 +5315,7 @@ codex.on("error", (err) => {
 });
 codex.on("exit", (code) => {
   log(`Codex process exited (code ${code})`);
+  const wasBootstrapped = codexBootstrapped;
   codexBootstrapped = false;
   replyTracker.reset();
   idempotencyTracker.terminateAll("aborted");
@@ -5301,9 +5324,13 @@ codex.on("exit", (code) => {
   statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
   clearPendingClaudeDisconnect("Codex process exited");
-  emitToClaude(systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running. ` + `Restart the Codex side (\`agentbridge codex\`); if it does not come back within ` + `${Math.round(BOOTSTRAP_TIMEOUT_MS / 1000)}s the daemon will self-replace so the next launch starts clean.`));
+  if (wasBootstrapped) {
+    emitToClaude(systemMessage("system_codex_exit", `\u26A0\uFE0F Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running. ` + `Restart the Codex side (\`agentbridge codex\`); if it does not come back within ` + `${Math.round(BOOTSTRAP_TIMEOUT_MS / 1000)}s the daemon will self-replace so the next launch starts clean.`));
+  }
   broadcastStatus();
-  armBootDeadline();
+  if (wasBootstrapped) {
+    armBootDeadline();
+  }
 });
 function startControlServer() {
   let server;

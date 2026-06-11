@@ -40,9 +40,22 @@
  *  - FAKE_APP_TURNINTERRUPT_LOG append turn/interrupt params (command-driven)
  *  - FAKE_APP_TURNSTEER_LOG     append turn/steer params (command-driven)
  *  - FAKE_APP_INTERRUPT_DELAY_MS defer the interrupt terminal boundary (command-driven)
+ *  - FAKE_CODEX_FAIL_FIRST_BOOT path to a spawn-counter file. When set, the FIRST
+ *                               spawned app-server instance refuses the WS upgrade
+ *                               so the daemon's codex.start() rejects fast (driving
+ *                               cleanupAfterFailedStart → SIGKILL → codex 'exit'
+ *                               during an in-progress boot retry); subsequent spawns
+ *                               (the retry) boot normally. Lets tests reproduce a
+ *                               fail-once-then-recover boot without a 10s healthz wait.
+ *
+ * Command-file commands (command-driven, one per line, file is consumed each poll):
+ *  - start-turn / complete-turn / agent-message:<text> / close-app-server (WS only)
+ *  - exit-process               the app-server PROCESS exits (process.exit(0)),
+ *                               firing the daemon's codex 'exit' AFTER a successful
+ *                               bootstrap (the genuine post-boot Codex-death path).
  */
 
-import { appendFileSync, existsSync, readFileSync, unlinkSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 
 export type FakeCodexCapability = "minimal" | "handshake" | "command-driven";
 
@@ -93,6 +106,26 @@ function main(): void {
   const turnInterruptLog = process.env.FAKE_APP_TURNINTERRUPT_LOG;
   const turnSteerLog = process.env.FAKE_APP_TURNSTEER_LOG;
   const interruptDelayMs = Number(process.env.FAKE_APP_INTERRUPT_DELAY_MS || 0);
+
+  // Fail-first-boot lever: count spawns via a shared file; the FIRST spawned
+  // instance refuses the WS upgrade so the daemon's start() rejects fast (a boot
+  // retry), exercising the codex 'exit'-during-boot path. The retry's instance
+  // sees count>0 and boots normally. The counter is bumped synchronously at spawn
+  // time (before serving) so the very first connection attempt already fails.
+  const failFirstBootFile = process.env.FAKE_CODEX_FAIL_FIRST_BOOT;
+  let isFirstFailingBoot = false;
+  if (failFirstBootFile) {
+    let priorSpawns = 0;
+    try {
+      priorSpawns = Number(readFileSync(failFirstBootFile, "utf-8").trim()) || 0;
+    } catch {
+      priorSpawns = 0;
+    }
+    isFirstFailingBoot = priorSpawns === 0;
+    try {
+      writeFileSync(failFirstBootFile, String(priorSpawns + 1));
+    } catch {}
+  }
 
   // Single live app-server WS — the daemon keeps ONE persistent connection.
   let appWs: import("bun").ServerWebSocket<unknown> | null = null;
@@ -204,6 +237,12 @@ function main(): void {
       if (url.pathname === "/healthz" || url.pathname === "/readyz") {
         return Response.json({ ok: true });
       }
+      // Fail-first-boot: healthz stays green (waitForHealthy passes) but the WS
+      // upgrade is refused, so connectToAppServer rejects almost immediately —
+      // start() then throws and the daemon SIGKILLs this child during its retry.
+      if (isFirstFailingBoot) {
+        return new Response("fake codex app-server: refusing first-boot upgrade", { status: 503 });
+      }
       if (serverInstance.upgrade(req)) return undefined;
       return new Response("fake codex app-server");
     },
@@ -229,6 +268,13 @@ function main(): void {
       try {
         unlinkSync(commandFile);
       } catch {}
+      if (command === "exit-process") {
+        // Kill the whole app-server PROCESS (not just the WS): the daemon's
+        // codex child truly dies, firing codex 'exit' AFTER a successful boot —
+        // the genuine "a previously-healthy Codex died" path. Handled before the
+        // appWs guard so it works regardless of WS state.
+        process.exit(0);
+      }
       const ws = appWs;
       if (!ws) return;
       if (command === "start-turn") {
