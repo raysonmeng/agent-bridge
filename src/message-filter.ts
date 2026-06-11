@@ -8,6 +8,19 @@ export interface FilterResult {
   marker: MarkerLevel;
 }
 
+export interface RouteCodexMessageContext {
+  mode: FilterMode;
+  replyArmed: boolean;
+  inAttentionWindow: boolean;
+}
+
+export interface RouteCodexMessageResult extends FilterResult {
+  reason: "forward" | "buffer" | "drop" | "buffer-attention" | "force-forward-reply-required";
+  flushStatusBuffer?: boolean;
+  startAttentionWindow?: boolean;
+  noteReplyForwarded?: boolean;
+}
+
 const MARKER_REGEX = /^\s*\[(IMPORTANT|STATUS|FYI)\]\s*/i;
 
 export function parseMarker(content: string): { marker: MarkerLevel; body: string } {
@@ -32,6 +45,45 @@ export function classifyMessage(content: string, mode: FilterMode): FilterResult
     case "untagged":
       return { action: "forward", marker };
   }
+}
+
+export function routeCodexMessage(
+  content: string,
+  ctx: RouteCodexMessageContext,
+): RouteCodexMessageResult {
+  const result = classifyMessage(content, ctx.mode);
+
+  if (ctx.replyArmed) {
+    return {
+      action: "forward",
+      marker: result.marker,
+      reason: "force-forward-reply-required",
+      flushStatusBuffer: true,
+      noteReplyForwarded: true,
+    };
+  }
+
+  if (ctx.inAttentionWindow && result.marker === "status") {
+    return {
+      action: "buffer",
+      marker: result.marker,
+      reason: "buffer-attention",
+    };
+  }
+
+  if (result.action === "forward" && result.marker === "important") {
+    return {
+      ...result,
+      reason: "forward",
+      flushStatusBuffer: true,
+      startAttentionWindow: true,
+    };
+  }
+
+  return {
+    ...result,
+    reason: result.action,
+  };
 }
 
 // NOTE: the static "bridge contract" (message markers, git-write prohibition,

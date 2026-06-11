@@ -8,7 +8,7 @@ import { validateClaudeClientIdentity, evaluateInjectionAttachGuard } from "./da
 import {
   REPLY_REQUIRED_INSTRUCTION,
   StatusBuffer,
-  classifyMessage,
+  routeCodexMessage,
   type FilterMode,
 } from "./message-filter";
 import { TuiConnectionState } from "./tui-connection-state";
@@ -440,35 +440,26 @@ codex.on("turnStarted", () => {
 
 codex.on("agentMessage", (msg: BridgeMessage) => {
   if (msg.source !== "codex") return;
-  const result = classifyMessage(msg.content, FILTER_MODE);
+  const route = routeCodexMessage(msg.content, {
+    mode: FILTER_MODE,
+    replyArmed: replyTracker.isArmed,
+    inAttentionWindow,
+  });
 
-  // When require_reply is armed, force-forward ALL messages regardless of marker
-  if (replyTracker.isArmed) {
-    log(`Codex → Claude [${result.marker}/force-forward-reply-required] (${msg.content.length} chars)`);
+  log(`Codex → Claude [${route.marker}/${route.reason}] (${msg.content.length} chars)`);
+
+  if (route.noteReplyForwarded) {
     replyTracker.noteForwarded();
-    if (statusBuffer.size > 0) {
-      statusBuffer.flush("reply-required message arrived");
-    }
-    emitToClaude(msg);
-    return;
   }
 
-  // During attention window, suppress STATUS to give Claude space to respond
-  if (inAttentionWindow && result.marker === "status") {
-    log(`Codex → Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
-    statusBuffer.add(msg);
-    return;
+  if (route.flushStatusBuffer) {
+    statusBuffer.flush(route.noteReplyForwarded ? "reply-required message arrived" : "important message arrived");
   }
 
-  log(`Codex → Claude [${result.marker}/${result.action}] (${msg.content.length} chars)`);
-  switch (result.action) {
+  switch (route.action) {
     case "forward":
-      if (result.marker === "important" && statusBuffer.size > 0) {
-        statusBuffer.flush("important message arrived");
-      }
       emitToClaude(msg);
-      // IMPORTANT message — give Claude an attention window to respond
-      if (result.marker === "important") {
+      if (route.startAttentionWindow) {
         startAttentionWindow();
       }
       break;

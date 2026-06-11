@@ -3,6 +3,7 @@ import {
   StatusBuffer,
   classifyMessage,
   parseMarker,
+  routeCodexMessage,
 } from "../message-filter";
 import type { BridgeMessage } from "../types";
 
@@ -70,6 +71,101 @@ describe("classifyMessage", () => {
   test("forwards everything in full mode", () => {
     expect(classifyMessage("[FYI] x", "full")).toEqual({ action: "forward", marker: "untagged" });
     expect(classifyMessage("[STATUS] x", "full")).toEqual({ action: "forward", marker: "untagged" });
+  });
+});
+
+describe("routeCodexMessage", () => {
+  const markerCases = [
+    { marker: "important", content: "[IMPORTANT] important update" },
+    { marker: "status", content: "[STATUS] progress update" },
+    { marker: "fyi", content: "[FYI] background update" },
+    { marker: "untagged", content: "plain update" },
+  ] as const;
+
+  test("covers the full mode x reply armed x attention window x marker matrix", () => {
+    for (const mode of ["filtered", "full"] as const) {
+      for (const replyArmed of [false, true]) {
+        for (const inAttentionWindow of [false, true]) {
+          for (const markerCase of markerCases) {
+            const route = routeCodexMessage(markerCase.content, { mode, replyArmed, inAttentionWindow });
+
+            if (replyArmed) {
+              expect(route).toEqual({
+                action: "forward",
+                marker: mode === "full" ? "untagged" : markerCase.marker,
+                reason: "force-forward-reply-required",
+                flushStatusBuffer: true,
+                noteReplyForwarded: true,
+              });
+              continue;
+            }
+
+            if (mode === "full") {
+              expect(route).toEqual({
+                action: "forward",
+                marker: "untagged",
+                reason: "forward",
+              });
+              continue;
+            }
+
+            if (inAttentionWindow && markerCase.marker === "status") {
+              expect(route).toEqual({
+                action: "buffer",
+                marker: "status",
+                reason: "buffer-attention",
+              });
+              continue;
+            }
+
+            switch (markerCase.marker) {
+              case "important":
+                expect(route).toEqual({
+                  action: "forward",
+                  marker: "important",
+                  reason: "forward",
+                  flushStatusBuffer: true,
+                  startAttentionWindow: true,
+                });
+                break;
+              case "status":
+                expect(route).toEqual({
+                  action: "buffer",
+                  marker: "status",
+                  reason: "buffer",
+                });
+                break;
+              case "fyi":
+                expect(route).toEqual({
+                  action: "drop",
+                  marker: "fyi",
+                  reason: "drop",
+                });
+                break;
+              case "untagged":
+                expect(route).toEqual({
+                  action: "forward",
+                  marker: "untagged",
+                  reason: "forward",
+                });
+                break;
+            }
+          }
+        }
+      }
+    }
+  });
+
+  test("does not start an attention window for IMPORTANT in full mode", () => {
+    expect(routeCodexMessage("[IMPORTANT] x", {
+      mode: "full",
+      replyArmed: false,
+      inAttentionWindow: false,
+    })).toEqual({
+      action: "forward",
+      marker: "untagged",
+      reason: "forward",
+    });
   });
 });
 

@@ -131,6 +131,66 @@ describe("daemon wiring", () => {
     expect(aborted.content).toContain("retry");
   }, 20000);
 
+  test("filtered routing buffers STATUS, flushes it on IMPORTANT, then buffers STATUS during attention", async () => {
+    const harness = await startHarness({
+      pairId: "main-routeabcd",
+      pairName: "main",
+      extraEnv: { AGENTBRIDGE_ATTENTION_WINDOW_MS: "1000" },
+    });
+
+    await harness.attachClaude();
+    await harness.connectTui();
+
+    harness.sendAppCommand("agent-message:[STATUS] buffered before important");
+    await sleep(200);
+    expect(harness.messages.some((m) => m.content.includes("buffered before important"))).toBe(false);
+
+    harness.sendAppCommand("agent-message:[IMPORTANT] important flush trigger");
+    const summary = await waitForMessage(
+      harness.messages,
+      (message) => message.content.includes("buffered before important"),
+      "status summary flushed by IMPORTANT",
+    );
+    const important = await waitForMessage(
+      harness.messages,
+      (message) => message.content.includes("important flush trigger"),
+      "forwarded IMPORTANT message",
+    );
+
+    expect(summary.content).toContain("[STATUS summary");
+    expect(important.content).toContain("[IMPORTANT] important flush trigger");
+
+    harness.sendAppCommand("agent-message:[STATUS] buffered during attention");
+    await sleep(200);
+    expect(harness.messages.some((m) => m.content.includes("buffered during attention"))).toBe(false);
+  }, 20000);
+
+  test("full mode forwards IMPORTANT without opening an attention window", async () => {
+    const harness = await startHarness({
+      pairId: "main-fullroute",
+      pairName: "main",
+      extraEnv: {
+        AGENTBRIDGE_FILTER_MODE: "full",
+        AGENTBRIDGE_ATTENTION_WINDOW_MS: "1000",
+      },
+    });
+
+    await harness.attachClaude();
+    await harness.connectTui();
+
+    harness.sendAppCommand("agent-message:[IMPORTANT] full mode important");
+    await waitForMessage(
+      harness.messages,
+      (message) => message.content.includes("full mode important"),
+      "full-mode IMPORTANT",
+    );
+
+    const res = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+    expect(res.ok).toBe(true);
+    const status = (await res.json()) as DaemonStatus;
+    expect(status.attentionWindowActive).toBe(false);
+  }, 20000);
+
   test("budget pause gate: STOP directive, reply rejected, RESUME reopens", async () => {
     // Fixture probe driven by per-agent JSON files the test rewrites at runtime
     // (explicit AGENTBRIDGE_QUOTA_PROBE is exclusive — no fallback to real probes).
@@ -1271,6 +1331,7 @@ const commandFile = process.env.FAKE_APP_COMMAND_FILE;
 let appWs = null;
 let lastStartedTurnId = null;
 let turnStartCounter = 0;
+let agentMessageCounter = 0;
 
 const server = Bun.serve({
   hostname: "127.0.0.1",
@@ -1367,6 +1428,13 @@ setInterval(() => {
   if (command === "complete-turn" && lastStartedTurnId) {
     appWs.send(JSON.stringify({ method: "turn/completed", params: { turn: { id: lastStartedTurnId } } }));
     lastStartedTurnId = null;
+  }
+  if (command.startsWith("agent-message:")) {
+    const content = command.slice("agent-message:".length);
+    const id = "agent-message-" + (++agentMessageCounter);
+    appWs.send(JSON.stringify({ method: "item/started", params: { item: { id, type: "agentMessage" } } }));
+    appWs.send(JSON.stringify({ method: "item/agentMessage/delta", params: { itemId: id, delta: content } }));
+    appWs.send(JSON.stringify({ method: "item/completed", params: { item: { id, type: "agentMessage" } } }));
   }
   if (command === "close-app-server") {
     appWs.close(1011, "test app-server close");

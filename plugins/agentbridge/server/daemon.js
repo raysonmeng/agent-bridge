@@ -21,7 +21,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("c8dba20", "source"),
+  commit: defineString("2f27278", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -2399,6 +2399,37 @@ function classifyMessage(content, mode) {
     case "untagged":
       return { action: "forward", marker };
   }
+}
+function routeCodexMessage(content, ctx) {
+  const result = classifyMessage(content, ctx.mode);
+  if (ctx.replyArmed) {
+    return {
+      action: "forward",
+      marker: result.marker,
+      reason: "force-forward-reply-required",
+      flushStatusBuffer: true,
+      noteReplyForwarded: true
+    };
+  }
+  if (ctx.inAttentionWindow && result.marker === "status") {
+    return {
+      action: "buffer",
+      marker: result.marker,
+      reason: "buffer-attention"
+    };
+  }
+  if (result.action === "forward" && result.marker === "important") {
+    return {
+      ...result,
+      reason: "forward",
+      flushStatusBuffer: true,
+      startAttentionWindow: true
+    };
+  }
+  return {
+    ...result,
+    reason: result.action
+  };
 }
 var REPLY_REQUIRED_INSTRUCTION = `
 
@@ -4839,29 +4870,22 @@ codex.on("turnStarted", () => {
 codex.on("agentMessage", (msg) => {
   if (msg.source !== "codex")
     return;
-  const result = classifyMessage(msg.content, FILTER_MODE);
-  if (replyTracker.isArmed) {
-    log(`Codex \u2192 Claude [${result.marker}/force-forward-reply-required] (${msg.content.length} chars)`);
+  const route = routeCodexMessage(msg.content, {
+    mode: FILTER_MODE,
+    replyArmed: replyTracker.isArmed,
+    inAttentionWindow
+  });
+  log(`Codex \u2192 Claude [${route.marker}/${route.reason}] (${msg.content.length} chars)`);
+  if (route.noteReplyForwarded) {
     replyTracker.noteForwarded();
-    if (statusBuffer.size > 0) {
-      statusBuffer.flush("reply-required message arrived");
-    }
-    emitToClaude(msg);
-    return;
   }
-  if (inAttentionWindow && result.marker === "status") {
-    log(`Codex \u2192 Claude [${result.marker}/buffer-attention] (${msg.content.length} chars)`);
-    statusBuffer.add(msg);
-    return;
+  if (route.flushStatusBuffer) {
+    statusBuffer.flush(route.noteReplyForwarded ? "reply-required message arrived" : "important message arrived");
   }
-  log(`Codex \u2192 Claude [${result.marker}/${result.action}] (${msg.content.length} chars)`);
-  switch (result.action) {
+  switch (route.action) {
     case "forward":
-      if (result.marker === "important" && statusBuffer.size > 0) {
-        statusBuffer.flush("important message arrived");
-      }
       emitToClaude(msg);
-      if (result.marker === "important") {
+      if (route.startAttentionWindow) {
         startAttentionWindow();
       }
       break;
