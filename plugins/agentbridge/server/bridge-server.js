@@ -13662,6 +13662,7 @@ class StdioServerTransport {
 // src/claude-adapter.ts
 import { EventEmitter } from "events";
 import { randomUUID } from "crypto";
+import { performance } from "perf_hooks";
 
 // src/rotating-log.ts
 import { appendFileSync, existsSync, renameSync, statSync, unlinkSync } from "fs";
@@ -13942,6 +13943,8 @@ var BUDGET_UNAVAILABLE_TEXT = "\u9884\u7B97\u611F\u77E5\u4E0D\u53EF\u7528\uFF1A\
 // src/claude-adapter.ts
 var DEFAULT_MAX_BUFFERED_MESSAGES = 100;
 var DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
+var DEFAULT_DEDUPE_CAPACITY = 2048;
+var DEFAULT_DEDUPE_TTL_MS = 20 * 60 * 1000;
 var CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
   "",
@@ -13998,6 +14001,10 @@ class ClaudeAdapter extends EventEmitter {
   oversizedMessageCount = 0;
   oversizedMessageBytes = 0;
   oversizedMessageSourceCounts = {};
+  dedupeCapacity;
+  dedupeTtlMs;
+  monotonicNow;
+  deliveredMessageIds = new Map;
   budgetSnapshot = null;
   constructor(logFile = new StateDirResolver().logFile, options = {}) {
     super();
@@ -14012,6 +14019,9 @@ class ClaudeAdapter extends EventEmitter {
     }
     this.maxBufferedMessages = positiveIntegerOr(options.maxBufferedMessages, parsePositiveIntegerEnv("AGENTBRIDGE_MAX_BUFFERED_MESSAGES", DEFAULT_MAX_BUFFERED_MESSAGES));
     this.maxBufferedBytes = positiveIntegerOr(options.maxBufferedBytes, parsePositiveIntegerEnv("AGENTBRIDGE_MAX_BUFFERED_BYTES", DEFAULT_MAX_BUFFERED_BYTES));
+    this.dedupeCapacity = positiveIntegerOr(options.dedupeCapacity, DEFAULT_DEDUPE_CAPACITY);
+    this.dedupeTtlMs = positiveIntegerOr(options.dedupeTtlMs, DEFAULT_DEDUPE_TTL_MS);
+    this.monotonicNow = options.now ?? (() => performance.now());
     this.server = new Server({ name: "agentbridge", version: "0.1.0" }, {
       capabilities: {
         experimental: { "claude/channel": {} },
@@ -14038,10 +14048,12 @@ class ClaudeAdapter extends EventEmitter {
   }
   async pushNotification(message) {
     this.log(`pushNotification (instance=${this.instanceId}, msgId=${message.id}, len=${message.content.length})`);
+    if (!this.rememberDelivery(message))
+      return;
     await this.pushViaChannel(message);
   }
   async pushViaChannel(message) {
-    const msgId = `codex_msg_${this.notificationIdPrefix}_${++this.notificationSeq}`;
+    const deliveryAttemptId = `codex_msg_${this.notificationIdPrefix}_${++this.notificationSeq}`;
     const ts = new Date(message.timestamp).toISOString();
     try {
       await this.server.notification({
@@ -14050,7 +14062,8 @@ class ClaudeAdapter extends EventEmitter {
           content: message.content,
           meta: {
             chat_id: this.sessionId,
-            message_id: msgId,
+            message_id: message.id,
+            delivery_attempt_id: deliveryAttemptId,
             user: "Codex",
             user_id: "codex",
             ts,
@@ -14058,10 +14071,35 @@ class ClaudeAdapter extends EventEmitter {
           }
         }
       });
-      this.log(`Pushed notification: ${msgId}`);
+      this.log(`Pushed notification: ${message.id} (attempt=${deliveryAttemptId})`);
     } catch (e) {
       this.log(`Push notification failed: ${e.message}`);
       this.queueFallbackMessage(message);
+    }
+  }
+  rememberDelivery(message) {
+    const now = this.monotonicNow();
+    this.pruneDeliveredMessageIds(now);
+    if (this.deliveredMessageIds.has(message.id)) {
+      this.deliveredMessageIds.delete(message.id);
+      this.deliveredMessageIds.set(message.id, now);
+      this.log(`Duplicate Codex message suppressed (msgId=${message.id}, source=${message.source}, ` + `instance=${this.instanceId})`);
+      return false;
+    }
+    this.deliveredMessageIds.set(message.id, now);
+    while (this.deliveredMessageIds.size > this.dedupeCapacity) {
+      const oldest = this.deliveredMessageIds.keys().next().value;
+      if (oldest === undefined)
+        break;
+      this.deliveredMessageIds.delete(oldest);
+    }
+    return true;
+  }
+  pruneDeliveredMessageIds(now) {
+    for (const [id, seenAt] of this.deliveredMessageIds) {
+      if (now - seenAt <= this.dedupeTtlMs)
+        break;
+      this.deliveredMessageIds.delete(id);
     }
   }
   queueFallbackMessage(message) {
@@ -14341,7 +14379,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("2981e06", "source"),
+  commit: defineString("75e139d", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -15789,6 +15827,7 @@ var lastReconnectNotifyTs = 0;
 var disabledRecoveryTimer = null;
 var disabledRecoveryInFlight = false;
 var disabledRecoveryAttempts = 0;
+var nextSystemMessageId = 0;
 var DISABLED_RECOVERY_MAX_ATTEMPTS = 6;
 var DISABLED_RECOVERY_CONFIRM_TIMEOUT_MS = 1000;
 if (process.env.AGENTBRIDGE_TRACE === "1") {
@@ -16124,7 +16163,7 @@ async function pollDisabledRecovery() {
 }
 function systemMessage(idPrefix, content) {
   return {
-    id: `${idPrefix}_${Date.now()}`,
+    id: `${idPrefix}_${++nextSystemMessageId}`,
     source: "codex",
     content,
     timestamp: Date.now()

@@ -4,7 +4,13 @@ import { ClaudeAdapter } from "../claude-adapter";
 // Access internals for testing
 function createAdapter(
   envMode?: string,
-  options?: { maxBufferedMessages?: number; maxBufferedBytes?: number },
+  options?: {
+    maxBufferedMessages?: number;
+    maxBufferedBytes?: number;
+    dedupeCapacity?: number;
+    dedupeTtlMs?: number;
+    now?: () => number;
+  },
 ): any {
   const origMode = process.env.AGENTBRIDGE_MODE;
   const origMax = process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES;
@@ -32,9 +38,11 @@ function createAdapter(
   return adapter;
 }
 
-function makeBridgeMessage(content: string, ts?: number) {
+let nextTestMessageId = 0;
+
+function makeBridgeMessage(content: string, ts?: number, id?: string) {
   return {
-    id: `test_${Date.now()}`,
+    id: id ?? `test_${++nextTestMessageId}`,
     source: "codex" as const,
     content,
     timestamp: ts ?? Date.now(),
@@ -155,7 +163,7 @@ describe("Message delivery: fallback queue", () => {
     expect(adapter.oversizedMessageBytes).toBe(9);
   });
 
-  test("push message ids include a session-unique prefix", async () => {
+  test("push meta uses BridgeMessage.id as message_id and a separate delivery_attempt_id", async () => {
     const adapter = createAdapter();
 
     const notifications: any[] = [];
@@ -165,18 +173,100 @@ describe("Message delivery: fallback queue", () => {
       },
     };
 
-    await adapter.pushNotification(makeBridgeMessage("first push", 1705312200000));
-    await adapter.pushNotification(makeBridgeMessage("second push", 1705312205000));
+    await adapter.pushNotification(makeBridgeMessage("first push", 1705312200000, "codex-item-1"));
+    await adapter.pushNotification(makeBridgeMessage("second push", 1705312205000, "codex-item-2"));
 
     expect(notifications).toHaveLength(2);
 
-    const firstId = notifications[0].params.meta.message_id as string;
-    const secondId = notifications[1].params.meta.message_id as string;
+    const firstMeta = notifications[0].params.meta;
+    const secondMeta = notifications[1].params.meta;
 
-    expect(firstId).toMatch(/^codex_msg_[a-f0-9]{12}_1$/);
-    expect(secondId).toMatch(/^codex_msg_[a-f0-9]{12}_2$/);
-    expect(firstId.replace(/_1$/, "")).toBe(secondId.replace(/_2$/, ""));
-    expect(firstId).not.toBe("codex_msg_1");
+    expect(firstMeta.message_id).toBe("codex-item-1");
+    expect(secondMeta.message_id).toBe("codex-item-2");
+    expect(firstMeta.delivery_attempt_id).toMatch(/^codex_msg_[a-f0-9]{12}_1$/);
+    expect(secondMeta.delivery_attempt_id).toMatch(/^codex_msg_[a-f0-9]{12}_2$/);
+    expect(firstMeta.delivery_attempt_id.replace(/_1$/, "")).toBe(secondMeta.delivery_attempt_id.replace(/_2$/, ""));
+    expect(firstMeta.delivery_attempt_id).not.toBe(firstMeta.message_id);
+  });
+
+  test("pushNotification absorbs a backpressure rebuffer replay with the same BridgeMessage.id", async () => {
+    const adapter = createAdapter();
+    const notifications = withMockedChannel(adapter);
+    const logs: string[] = [];
+    adapter.logger = { log: (msg: string) => logs.push(msg) };
+
+    await adapter.pushNotification(makeBridgeMessage("first delivery", 1705312200000, "same-id"));
+    await adapter.pushNotification(makeBridgeMessage("duplicate delivery", 1705312201000, "same-id"));
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].params.content).toBe("first delivery");
+    expect(adapter.pendingMessages).toHaveLength(0);
+    expect(logs.some((line) => line.includes("Duplicate Codex message suppressed") && line.includes("same-id"))).toBe(true);
+  });
+
+  test("pushNotification does not enqueue fallback twice for the same BridgeMessage.id", async () => {
+    const adapter = createAdapter();
+    withMockedChannel(adapter, "fail");
+
+    await adapter.pushNotification(makeBridgeMessage("queued once", 1705312200000, "fallback-id"));
+    await adapter.pushNotification(makeBridgeMessage("queued duplicate", 1705312201000, "fallback-id"));
+
+    expect(adapter.pendingMessages.map((m: any) => m.content)).toEqual(["queued once"]);
+    expect(adapter.pendingMessageBytes).toBe(Buffer.byteLength("queued once", "utf8"));
+  });
+
+  test("pushNotification accepts an id again after LRU eviction", async () => {
+    const adapter = createAdapter(undefined, { dedupeCapacity: 2 });
+    const notifications = withMockedChannel(adapter);
+
+    await adapter.pushNotification(makeBridgeMessage("first a", 1705312200000, "id-a"));
+    await adapter.pushNotification(makeBridgeMessage("first b", 1705312201000, "id-b"));
+    await adapter.pushNotification(makeBridgeMessage("first c", 1705312202000, "id-c"));
+    await adapter.pushNotification(makeBridgeMessage("second a", 1705312203000, "id-a"));
+
+    expect(notifications.map((n) => n.params.content)).toEqual([
+      "first a",
+      "first b",
+      "first c",
+      "second a",
+    ]);
+  });
+
+  test("pushNotification accepts an id again after dedupe TTL expires", async () => {
+    let now = 1_000;
+    const adapter = createAdapter(undefined, {
+      dedupeCapacity: 10,
+      dedupeTtlMs: 100,
+      now: () => now,
+    });
+    const notifications = withMockedChannel(adapter);
+
+    await adapter.pushNotification(makeBridgeMessage("first", 1705312200000, "ttl-id"));
+    now += 50;
+    await adapter.pushNotification(makeBridgeMessage("duplicate within ttl", 1705312201000, "ttl-id"));
+    now += 101;
+    await adapter.pushNotification(makeBridgeMessage("after ttl", 1705312202000, "ttl-id"));
+
+    expect(notifications.map((n) => n.params.content)).toEqual(["first", "after ttl"]);
+  });
+
+  test("pushNotification dedupe TTL ignores wall-clock jumps", async () => {
+    const originalDateNow = Date.now;
+    let wallNow = 1_000;
+    Date.now = () => wallNow;
+
+    try {
+      const adapter = createAdapter(undefined, { dedupeTtlMs: 60_000 });
+      const notifications = withMockedChannel(adapter);
+
+      await adapter.pushNotification(makeBridgeMessage("first", 1705312200000, "wall-clock-id"));
+      wallNow += 120_000;
+      await adapter.pushNotification(makeBridgeMessage("duplicate after wall jump", 1705312201000, "wall-clock-id"));
+
+      expect(notifications.map((n) => n.params.content)).toEqual(["first"]);
+    } finally {
+      Date.now = originalDateNow;
+    }
   });
 
   test("pushNotification falls back to the queue when push delivery throws", async () => {

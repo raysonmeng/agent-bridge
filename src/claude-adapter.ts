@@ -20,6 +20,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { EventEmitter } from "node:events";
 import { randomUUID } from "node:crypto";
+import { performance } from "node:perf_hooks";
 import { createProcessLogger, type ProcessLogger } from "./process-log";
 import { StateDirResolver } from "./state-dir";
 import type { BridgeMessage } from "./types";
@@ -36,10 +37,16 @@ export type ReplySender = (
 export interface ClaudeAdapterOptions {
   maxBufferedMessages?: number;
   maxBufferedBytes?: number;
+  dedupeCapacity?: number;
+  dedupeTtlMs?: number;
+  /** Monotonic milliseconds for internal dedupe TTL; defaults to performance.now(). */
+  now?: () => number;
 }
 
 const DEFAULT_MAX_BUFFERED_MESSAGES = 100;
 const DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
+const DEFAULT_DEDUPE_CAPACITY = 2048;
+const DEFAULT_DEDUPE_TTL_MS = 20 * 60 * 1000;
 
 export const CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
@@ -98,6 +105,10 @@ export class ClaudeAdapter extends EventEmitter {
   private oversizedMessageCount = 0;
   private oversizedMessageBytes = 0;
   private oversizedMessageSourceCounts: Partial<Record<BridgeMessage["source"], number>> = {};
+  private readonly dedupeCapacity: number;
+  private readonly dedupeTtlMs: number;
+  private readonly monotonicNow: () => number;
+  private deliveredMessageIds = new Map<string, number>();
 
   // Latest budget snapshot, fed by bridge from DaemonStatus.budget broadcasts.
   private budgetSnapshot: BudgetSnapshot | null = null;
@@ -127,6 +138,9 @@ export class ClaudeAdapter extends EventEmitter {
       options.maxBufferedBytes,
       parsePositiveIntegerEnv("AGENTBRIDGE_MAX_BUFFERED_BYTES", DEFAULT_MAX_BUFFERED_BYTES),
     );
+    this.dedupeCapacity = positiveIntegerOr(options.dedupeCapacity, DEFAULT_DEDUPE_CAPACITY);
+    this.dedupeTtlMs = positiveIntegerOr(options.dedupeTtlMs, DEFAULT_DEDUPE_TTL_MS);
+    this.monotonicNow = options.now ?? (() => performance.now());
 
     this.server = new Server(
       { name: "agentbridge", version: "0.1.0" },
@@ -170,11 +184,12 @@ export class ClaudeAdapter extends EventEmitter {
 
   async pushNotification(message: BridgeMessage) {
     this.log(`pushNotification (instance=${this.instanceId}, msgId=${message.id}, len=${message.content.length})`);
+    if (!this.rememberDelivery(message)) return;
     await this.pushViaChannel(message);
   }
 
   private async pushViaChannel(message: BridgeMessage) {
-    const msgId = `codex_msg_${this.notificationIdPrefix}_${++this.notificationSeq}`;
+    const deliveryAttemptId = `codex_msg_${this.notificationIdPrefix}_${++this.notificationSeq}`;
     const ts = new Date(message.timestamp).toISOString();
 
     try {
@@ -184,7 +199,8 @@ export class ClaudeAdapter extends EventEmitter {
           content: message.content,
           meta: {
             chat_id: this.sessionId,
-            message_id: msgId,
+            message_id: message.id,
+            delivery_attempt_id: deliveryAttemptId,
             user: "Codex",
             user_id: "codex",
             ts,
@@ -192,10 +208,40 @@ export class ClaudeAdapter extends EventEmitter {
           },
         },
       });
-      this.log(`Pushed notification: ${msgId}`);
+      this.log(`Pushed notification: ${message.id} (attempt=${deliveryAttemptId})`);
     } catch (e: any) {
       this.log(`Push notification failed: ${e.message}`);
       this.queueFallbackMessage(message);
+    }
+  }
+
+  private rememberDelivery(message: BridgeMessage): boolean {
+    const now = this.monotonicNow();
+    this.pruneDeliveredMessageIds(now);
+    if (this.deliveredMessageIds.has(message.id)) {
+      // Refresh recency so duplicate bursts do not evict a still-active key.
+      this.deliveredMessageIds.delete(message.id);
+      this.deliveredMessageIds.set(message.id, now);
+      this.log(
+        `Duplicate Codex message suppressed (msgId=${message.id}, source=${message.source}, ` +
+        `instance=${this.instanceId})`,
+      );
+      return false;
+    }
+
+    this.deliveredMessageIds.set(message.id, now);
+    while (this.deliveredMessageIds.size > this.dedupeCapacity) {
+      const oldest = this.deliveredMessageIds.keys().next().value;
+      if (oldest === undefined) break;
+      this.deliveredMessageIds.delete(oldest);
+    }
+    return true;
+  }
+
+  private pruneDeliveredMessageIds(now: number): void {
+    for (const [id, seenAt] of this.deliveredMessageIds) {
+      if (now - seenAt <= this.dedupeTtlMs) break;
+      this.deliveredMessageIds.delete(id);
     }
   }
 

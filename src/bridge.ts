@@ -66,6 +66,7 @@ let lastReconnectNotifyTs = 0;
 let disabledRecoveryTimer: ReturnType<typeof setInterval> | null = null;
 let disabledRecoveryInFlight = false;
 let disabledRecoveryAttempts = 0;
+let nextSystemMessageId = 0;
 
 const DISABLED_RECOVERY_MAX_ATTEMPTS = 6;
 const DISABLED_RECOVERY_CONFIRM_TIMEOUT_MS = 1000;
@@ -555,7 +556,7 @@ async function pollDisabledRecovery() {
 
 function systemMessage(idPrefix: string, content: string): BridgeMessage {
   return {
-    id: `${idPrefix}_${Date.now()}`,
+    id: `${idPrefix}_${++nextSystemMessageId}`,
     source: "codex",
     content,
     timestamp: Date.now(),
