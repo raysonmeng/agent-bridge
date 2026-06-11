@@ -14379,7 +14379,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("797ae05", "source"),
+  commit: defineString("ee9d6ec", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -14495,6 +14495,7 @@ class DaemonClient extends EventEmitter2 {
   wsId = 0;
   nextRequestId = 1;
   pendingReplies = new PendingRequestRegistry;
+  pendingEventWaiters = new PendingRequestRegistry;
   constructor(url, options = {}) {
     super();
     this.url = url;
@@ -14554,72 +14555,58 @@ class DaemonClient extends EventEmitter2 {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return null;
     }
-    return await new Promise((resolve) => {
-      let settled = false;
-      let timer = null;
-      const cleanup = () => {
-        if (settled)
-          return;
-        settled = true;
-        if (timer) {
-          clearTimeout(timer);
-          timer = null;
-        }
-        this.off("status", onStatus);
-        this.off("rejected", onRejected);
-        this.off("disconnect", onDisconnect);
-      };
-      const finish = (value) => {
-        cleanup();
-        resolve(value);
-      };
-      const onStatus = (status) => finish(status);
-      const onRejected = () => finish(null);
-      const onDisconnect = () => finish(null);
-      this.on("status", onStatus);
-      this.on("rejected", onRejected);
-      this.on("disconnect", onDisconnect);
-      timer = setTimeout(() => {
-        finish(null);
-      }, timeoutMs);
-      try {
-        this.attachClaude();
-      } catch {
-        finish(null);
-      }
+    return this.awaitTypedResponse({
+      key: "status",
+      successEvent: "status",
+      successValue: (status) => status,
+      failValue: null,
+      timeoutMs,
+      send: () => this.attachClaude()
     });
   }
   async probeIncumbent(timeoutMs = 3000) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return { connected: false, alive: false };
     }
-    return await new Promise((resolve) => {
-      let settled = false;
-      let timer = null;
-      const finish = (value) => {
-        if (settled)
-          return;
-        settled = true;
-        if (timer)
-          clearTimeout(timer);
-        this.off("incumbentStatus", onStatus);
-        this.off("disconnect", onDisconnect);
-        this.off("rejected", onRejected);
-        resolve(value);
-      };
-      const onStatus = (s) => finish(s);
-      const onDisconnect = () => finish({ connected: false, alive: false });
-      const onRejected = () => finish({ connected: false, alive: false });
-      this.on("incumbentStatus", onStatus);
-      this.on("disconnect", onDisconnect);
-      this.on("rejected", onRejected);
-      timer = setTimeout(() => finish({ connected: false, alive: false }), timeoutMs);
-      try {
-        this.send({ type: "probe_incumbent" });
-      } catch {
-        finish({ connected: false, alive: false });
-      }
+    return this.awaitTypedResponse({
+      key: "incumbent_status",
+      successEvent: "incumbentStatus",
+      successValue: (s) => s,
+      failValue: { connected: false, alive: false },
+      timeoutMs,
+      send: () => this.send({ type: "probe_incumbent" })
     });
+  }
+  awaitTypedResponse(opts) {
+    const { key, successEvent, successValue, failValue, timeoutMs, send } = opts;
+    const onSuccess = (payload) => {
+      this.pendingEventWaiters.settle(key, successValue(payload));
+    };
+    const onRejected = () => {
+      this.pendingEventWaiters.settle(key, failValue);
+    };
+    const onDisconnect = () => {
+      this.pendingEventWaiters.settle(key, failValue);
+    };
+    const pending = this.pendingEventWaiters.register(key, {
+      timeoutMs,
+      onTimeout: ({ resolve }) => resolve(failValue)
+    });
+    const cleanup = () => {
+      this.off(successEvent, onSuccess);
+      this.off("rejected", onRejected);
+      this.off("disconnect", onDisconnect);
+    };
+    pending.finally(cleanup);
+    this.on(successEvent, onSuccess);
+    this.on("rejected", onRejected);
+    this.on("disconnect", onDisconnect);
+    try {
+      send();
+    } catch {
+      this.pendingEventWaiters.settle(key, failValue);
+    }
+    return pending;
   }
   async disconnect() {
     if (!this.ws)

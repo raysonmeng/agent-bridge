@@ -59,6 +59,17 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   // CLIENT_REPLY_TIMEOUT_MS timer is intentionally ref'd (registry default),
   // matching the prior raw setTimeout.
   private pendingReplies = new PendingRequestRegistry<SendReplyResult>();
+  // Event-style waiters (attach-status / probe-incumbent). Keyed by the control
+  // message TYPE we are awaiting ("status" / "incumbent_status") — safe because
+  // these requests never race the same type on one connection (attach reconnect
+  // is serialized by bridge.ts's reconnectTask + disabledRecoveryInFlight guards;
+  // probeIncumbent runs once per short-lived DaemonClient). Distinct types use
+  // distinct keys, so a concurrent attach+probe would still be independent.
+  // RESOLVE-ONLY: every exit path (typed response, disconnect, rejected,
+  // timeout, send throw) RESOLVES with a per-site fail-open / success value;
+  // none reject. Timers are ref'd (registry default), matching the prior raw
+  // setTimeout in both waiters.
+  private pendingEventWaiters = new PendingRequestRegistry<unknown>();
 
   constructor(private readonly url: string, private readonly options: DaemonClientOptions = {}) {
     super();
@@ -131,44 +142,17 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       return null;
     }
 
-    return await new Promise<DaemonStatus | null>((resolve) => {
-      let settled = false;
-      let timer: ReturnType<typeof setTimeout> | null = null;
-
-      const cleanup = () => {
-        if (settled) return;
-        settled = true;
-        if (timer) {
-          clearTimeout(timer);
-          timer = null;
-        }
-        this.off("status", onStatus);
-        this.off("rejected", onRejected);
-        this.off("disconnect", onDisconnect);
-      };
-
-      const finish = (value: DaemonStatus | null) => {
-        cleanup();
-        resolve(value);
-      };
-
-      const onStatus = (status: DaemonStatus) => finish(status);
-      const onRejected = () => finish(null);
-      const onDisconnect = () => finish(null);
-
-      this.on("status", onStatus);
-      this.on("rejected", onRejected);
-      this.on("disconnect", onDisconnect);
-
-      timer = setTimeout(() => {
-        finish(null);
-      }, timeoutMs);
-
-      try {
-        this.attachClaude();
-      } catch {
-        finish(null);
-      }
+    // Fail-OPEN to null on timeout / disconnect / rejected close / send throw,
+    // so a hung or contesting daemon lets the caller proceed (the daemon's own
+    // admission probe at attach time is the backstop). Resolves the actual
+    // DaemonStatus when the daemon confirms the attach via a `status` event.
+    return this.awaitTypedResponse<DaemonStatus | null>({
+      key: "status",
+      successEvent: "status",
+      successValue: (status: DaemonStatus) => status,
+      failValue: null,
+      timeoutMs,
+      send: () => this.attachClaude(),
     });
   }
 
@@ -186,36 +170,87 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       return { connected: false, alive: false };
     }
 
-    return await new Promise((resolve) => {
-      let settled = false;
-      let timer: ReturnType<typeof setTimeout> | null = null;
-
-      const finish = (value: { connected: boolean; alive: boolean }) => {
-        if (settled) return;
-        settled = true;
-        if (timer) clearTimeout(timer);
-        this.off("incumbentStatus", onStatus);
-        this.off("disconnect", onDisconnect);
-        this.off("rejected", onRejected);
-        resolve(value);
-      };
-
-      const onStatus = (s: { connected: boolean; alive: boolean }) => finish(s);
-      const onDisconnect = () => finish({ connected: false, alive: false });
-      const onRejected = () => finish({ connected: false, alive: false });
-
-      this.on("incumbentStatus", onStatus);
-      this.on("disconnect", onDisconnect);
-      this.on("rejected", onRejected);
-
-      timer = setTimeout(() => finish({ connected: false, alive: false }), timeoutMs);
-
-      try {
-        this.send({ type: "probe_incumbent" });
-      } catch {
-        finish({ connected: false, alive: false });
-      }
+    // Fail-OPEN to {connected:false, alive:false} on timeout, a closed socket,
+    // a rejected close, a send throw, or an older daemon that stays silent —
+    // so the conflict guard never blocks a legitimate launch on a probe
+    // failure (admission #68 is the backstop). Resolves the daemon's reported
+    // incumbent state when it answers via an `incumbentStatus` event.
+    return this.awaitTypedResponse<{ connected: boolean; alive: boolean }>({
+      key: "incumbent_status",
+      successEvent: "incumbentStatus",
+      successValue: (s: { connected: boolean; alive: boolean }) => s,
+      failValue: { connected: false, alive: false },
+      timeoutMs,
+      send: () => this.send({ type: "probe_incumbent" }),
     });
+  }
+
+  /**
+   * Shared skeleton for the two event-style request/response waiters
+   * (attach-status, probe-incumbent). Each waiter sends a control message and
+   * awaits a single typed response, with RESOLVE-ONLY fail-open semantics on
+   * timeout / disconnect / rejected close / send throw.
+   *
+   * The `PendingRequestRegistry` owns the timer + idempotent settle bookkeeping
+   * (keyed by the awaited message `key`). This helper additionally wires the
+   * EventEmitter listeners the registry does not manage: the success event maps
+   * to `settle(key, successValue)`, while `disconnect` / `rejected` settle the
+   * fail value. Listeners are removed on EVERY settle path via the promise's
+   * `finally`, so no path leaks a listener — equivalent to the prior per-waiter
+   * `cleanup()` that ran on its single `settled` transition.
+   *
+   * NOTE on key collision: `key` is the awaited message TYPE. attach uses
+   * "status" and probe uses "incumbent_status" (distinct), and same-type calls
+   * never run concurrently on one connection (see `pendingEventWaiters` doc), so
+   * the registry's id→entry map never overwrites a live waiter here.
+   */
+  private awaitTypedResponse<T>(opts: {
+    key: string;
+    successEvent: "status" | "incumbentStatus";
+    successValue: (payload: any) => T;
+    failValue: T;
+    timeoutMs: number;
+    send: () => void;
+  }): Promise<T> {
+    const { key, successEvent, successValue, failValue, timeoutMs, send } = opts;
+
+    const onSuccess = (payload: any) => {
+      this.pendingEventWaiters.settle(key, successValue(payload));
+    };
+    const onRejected = () => {
+      this.pendingEventWaiters.settle(key, failValue);
+    };
+    const onDisconnect = () => {
+      this.pendingEventWaiters.settle(key, failValue);
+    };
+
+    const pending = this.pendingEventWaiters.register(key, {
+      timeoutMs,
+      onTimeout: ({ resolve }) => resolve(failValue),
+    }) as Promise<T>;
+
+    // Remove listeners on every settle path (success / disconnect / rejected /
+    // timeout / send-throw). registry.settle and the timeout both resolve the
+    // promise, so `finally` is the single cleanup site — matching the prior
+    // idempotent `cleanup()`.
+    const cleanup = () => {
+      this.off(successEvent, onSuccess);
+      this.off("rejected", onRejected);
+      this.off("disconnect", onDisconnect);
+    };
+    pending.finally(cleanup);
+
+    this.on(successEvent, onSuccess);
+    this.on("rejected", onRejected);
+    this.on("disconnect", onDisconnect);
+
+    try {
+      send();
+    } catch {
+      this.pendingEventWaiters.settle(key, failValue);
+    }
+
+    return pending;
   }
 
   async disconnect() {
