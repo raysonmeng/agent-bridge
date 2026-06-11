@@ -2226,10 +2226,38 @@ export class CodexAdapter extends EventEmitter {
   private markTurnCompleted(turnId?: string) {
     const completedId = typeof turnId === "string" && turnId.length > 0 ? turnId : null;
     if (completedId !== null) {
+      // LOW-7: symmetric eviction. A turn STARTED without an id is keyed
+      // `unknown:<ts>`; its COMPLETED event may carry a real id. Evicting only
+      // the real id strands the placeholder, pinning turnInProgress=true forever
+      // (every later reply gets busy-rejected). Conservatively reclaim a SINGLE
+      // dangling `unknown:` placeholder here — only when exactly one exists, so a
+      // legitimate concurrent real turn is never collateral. We reclaim whether
+      // or not the real id matched: if the id-keyed turn existed it was a normal
+      // completion, and any lone placeholder still belongs to the
+      // started-without-id pair this completion closes out.
+      const idWasTracked = this.activeTurnIds.has(completedId);
       this.activeTurnIds.delete(completedId);
       this.clearTurnWatchdog(completedId);
       this.stalledTurnIds.delete(completedId);
       this.currentlyStalledTurnIds.delete(completedId);
+
+      // Reclaim the placeholder ONLY when the completed real id was NOT already
+      // tracked: that means the matching turn/started carried no id and was
+      // keyed `unknown:` — this completion closes it out. If the id WAS tracked
+      // it was a normal id-keyed turn, so any lingering placeholder belongs to a
+      // different, possibly still-live, started-without-id turn — leave it for
+      // the watchdog / reset path. Require exactly one placeholder so a real turn
+      // is never collateral when correlation is ambiguous.
+      if (!idWasTracked) {
+        const placeholders = [...this.activeTurnIds].filter((id) => id.startsWith("unknown:"));
+        if (placeholders.length === 1) {
+          const placeholder = placeholders[0]!;
+          this.activeTurnIds.delete(placeholder);
+          this.clearTurnWatchdog(placeholder);
+          this.stalledTurnIds.delete(placeholder);
+          this.currentlyStalledTurnIds.delete(placeholder);
+        }
+      }
     } else {
       this.activeTurnIds.clear();
       this.clearAllTurnWatchdogs();
