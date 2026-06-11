@@ -64,6 +64,16 @@ export class StateDirResolver {
     return join(this.stateDir, "status.json");
   }
 
+  /**
+   * Unified daemon disk identity (arch-review P2 #536). Atomically written at
+   * startup (phase=booting) and replaced at bootstrap (phase=ready); merges the
+   * legacy `daemon.pid` + `status.json` into one source. Readers prefer this and
+   * fall back to the legacy pair for one version cycle.
+   */
+  get daemonRecordFile(): string {
+    return join(this.stateDir, "daemon.json");
+  }
+
   get currentThreadFile(): string {
     return join(this.stateDir, "current-thread.json");
   }

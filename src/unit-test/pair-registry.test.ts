@@ -23,6 +23,7 @@ import {
   isEntryReclaimable,
   listPairDirs,
   MAX_PAIR_SLOT,
+  pairDirDaemonAlive,
   pairDirPath,
   pairsRootDir,
   PairError,
@@ -1040,5 +1041,68 @@ describe("pruneReclaimableEntries via removePairEntryAndDir — apply deletes en
     expect(res.entry?.pairId).toBe(id);
     expect(existsSync(dir)).toBe(false);
     expect(readRegistry(base).pairs.some((p) => p.pairId === id)).toBe(false);
+  });
+});
+
+describe("pairDirDaemonAlive — unified daemon.json + legacy compat (#536)", () => {
+  let base: string;
+  const DEAD_PID = 2147483646; // far outside any live pid range
+
+  beforeEach(() => {
+    base = mkdtempSync(join(tmpdir(), "abg-pair-alive-"));
+  });
+  afterEach(() => {
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  function dirFor(id: string): string {
+    const dir = join(base, "pairs", id);
+    mkdirSync(dir, { recursive: true });
+    return dir;
+  }
+
+  test("LEGACY-only: live pid in daemon.pid → alive (bit-for-bit old behavior)", () => {
+    const dir = dirFor("p-legacy-live");
+    writeFileSync(join(dir, "daemon.pid"), `${process.pid}\n`, "utf-8");
+    expect(pairDirDaemonAlive(base, "p-legacy-live")).toBe(true);
+  });
+
+  test("LEGACY-only: live pid only in status.json → alive (union preserved)", () => {
+    const dir = dirFor("p-legacy-status");
+    writeFileSync(join(dir, "status.json"), JSON.stringify({ pid: process.pid }), "utf-8");
+    expect(pairDirDaemonAlive(base, "p-legacy-status")).toBe(true);
+  });
+
+  test("LEGACY-only: dead pid in both → not alive", () => {
+    const dir = dirFor("p-legacy-dead");
+    writeFileSync(join(dir, "daemon.pid"), `${DEAD_PID}\n`, "utf-8");
+    writeFileSync(join(dir, "status.json"), JSON.stringify({ pid: DEAD_PID }), "utf-8");
+    expect(pairDirDaemonAlive(base, "p-legacy-dead")).toBe(false);
+  });
+
+  test("daemon.json-only: live pid → alive", () => {
+    const dir = dirFor("p-record-live");
+    writeFileSync(join(dir, "daemon.json"), JSON.stringify({ pid: process.pid, phase: "ready" }), "utf-8");
+    expect(pairDirDaemonAlive(base, "p-record-live")).toBe(true);
+  });
+
+  test("daemon.json-only: dead pid → not alive", () => {
+    const dir = dirFor("p-record-dead");
+    writeFileSync(join(dir, "daemon.json"), JSON.stringify({ pid: DEAD_PID, phase: "ready" }), "utf-8");
+    expect(pairDirDaemonAlive(base, "p-record-dead")).toBe(false);
+  });
+
+  test("BOTH present, any live anchor → alive (conservative union)", () => {
+    const dir = dirFor("p-both");
+    // daemon.json carries a DEAD pid but legacy daemon.pid is live: union must
+    // still report alive (any sign of life keeps the dir).
+    writeFileSync(join(dir, "daemon.json"), JSON.stringify({ pid: DEAD_PID, phase: "ready" }), "utf-8");
+    writeFileSync(join(dir, "daemon.pid"), `${process.pid}\n`, "utf-8");
+    expect(pairDirDaemonAlive(base, "p-both")).toBe(true);
+  });
+
+  test("nothing on disk → not alive", () => {
+    dirFor("p-empty");
+    expect(pairDirDaemonAlive(base, "p-empty")).toBe(false);
   });
 });

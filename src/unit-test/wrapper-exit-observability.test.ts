@@ -8,8 +8,21 @@ import {
   discoverNativeChildPid,
   findCodexSqliteLog,
   readTurnInProgress,
+  readUnifiedTurnInProgress,
   refineCleanExitClassification,
 } from "../wrapper-exit-observability";
+
+const PATHS = { daemonRecordFile: "/rec", pidFile: "/pid", statusFile: "/status" };
+
+/** Build a path-dispatching read fn for the three on-disk states. */
+function reader(files: { rec?: string; pid?: string; status?: string }) {
+  return (p: string): string => {
+    if (p === PATHS.daemonRecordFile && files.rec !== undefined) return files.rec;
+    if (p === PATHS.pidFile && files.pid !== undefined) return files.pid;
+    if (p === PATHS.statusFile && files.status !== undefined) return files.status;
+    throw new Error("ENOENT");
+  };
+}
 
 describe("discoverNativeChildPid", () => {
   test("parses the first child pid from pgrep output", () => {
@@ -47,6 +60,44 @@ describe("readTurnInProgress", () => {
     expect(readTurnInProgress("/x", () => staleTrue, () => true)).toBe(true);
     // No pid recorded (legacy file) → field taken at face value.
     expect(readTurnInProgress("/x", () => JSON.stringify({ turnInProgress: false }), () => false)).toBe(false);
+  });
+});
+
+describe("readUnifiedTurnInProgress (#536 — daemon.json + legacy fallback)", () => {
+  const alive = () => true;
+  const dead = () => false;
+
+  test("reads turnInProgress from daemon.json (preferred source)", () => {
+    const read = reader({ rec: JSON.stringify({ pid: 1, phase: "ready", turnInProgress: true }) });
+    expect(readUnifiedTurnInProgress(PATHS, read, alive)).toBe(true);
+    const read2 = reader({ rec: JSON.stringify({ pid: 1, phase: "ready", turnInProgress: false }) });
+    expect(readUnifiedTurnInProgress(PATHS, read2, alive)).toBe(false);
+  });
+
+  test("falls back to legacy status.json when daemon.json absent (old daemon)", () => {
+    const read = reader({ status: JSON.stringify({ pid: 1, turnInProgress: true }) });
+    expect(readUnifiedTurnInProgress(PATHS, read, alive)).toBe(true);
+  });
+
+  test("daemon.json wins over a stale legacy status.json", () => {
+    const read = reader({
+      rec: JSON.stringify({ pid: 1, phase: "ready", turnInProgress: false }),
+      status: JSON.stringify({ pid: 1, turnInProgress: true }),
+    });
+    expect(readUnifiedTurnInProgress(PATHS, read, alive)).toBe(false);
+  });
+
+  test("unknown when field missing, nothing on disk, or json invalid", () => {
+    expect(readUnifiedTurnInProgress(PATHS, reader({ rec: JSON.stringify({ pid: 1 }) }), alive)).toBeNull();
+    expect(readUnifiedTurnInProgress(PATHS, reader({}), alive)).toBeNull();
+    expect(readUnifiedTurnInProgress(PATHS, reader({ rec: "not-json" }), alive)).toBeNull();
+  });
+
+  test("stale record from a dead daemon degrades to unknown (same trust gate)", () => {
+    // daemon.json with turnInProgress:true but its writing pid is dead → unknown.
+    const read = reader({ rec: JSON.stringify({ pid: 4242, phase: "ready", turnInProgress: true }) });
+    expect(readUnifiedTurnInProgress(PATHS, read, dead)).toBeNull();
+    expect(readUnifiedTurnInProgress(PATHS, read, alive)).toBe(true);
   });
 });
 

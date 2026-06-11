@@ -401,9 +401,9 @@ async function rowForPair(base: string, pair: PairEntry): Promise<PairRow> {
     controlPort: ports.controlPort,
     log: () => {},
   });
-  const [running, status] = await Promise.all([
+  const [running, record] = await Promise.all([
     lifecycle.isHealthy(),
-    Promise.resolve(lifecycle.readStatus()),
+    Promise.resolve(lifecycle.readDaemonRecord()),
   ]);
   const thread = readRawCurrentThread(stateDir);
 
@@ -415,7 +415,7 @@ async function rowForPair(base: string, pair: PairEntry): Promise<PairRow> {
     source: pair.source,
     cwd: pair.cwd,
     running,
-    pid: typeof status?.pid === "number" ? status.pid : null,
+    pid: typeof record?.pid === "number" ? record.pid : null,
     threadId: thread?.threadId ?? null,
     threadStatus: thread?.status ?? null,
     threadUpdatedAt: thread?.updatedAt ?? null,

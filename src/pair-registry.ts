@@ -907,11 +907,18 @@ export function listPairDirs(base: string): string[] {
 }
 
 /**
- * Conservative liveness probe for a pair dir: returns true if EITHER `daemon.pid`
- * OR `status.json`'s pid points at a living process. Conservative on purpose —
- * any sign of life keeps the dir, because wrongly deleting a live pair's state is
- * far worse than skipping an orphan we are unsure about. Shared by the prune
- * pre-filter and the in-lock delete gate so both agree on EPERM (= alive).
+ * Conservative liveness probe for a pair dir: returns true if the pid from the
+ * unified `daemon.json` record, OR `daemon.pid`, OR `status.json` points at a
+ * living process. Conservative on purpose — any sign of life keeps the dir,
+ * because wrongly deleting a live pair's state is far worse than skipping an
+ * orphan we are unsure about. Shared by the prune pre-filter and the in-lock
+ * delete gate so both agree on EPERM (= alive).
+ *
+ * The daemon.json pid is taken in ADDITION to (not instead of) the legacy pair
+ * (arch-review P2 #536): a new daemon writes all three in lockstep, while an old
+ * daemon wrote only the legacy pair — checking the union keeps both eras alive
+ * and preserves the original "any sign of life" semantics bit-for-bit for a
+ * legacy-only dir.
  *
  * Note: it does NOT confirm the pid is actually an AgentBridge daemon (no
  * isDaemonProcess/ps check), so a stale pid OS-reused by an unrelated live
@@ -922,6 +929,12 @@ export function listPairDirs(base: string): string[] {
 export function pairDirDaemonAlive(base: string, pairId: string): boolean {
   const dir = join(pairsDir(base), pairId);
   const pids: number[] = [];
+  try {
+    const record = JSON.parse(readFileSync(join(dir, "daemon.json"), "utf-8")) as { pid?: unknown };
+    if (typeof record?.pid === "number" && Number.isFinite(record.pid)) pids.push(record.pid);
+  } catch {
+    // no/unparseable daemon.json — fall through to the legacy pair below
+  }
   try {
     const pid = Number.parseInt(readFileSync(join(dir, "daemon.pid"), "utf-8").trim(), 10);
     if (Number.isFinite(pid)) pids.push(pid);

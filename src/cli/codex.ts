@@ -15,7 +15,7 @@ import { checkAgentsMdContract } from "../agents-contract";
 import {
   captureTuiLogTail,
   discoverNativeChildPid,
-  readTurnInProgress,
+  readUnifiedTurnInProgress,
   refineCleanExitClassification,
 } from "../wrapper-exit-observability";
 import { ConfigService } from "../config-service";
@@ -341,11 +341,12 @@ export async function runCodex(args: string[]) {
     process.exit(1);
   }
 
-  // Read proxyUrl from daemon status or fall back to config
+  // Read proxyUrl from the unified daemon record (daemon.json, falling back to
+  // the legacy status.json) or, last resort, the config.
   let proxyUrl: string;
-  const status = lifecycle.readStatus();
-  if (status?.proxyUrl) {
-    proxyUrl = status.proxyUrl;
+  const record = lifecycle.readDaemonRecord();
+  if (record?.proxyUrl) {
+    proxyUrl = record.proxyUrl;
   } else {
     // Mirror exactly how the daemon resolves its proxy port (daemon.ts:39):
     // CODEX_PROXY_PORT (set by applyPairEnv in pair mode; user-set in manual mode)
@@ -609,7 +610,13 @@ export async function runCodex(args: string[]) {
       // turn state (status.json, refreshed on every turn transition). A clean
       // exit DURING a turn is the alarming one — the user sees "Codex died"
       // while the agent loop usually finishes app-server-side (issue #102).
-      classification = refineCleanExitClassification(readTurnInProgress(stateDir.statusFile));
+      classification = refineCleanExitClassification(
+        readUnifiedTurnInProgress({
+          daemonRecordFile: stateDir.daemonRecordFile,
+          pidFile: stateDir.pidFile,
+          statusFile: stateDir.statusFile,
+        }),
+      );
     }
 
     // Freeze the native TUI's structured-log tail into the exit block — the

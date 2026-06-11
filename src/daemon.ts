@@ -2,7 +2,9 @@
 
 import type { ServerWebSocket } from "bun";
 import { rmSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { BUILD_INFO, daemonStatusBuildInfo } from "./build-info";
+import { portFromUrl, type DaemonRecord } from "./daemon-record";
 import { CodexAdapter } from "./codex-adapter";
 import { validateClaudeClientIdentity, evaluateInjectionAttachGuard } from "./daemon-identity";
 import {
@@ -117,6 +119,13 @@ const ALLOW_IDENTITYLESS_CLIENT = process.env.AGENTBRIDGE_COMPAT_IDENTITYLESS ==
 const BUDGET_CONFIG = applyBudgetEnvOverrides(config.budget);
 
 const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
+
+// Unified daemon.json identity (arch-review P2 #536). A per-START random nonce
+// gives launchers a stronger "this is the exact process I registered" check than
+// a ps regex (it can be echoed on /healthz); startedAt timestamps the booting
+// record. Both are stable for the daemon's lifetime.
+const DAEMON_NONCE = randomUUID();
+const DAEMON_STARTED_AT = Date.now();
 
 const codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile);
 const attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
@@ -1576,10 +1585,50 @@ function systemMessage(idPrefix: string, content: string): BridgeMessage {
 
 function writePidFile() {
   daemonLifecycle.writePid();
+  // Unified daemon.json (arch-review P2 #536): write the BOOTING phase at process
+  // start, atomically, alongside the legacy daemon.pid. proxyUrl/ports/build are
+  // already known here (codex constructed); turn fields default to the idle/boot
+  // state. bootstrap success replaces this with the READY phase (writeStatusFile).
+  daemonLifecycle.writeDaemonRecord(buildDaemonRecord("booting"));
 }
 
 function removePidFile() {
   daemonLifecycle.removePidFile();
+  daemonLifecycle.removeDaemonRecord();
+}
+
+/**
+ * Build the unified daemon.json record (arch-review P2 #536). The `ready` phase
+ * carries the same fields the legacy status.json + /healthz advertised, so every
+ * consumer reads one source. The `booting` phase is the same shape with the
+ * pre-bootstrap turn defaults — proxyUrl/ports/build are known from process
+ * start, so even a booting record is fully port-recoverable for kill.
+ */
+function buildDaemonRecord(phase: "booting" | "ready"): DaemonRecord {
+  return {
+    pid: process.pid,
+    phase,
+    startedAt: DAEMON_STARTED_AT,
+    nonce: DAEMON_NONCE,
+    // Pair identity for diagnostics (null in legacy/manual single-pair mode).
+    pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
+    cwd: process.cwd(),
+    stateDir: stateDir.dir,
+    proxyUrl: codex.proxyUrl,
+    appServerUrl: codex.appServerUrl,
+    ports: {
+      appPort: portFromUrl(codex.appServerUrl) ?? CODEX_APP_PORT,
+      proxyPort: portFromUrl(codex.proxyUrl) ?? CODEX_PROXY_PORT,
+      controlPort: CONTROL_PORT,
+    },
+    build: daemonStatusBuildInfo(),
+    // Refreshed on every turn-phase transition (the unified turnPhaseChanged
+    // handler calls tryWriteStatusFile → writeStatusFile) so the TUI wrapper
+    // reads an up-to-date value at exit time: exit_0_during_turn vs exit_0_idle.
+    turnInProgress: codex.turnInProgress,
+    turnPhase: codex.turnPhase,
+    attentionWindowActive: inAttentionWindow,
+  };
 }
 
 function writeStatusFile() {
@@ -1605,10 +1654,15 @@ function writeStatusFile() {
     // the control status stream cannot drift on this field either.
     appServerInfo: codex.capturedAppServerInfo,
   });
+  // Unified daemon.json (arch-review P2 #536): atomically replace booting → ready
+  // (or refresh the ready record on a turn-phase/attention transition) in lockstep
+  // with the legacy status.json, so the two never drift.
+  daemonLifecycle.writeDaemonRecord(buildDaemonRecord("ready"));
 }
 
 function removeStatusFile() {
   daemonLifecycle.removeStatusFile();
+  daemonLifecycle.removeDaemonRecord();
 }
 
 /**

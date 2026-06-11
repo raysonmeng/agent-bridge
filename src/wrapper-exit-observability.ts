@@ -19,6 +19,7 @@
 import { readFileSync, readdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { pidLooksAlive } from "./process-lifecycle";
+import { readUnifiedDaemonRecord, type ReadFile } from "./daemon-record";
 
 export type RunCommand = (cmd: string, args: string[]) => string;
 
@@ -69,6 +70,29 @@ export function readTurnInProgress(
 // Delegates to the consolidated liveness probe (pid<=0 guard + EPERM = alive),
 // the single source of truth in process-lifecycle.ts.
 const defaultIsPidAlive = pidLooksAlive;
+
+/**
+ * Unified turnInProgress read (arch-review P2 #536): prefer the daemon.json
+ * record, fall back to the legacy status.json path. Applies the SAME trust gate
+ * as {@link readTurnInProgress} — the field is only trusted when the writing
+ * daemon's pid is still alive, so a daemon killed MID-TURN (record left with
+ * turnInProgress:true) degrades to "unknown" rather than misclassifying a later
+ * idle exit as exit_0_during_turn. Returns null when no record/field/live-pid is
+ * available.
+ */
+export function readUnifiedTurnInProgress(
+  paths: { daemonRecordFile: string; pidFile: string; statusFile: string },
+  read: ReadFile = (p) => readFileSync(p, "utf-8"),
+  isPidAlive: (pid: number) => boolean = defaultIsPidAlive,
+): boolean | null {
+  const record = readUnifiedDaemonRecord(paths, read);
+  if (!record) return null;
+  if (typeof record.turnInProgress !== "boolean") return null;
+  // Same stale-mid-turn guard as the legacy reader: an absent/dead writer pid
+  // means the record may outlive its daemon — do not trust the field.
+  if (typeof record.pid === "number" && !isPidAlive(record.pid)) return null;
+  return record.turnInProgress;
+}
 
 /**
  * Refine the clean-exit classification using the daemon-side turn state.

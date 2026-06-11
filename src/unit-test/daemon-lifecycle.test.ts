@@ -249,6 +249,65 @@ describe("DaemonLifecycle", () => {
     expect(lc.readStatus()).toBeNull();
   });
 
+  // --- Unified daemon.json (arch-review P2 #536) ---
+
+  test("writeDaemonRecord + readDaemonRecord round-trip via daemon.json", () => {
+    const lc = createLifecycle();
+    lc.writeDaemonRecord({ pid: 4242, phase: "ready", proxyUrl: "ws://127.0.0.1:4501" });
+    expect(existsSync(stateDir.daemonRecordFile)).toBe(true);
+    const rec = lc.readDaemonRecord();
+    expect(rec?.pid).toBe(4242);
+    expect(rec?.proxyUrl).toBe("ws://127.0.0.1:4501");
+    expect(rec?.phase).toBe("ready");
+  });
+
+  test("readDaemonRecord prefers daemon.json over legacy status.json", () => {
+    const lc = createLifecycle();
+    lc.writePid(700);
+    lc.writeStatus({ pid: 700, proxyUrl: "ws://127.0.0.1:4501" });
+    lc.writeDaemonRecord({ pid: 701, phase: "ready", proxyUrl: "ws://127.0.0.1:4701" });
+    const rec = lc.readDaemonRecord();
+    expect(rec?.pid).toBe(701);
+    expect(rec?.proxyUrl).toBe("ws://127.0.0.1:4701");
+  });
+
+  test("readDaemonRecord falls back to legacy files when daemon.json absent (old daemon)", () => {
+    const lc = createLifecycle();
+    lc.writePid(800);
+    lc.writeStatus({ pid: 800, proxyUrl: "ws://127.0.0.1:4801", controlPort: 4802 });
+    expect(existsSync(stateDir.daemonRecordFile)).toBe(false);
+    const rec = lc.readDaemonRecord();
+    expect(rec?.pid).toBe(800);
+    expect(rec?.proxyUrl).toBe("ws://127.0.0.1:4801");
+    expect(rec?.phase).toBe("ready"); // status.json present → ready
+    expect(rec?.ports?.controlPort).toBe(4802);
+  });
+
+  test("readDaemonRecord returns null when nothing on disk", () => {
+    const lc = createLifecycle();
+    expect(lc.readDaemonRecord()).toBeNull();
+  });
+
+  test("cleanup (via kill on dead pid) removes daemon.json alongside legacy files", async () => {
+    const lc = createLifecycle();
+    lc.writePid(9999999);
+    lc.writeStatus({ pid: 9999999 });
+    lc.writeDaemonRecord({ pid: 9999999, phase: "ready" });
+    expect(existsSync(stateDir.daemonRecordFile)).toBe(true);
+
+    // Dead pid → kill() runs cleanup(), which must remove ALL THREE files so a
+    // killed daemon leaves no live-looking record behind.
+    await lc.kill();
+    expect(existsSync(stateDir.pidFile)).toBe(false);
+    expect(existsSync(stateDir.statusFile)).toBe(false);
+    expect(existsSync(stateDir.daemonRecordFile)).toBe(false);
+  });
+
+  test("removeDaemonRecord does not throw when file missing", () => {
+    const lc = createLifecycle();
+    expect(() => lc.removeDaemonRecord()).not.toThrow();
+  });
+
   test("isHealthy returns false for non-existent port", async () => {
     const lc = createLifecycle(19999);
     expect(await lc.isHealthy()).toBe(false);
