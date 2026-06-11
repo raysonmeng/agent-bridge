@@ -14382,7 +14382,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("2e5a131", "source"),
+  commit: defineString("47a6d3e", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -15771,6 +15771,9 @@ function pairScopedCommand(cmd, name = cliInvocationName()) {
 }
 
 // src/bridge-disabled-state.ts
+function shouldEmitReconnectSuccess(state) {
+  return !state.daemonDisabled;
+}
 function disabledReplyError(reason) {
   const claudeCmd = pairScopedCommand("claude");
   switch (reason) {
@@ -16248,6 +16251,9 @@ function reconnectToDaemon() {
         }
         try {
           await connectToDaemon(true);
+          if (!shouldEmitReconnectSuccess({ daemonDisabled })) {
+            return;
+          }
           log("Reconnected to AgentBridge daemon successfully");
           const now = Date.now();
           if (now - lastReconnectNotifyTs >= RECONNECT_NOTIFY_COOLDOWN_MS) {

@@ -1,5 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
-import { disabledReplyError } from "../bridge-disabled-state";
+import { disabledReplyError, shouldEmitReconnectSuccess } from "../bridge-disabled-state";
 
 describe("bridge disabled-state messaging", () => {
   // These assert the bare hint substrings, i.e. manual/no-pair mode. The leading
@@ -62,5 +62,25 @@ describe("bridge disabled-state messaging", () => {
     // the bare "rejected" reason — the cause here is exhausted retries, not
     // an active competing session.
     expect(message).not.toContain("another Claude Code session is already connected");
+  });
+});
+
+describe("shouldEmitReconnectSuccess (reconnect false-success guard)", () => {
+  // Regression: the reconnect loop only checked daemonDisabled at entry. A
+  // socket attach rejected mid-loop (EVICTED_STALE / REPLACED / CONTRACT_MISMATCH)
+  // synchronously flips daemonDisabled=true; on the NEXT iteration
+  // connectToDaemon() early-returns WITHOUT throwing, so the loop's success
+  // branch fired "Reconnected successfully" while the bridge was actually
+  // disabled (reply tool still returns disabledReplyError). The success branch
+  // must consult this helper before logging/notifying.
+
+  test("emits success on a genuine reconnect (not disabled)", () => {
+    expect(shouldEmitReconnectSuccess({ daemonDisabled: false })).toBe(true);
+  });
+
+  test("does NOT emit success when the daemon was disabled mid-loop", () => {
+    // connectToDaemon() returned without throwing only because daemonDisabled
+    // was set by the rejected handler — this is a false success, suppress it.
+    expect(shouldEmitReconnectSuccess({ daemonDisabled: true })).toBe(false);
   });
 });

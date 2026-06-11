@@ -7,7 +7,7 @@ import { DaemonClient } from "./daemon-client";
 import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
 import { ConfigService } from "./config-service";
-import { disabledReplyError, type BridgeDisabledReason } from "./bridge-disabled-state";
+import { disabledReplyError, shouldEmitReconnectSuccess, type BridgeDisabledReason } from "./bridge-disabled-state";
 import { guardAgentBridgeEnv, normalizeEnvGuardMode } from "./env-guard";
 import { pairScopedCommand } from "./pair-command";
 import { readControlToken, resolveControlTokenPath } from "./control-token";
@@ -406,6 +406,16 @@ function reconnectToDaemon(): Promise<void> {
 
         try {
           await connectToDaemon(true);
+          // connectToDaemon() returns WITHOUT throwing when the bridge is
+          // already disabled (see its early-return guard). A mid-loop attach
+          // rejection (EVICTED_STALE / REPLACED / CONTRACT_MISMATCH) flips
+          // daemonDisabled true synchronously in the `rejected` handler, so this
+          // iteration's connectToDaemon may have returned silently rather than
+          // genuinely reconnecting. Don't declare a false success that
+          // contradicts the eviction/contract-mismatch notice already sent.
+          if (!shouldEmitReconnectSuccess({ daemonDisabled })) {
+            return;
+          }
           log("Reconnected to AgentBridge daemon successfully");
 
           const now = Date.now();

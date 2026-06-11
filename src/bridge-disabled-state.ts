@@ -7,6 +7,23 @@ export type BridgeDisabledReason =
 
 import { pairScopedCommand } from "./pair-command";
 
+/**
+ * Decide whether the reconnect loop may declare a reconnect succeeded.
+ *
+ * `connectToDaemon()` early-returns WITHOUT throwing when invoked while the
+ * bridge is already disabled (see bridge.ts). During the reconnect loop a
+ * socket attach rejected mid-flight (EVICTED_STALE / REPLACED /
+ * CONTRACT_MISMATCH) flips `daemonDisabled` true synchronously, so the very
+ * next iteration's `connectToDaemon(true)` returns silently — which would
+ * otherwise fall through to the loop's success branch and emit a false
+ * "Reconnected successfully" notification while the bridge is in fact disabled.
+ * The success branch must consult this guard first: only a genuinely
+ * NOT-disabled bridge counts as a real reconnect.
+ */
+export function shouldEmitReconnectSuccess(state: { daemonDisabled: boolean }): boolean {
+  return !state.daemonDisabled;
+}
+
 export function disabledReplyError(reason: BridgeDisabledReason): string {
   // These render in the bridge (MCP server) process, which inherits
   // AGENTBRIDGE_PAIR_ID in multi-pair mode — so the suggested commands carry
