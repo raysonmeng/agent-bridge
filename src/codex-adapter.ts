@@ -55,6 +55,7 @@ import {
   APP_SERVER_RECONNECT_NEW_TUI_REASON,
 } from "./turn-notices";
 import { isAllowedWsUpgrade, wsOriginRejectedResponse } from "./ws-origin-guard";
+import { PendingRequestRegistry } from "./pending-request-registry";
 
 interface TuiSocketData {
   connId: number;
@@ -260,12 +261,15 @@ export class CodexAdapter extends EventEmitter {
   // error message, so a repeated legacy rate-limit error does not spam the log.
   private warnedFragileRateLimitMessages = new Set<string>();
   private sessionRestoreInProgress = false;
-  private replayPending = new Map<number | string, {
-    method: string;
-    resolve: (response: unknown) => void;
-    reject: (err: Error) => void;
-    timer: ReturnType<typeof setTimeout>;
-  }>();
+  // Session-replay waiter: id-keyed pending-request registry. REJECT semantics —
+  // a timeout, a send failure, and an app-server error response all REJECT;
+  // only a clean app-server response resolves. The timer is intentionally ref'd
+  // (registry default), matching the prior raw setTimeout (no unref).
+  private replayPending = new PendingRequestRegistry<unknown>();
+  // Companion lookup so tryConsumeReplayResponse can name the method in its
+  // reject message (`${method} rejected: ...`). Keyed by the same replay id and
+  // cleared in lockstep with the registry entry on every exit path.
+  private replayMethods = new Map<number | string, string>();
   private static readonly SESSION_REPLAY_TIMEOUT_MS = 5000;
 
   constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile) {
@@ -1044,22 +1048,28 @@ export class CodexAdapter extends EventEmitter {
       return Promise.reject(new Error(`replay parse failed for ${method}: ${m}`));
     }
 
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.replayPending.delete(id);
-        reject(new Error(`replay timeout (${CodexAdapter.SESSION_REPLAY_TIMEOUT_MS}ms) for ${method} id=${JSON.stringify(id)}`));
-      }, CodexAdapter.SESSION_REPLAY_TIMEOUT_MS);
-
-      this.replayPending.set(id, { method, resolve, reject, timer });
-      try {
-        this.appServerWs!.send(raw);
-      } catch (e: unknown) {
-        clearTimeout(timer);
-        this.replayPending.delete(id);
-        const m = e instanceof Error ? e.message : String(e);
-        reject(new Error(`replay send failed for ${method}: ${m}`));
-      }
+    // Read the (test-mutable) static ONCE for both the arm value and the
+    // timeout message, matching the prior raw setTimeout which interpolated
+    // the same field at fire time.
+    const timeoutMs = CodexAdapter.SESSION_REPLAY_TIMEOUT_MS;
+    this.replayMethods.set(id, method);
+    const pending = this.replayPending.register(id, {
+      timeoutMs,
+      onTimeout: ({ reject }) => {
+        this.replayMethods.delete(id);
+        reject(new Error(`replay timeout (${timeoutMs}ms) for ${method} id=${JSON.stringify(id)}`));
+      },
     });
+    try {
+      this.appServerWs!.send(raw);
+    } catch (e: unknown) {
+      // reject() clears the timer + drops the registry entry; keep the
+      // companion method map in lockstep.
+      this.replayMethods.delete(id);
+      const m = e instanceof Error ? e.message : String(e);
+      this.replayPending.reject(id, new Error(`replay send failed for ${method}: ${m}`));
+    }
+    return pending;
   }
 
   /**
@@ -1071,19 +1081,21 @@ export class CodexAdapter extends EventEmitter {
   private tryConsumeReplayResponse(payload: Record<string, unknown>): boolean {
     const id = payload.id;
     if (id === undefined) return false;
-    const pending = this.replayPending.get(id as number | string);
-    if (!pending) return false;
+    const key = id as number | string;
+    if (!this.replayPending.has(key)) return false;
 
-    clearTimeout(pending.timer);
-    this.replayPending.delete(id as number | string);
+    const method = this.replayMethods.get(key) ?? "replay";
+    this.replayMethods.delete(key);
 
     if (payload.error !== undefined) {
       const errMsg = typeof payload.error === "object" && payload.error !== null && "message" in payload.error
         ? String((payload.error as { message?: unknown }).message ?? "unknown")
         : JSON.stringify(payload.error);
-      pending.reject(new Error(`${pending.method} rejected: ${errMsg}`));
+      // reject() clears the timer + drops the registry entry.
+      this.replayPending.reject(key, new Error(`${method} rejected: ${errMsg}`));
     } else {
-      pending.resolve(payload);
+      // settle() clears the timer + drops the registry entry.
+      this.replayPending.settle(key, payload);
     }
     return true;
   }

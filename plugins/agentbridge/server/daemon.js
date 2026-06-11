@@ -21,7 +21,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("392fac9", "source"),
+  commit: defineString("797ae05", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -676,6 +676,76 @@ function wsOriginRejectedResponse() {
   return new Response("Forbidden: WebSocket Origin not allowed", { status: 403 });
 }
 
+// src/pending-request-registry.ts
+class PendingRequestRegistry {
+  entries = new Map;
+  setTimer;
+  clearTimer;
+  constructor(deps = {}) {
+    this.setTimer = deps.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
+    this.clearTimer = deps.clearTimer ?? ((handle) => clearTimeout(handle));
+  }
+  get size() {
+    return this.entries.size;
+  }
+  has(id) {
+    return this.entries.has(id);
+  }
+  register(id, options) {
+    const existing = this.entries.get(id);
+    if (existing) {
+      this.clearTimer(existing.timer);
+      this.entries.delete(id);
+    }
+    return new Promise((resolve, reject) => {
+      const timer = this.setTimer(() => {
+        if (!this.entries.has(id))
+          return;
+        this.entries.delete(id);
+        options.onTimeout({ resolve, reject });
+      }, options.timeoutMs);
+      if (options.unref) {
+        timer.unref?.();
+      }
+      this.entries.set(id, { resolve, reject, timer });
+    });
+  }
+  settle(id, value) {
+    const entry = this.entries.get(id);
+    if (!entry)
+      return false;
+    this.clearTimer(entry.timer);
+    this.entries.delete(id);
+    entry.resolve(value);
+    return true;
+  }
+  reject(id, error) {
+    const entry = this.entries.get(id);
+    if (!entry)
+      return false;
+    this.clearTimer(entry.timer);
+    this.entries.delete(id);
+    entry.reject(error);
+    return true;
+  }
+  settleAll(value) {
+    const make = typeof value === "function" ? value : () => value;
+    for (const [id, entry] of this.entries) {
+      this.clearTimer(entry.timer);
+      this.entries.delete(id);
+      entry.resolve(make(id));
+    }
+  }
+  rejectAll(error) {
+    const make = typeof error === "function" ? error : () => error;
+    for (const [id, entry] of this.entries) {
+      this.clearTimer(entry.timer);
+      this.entries.delete(id);
+      entry.reject(make(id));
+    }
+  }
+}
+
 // src/codex-adapter.ts
 class CodexAdapter extends EventEmitter {
   static RESPONSE_TRACKING_TTL_MS = 30000;
@@ -730,7 +800,8 @@ class CodexAdapter extends EventEmitter {
   warnedAppServerVersions = new Set;
   warnedFragileRateLimitMessages = new Set;
   sessionRestoreInProgress = false;
-  replayPending = new Map;
+  replayPending = new PendingRequestRegistry;
+  replayMethods = new Map;
   static SESSION_REPLAY_TIMEOUT_MS = 5000;
   constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile) {
     super();
@@ -1242,36 +1313,38 @@ class CodexAdapter extends EventEmitter {
       const m = e instanceof Error ? e.message : String(e);
       return Promise.reject(new Error(`replay parse failed for ${method}: ${m}`));
     }
-    return new Promise((resolve, reject) => {
-      const timer = setTimeout(() => {
-        this.replayPending.delete(id);
-        reject(new Error(`replay timeout (${CodexAdapter.SESSION_REPLAY_TIMEOUT_MS}ms) for ${method} id=${JSON.stringify(id)}`));
-      }, CodexAdapter.SESSION_REPLAY_TIMEOUT_MS);
-      this.replayPending.set(id, { method, resolve, reject, timer });
-      try {
-        this.appServerWs.send(raw);
-      } catch (e) {
-        clearTimeout(timer);
-        this.replayPending.delete(id);
-        const m = e instanceof Error ? e.message : String(e);
-        reject(new Error(`replay send failed for ${method}: ${m}`));
+    const timeoutMs = CodexAdapter.SESSION_REPLAY_TIMEOUT_MS;
+    this.replayMethods.set(id, method);
+    const pending = this.replayPending.register(id, {
+      timeoutMs,
+      onTimeout: ({ reject }) => {
+        this.replayMethods.delete(id);
+        reject(new Error(`replay timeout (${timeoutMs}ms) for ${method} id=${JSON.stringify(id)}`));
       }
     });
+    try {
+      this.appServerWs.send(raw);
+    } catch (e) {
+      this.replayMethods.delete(id);
+      const m = e instanceof Error ? e.message : String(e);
+      this.replayPending.reject(id, new Error(`replay send failed for ${method}: ${m}`));
+    }
+    return pending;
   }
   tryConsumeReplayResponse(payload) {
     const id = payload.id;
     if (id === undefined)
       return false;
-    const pending = this.replayPending.get(id);
-    if (!pending)
+    const key = id;
+    if (!this.replayPending.has(key))
       return false;
-    clearTimeout(pending.timer);
-    this.replayPending.delete(id);
+    const method = this.replayMethods.get(key) ?? "replay";
+    this.replayMethods.delete(key);
     if (payload.error !== undefined) {
       const errMsg = typeof payload.error === "object" && payload.error !== null && "message" in payload.error ? String(payload.error.message ?? "unknown") : JSON.stringify(payload.error);
-      pending.reject(new Error(`${pending.method} rejected: ${errMsg}`));
+      this.replayPending.reject(key, new Error(`${method} rejected: ${errMsg}`));
     } else {
-      pending.resolve(payload);
+      this.replayPending.settle(key, payload);
     }
     return true;
   }

@@ -14379,7 +14379,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("392fac9", "source"),
+  commit: defineString("797ae05", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -14415,6 +14415,76 @@ var CLIENT_REPLY_TIMEOUT_MS = 15000;
 var INTERRUPT_CLIENT_MARGIN_MS = 2000;
 var MAX_INTERRUPT_TIMEOUT_MS = CLIENT_REPLY_TIMEOUT_MS - INTERRUPT_CLIENT_MARGIN_MS;
 
+// src/pending-request-registry.ts
+class PendingRequestRegistry {
+  entries = new Map;
+  setTimer;
+  clearTimer;
+  constructor(deps = {}) {
+    this.setTimer = deps.setTimer ?? ((fn, ms) => setTimeout(fn, ms));
+    this.clearTimer = deps.clearTimer ?? ((handle) => clearTimeout(handle));
+  }
+  get size() {
+    return this.entries.size;
+  }
+  has(id) {
+    return this.entries.has(id);
+  }
+  register(id, options) {
+    const existing = this.entries.get(id);
+    if (existing) {
+      this.clearTimer(existing.timer);
+      this.entries.delete(id);
+    }
+    return new Promise((resolve, reject) => {
+      const timer = this.setTimer(() => {
+        if (!this.entries.has(id))
+          return;
+        this.entries.delete(id);
+        options.onTimeout({ resolve, reject });
+      }, options.timeoutMs);
+      if (options.unref) {
+        timer.unref?.();
+      }
+      this.entries.set(id, { resolve, reject, timer });
+    });
+  }
+  settle(id, value) {
+    const entry = this.entries.get(id);
+    if (!entry)
+      return false;
+    this.clearTimer(entry.timer);
+    this.entries.delete(id);
+    entry.resolve(value);
+    return true;
+  }
+  reject(id, error2) {
+    const entry = this.entries.get(id);
+    if (!entry)
+      return false;
+    this.clearTimer(entry.timer);
+    this.entries.delete(id);
+    entry.reject(error2);
+    return true;
+  }
+  settleAll(value) {
+    const make = typeof value === "function" ? value : () => value;
+    for (const [id, entry] of this.entries) {
+      this.clearTimer(entry.timer);
+      this.entries.delete(id);
+      entry.resolve(make(id));
+    }
+  }
+  rejectAll(error2) {
+    const make = typeof error2 === "function" ? error2 : () => error2;
+    for (const [id, entry] of this.entries) {
+      this.clearTimer(entry.timer);
+      this.entries.delete(id);
+      entry.reject(make(id));
+    }
+  }
+}
+
 // src/daemon-client.ts
 var nextSocketId = 0;
 
@@ -14424,7 +14494,7 @@ class DaemonClient extends EventEmitter2 {
   ws = null;
   wsId = 0;
   nextRequestId = 1;
-  pendingReplies = new Map;
+  pendingReplies = new PendingRequestRegistry;
   constructor(url, options = {}) {
     super();
     this.url = url;
@@ -14568,21 +14638,19 @@ class DaemonClient extends EventEmitter2 {
       return { success: false, error: "AgentBridge daemon is not connected." };
     }
     const requestId = `reply_${Date.now()}_${this.nextRequestId++}`;
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        this.pendingReplies.delete(requestId);
-        resolve({ success: false, error: "Timed out waiting for AgentBridge daemon reply." });
-      }, CLIENT_REPLY_TIMEOUT_MS);
-      this.pendingReplies.set(requestId, { resolve, timer });
-      this.send({
-        type: "claude_to_codex",
-        requestId,
-        message,
-        ...requireReply ? { requireReply: true } : {},
-        ...onBusy && onBusy !== "reject" ? { onBusy } : {},
-        ...idempotencyKey ? { idempotencyKey } : {}
-      });
+    const pending = this.pendingReplies.register(requestId, {
+      timeoutMs: CLIENT_REPLY_TIMEOUT_MS,
+      onTimeout: ({ resolve }) => resolve({ success: false, error: "Timed out waiting for AgentBridge daemon reply." })
     });
+    this.send({
+      type: "claude_to_codex",
+      requestId,
+      message,
+      ...requireReply ? { requireReply: true } : {},
+      ...onBusy && onBusy !== "reject" ? { onBusy } : {},
+      ...idempotencyKey ? { idempotencyKey } : {}
+    });
+    return pending;
   }
   attachSocketHandlers(ws, socketId) {
     ws.onmessage = (event) => {
@@ -14598,12 +14666,7 @@ class DaemonClient extends EventEmitter2 {
           this.emit("codexMessage", message.message);
           return;
         case "claude_to_codex_result": {
-          const pending = this.pendingReplies.get(message.requestId);
-          if (!pending)
-            return;
-          clearTimeout(pending.timer);
-          this.pendingReplies.delete(message.requestId);
-          pending.resolve({
+          this.pendingReplies.settle(message.requestId, {
             success: message.success,
             error: message.error,
             ...message.code !== undefined ? { code: message.code } : {},
@@ -14644,11 +14707,7 @@ class DaemonClient extends EventEmitter2 {
     ws.onerror = () => {};
   }
   rejectPendingReplies(error2) {
-    for (const [requestId, pending] of this.pendingReplies.entries()) {
-      clearTimeout(pending.timer);
-      pending.resolve({ success: false, error: error2 });
-      this.pendingReplies.delete(requestId);
-    }
+    this.pendingReplies.settleAll(() => ({ success: false, error: error2 }));
   }
   send(message) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {

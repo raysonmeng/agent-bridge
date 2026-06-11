@@ -10,6 +10,7 @@ import {
 } from "./control-protocol";
 import type { ControlClientIdentity, ControlClientMessage, ControlServerMessage, DaemonStatus, TurnPhase } from "./control-protocol";
 import { CLIENT_REPLY_TIMEOUT_MS } from "./interrupt-timing";
+import { PendingRequestRegistry } from "./pending-request-registry";
 
 /**
  * Result of a claude_to_codex round trip. `code` / `phase` / `retryAfterMs`
@@ -52,13 +53,12 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   private ws: WebSocket | null = null;
   private wsId: number = 0; // Track socket identity for debugging
   private nextRequestId = 1;
-  private pendingReplies = new Map<
-    string,
-    {
-      resolve: (value: SendReplyResult) => void;
-      timer: ReturnType<typeof setTimeout>;
-    }
-  >();
+  // Reply waiter: id-keyed pending-request registry. RESOLVE-ONLY semantics —
+  // a timeout, a daemon result, and a connection drop all RESOLVE the promise
+  // with a SendReplyResult (success or failure); none of them reject. The
+  // CLIENT_REPLY_TIMEOUT_MS timer is intentionally ref'd (registry default),
+  // matching the prior raw setTimeout.
+  private pendingReplies = new PendingRequestRegistry<SendReplyResult>();
 
   constructor(private readonly url: string, private readonly options: DaemonClientOptions = {}) {
     super();
@@ -244,30 +244,28 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     }
 
     const requestId = `reply_${Date.now()}_${this.nextRequestId++}`;
-    return new Promise((resolve) => {
-      // CLIENT_REPLY_TIMEOUT_MS applies to the daemon's IMMEDIATE result. The
-      // interrupt path can legitimately defer the result until the daemon-side
-      // terminal-wait budget elapses — that budget is CLAMPED below this value
-      // (see interrupt-timing.ts: clampInterruptTimeoutMs), so the daemon always
-      // answers before this timer fires. INVARIANT: do not shrink this timeout
-      // without also lowering MAX_INTERRUPT_TIMEOUT_MS, or an over-large
-      // AGENTBRIDGE_INTERRUPT_TIMEOUT_MS could outlast it and a false timeout +
-      // Claude retry would double-turn.
-      const timer = setTimeout(() => {
-        this.pendingReplies.delete(requestId);
-        resolve({ success: false, error: "Timed out waiting for AgentBridge daemon reply." });
-      }, CLIENT_REPLY_TIMEOUT_MS);
-
-      this.pendingReplies.set(requestId, { resolve, timer });
-      this.send({
-        type: "claude_to_codex",
-        requestId,
-        message,
-        ...(requireReply ? { requireReply: true } : {}),
-        ...(onBusy && onBusy !== "reject" ? { onBusy } : {}),
-        ...(idempotencyKey ? { idempotencyKey } : {}),
-      });
+    // CLIENT_REPLY_TIMEOUT_MS applies to the daemon's IMMEDIATE result. The
+    // interrupt path can legitimately defer the result until the daemon-side
+    // terminal-wait budget elapses — that budget is CLAMPED below this value
+    // (see interrupt-timing.ts: clampInterruptTimeoutMs), so the daemon always
+    // answers before this timer fires. INVARIANT: do not shrink this timeout
+    // without also lowering MAX_INTERRUPT_TIMEOUT_MS, or an over-large
+    // AGENTBRIDGE_INTERRUPT_TIMEOUT_MS could outlast it and a false timeout +
+    // Claude retry would double-turn.
+    const pending = this.pendingReplies.register(requestId, {
+      timeoutMs: CLIENT_REPLY_TIMEOUT_MS,
+      onTimeout: ({ resolve }) =>
+        resolve({ success: false, error: "Timed out waiting for AgentBridge daemon reply." }),
     });
+    this.send({
+      type: "claude_to_codex",
+      requestId,
+      message,
+      ...(requireReply ? { requireReply: true } : {}),
+      ...(onBusy && onBusy !== "reject" ? { onBusy } : {}),
+      ...(idempotencyKey ? { idempotencyKey } : {}),
+    });
+    return pending;
   }
 
   private attachSocketHandlers(ws: WebSocket, socketId: number) {
@@ -286,13 +284,11 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
           this.emit("codexMessage", message.message);
           return;
         case "claude_to_codex_result": {
-          const pending = this.pendingReplies.get(message.requestId);
-          if (!pending) return;
-          clearTimeout(pending.timer);
-          this.pendingReplies.delete(message.requestId);
           // Pass the PR B structured fields through when the daemon sent them
-          // (older daemons only populate success/error).
-          pending.resolve({
+          // (older daemons only populate success/error). settle() is a no-op for
+          // an unknown / already-settled requestId — same guard as the prior
+          // `if (!pending) return`.
+          this.pendingReplies.settle(message.requestId, {
             success: message.success,
             error: message.error,
             ...(message.code !== undefined ? { code: message.code } : {}),
@@ -347,11 +343,11 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   }
 
   private rejectPendingReplies(error: string) {
-    for (const [requestId, pending] of this.pendingReplies.entries()) {
-      clearTimeout(pending.timer);
-      pending.resolve({ success: false, error });
-      this.pendingReplies.delete(requestId);
-    }
+    // RESOLVE-ONLY teardown: every in-flight reply resolves with a failure
+    // value (never rejects), matching the prior per-entry resolve(). Use the
+    // factory form so each settled promise gets its OWN result object, exactly
+    // as the old per-entry literal did (no shared reference across callers).
+    this.pendingReplies.settleAll(() => ({ success: false, error }));
   }
 
   private send(message: ControlClientMessage) {
