@@ -2,7 +2,10 @@ import { describe, expect, test, beforeEach, afterEach } from "bun:test";
 import { ClaudeAdapter } from "../claude-adapter";
 
 // Access internals for testing
-function createAdapter(envMode?: string): any {
+function createAdapter(
+  envMode?: string,
+  options?: { maxBufferedMessages?: number; maxBufferedBytes?: number },
+): any {
   const origMode = process.env.AGENTBRIDGE_MODE;
   const origMax = process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES;
 
@@ -12,7 +15,7 @@ function createAdapter(envMode?: string): any {
     delete process.env.AGENTBRIDGE_MODE;
   }
 
-  const adapter = new ClaudeAdapter() as any;
+  const adapter = new ClaudeAdapter(undefined, options) as any;
 
   // Restore env immediately after construction reads it
   if (origMode !== undefined) {
@@ -38,19 +41,20 @@ function makeBridgeMessage(content: string, ts?: number) {
   };
 }
 
+function withMockedChannel(adapter: any, mode: "success" | "fail" = "success") {
+  const notifications: any[] = [];
+  adapter.server = {
+    notification: async (payload: any) => {
+      if (mode === "fail") throw new Error("channel unavailable");
+      notifications.push(payload);
+    },
+  };
+  return notifications;
+}
+
 describe("Push-only delivery: AGENTBRIDGE_MODE is ignored", () => {
   // Pull mode was removed (it could not wake an idle session and silently
   // broke the budget RESUME chain). Any legacy env value must be ignored.
-  function withMockedChannel(adapter: any) {
-    const notifications: any[] = [];
-    adapter.server = {
-      notification: async (payload: any) => {
-        notifications.push(payload);
-      },
-    };
-    return notifications;
-  }
-
   test("delivers via channel when AGENTBRIDGE_MODE is unset", async () => {
     const adapter = createAdapter();
     const notifications = withMockedChannel(adapter);
@@ -101,10 +105,7 @@ describe("Message delivery: fallback queue", () => {
   });
 
   test("queueFallbackMessage drops oldest when queue is full", () => {
-    const orig = process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES;
-    process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES = "3";
-    const adapter = createAdapter();
-    process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES = orig;
+    const adapter = createAdapter(undefined, { maxBufferedMessages: 3 });
 
     adapter.queueFallbackMessage(makeBridgeMessage("msg1"));
     adapter.queueFallbackMessage(makeBridgeMessage("msg2"));
@@ -115,6 +116,43 @@ describe("Message delivery: fallback queue", () => {
     expect(adapter.pendingMessages[0].content).toBe("msg2");
     expect(adapter.pendingMessages[2].content).toBe("msg4");
     expect(adapter.droppedMessageCount).toBe(1);
+  });
+
+  test("queueFallbackMessage drops oldest until the byte cap is respected", () => {
+    const adapter = createAdapter(undefined, { maxBufferedMessages: 10, maxBufferedBytes: 8 });
+
+    adapter.queueFallbackMessage(makeBridgeMessage("aa"));
+    adapter.queueFallbackMessage(makeBridgeMessage("bbb"));
+    adapter.queueFallbackMessage(makeBridgeMessage("cccc"));
+    adapter.queueFallbackMessage(makeBridgeMessage("dd"));
+
+    expect(adapter.pendingMessages.map((m: any) => m.content)).toEqual(["cccc", "dd"]);
+    expect(adapter.pendingMessageBytes).toBe(6);
+    expect(adapter.droppedMessageCount).toBe(2);
+  });
+
+  test("queueFallbackMessage counts UTF-8 bytes, not JavaScript string length", () => {
+    const adapter = createAdapter(undefined, { maxBufferedMessages: 10, maxBufferedBytes: 7 });
+
+    adapter.queueFallbackMessage(makeBridgeMessage("éé")); // 4 UTF-8 bytes
+    adapter.queueFallbackMessage(makeBridgeMessage("abc")); // 3 UTF-8 bytes
+    adapter.queueFallbackMessage(makeBridgeMessage("d")); // drops the 4-byte message
+
+    expect(adapter.pendingMessages.map((m: any) => m.content)).toEqual(["abc", "d"]);
+    expect(adapter.pendingMessageBytes).toBe(4);
+    expect(adapter.droppedMessageCount).toBe(1);
+  });
+
+  test("queueFallbackMessage omits a single oversized message without storing its payload", () => {
+    const adapter = createAdapter(undefined, { maxBufferedMessages: 10, maxBufferedBytes: 8 });
+
+    adapter.queueFallbackMessage(makeBridgeMessage("small"));
+    adapter.queueFallbackMessage(makeBridgeMessage("x".repeat(9)));
+
+    expect(adapter.pendingMessages.map((m: any) => m.content)).toEqual(["small"]);
+    expect(adapter.pendingMessageBytes).toBe(5);
+    expect(adapter.oversizedMessageCount).toBe(1);
+    expect(adapter.oversizedMessageBytes).toBe(9);
   });
 
   test("push message ids include a session-unique prefix", async () => {
@@ -143,17 +181,25 @@ describe("Message delivery: fallback queue", () => {
 
   test("pushNotification falls back to the queue when push delivery throws", async () => {
     const adapter = createAdapter();
-
-    adapter.server = {
-      notification: async () => {
-        throw new Error("channel unavailable");
-      },
-    };
+    withMockedChannel(adapter, "fail");
 
     await adapter.pushNotification(makeBridgeMessage("fallback msg"));
 
     expect(adapter.pendingMessages).toHaveLength(1);
     expect(adapter.pendingMessages[0].content).toBe("fallback msg");
+  });
+
+  test("push recovery does not auto-replay fallback backlog or duplicate messages", async () => {
+    const adapter = createAdapter();
+    withMockedChannel(adapter, "fail");
+    await adapter.pushNotification(makeBridgeMessage("queued while push failed"));
+
+    const notifications = withMockedChannel(adapter, "success");
+    await adapter.pushNotification(makeBridgeMessage("live after recovery"));
+
+    expect(notifications).toHaveLength(1);
+    expect(notifications[0].params.content).toBe("live after recovery");
+    expect(adapter.pendingMessages.map((m: any) => m.content)).toEqual(["queued while push failed"]);
   });
 });
 
@@ -188,10 +234,7 @@ describe("Message delivery: drainMessages (get_messages)", () => {
   });
 
   test("includes dropped count when messages were lost", () => {
-    const orig = process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES;
-    process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES = "2";
-    const adapter = createAdapter();
-    process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES = orig;
+    const adapter = createAdapter(undefined, { maxBufferedMessages: 2 });
 
     adapter.queueFallbackMessage(makeBridgeMessage("a"));
     adapter.queueFallbackMessage(makeBridgeMessage("b"));
@@ -200,8 +243,56 @@ describe("Message delivery: drainMessages (get_messages)", () => {
     const result = adapter.drainMessages();
     const text = result.content[0].text;
     expect(text).toContain("1 older message");
-    expect(text).toContain("dropped due to queue overflow");
+    expect(text).toContain("dropped due to fallback queue overflow");
     expect(adapter.droppedMessageCount).toBe(0); // reset after drain
+  });
+
+  test("includes byte overflow and oversized notices without enqueuing sentinel messages", () => {
+    const adapter = createAdapter(undefined, { maxBufferedMessages: 10, maxBufferedBytes: 10 });
+
+    adapter.queueFallbackMessage(makeBridgeMessage("12345"));
+    adapter.queueFallbackMessage(makeBridgeMessage("abcdef"));
+    adapter.queueFallbackMessage(makeBridgeMessage("x".repeat(11)));
+
+    const result = adapter.drainMessages();
+    const text = result.content[0].text;
+
+    expect(text).toContain("[1 new message from Codex]");
+    expect(text).toContain("1 older message");
+    expect(text).toContain("dropped due to fallback queue overflow");
+    expect(text).toContain("1 oversized message from Codex omitted (>10B)");
+    expect(text).not.toContain("12345");
+    expect(text).not.toContain("xxxxxxxxxxx");
+    expect(adapter.pendingMessages).toHaveLength(0);
+    expect(adapter.pendingMessageBytes).toBe(0);
+    expect(adapter.droppedMessageCount).toBe(0);
+    expect(adapter.oversizedMessageCount).toBe(0);
+  });
+
+  test("omits empty count header when drain only has oversized notices", () => {
+    const adapter = createAdapter(undefined, { maxBufferedMessages: 10, maxBufferedBytes: 8 });
+
+    adapter.queueFallbackMessage(makeBridgeMessage("x".repeat(9)));
+
+    const result = adapter.drainMessages();
+    const text = result.content[0].text;
+
+    expect(text).not.toContain("0 new");
+    expect(text).not.toContain("[0 new message from Codex]");
+    expect(text).toContain("1 oversized message from Codex omitted (>8B)");
+  });
+
+  test("drainMessages reports no messages after clearing since-drain drop counters", () => {
+    const adapter = createAdapter(undefined, { maxBufferedMessages: 1 });
+
+    adapter.queueFallbackMessage(makeBridgeMessage("first"));
+    adapter.queueFallbackMessage(makeBridgeMessage("second"));
+
+    const firstDrain = adapter.drainMessages();
+    expect(firstDrain.content[0].text).toContain("dropped due to fallback queue overflow");
+
+    const secondDrain = adapter.drainMessages();
+    expect(secondDrain.content[0].text).toBe("No new messages from Codex.");
   });
 
   test("singular message uses correct grammar", () => {
@@ -237,6 +328,17 @@ describe("Message delivery: reply pending hint", () => {
 
     const result = await adapter.handleReply({ chat_id: "test", text: "hello codex" });
     expect(result.content[0].text).toBe("Reply sent to Codex.");
+  });
+
+  test("handleReply failures do not enqueue fallback messages", async () => {
+    const adapter = createAdapter();
+    adapter.replySender = async () => ({ success: false, error: "busy", code: "busy_reject" });
+
+    const result = await adapter.handleReply({ text: "hello codex" });
+
+    expect(result.isError).toBe(true);
+    expect(adapter.pendingMessages).toHaveLength(0);
+    expect(adapter.getPendingMessageCount()).toBe(0);
   });
 
   test("handleReply returns error when text is missing", async () => {

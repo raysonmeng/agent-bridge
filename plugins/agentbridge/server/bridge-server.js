@@ -13940,6 +13940,8 @@ function renderBudgetSnapshot(snapshot) {
 var BUDGET_UNAVAILABLE_TEXT = "\u9884\u7B97\u611F\u77E5\u4E0D\u53EF\u7528\uFF1A\u672A\u68C0\u6D4B\u5230 agent-quota-guard \u63A2\u9488\uFF08~/.budget-guard/bin/budget-probe\uFF09\u6216 budget \u529F\u80FD\u5DF2\u7981\u7528\u3002\u534F\u4F5C\u4E0D\u53D7\u5F71\u54CD\u3002";
 
 // src/claude-adapter.ts
+var DEFAULT_MAX_BUFFERED_MESSAGES = 100;
+var DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 var CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
   "",
@@ -13988,10 +13990,16 @@ class ClaudeAdapter extends EventEmitter {
   logFile;
   logger;
   pendingMessages = [];
+  pendingMessageByteSizes = [];
+  pendingMessageBytes = 0;
   maxBufferedMessages;
+  maxBufferedBytes;
   droppedMessageCount = 0;
+  oversizedMessageCount = 0;
+  oversizedMessageBytes = 0;
+  oversizedMessageSourceCounts = {};
   budgetSnapshot = null;
-  constructor(logFile = new StateDirResolver().logFile) {
+  constructor(logFile = new StateDirResolver().logFile, options = {}) {
     super();
     this.logFile = logFile;
     this.logger = createProcessLogger({ component: "ClaudeAdapter", logFile: this.logFile });
@@ -14002,7 +14010,8 @@ class ClaudeAdapter extends EventEmitter {
     if (process.env.AGENTBRIDGE_MODE) {
       this.log(`AGENTBRIDGE_MODE="${process.env.AGENTBRIDGE_MODE}" is no longer supported \u2014 ` + "pull mode was removed; push delivery (with per-message fallback queue) is always used.");
     }
-    this.maxBufferedMessages = parseInt(process.env.AGENTBRIDGE_MAX_BUFFERED_MESSAGES ?? "100", 10);
+    this.maxBufferedMessages = positiveIntegerOr(options.maxBufferedMessages, parsePositiveIntegerEnv("AGENTBRIDGE_MAX_BUFFERED_MESSAGES", DEFAULT_MAX_BUFFERED_MESSAGES));
+    this.maxBufferedBytes = positiveIntegerOr(options.maxBufferedBytes, parsePositiveIntegerEnv("AGENTBRIDGE_MAX_BUFFERED_BYTES", DEFAULT_MAX_BUFFERED_BYTES));
     this.server = new Server({ name: "agentbridge", version: "0.1.0" }, {
       capabilities: {
         experimental: { "claude/channel": {} },
@@ -14056,32 +14065,61 @@ class ClaudeAdapter extends EventEmitter {
     }
   }
   queueFallbackMessage(message) {
-    if (this.pendingMessages.length >= this.maxBufferedMessages) {
-      this.pendingMessages.shift();
+    const messageBytes = utf8ByteLength(message.content);
+    if (messageBytes > this.maxBufferedBytes) {
+      this.oversizedMessageCount++;
+      this.oversizedMessageBytes += messageBytes;
+      this.oversizedMessageSourceCounts[message.source] = (this.oversizedMessageSourceCounts[message.source] ?? 0) + 1;
+      this.log(`Fallback queue omitted oversized ${message.source} message ` + `(${formatBytes(messageBytes)} > ${formatBytes(this.maxBufferedBytes)}; ` + `total oversized: ${this.oversizedMessageCount})`);
+      return;
+    }
+    let dropped = 0;
+    while (this.pendingMessages.length >= this.maxBufferedMessages || this.pendingMessageBytes + messageBytes > this.maxBufferedBytes) {
+      const droppedMessage = this.pendingMessages.shift();
+      const droppedBytes = this.pendingMessageByteSizes.shift() ?? 0;
+      if (!droppedMessage)
+        break;
+      this.pendingMessageBytes = Math.max(0, this.pendingMessageBytes - droppedBytes);
       this.droppedMessageCount++;
-      this.log(`Fallback queue full, dropped oldest message (total dropped: ${this.droppedMessageCount})`);
+      dropped++;
+    }
+    if (dropped > 0) {
+      this.log(`Fallback queue overflow: dropped ${dropped} oldest message${dropped > 1 ? "s" : ""} ` + `(${this.pendingMessages.length} pending, ${formatBytes(this.pendingMessageBytes)} buffered, ` + `${this.droppedMessageCount} dropped since last drain)`);
     }
     this.pendingMessages.push(message);
-    this.log(`Queued fallback message (${this.pendingMessages.length} pending, instance=${this.instanceId})`);
+    this.pendingMessageByteSizes.push(messageBytes);
+    this.pendingMessageBytes += messageBytes;
+    this.log(`Queued fallback message (${this.pendingMessages.length} pending, ` + `${formatBytes(this.pendingMessageBytes)} buffered, instance=${this.instanceId})`);
   }
   drainMessages() {
-    this.log(`get_messages called (instance=${this.instanceId}, pending=${this.pendingMessages.length}, dropped=${this.droppedMessageCount})`);
-    if (this.pendingMessages.length === 0 && this.droppedMessageCount === 0) {
+    this.log(`get_messages called (instance=${this.instanceId}, pending=${this.pendingMessages.length}, ` + `bytes=${this.pendingMessageBytes}, dropped=${this.droppedMessageCount}, oversized=${this.oversizedMessageCount})`);
+    if (this.pendingMessages.length === 0 && this.droppedMessageCount === 0 && this.oversizedMessageCount === 0) {
       return {
         content: [{ type: "text", text: "No new messages from Codex." }]
       };
     }
     const messages = this.pendingMessages;
     this.pendingMessages = [];
+    this.pendingMessageByteSizes = [];
+    this.pendingMessageBytes = 0;
     const dropped = this.droppedMessageCount;
     this.droppedMessageCount = 0;
+    const oversizedSourceCounts = this.oversizedMessageSourceCounts;
+    const oversized = this.oversizedMessageCount;
+    const oversizedBytes = this.oversizedMessageBytes;
+    this.oversizedMessageSourceCounts = {};
+    this.oversizedMessageCount = 0;
+    this.oversizedMessageBytes = 0;
     const count = messages.length;
-    let header = `[${count} new message${count > 1 ? "s" : ""} from Codex]`;
+    const notices = [];
     if (dropped > 0) {
-      header += ` (${dropped} older message${dropped > 1 ? "s" : ""} were dropped due to queue overflow)`;
+      notices.push(`${dropped} older message${dropped > 1 ? "s" : ""} ` + `${dropped > 1 ? "were" : "was"} dropped due to fallback queue overflow`);
     }
-    header += `
-chat_id: ${this.sessionId}`;
+    if (oversized > 0) {
+      for (const [source, sourceCount] of Object.entries(oversizedSourceCounts)) {
+        notices.push(`${sourceCount} oversized message${sourceCount === 1 ? "" : "s"} ` + `from ${formatSource(source)} omitted ` + `(>${formatBytes(this.maxBufferedBytes)})`);
+      }
+    }
     const formatted = messages.map((msg, i) => {
       const ts = new Date(msg.timestamp).toISOString();
       return `---
@@ -14090,14 +14128,25 @@ Codex: ${msg.content}`;
     }).join(`
 
 `);
-    this.log(`get_messages returning ${count} message(s) (instance=${this.instanceId}, dropped=${dropped})`);
+    const noticeText = notices.map((notice) => `WARNING: ${notice}`).join(`
+`);
+    const parts = [];
+    if (count > 0) {
+      parts.push(`[${count} new message${count > 1 ? "s" : ""} from Codex]
+chat_id: ${this.sessionId}`);
+    }
+    if (noticeText)
+      parts.push(noticeText);
+    if (formatted)
+      parts.push(formatted);
+    this.log(`get_messages returning ${count} message(s) ` + `(instance=${this.instanceId}, dropped=${dropped}, oversized=${oversized}, oversizedBytes=${oversizedBytes})`);
     return {
       content: [
         {
           type: "text",
-          text: `${header}
+          text: parts.join(`
 
-${formatted}`
+`)
         }
       ]
     };
@@ -14253,6 +14302,27 @@ ${formatted}`
     this.logger.log(msg);
   }
 }
+function parsePositiveIntegerEnv(name, fallback) {
+  return positiveIntegerOr(parseInt(process.env[name] ?? "", 10), fallback);
+}
+function positiveIntegerOr(value, fallback) {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+function utf8ByteLength(value) {
+  return Buffer.byteLength(value, "utf8");
+}
+function formatSource(source) {
+  return source === "codex" ? "Codex" : "Claude";
+}
+function formatBytes(bytes) {
+  if (bytes < 1024)
+    return `${bytes}B`;
+  if (bytes % (1024 * 1024) === 0)
+    return `${bytes / (1024 * 1024)}MiB`;
+  if (bytes % 1024 === 0)
+    return `${bytes / 1024}KiB`;
+  return `${bytes}B`;
+}
 
 // src/contract-version.ts
 var CONTRACT_VERSION = 1;
@@ -14271,7 +14341,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("56a5f87", "source"),
+  commit: defineString("ccd2875", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
