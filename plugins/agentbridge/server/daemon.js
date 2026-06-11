@@ -21,7 +21,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("2f27278", "source"),
+  commit: defineString("2981e06", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -3338,6 +3338,27 @@ class ConfigService {
   }
 }
 
+// src/budget/budget-gate.ts
+function matchingGateReset(usage) {
+  if (!usage)
+    return 0;
+  const windows = [usage.fiveHour, usage.weekly].filter((window) => !!window && window.resetEpoch > 0);
+  const matching = windows.filter((window) => Math.abs(window.util - usage.gateUtil) < 0.0001);
+  const candidates = matching.length > 0 ? matching : windows;
+  if (candidates.length === 0)
+    return 0;
+  return Math.min(...candidates.map((window) => window.resetEpoch));
+}
+function resumeBlockingEpoch(usage, cfg, now) {
+  if (!usage)
+    return 0;
+  if (usage.rateLimitedUntil > now)
+    return usage.rateLimitedUntil;
+  if (usage.gateUtil >= cfg.resumeBelow)
+    return matchingGateReset(usage);
+  return 0;
+}
+
 // src/budget/types.ts
 var STALE_MAX_AGE_SEC = 600;
 
@@ -3361,25 +3382,6 @@ function usageSummary(name, usage) {
   if (!usage)
     return `${AGENT_LABEL[name]} \u672A\u77E5`;
   return `${AGENT_LABEL[name]} gate=${pct(usage.gateUtil)} warn=${pct(usage.warnUtil)} 5h\u91CD\u7F6E=${formatEpoch(usage.fiveHour?.resetEpoch ?? 0)}`;
-}
-function matchingGateReset(usage) {
-  if (!usage)
-    return 0;
-  const windows = [usage.fiveHour, usage.weekly].filter((window) => !!window && window.resetEpoch > 0);
-  const matching = windows.filter((window) => Math.abs(window.util - usage.gateUtil) < 0.0001);
-  const candidates = matching.length > 0 ? matching : windows;
-  if (candidates.length === 0)
-    return 0;
-  return Math.min(...candidates.map((window) => window.resetEpoch));
-}
-function resumeBlockingEpoch(usage, cfg, now) {
-  if (!usage)
-    return 0;
-  if (usage.rateLimitedUntil > now)
-    return usage.rateLimitedUntil;
-  if (usage.gateUtil >= cfg.resumeBelow)
-    return matchingGateReset(usage);
-  return 0;
 }
 function resumeAfterEpoch(claude, codex, cfg, now) {
   const epochs = [
@@ -3563,8 +3565,162 @@ function computeBudgetState(claude, codex, cfg, now) {
   };
 }
 
-// src/budget/budget-coordinator.ts
+// src/budget/budget-fingerprint.ts
 var RESET_FINGERPRINT_BUCKET_SEC = 600;
+var AGENT_LABEL2 = {
+  claude: "Claude",
+  codex: "Codex"
+};
+function pct2(value) {
+  return `${Math.round(value * 10) / 10}%`;
+}
+function formatEpoch2(epoch) {
+  return new Date(epoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
+}
+var INITIAL_FINGERPRINT_STATE = {
+  side: null,
+  fingerprint: null,
+  resumeEpoch: null,
+  reason: null
+};
+function sideToAgents(side) {
+  if (side === "both")
+    return ["claude", "codex"];
+  if (side === "claude")
+    return ["claude"];
+  if (side === "codex")
+    return ["codex"];
+  return [];
+}
+function agentsToSide(agents) {
+  const claude = agents.has("claude");
+  const codex = agents.has("codex");
+  if (claude && codex)
+    return "both";
+  if (claude)
+    return "claude";
+  if (codex)
+    return "codex";
+  return null;
+}
+function shouldEnter(usage, cfg, now) {
+  if (!isDecisionGrade(usage, now))
+    return false;
+  return usage.gateUtil >= cfg.pauseAt;
+}
+function canAgentResume(usage, cfg, now) {
+  if (!isDecisionGrade(usage, now))
+    return false;
+  if (usage.rateLimitedUntil > now)
+    return false;
+  return usage.gateUtil < cfg.resumeBelow;
+}
+function nextActiveSide(prevSide, state, cfg) {
+  const active = new Set(sideToAgents(prevSide));
+  for (const agent of ["claude", "codex"]) {
+    const usage = state.perAgent[agent];
+    if (shouldEnter(usage, cfg, state.now)) {
+      active.add(agent);
+    } else if (active.has(agent) && canAgentResume(usage, cfg, state.now)) {
+      active.delete(agent);
+    }
+  }
+  return agentsToSide(active);
+}
+function activeSideReason(agent, usage, cfg, now) {
+  if (!usage)
+    return `${AGENT_LABEL2[agent]} \u63A2\u6D4B\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u4FDD\u6301\u4E0A\u4E00\u8F6E\u9884\u7B97\u5E72\u9884`;
+  if (usage.rateLimitedUntil > now) {
+    return `${AGENT_LABEL2[agent]} \u63A2\u9488\u88AB\u9650\u6D41\u81F3 ${formatEpoch2(usage.rateLimitedUntil)}`;
+  }
+  if (usage.gateUtil >= cfg.pauseAt) {
+    return `${AGENT_LABEL2[agent]} gateUtil ${pct2(usage.gateUtil)} \u2265 pauseAt ${pct2(cfg.pauseAt)}`;
+  }
+  return `${AGENT_LABEL2[agent]} gateUtil ${pct2(usage.gateUtil)} \u5C1A\u672A\u4F4E\u4E8E resumeBelow ${pct2(cfg.resumeBelow)}`;
+}
+function interventionReason(side, state, cfg) {
+  return sideToAgents(side).map((agent) => activeSideReason(agent, state.perAgent[agent], cfg, state.now)).join("\uFF1B");
+}
+function resumeAfterEpoch2(side, state, cfg) {
+  const epochs = sideToAgents(side).map((agent) => resumeBlockingEpoch(state.perAgent[agent], cfg, state.now)).filter((epoch) => epoch > 0);
+  if (epochs.length === 0)
+    return null;
+  return Math.max(...epochs);
+}
+function activeSideProbeUncertain(side, state) {
+  return sideToAgents(side).some((agent) => {
+    const usage = state.perAgent[agent];
+    return usage === null || usage.rateLimitedUntil > state.now || !isDecisionGrade(usage, state.now);
+  });
+}
+function directiveFingerprint(state, activeSide) {
+  const side = activeSide ?? (state.phase === "balance" ? state.drift.lighter ?? "none" : state.pause.side ?? "none");
+  let reset = 0;
+  if (activeSide === "claude") {
+    reset = state.pause.resetEpochs.claude;
+  } else if (activeSide === "codex") {
+    reset = state.pause.resetEpochs.codex;
+  } else if (activeSide === "both") {
+    reset = Math.max(state.pause.resetEpochs.claude, state.pause.resetEpochs.codex);
+  } else if (state.phase === "balance" && state.drift.lighter) {
+    reset = state.perAgent[state.drift.lighter]?.fiveHour?.resetEpoch ?? 0;
+  }
+  return [
+    activeSide ? "paused" : state.phase,
+    state.drift.heavier ?? "none",
+    side,
+    Math.round(reset / RESET_FINGERPRINT_BUCKET_SEC)
+  ].join("|");
+}
+function classifyPoll(prev, state, cfg) {
+  const previousSide = prev.side;
+  const currentSide = nextActiveSide(previousSide, state, cfg);
+  if (currentSide) {
+    const reason = interventionReason(currentSide, state, cfg);
+    const nextResumeRaw = resumeAfterEpoch2(currentSide, state, cfg);
+    const resumeEpoch = previousSide === currentSide ? nextResumeRaw ?? prev.resumeEpoch : nextResumeRaw;
+    const uncertain = previousSide === currentSide && activeSideProbeUncertain(currentSide, state) && prev.fingerprint;
+    const fingerprint2 = uncertain ? prev.fingerprint : directiveFingerprint(state, currentSide);
+    const pauseChanged = !previousSide;
+    const emit = !previousSide || previousSide !== currentSide || fingerprint2 !== prev.fingerprint;
+    return {
+      next: { side: currentSide, fingerprint: fingerprint2, resumeEpoch, reason },
+      effect: {
+        kind: uncertain ? "hold-uncertain" : "enter",
+        side: currentSide,
+        reason,
+        resumeEpoch,
+        emit,
+        pauseChanged
+      }
+    };
+  }
+  if (previousSide) {
+    return {
+      next: { side: null, fingerprint: null, resumeEpoch: null, reason: null },
+      effect: { kind: "exit", previousSide }
+    };
+  }
+  if (!isDecisionGrade(state.perAgent.claude, state.now) || !isDecisionGrade(state.perAgent.codex, state.now)) {
+    return { next: prev, effect: { kind: "none" } };
+  }
+  if (!state.directiveToClaude) {
+    return {
+      next: { side: null, fingerprint: null, resumeEpoch: null, reason: null },
+      effect: { kind: "none" }
+    };
+  }
+  const fingerprint = directiveFingerprint(state);
+  if (fingerprint !== prev.fingerprint) {
+    return {
+      next: { side: null, fingerprint, resumeEpoch: null, reason: null },
+      effect: { kind: "advise", phase: state.phase }
+    };
+  }
+  return { next: prev, effect: { kind: "none" } };
+}
+
+// src/budget/budget-coordinator.ts
 var LOW_UTIL_PCT = 50;
 var NEAR_PAUSE_MARGIN_PCT = 10;
 var NEAR_WARN_UTIL_PCT = 75;
@@ -3582,27 +3738,17 @@ var REAL_BUDGET_POLL_SCHEDULER = {
     clearTimeout(timer);
   }
 };
-var AGENT_LABEL2 = {
+var AGENT_LABEL3 = {
   claude: "Claude",
   codex: "Codex"
 };
-function pct2(value) {
+function pct3(value) {
   return `${Math.round(value * 10) / 10}%`;
 }
 function usageLine(agent, usage) {
   if (!usage)
-    return `${AGENT_LABEL2[agent]} \u672A\u77E5`;
-  return `${AGENT_LABEL2[agent]} gate=${pct2(usage.gateUtil)} warn=${pct2(usage.warnUtil)}`;
-}
-function matchingGateReset2(usage) {
-  if (!usage)
-    return 0;
-  const windows = [usage.fiveHour, usage.weekly].filter((window) => !!window && window.resetEpoch > 0);
-  const matching = windows.filter((window) => Math.abs(window.util - usage.gateUtil) < 0.0001);
-  const candidates = matching.length > 0 ? matching : windows;
-  if (candidates.length === 0)
-    return 0;
-  return Math.min(...candidates.map((window) => window.resetEpoch));
+    return `${AGENT_LABEL3[agent]} \u672A\u77E5`;
+  return `${AGENT_LABEL3[agent]} gate=${pct3(usage.gateUtil)} warn=${pct3(usage.warnUtil)}`;
 }
 function maxPollDelayMs(config) {
   return Math.max(0, config.pollSeconds * 1000);
@@ -3665,11 +3811,8 @@ class BudgetCoordinator {
   log;
   timer = null;
   running = false;
-  activeSides = new Set;
-  lastDirectiveFingerprint = null;
+  fpState = INITIAL_FINGERPRINT_STATE;
   latestSnapshot = null;
-  pauseReason = null;
-  pauseResumeAfterEpoch = null;
   pendingOverrideTier = null;
   pendingOverrides = null;
   lastAppliedTier = "full";
@@ -3701,10 +3844,10 @@ class BudgetCoordinator {
     }
   }
   isPaused() {
-    return this.activeSides.size > 0;
+    return this.fpState.side !== null;
   }
   isGateClosed() {
-    return this.activeSides.has("codex");
+    return this.fpState.side === "codex" || this.fpState.side === "both";
   }
   getSnapshot() {
     return this.latestSnapshot;
@@ -3774,81 +3917,31 @@ class BudgetCoordinator {
     this.onSnapshot(snapshot);
   }
   applyState(state) {
-    const previousSide = this.pauseSide();
-    this.updateActiveSides(state);
-    const currentSide = this.pauseSide();
-    if (currentSide) {
-      this.pauseReason = this.interventionReason(state);
-      const nextResumeAfterEpoch = this.resumeAfterEpoch(state);
-      this.pauseResumeAfterEpoch = previousSide === currentSide ? nextResumeAfterEpoch ?? this.pauseResumeAfterEpoch : nextResumeAfterEpoch;
-      const fingerprint2 = previousSide === currentSide && this.activeSideProbeUncertain(state) && this.lastDirectiveFingerprint ? this.lastDirectiveFingerprint : this.directiveFingerprint(state, currentSide);
-      if (!previousSide) {
-        this.onPauseChange(true);
+    const { next, effect } = classifyPoll(this.fpState, state, this.config);
+    this.fpState = next;
+    switch (effect.kind) {
+      case "enter":
+      case "hold-uncertain": {
+        if (effect.pauseChanged)
+          this.onPauseChange(true);
+        if (effect.emit) {
+          this.emitDirective(this.interventionPrefix(effect.side), this.interventionDirective(state, effect.side, effect.reason, effect.resumeEpoch));
+        }
+        return;
       }
-      if (!previousSide || previousSide !== currentSide || fingerprint2 !== this.lastDirectiveFingerprint) {
-        this.emitDirective(this.interventionPrefix(currentSide), this.interventionDirective(state, currentSide));
+      case "exit": {
+        this.onPauseChange(false);
+        this.emitDirective(this.recoveryPrefix(effect.previousSide), this.recoveryDirective(state, effect.previousSide));
+        return;
       }
-      this.lastDirectiveFingerprint = fingerprint2;
-      return;
-    }
-    if (previousSide) {
-      this.pauseReason = null;
-      this.pauseResumeAfterEpoch = null;
-      this.lastDirectiveFingerprint = null;
-      this.onPauseChange(false);
-      this.emitDirective(this.recoveryPrefix(previousSide), this.recoveryDirective(state, previousSide));
-      return;
-    }
-    if (!isDecisionGrade(state.perAgent.claude, state.now) || !isDecisionGrade(state.perAgent.codex, state.now)) {
-      return;
-    }
-    if (!state.directiveToClaude) {
-      this.lastDirectiveFingerprint = null;
-      return;
-    }
-    const fingerprint = this.directiveFingerprint(state);
-    if (fingerprint !== this.lastDirectiveFingerprint) {
-      const prefix = state.phase === "balance" ? "system_budget_balance" : "system_budget_parallel";
-      this.emitDirective(prefix, state.directiveToClaude);
-      this.lastDirectiveFingerprint = fingerprint;
-    }
-  }
-  updateActiveSides(state) {
-    for (const agent of ["claude", "codex"]) {
-      const usage = state.perAgent[agent];
-      if (this.shouldEnter(usage, state.now)) {
-        this.activeSides.add(agent);
-      } else if (this.activeSides.has(agent) && this.canAgentResume(usage, state.now)) {
-        this.activeSides.delete(agent);
+      case "advise": {
+        const prefix = effect.phase === "balance" ? "system_budget_balance" : "system_budget_parallel";
+        this.emitDirective(prefix, state.directiveToClaude);
+        return;
       }
+      case "none":
+        return;
     }
-  }
-  shouldEnter(usage, now) {
-    if (!isDecisionGrade(usage, now))
-      return false;
-    return usage.gateUtil >= this.config.pauseAt;
-  }
-  canAgentResume(usage, now) {
-    if (!isDecisionGrade(usage, now))
-      return false;
-    if (usage.rateLimitedUntil > now)
-      return false;
-    return usage.gateUtil < this.config.resumeBelow;
-  }
-  resumeAfterEpoch(state) {
-    const epochs = ["claude", "codex"].filter((agent) => this.activeSides.has(agent)).map((agent) => this.resumeBlockingEpoch(state.perAgent[agent], state.now)).filter((epoch) => epoch > 0);
-    if (epochs.length === 0)
-      return null;
-    return Math.max(...epochs);
-  }
-  resumeBlockingEpoch(usage, now) {
-    if (!usage)
-      return 0;
-    if (usage.rateLimitedUntil > now)
-      return usage.rateLimitedUntil;
-    if (usage.gateUtil >= this.config.resumeBelow)
-      return matchingGateReset2(usage);
-    return 0;
   }
   tierControlEnabled() {
     if (!this.config.codexTierControl)
@@ -3883,44 +3976,8 @@ class BudgetCoordinator {
     this.pendingOverrideTier = tier;
     this.pendingOverrides = { ...overrides };
   }
-  directiveFingerprint(state, activeSide) {
-    const side = activeSide ?? (state.phase === "balance" ? state.drift.lighter ?? "none" : state.pause.side ?? "none");
-    let reset = 0;
-    if (activeSide === "claude") {
-      reset = state.pause.resetEpochs.claude;
-    } else if (activeSide === "codex") {
-      reset = state.pause.resetEpochs.codex;
-    } else if (activeSide === "both") {
-      reset = Math.max(state.pause.resetEpochs.claude, state.pause.resetEpochs.codex);
-    } else if (state.phase === "balance" && state.drift.lighter) {
-      reset = state.perAgent[state.drift.lighter]?.fiveHour?.resetEpoch ?? 0;
-    } else if (side === "claude") {
-      reset = state.pause.resetEpochs.claude;
-    } else if (side === "codex") {
-      reset = state.pause.resetEpochs.codex;
-    } else if (side === "both") {
-      reset = Math.max(state.pause.resetEpochs.claude, state.pause.resetEpochs.codex);
-    }
-    return [
-      activeSide ? "paused" : state.phase,
-      state.drift.heavier ?? "none",
-      side,
-      Math.round(reset / RESET_FINGERPRINT_BUCKET_SEC)
-    ].join("|");
-  }
   emitDirective(prefix, content) {
     this.emit(`${prefix}_${this.sequence++}`, content);
-  }
-  pauseSide() {
-    const claude = this.activeSides.has("claude");
-    const codex = this.activeSides.has("codex");
-    if (claude && codex)
-      return "both";
-    if (claude)
-      return "claude";
-    if (codex)
-      return "codex";
-    return null;
   }
   interventionPrefix(side) {
     return side === "claude" ? "system_budget_handoff" : "system_budget_pause";
@@ -3928,37 +3985,15 @@ class BudgetCoordinator {
   recoveryPrefix(previousSide) {
     return previousSide === "claude" ? "system_budget_claude_recovered" : "system_budget_resume";
   }
-  interventionDirective(state, side) {
-    return renderBudgetInterventionDirective(state.perAgent.claude, state.perAgent.codex, side, this.pauseReason ?? "\u9884\u7B97\u63A5\u8FD1\u8017\u5C3D", this.pauseResumeAfterEpoch, this.config);
-  }
-  interventionReason(state) {
-    return ["claude", "codex"].filter((agent) => this.activeSides.has(agent)).map((agent) => this.activeSideReason(agent, state.perAgent[agent], state.now)).join("\uFF1B");
-  }
-  activeSideProbeUncertain(state) {
-    return ["claude", "codex"].some((agent) => {
-      if (!this.activeSides.has(agent))
-        return false;
-      const usage = state.perAgent[agent];
-      return usage === null || usage.rateLimitedUntil > state.now || !isDecisionGrade(usage, state.now);
-    });
-  }
-  activeSideReason(agent, usage, now) {
-    if (!usage)
-      return `${AGENT_LABEL2[agent]} \u63A2\u6D4B\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u4FDD\u6301\u4E0A\u4E00\u8F6E\u9884\u7B97\u5E72\u9884`;
-    if (usage.rateLimitedUntil > now) {
-      return `${AGENT_LABEL2[agent]} \u63A2\u9488\u88AB\u9650\u6D41\u81F3 ${this.formatEpoch(usage.rateLimitedUntil)}`;
-    }
-    if (usage.gateUtil >= this.config.pauseAt) {
-      return `${AGENT_LABEL2[agent]} gateUtil ${pct2(usage.gateUtil)} \u2265 pauseAt ${pct2(this.config.pauseAt)}`;
-    }
-    return `${AGENT_LABEL2[agent]} gateUtil ${pct2(usage.gateUtil)} \u5C1A\u672A\u4F4E\u4E8E resumeBelow ${pct2(this.config.resumeBelow)}`;
+  interventionDirective(state, side, reason, resumeEpoch) {
+    return renderBudgetInterventionDirective(state.perAgent.claude, state.perAgent.codex, side, reason || "\u9884\u7B97\u63A5\u8FD1\u8017\u5C3D", resumeEpoch, this.config);
   }
   recoveryDirective(state, previousSide) {
     if (previousSide === "claude") {
       return [
         "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Claude \u4FA7\u9884\u7B97\u5DF2\u6062\u590D\u3002",
         `${usageLine("claude", state.perAgent.claude)}\uFF1B${usageLine("codex", state.perAgent.codex)}\u3002`,
-        `Claude gateUtil \u5DF2\u4F4E\u4E8E ${pct2(this.config.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
+        `Claude gateUtil \u5DF2\u4F4E\u4E8E ${pct3(this.config.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
         "Claude \u53EF\u6062\u590D orchestrator \u89D2\u8272\uFF1B\u540E\u7EED\u5206\u914D\u524D\u8BF7\u91CD\u65B0\u67E5\u8BE2\u5B9E\u65F6\u989D\u5EA6\uFF0C\u4E0D\u8981\u4F9D\u8D56\u65E7\u6570\u5B57\u3002"
       ].join(`
 `);
@@ -3967,7 +4002,7 @@ class BudgetCoordinator {
       return [
         "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Codex \u4FA7\u9884\u7B97\u95F8\u95E8\u89E3\u9664\u3002",
         `${usageLine("claude", state.perAgent.claude)}\uFF1B${usageLine("codex", state.perAgent.codex)}\u3002`,
-        `\u95F8\u95E8\u5DF2\u653E\u5F00\uFF1ACodex gateUtil \u4F4E\u4E8E ${pct2(this.config.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
+        `\u95F8\u95E8\u5DF2\u653E\u5F00\uFF1ACodex gateUtil \u4F4E\u4E8E ${pct3(this.config.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
         "\u5EFA\u8BAE Claude \u7528 reply \u5E26\u4E0A\u5F53\u524D\u76EE\u6807\u3001checkpoint \u548C\u4E0B\u4E00\u6B65\uFF0C\u5524\u9192 Codex \u63A5\u7EED\u6267\u884C\u3002"
       ].join(`
 `);
@@ -3975,13 +4010,10 @@ class BudgetCoordinator {
     return [
       "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011\u8054\u5408\u6682\u505C\u89E3\u9664\u3002",
       `${usageLine("claude", state.perAgent.claude)}\uFF1B${usageLine("codex", state.perAgent.codex)}\u3002`,
-      `\u95F8\u95E8\u5DF2\u653E\u5F00\uFF1A\u53CC\u65B9 gateUtil \u5747\u4F4E\u4E8E ${pct2(this.config.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
+      `\u95F8\u95E8\u5DF2\u653E\u5F00\uFF1A\u53CC\u65B9 gateUtil \u5747\u4F4E\u4E8E ${pct3(this.config.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
       "\u5EFA\u8BAE Claude \u7528 reply \u5E26\u4E0A\u5F53\u524D\u76EE\u6807\u3001checkpoint \u548C\u4E0B\u4E00\u6B65\uFF0C\u5524\u9192 Codex \u63A5\u7EED\u6267\u884C\u3002"
     ].join(`
 `);
-  }
-  formatEpoch(epoch) {
-    return new Date(epoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
   }
   toSnapshot(state) {
     const paused = this.isPaused();
@@ -3993,9 +4025,9 @@ class BudgetCoordinator {
       driftPct: state.drift.pct,
       paused,
       gateClosed: this.isGateClosed(),
-      pauseSide: this.pauseSide(),
-      pauseReason: paused ? this.pauseReason ?? state.pause.reason : null,
-      resumeAfterEpoch: paused ? this.pauseResumeAfterEpoch ?? state.pause.resumeAfterEpoch : null,
+      pauseSide: this.fpState.side,
+      pauseReason: paused ? this.fpState.reason ?? state.pause.reason : null,
+      resumeAfterEpoch: paused ? this.fpState.resumeEpoch ?? state.pause.resumeAfterEpoch : null,
       parallelRecommended: paused ? false : state.parallel.recommended,
       codexTier: state.effort.codexTier,
       claudeAdvice: state.effort.claudeAdvice
@@ -5165,8 +5197,8 @@ async function handleClaudeToCodex(ws, message) {
   if (budgetCoordinator?.isGateClosed()) {
     const reason = budgetPauseGateError();
     log(`Injection rejected by budget pause gate`);
-    const resumeAfterEpoch2 = budgetCoordinator?.getSnapshot()?.resumeAfterEpoch ?? null;
-    const retryAfterMs = resumeAfterEpoch2 !== null ? Math.max(0, resumeAfterEpoch2 * 1000 - Date.now()) : undefined;
+    const resumeAfterEpoch3 = budgetCoordinator?.getSnapshot()?.resumeAfterEpoch ?? null;
+    const retryAfterMs = resumeAfterEpoch3 !== null ? Math.max(0, resumeAfterEpoch3 * 1000 - Date.now()) : undefined;
     sendClaudeToCodexResult(ws, message.requestId, {
       success: false,
       code: "budget_paused",

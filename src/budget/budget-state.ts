@@ -1,3 +1,4 @@
+import { matchingGateReset, resumeBlockingEpoch } from "./budget-gate";
 import { STALE_MAX_AGE_SEC } from "./types";
 import type { AgentName, AgentUsage, BudgetConfig, BudgetState, CodexTier } from "./types";
 
@@ -29,25 +30,6 @@ function formatEpoch(epoch: number | null): string {
 function usageSummary(name: AgentName, usage: AgentUsage | null): string {
   if (!usage) return `${AGENT_LABEL[name]} 未知`;
   return `${AGENT_LABEL[name]} gate=${pct(usage.gateUtil)} warn=${pct(usage.warnUtil)} 5h重置=${formatEpoch(usage.fiveHour?.resetEpoch ?? 0)}`;
-}
-
-function matchingGateReset(usage: AgentUsage | null): number {
-  if (!usage) return 0;
-
-  const windows = [usage.fiveHour, usage.weekly].filter((window): window is NonNullable<typeof window> =>
-    !!window && window.resetEpoch > 0
-  );
-  const matching = windows.filter((window) => Math.abs(window.util - usage.gateUtil) < 0.0001);
-  const candidates = matching.length > 0 ? matching : windows;
-  if (candidates.length === 0) return 0;
-  return Math.min(...candidates.map((window) => window.resetEpoch));
-}
-
-function resumeBlockingEpoch(usage: AgentUsage | null, cfg: BudgetConfig, now: number): number {
-  if (!usage) return 0;
-  if (usage.rateLimitedUntil > now) return usage.rateLimitedUntil;
-  if (usage.gateUtil >= cfg.resumeBelow) return matchingGateReset(usage);
-  return 0;
 }
 
 function resumeAfterEpoch(

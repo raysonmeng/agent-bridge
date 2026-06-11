@@ -1,4 +1,9 @@
-import { computeBudgetState, isDecisionGrade, renderBudgetInterventionDirective } from "./budget-state";
+import { computeBudgetState, renderBudgetInterventionDirective } from "./budget-state";
+import {
+  classifyPoll,
+  INITIAL_FINGERPRINT_STATE,
+  type FingerprintState,
+} from "./budget-fingerprint";
 import type {
   AgentName,
   AgentUsage,
@@ -27,9 +32,6 @@ export interface BudgetPollDelayInput {
   paused: boolean;
 }
 
-// Directive-fingerprint quantum for reset epochs. Must absorb probe jitter
-// (seconds) while still distinguishing a genuine window reset (hours).
-const RESET_FINGERPRINT_BUCKET_SEC = 600;
 const LOW_UTIL_PCT = 50;
 const NEAR_PAUSE_MARGIN_PCT = 10;
 const NEAR_WARN_UTIL_PCT = 75;
@@ -72,18 +74,6 @@ function pct(value: number): string {
 function usageLine(agent: AgentName, usage: AgentUsage | null): string {
   if (!usage) return `${AGENT_LABEL[agent]} 未知`;
   return `${AGENT_LABEL[agent]} gate=${pct(usage.gateUtil)} warn=${pct(usage.warnUtil)}`;
-}
-
-function matchingGateReset(usage: AgentUsage | null): number {
-  if (!usage) return 0;
-
-  const windows = [usage.fiveHour, usage.weekly].filter((window): window is NonNullable<typeof window> =>
-    !!window && window.resetEpoch > 0
-  );
-  const matching = windows.filter((window) => Math.abs(window.util - usage.gateUtil) < 0.0001);
-  const candidates = matching.length > 0 ? matching : windows;
-  if (candidates.length === 0) return 0;
-  return Math.min(...candidates.map((window) => window.resetEpoch));
 }
 
 function maxPollDelayMs(config: Pick<BudgetConfig, "pollSeconds">): number {
@@ -158,11 +148,11 @@ export class BudgetCoordinator {
 
   private timer: BudgetPollTimer | null = null;
   private running = false;
-  private readonly activeSides = new Set<AgentName>();
-  private lastDirectiveFingerprint: string | null = null;
+  // Single source of truth for the directive state machine (side / fingerprint
+  // / resume bookkeeping). Replaces the former 4 mutable fields
+  // (activeSides, lastDirectiveFingerprint, pauseReason, pauseResumeAfterEpoch).
+  private fpState: FingerprintState = INITIAL_FINGERPRINT_STATE;
   private latestSnapshot: BudgetSnapshot | null = null;
-  private pauseReason: string | null = null;
-  private pauseResumeAfterEpoch: number | null = null;
   private pendingOverrideTier: CodexTier | null = null;
   private pendingOverrides: CodexTurnOverrides | null = null;
   private lastAppliedTier: CodexTier = "full";
@@ -196,11 +186,11 @@ export class BudgetCoordinator {
   }
 
   isPaused(): boolean {
-    return this.activeSides.size > 0;
+    return this.fpState.side !== null;
   }
 
   isGateClosed(): boolean {
-    return this.activeSides.has("codex");
+    return this.fpState.side === "codex" || this.fpState.side === "both";
   }
 
   getSnapshot(): BudgetSnapshot | null {
@@ -286,121 +276,43 @@ export class BudgetCoordinator {
     this.onSnapshot(snapshot);
   }
 
+  /**
+   * IO shell over the pure {@link classifyPoll} reducer. The reducer decides
+   * the next directive state and what to do; this method only carries out the
+   * effect (emit / onPauseChange) and commits the new state. All transition
+   * semantics — including the branch order that keeps a phantom blip from
+   * resetting the fingerprint — live in budget-fingerprint.ts.
+   */
   private applyState(state: BudgetState): void {
-    const previousSide = this.pauseSide();
-    this.updateActiveSides(state);
-    const currentSide = this.pauseSide();
+    const { next, effect } = classifyPoll(this.fpState, state, this.config);
+    this.fpState = next;
 
-    if (currentSide) {
-      this.pauseReason = this.interventionReason(state);
-      const nextResumeAfterEpoch = this.resumeAfterEpoch(state);
-      this.pauseResumeAfterEpoch = previousSide === currentSide
-        ? nextResumeAfterEpoch ?? this.pauseResumeAfterEpoch
-        : nextResumeAfterEpoch;
-      const fingerprint = previousSide === currentSide && this.activeSideProbeUncertain(state) && this.lastDirectiveFingerprint
-        ? this.lastDirectiveFingerprint
-        : this.directiveFingerprint(state, currentSide);
-      if (!previousSide) {
-        this.onPauseChange(true);
+    switch (effect.kind) {
+      case "enter":
+      case "hold-uncertain": {
+        if (effect.pauseChanged) this.onPauseChange(true);
+        if (effect.emit) {
+          this.emitDirective(
+            this.interventionPrefix(effect.side),
+            this.interventionDirective(state, effect.side, effect.reason, effect.resumeEpoch),
+          );
+        }
+        return;
       }
-      if (!previousSide || previousSide !== currentSide || fingerprint !== this.lastDirectiveFingerprint) {
-        this.emitDirective(
-          this.interventionPrefix(currentSide),
-          this.interventionDirective(state, currentSide),
-        );
+      case "exit": {
+        this.onPauseChange(false);
+        this.emitDirective(this.recoveryPrefix(effect.previousSide), this.recoveryDirective(state, effect.previousSide));
+        return;
       }
-      this.lastDirectiveFingerprint = fingerprint;
-      return;
-    }
-
-    if (previousSide) {
-      this.pauseReason = null;
-      this.pauseResumeAfterEpoch = null;
-      this.lastDirectiveFingerprint = null;
-      this.onPauseChange(false);
-      this.emitDirective(this.recoveryPrefix(previousSide), this.recoveryDirective(state, previousSide));
-      return;
-    }
-
-    // Drift/parallel advice compares the two sides — against a non-decision-
-    // grade record the comparison is a phantom. Observed live: a transient
-    // empty Claude probe record (gate=0%, no windows) inflated drift 54%→58%
-    // and emitted a directive on each side of the blip. Hold the previous
-    // directive state and KEEP the fingerprint — whether the phantom inflated
-    // drift (directive present) or deflated it away (directive null), the
-    // recovery to the same real state must re-emit nothing. This sits BEFORE
-    // the null-directive branch so a blip cannot reset the fingerprint.
-    // (Pause entry/exit above has its own decision-grade guards in
-    // shouldEnter/canAgentResume.)
-    if (
-      !isDecisionGrade(state.perAgent.claude, state.now) ||
-      !isDecisionGrade(state.perAgent.codex, state.now)
-    ) {
-      return;
-    }
-
-    if (!state.directiveToClaude) {
-      this.lastDirectiveFingerprint = null;
-      return;
-    }
-
-    const fingerprint = this.directiveFingerprint(state);
-    if (fingerprint !== this.lastDirectiveFingerprint) {
-      const prefix = state.phase === "balance" ? "system_budget_balance" : "system_budget_parallel";
-      this.emitDirective(prefix, state.directiveToClaude);
-      this.lastDirectiveFingerprint = fingerprint;
-    }
-  }
-
-  private updateActiveSides(state: BudgetState): void {
-    for (const agent of ["claude", "codex"] as const) {
-      const usage = state.perAgent[agent];
-      if (this.shouldEnter(usage, state.now)) {
-        this.activeSides.add(agent);
-      } else if (this.activeSides.has(agent) && this.canAgentResume(usage, state.now)) {
-        this.activeSides.delete(agent);
+      case "advise": {
+        const prefix = effect.phase === "balance" ? "system_budget_balance" : "system_budget_parallel";
+        // state.directiveToClaude is non-null whenever the reducer emits advise.
+        this.emitDirective(prefix, state.directiveToClaude!);
+        return;
       }
+      case "none":
+        return;
     }
-  }
-
-  // Only decision-grade records may CHANGE intervention state (enter or exit).
-  // Two real-machine failure shapes feed untrustworthy records into the
-  // decision loop:
-  //  - the probe serves a stale cache during an outage: hours-old utils with
-  //    resetEpochs already in the past would enter (and then freeze) a pause
-  //    whose "estimated resume" predates now;
-  //  - a windowless rate-limit-only record reads gateUtil=0, which must not
-  //    AUTHORIZE a resume the moment the throttle expires (the entry-side
-  //    information floor in quota-source has no resume-side counterpart).
-  // Untrustworthy data holds the current state — same semantics as a probe
-  // miss. The check itself is shared with the entry-side guard: see
-  // isDecisionGrade in budget-state.ts.
-
-  private shouldEnter(usage: AgentUsage | null, now: number): boolean {
-    if (!isDecisionGrade(usage, now)) return false;
-    return usage!.gateUtil >= this.config.pauseAt;
-  }
-
-  private canAgentResume(usage: AgentUsage | null, now: number): boolean {
-    if (!isDecisionGrade(usage, now)) return false;
-    if (usage!.rateLimitedUntil > now) return false;
-    return usage!.gateUtil < this.config.resumeBelow;
-  }
-
-  private resumeAfterEpoch(state: BudgetState): number | null {
-    const epochs = (["claude", "codex"] as const)
-      .filter((agent) => this.activeSides.has(agent))
-      .map((agent) => this.resumeBlockingEpoch(state.perAgent[agent], state.now))
-      .filter((epoch) => epoch > 0);
-    if (epochs.length === 0) return null;
-    return Math.max(...epochs);
-  }
-
-  private resumeBlockingEpoch(usage: AgentUsage | null, now: number): number {
-    if (!usage) return 0;
-    if (usage.rateLimitedUntil > now) return usage.rateLimitedUntil;
-    if (usage.gateUtil >= this.config.resumeBelow) return matchingGateReset(usage);
-    return 0;
   }
 
   private tierControlEnabled(): boolean {
@@ -439,55 +351,8 @@ export class BudgetCoordinator {
     this.pendingOverrides = { ...overrides };
   }
 
-  private directiveFingerprint(state: BudgetState, activeSide?: Exclude<PauseSide, null>): string {
-    const side = activeSide ?? (state.phase === "balance"
-      ? state.drift.lighter ?? "none"
-      : state.pause.side ?? "none");
-    let reset = 0;
-    if (activeSide === "claude") {
-      reset = state.pause.resetEpochs.claude;
-    } else if (activeSide === "codex") {
-      reset = state.pause.resetEpochs.codex;
-    } else if (activeSide === "both") {
-      reset = Math.max(state.pause.resetEpochs.claude, state.pause.resetEpochs.codex);
-    } else if (state.phase === "balance" && state.drift.lighter) {
-      reset = state.perAgent[state.drift.lighter]?.fiveHour?.resetEpoch ?? 0;
-    } else if (side === "claude") {
-      reset = state.pause.resetEpochs.claude;
-    } else if (side === "codex") {
-      reset = state.pause.resetEpochs.codex;
-    } else if (side === "both") {
-      reset = Math.max(state.pause.resetEpochs.claude, state.pause.resetEpochs.codex);
-    }
-
-    return [
-      activeSide ? "paused" : state.phase,
-      state.drift.heavier ?? "none",
-      side,
-      // Round-to-nearest bucket, not the raw epoch: the probe's reset_epoch
-      // jitters by ±1s between polls (observed live: 09:49:59 ⇄ 09:50:00),
-      // and a raw value re-emits the same directive every poll. Rounding —
-      // not floor — because real reset times sit ON round boundaries, so a
-      // floor bucket edge would keep flapping. A genuine window reset jumps
-      // hours and still lands in a different bucket.
-      // Domain assumption: jitter tolerance holds because reset epochs sit
-      // near bucket-aligned times. An ARBITRARY epoch at a half-bucket point
-      // (k*600+300) would still flap under ±1s — not a shape the probe emits.
-      Math.round(reset / RESET_FINGERPRINT_BUCKET_SEC),
-    ].join("|");
-  }
-
   private emitDirective(prefix: string, content: string): void {
     this.emit(`${prefix}_${this.sequence++}`, content);
-  }
-
-  private pauseSide(): PauseSide {
-    const claude = this.activeSides.has("claude");
-    const codex = this.activeSides.has("codex");
-    if (claude && codex) return "both";
-    if (claude) return "claude";
-    if (codex) return "codex";
-    return null;
   }
 
   private interventionPrefix(side: Exclude<PauseSide, null>): string {
@@ -498,46 +363,25 @@ export class BudgetCoordinator {
     return previousSide === "claude" ? "system_budget_claude_recovered" : "system_budget_resume";
   }
 
-  private interventionDirective(state: BudgetState, side: Exclude<PauseSide, null>): string {
+  private interventionDirective(
+    state: BudgetState,
+    side: Exclude<PauseSide, null>,
+    reason: string,
+    resumeEpoch: number | null,
+  ): string {
     return renderBudgetInterventionDirective(
       state.perAgent.claude,
       state.perAgent.codex,
       side,
-      this.pauseReason ?? "预算接近耗尽",
-      this.pauseResumeAfterEpoch,
+      // `reason` is always a non-empty string here: it comes from
+      // interventionReason(curSide) which joins ≥1 active agent, so the `||`
+      // fallback is defensive-only and never fires — observationally identical
+      // to the old `this.pauseReason ?? "..."` (whose null default was also
+      // never reached on this paused path).
+      reason || "预算接近耗尽",
+      resumeEpoch,
       this.config,
     );
-  }
-
-  private interventionReason(state: BudgetState): string {
-    return (["claude", "codex"] as const)
-      .filter((agent) => this.activeSides.has(agent))
-      .map((agent) => this.activeSideReason(agent, state.perAgent[agent], state.now))
-      .join("；");
-  }
-
-  private activeSideProbeUncertain(state: BudgetState): boolean {
-    return (["claude", "codex"] as const).some((agent) => {
-      if (!this.activeSides.has(agent)) return false;
-      const usage = state.perAgent[agent];
-      // Non-decision-grade covers every degraded shape (#103 lets stale /
-      // unknown-reset records through as display data): mid-pause they must
-      // hold the directive fingerprint, not recompute it against a phantom
-      // reset bucket — recomputing re-emitted the pause directive on each
-      // data-quality flap, the exact regression e7a66fc guarded against.
-      return usage === null || usage.rateLimitedUntil > state.now || !isDecisionGrade(usage, state.now);
-    });
-  }
-
-  private activeSideReason(agent: AgentName, usage: AgentUsage | null, now: number): string {
-    if (!usage) return `${AGENT_LABEL[agent]} 探测暂时不可用，保持上一轮预算干预`;
-    if (usage.rateLimitedUntil > now) {
-      return `${AGENT_LABEL[agent]} 探针被限流至 ${this.formatEpoch(usage.rateLimitedUntil)}`;
-    }
-    if (usage.gateUtil >= this.config.pauseAt) {
-      return `${AGENT_LABEL[agent]} gateUtil ${pct(usage.gateUtil)} ≥ pauseAt ${pct(this.config.pauseAt)}`;
-    }
-    return `${AGENT_LABEL[agent]} gateUtil ${pct(usage.gateUtil)} 尚未低于 resumeBelow ${pct(this.config.resumeBelow)}`;
   }
 
   private recoveryDirective(state: BudgetState, previousSide: Exclude<PauseSide, null>): string {
@@ -567,10 +411,6 @@ export class BudgetCoordinator {
     ].join("\n");
   }
 
-  private formatEpoch(epoch: number): string {
-    return new Date(epoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
-  }
-
   private toSnapshot(state: BudgetState): BudgetSnapshot {
     const paused = this.isPaused();
     return {
@@ -581,9 +421,9 @@ export class BudgetCoordinator {
       driftPct: state.drift.pct,
       paused,
       gateClosed: this.isGateClosed(),
-      pauseSide: this.pauseSide(),
-      pauseReason: paused ? this.pauseReason ?? state.pause.reason : null,
-      resumeAfterEpoch: paused ? this.pauseResumeAfterEpoch ?? state.pause.resumeAfterEpoch : null,
+      pauseSide: this.fpState.side,
+      pauseReason: paused ? this.fpState.reason ?? state.pause.reason : null,
+      resumeAfterEpoch: paused ? this.fpState.resumeEpoch ?? state.pause.resumeAfterEpoch : null,
       parallelRecommended: paused ? false : state.parallel.recommended,
       codexTier: state.effort.codexTier,
       claudeAdvice: state.effort.claudeAdvice,
