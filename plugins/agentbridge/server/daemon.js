@@ -3,6 +3,7 @@
 
 // src/daemon.ts
 import { rmSync as rmSync2 } from "fs";
+import { randomUUID as randomUUID4 } from "crypto";
 
 // src/contract-version.ts
 var CONTRACT_VERSION = 1;
@@ -21,7 +22,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("ee9d6ec", "source"),
+  commit: defineString("ab65a14", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -44,13 +45,139 @@ function formatBuildInfo(build) {
   return `${build.version}/${build.commit}/${build.bundle}/contract-v${build.contractVersion}`;
 }
 
+// src/daemon-record.ts
+import { readFileSync } from "fs";
+
+// src/atomic-json.ts
+import * as fs from "fs";
+import { randomUUID } from "crypto";
+import { dirname } from "path";
+function tmpPathFor(targetPath) {
+  return `${targetPath}.tmp.${process.pid}.${randomUUID()}`;
+}
+function atomicWriteText(path, content, options = {}) {
+  fs.mkdirSync(dirname(path), { recursive: true });
+  const tmp = tmpPathFor(path);
+  let renamed = false;
+  const fd = fs.openSync(tmp, "w", options.mode ?? 438);
+  try {
+    try {
+      fs.writeFileSync(fd, content, "utf-8");
+      if (options.fsync)
+        fs.fsyncSync(fd);
+    } finally {
+      fs.closeSync(fd);
+    }
+    fs.renameSync(tmp, path);
+    renamed = true;
+  } finally {
+    if (!renamed) {
+      try {
+        fs.unlinkSync(tmp);
+      } catch {}
+    }
+  }
+}
+function atomicWriteJson(path, value, options = {}) {
+  atomicWriteText(path, JSON.stringify(value, null, 2) + `
+`, options);
+}
+
+// src/daemon-record.ts
+var defaultRead = (path) => readFileSync(path, "utf-8");
+function writeDaemonRecord(path, record) {
+  atomicWriteJson(path, record);
+}
+function readDaemonRecord(path, read = defaultRead) {
+  let parsed;
+  try {
+    parsed = JSON.parse(read(path));
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null)
+    return null;
+  const obj = parsed;
+  if (typeof obj.pid !== "number" || !Number.isFinite(obj.pid))
+    return null;
+  const phase = obj.phase === "ready" ? "ready" : "booting";
+  return { ...obj, pid: obj.pid, phase };
+}
+function synthesizeLegacyRecord(pidFilePath, statusFilePath, read = defaultRead) {
+  let pidFromPidFile = null;
+  try {
+    const raw = read(pidFilePath).trim();
+    const n = Number.parseInt(raw, 10);
+    if (Number.isFinite(n))
+      pidFromPidFile = n;
+  } catch {}
+  let status = null;
+  try {
+    const parsed = JSON.parse(read(statusFilePath));
+    if (typeof parsed === "object" && parsed !== null)
+      status = parsed;
+  } catch {}
+  const pidFromStatus = status && typeof status.pid === "number" && Number.isFinite(status.pid) ? status.pid : null;
+  const pid = pidFromPidFile ?? pidFromStatus;
+  if (pid === null)
+    return null;
+  const record = {
+    pid,
+    phase: status ? "ready" : "booting"
+  };
+  if (status) {
+    if (typeof status.proxyUrl === "string")
+      record.proxyUrl = status.proxyUrl;
+    if (typeof status.appServerUrl === "string")
+      record.appServerUrl = status.appServerUrl;
+    const controlPort = typeof status.controlPort === "number" ? status.controlPort : undefined;
+    const proxyPort = portFromUrl(status.proxyUrl);
+    const appPort = portFromUrl(status.appServerUrl);
+    if (controlPort !== undefined || proxyPort !== undefined || appPort !== undefined) {
+      record.ports = {};
+      if (appPort !== undefined)
+        record.ports.appPort = appPort;
+      if (proxyPort !== undefined)
+        record.ports.proxyPort = proxyPort;
+      if (controlPort !== undefined)
+        record.ports.controlPort = controlPort;
+    }
+    if (status.pairId === null || typeof status.pairId === "string")
+      record.pairId = status.pairId;
+    if (status.cwd === null || typeof status.cwd === "string")
+      record.cwd = status.cwd;
+    if (status.stateDir === null || typeof status.stateDir === "string")
+      record.stateDir = status.stateDir;
+    if (typeof status.build === "object" && status.build !== null) {
+      record.build = status.build;
+    }
+    if (typeof status.turnPhase === "string")
+      record.turnPhase = status.turnPhase;
+    if (typeof status.turnInProgress === "boolean")
+      record.turnInProgress = status.turnInProgress;
+    if (typeof status.attentionWindowActive === "boolean") {
+      record.attentionWindowActive = status.attentionWindowActive;
+    }
+  }
+  return record;
+}
+function readUnifiedDaemonRecord(paths, read = defaultRead) {
+  return readDaemonRecord(paths.daemonRecordFile, read) ?? synthesizeLegacyRecord(paths.pidFile, paths.statusFile, read);
+}
+function portFromUrl(url) {
+  if (typeof url !== "string")
+    return;
+  const match = url.match(/:(\d+)(?:[/?]|$)/);
+  return match ? Number.parseInt(match[1], 10) : undefined;
+}
+
 // src/codex-adapter.ts
 import { spawn, execFileSync } from "child_process";
 import { createInterface } from "readline";
 import { EventEmitter } from "events";
 
 // src/state-dir.ts
-import { mkdirSync, existsSync } from "fs";
+import { mkdirSync as mkdirSync2, existsSync } from "fs";
 import { join } from "path";
 import { homedir, platform } from "os";
 
@@ -69,7 +196,7 @@ class StateDirResolver {
   }
   ensure() {
     if (!existsSync(this.stateDir)) {
-      mkdirSync(this.stateDir, { recursive: true });
+      mkdirSync2(this.stateDir, { recursive: true });
     }
   }
   get dir() {
@@ -86,6 +213,9 @@ class StateDirResolver {
   }
   get statusFile() {
     return join(this.stateDir, "status.json");
+  }
+  get daemonRecordFile() {
+    return join(this.stateDir, "daemon.json");
   }
   get currentThreadFile() {
     return join(this.stateDir, "current-thread.json");
@@ -205,15 +335,15 @@ async function cleanupPorts(options) {
 }
 
 // src/rotating-log.ts
-import { appendFileSync, existsSync as existsSync2, renameSync, statSync, unlinkSync } from "fs";
-import { dirname } from "path";
+import { appendFileSync, existsSync as existsSync2, renameSync as renameSync2, statSync, unlinkSync as unlinkSync2 } from "fs";
+import { dirname as dirname2 } from "path";
 var DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
 var DEFAULT_KEEP = 3;
-var REAL_FS_OPS = { statSync, renameSync, unlinkSync, appendFileSync, existsSync: existsSync2 };
+var REAL_FS_OPS = { statSync, renameSync: renameSync2, unlinkSync: unlinkSync2, appendFileSync, existsSync: existsSync2 };
 function appendRotatingLog(path, content, options = {}, fsOps = REAL_FS_OPS) {
   const maxBytes = options.maxBytes ?? positiveIntFromEnv("AGENTBRIDGE_LOG_MAX_BYTES", DEFAULT_MAX_BYTES);
   const keep = options.keep ?? positiveIntFromEnv("AGENTBRIDGE_LOG_ROTATE_KEEP", DEFAULT_KEEP);
-  if (!fsOps.existsSync(dirname(path)))
+  if (!fsOps.existsSync(dirname2(path)))
     return;
   rotateIfNeeded(path, Buffer.byteLength(content), maxBytes, keep, fsOps);
   fsOps.appendFileSync(path, content, "utf-8");
@@ -420,7 +550,7 @@ function clampInterruptTimeoutMs(requested) {
 // src/codex-transport.ts
 import { createServer, connect } from "net";
 import { spawnSync } from "child_process";
-import { mkdirSync as mkdirSync2, rmSync, chmodSync } from "fs";
+import { mkdirSync as mkdirSync3, rmSync, chmodSync } from "fs";
 import { join as join2 } from "path";
 import { tmpdir } from "os";
 var CODEX_TRANSPORT_ENV = "AGENTBRIDGE_CODEX_TRANSPORT";
@@ -481,7 +611,7 @@ function ensureSocketDir(socketPath) {
   const dir = socketPath.slice(0, socketPath.lastIndexOf("/"));
   if (!dir)
     return;
-  mkdirSync2(dir, { recursive: true, mode: 448 });
+  mkdirSync3(dir, { recursive: true, mode: 448 });
   try {
     chmodSync(dir, 448);
   } catch (err) {
@@ -2329,46 +2459,9 @@ var CLOSE_CODE_TOKEN_MISMATCH = 4005;
 var CLOSE_CODE_CONTRACT_MISMATCH = 4006;
 
 // src/control-token.ts
-import { chmodSync as chmodSync2, readFileSync } from "fs";
+import { chmodSync as chmodSync2, readFileSync as readFileSync2 } from "fs";
 import { join as join3 } from "path";
 import { randomUUID as randomUUID2 } from "crypto";
-
-// src/atomic-json.ts
-import * as fs from "fs";
-import { randomUUID } from "crypto";
-import { dirname as dirname2 } from "path";
-function tmpPathFor(targetPath) {
-  return `${targetPath}.tmp.${process.pid}.${randomUUID()}`;
-}
-function atomicWriteText(path, content, options = {}) {
-  fs.mkdirSync(dirname2(path), { recursive: true });
-  const tmp = tmpPathFor(path);
-  let renamed = false;
-  const fd = fs.openSync(tmp, "w", options.mode ?? 438);
-  try {
-    try {
-      fs.writeFileSync(fd, content, "utf-8");
-      if (options.fsync)
-        fs.fsyncSync(fd);
-    } finally {
-      fs.closeSync(fd);
-    }
-    fs.renameSync(tmp, path);
-    renamed = true;
-  } finally {
-    if (!renamed) {
-      try {
-        fs.unlinkSync(tmp);
-      } catch {}
-    }
-  }
-}
-function atomicWriteJson(path, value, options = {}) {
-  atomicWriteText(path, JSON.stringify(value, null, 2) + `
-`, options);
-}
-
-// src/control-token.ts
 var CONTROL_TOKEN_FILENAME = "control-token";
 function resolveControlTokenPath(stateDir) {
   return join3(stateDir, CONTROL_TOKEN_FILENAME);
@@ -2697,7 +2790,7 @@ class TuiConnectionState {
 
 // src/daemon-lifecycle.ts
 import { spawn as spawn2 } from "child_process";
-import { existsSync as existsSync3, readFileSync as readFileSync2, statSync as statSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2, openSync as openSync2, closeSync as closeSync2, constants } from "fs";
+import { existsSync as existsSync3, readFileSync as readFileSync3, statSync as statSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2, openSync as openSync2, closeSync as closeSync2, constants } from "fs";
 import { fileURLToPath } from "url";
 
 // src/process-lifecycle.ts
@@ -2963,9 +3056,24 @@ class DaemonLifecycle {
     }
     throw new Error(`Timed out waiting for AgentBridge daemon readiness+identity on ${this.readyUrl} (control port ${this.controlPort})`);
   }
+  readDaemonRecord() {
+    return readUnifiedDaemonRecord({
+      daemonRecordFile: this.stateDir.daemonRecordFile,
+      pidFile: this.stateDir.pidFile,
+      statusFile: this.stateDir.statusFile
+    });
+  }
+  writeDaemonRecord(record) {
+    writeDaemonRecord(this.stateDir.daemonRecordFile, record);
+  }
+  removeDaemonRecord() {
+    try {
+      unlinkSync3(this.stateDir.daemonRecordFile);
+    } catch {}
+  }
   readStatus() {
     try {
-      const raw = readFileSync2(this.stateDir.statusFile, "utf-8");
+      const raw = readFileSync3(this.stateDir.statusFile, "utf-8");
       return JSON.parse(raw);
     } catch {
       return null;
@@ -2976,7 +3084,7 @@ class DaemonLifecycle {
   }
   readPid() {
     try {
-      const raw = readFileSync2(this.stateDir.pidFile, "utf-8").trim();
+      const raw = readFileSync3(this.stateDir.pidFile, "utf-8").trim();
       if (!raw)
         return null;
       const pid = Number.parseInt(raw, 10);
@@ -3028,8 +3136,10 @@ class DaemonLifecycle {
     daemonProc.unref();
   }
   removeStalePidFile() {
-    this.log("Removing stale pid file");
+    this.log("Removing stale daemon identity files");
     this.removePidFile();
+    this.removeStatusFile();
+    this.removeDaemonRecord();
   }
   async replaceUnhealthyDaemon(statusPid) {
     await this.withStartupLockStrict(async (locked) => {
@@ -3089,7 +3199,7 @@ class DaemonLifecycle {
         if (reclaimed)
           return false;
         try {
-          const holderPid = Number.parseInt(readFileSync2(this.stateDir.lockFile, "utf-8").trim(), 10);
+          const holderPid = Number.parseInt(readFileSync3(this.stateDir.lockFile, "utf-8").trim(), 10);
           if (Number.isFinite(holderPid) && !isProcessAlive(holderPid)) {
             this.log(`Stale startup lock from dead process ${holderPid}, reclaiming`);
             this.releaseLock();
@@ -3164,6 +3274,7 @@ class DaemonLifecycle {
   cleanup() {
     this.removePidFile();
     this.removeStatusFile();
+    this.removeDaemonRecord();
   }
 }
 async function fetchWithTimeout(url, timeoutMs = HEALTH_FETCH_TIMEOUT_MS) {
@@ -3177,7 +3288,7 @@ async function fetchWithTimeout(url, timeoutMs = HEALTH_FETCH_TIMEOUT_MS) {
 }
 
 // src/config-service.ts
-import { readFileSync as readFileSync3, mkdirSync as mkdirSync4, existsSync as existsSync4 } from "fs";
+import { readFileSync as readFileSync4, mkdirSync as mkdirSync4, existsSync as existsSync4 } from "fs";
 import { join as join4 } from "path";
 var DEFAULT_BUDGET_CONFIG = {
   enabled: true,
@@ -3374,7 +3485,7 @@ class ConfigService {
   load() {
     let raw;
     try {
-      raw = readFileSync3(this.configPath, "utf-8");
+      raw = readFileSync4(this.configPath, "utf-8");
     } catch (err) {
       if (err?.code === "ENOENT") {
         return { state: "absent" };
@@ -4615,7 +4726,7 @@ class ReplyRequiredTracker {
 import {
   existsSync as existsSync6,
   readdirSync,
-  readFileSync as readFileSync4
+  readFileSync as readFileSync5
 } from "fs";
 import { homedir as homedir3 } from "os";
 import { basename as basename2, join as join6 } from "path";
@@ -4631,7 +4742,7 @@ function codexHome(env = process.env) {
 }
 function readRawCurrentThread(stateDir) {
   try {
-    const parsed = JSON.parse(readFileSync4(stateDir.currentThreadFile, "utf-8"));
+    const parsed = JSON.parse(readFileSync5(stateDir.currentThreadFile, "utf-8"));
     if (parsed?.version === 1 && typeof parsed.threadId === "string" && parsed.threadId.length > 0 && (parsed.status === "pending" || parsed.status === "current") && typeof parsed.cwd === "string") {
       return parsed;
     }
@@ -4850,6 +4961,8 @@ var CODEX_BOOT_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_CODEX_BOOT_RETRIES", 2
 var ALLOW_IDENTITYLESS_CLIENT = process.env.AGENTBRIDGE_COMPAT_IDENTITYLESS === "1";
 var BUDGET_CONFIG = applyBudgetEnvOverrides(config.budget);
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
+var DAEMON_NONCE = randomUUID4();
+var DAEMON_STARTED_AT = Date.now();
 var codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile);
 var attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
 var controlServer = null;
@@ -5730,9 +5843,33 @@ function systemMessage(idPrefix, content) {
 }
 function writePidFile() {
   daemonLifecycle.writePid();
+  daemonLifecycle.writeDaemonRecord(buildDaemonRecord("booting"));
 }
 function removePidFile() {
   daemonLifecycle.removePidFile();
+  daemonLifecycle.removeDaemonRecord();
+}
+function buildDaemonRecord(phase) {
+  return {
+    pid: process.pid,
+    phase,
+    startedAt: DAEMON_STARTED_AT,
+    nonce: DAEMON_NONCE,
+    pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
+    cwd: process.cwd(),
+    stateDir: stateDir.dir,
+    proxyUrl: codex.proxyUrl,
+    appServerUrl: codex.appServerUrl,
+    ports: {
+      appPort: portFromUrl(codex.appServerUrl) ?? CODEX_APP_PORT,
+      proxyPort: portFromUrl(codex.proxyUrl) ?? CODEX_PROXY_PORT,
+      controlPort: CONTROL_PORT
+    },
+    build: daemonStatusBuildInfo(),
+    turnInProgress: codex.turnInProgress,
+    turnPhase: codex.turnPhase,
+    attentionWindowActive: inAttentionWindow
+  };
 }
 function writeStatusFile() {
   daemonLifecycle.writeStatus({
@@ -5749,9 +5886,11 @@ function writeStatusFile() {
     attentionWindowActive: inAttentionWindow,
     appServerInfo: codex.capturedAppServerInfo
   });
+  daemonLifecycle.writeDaemonRecord(buildDaemonRecord("ready"));
 }
 function removeStatusFile() {
   daemonLifecycle.removeStatusFile();
+  daemonLifecycle.removeDaemonRecord();
 }
 function armBootDeadline() {
   if (bootDeadlineTimer)

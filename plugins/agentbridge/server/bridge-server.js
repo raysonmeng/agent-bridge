@@ -13840,6 +13840,9 @@ class StateDirResolver {
   get statusFile() {
     return join(this.stateDir, "status.json");
   }
+  get daemonRecordFile() {
+    return join(this.stateDir, "daemon.json");
+  }
   get currentThreadFile() {
     return join(this.stateDir, "current-thread.json");
   }
@@ -14379,7 +14382,7 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.12", "0.0.0-source"),
-  commit: defineString("ee9d6ec", "source"),
+  commit: defineString("ab65a14", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION)
 });
@@ -14710,7 +14713,7 @@ class DaemonClient extends EventEmitter2 {
 
 // src/daemon-lifecycle.ts
 import { spawn } from "child_process";
-import { existsSync as existsSync3, readFileSync, statSync as statSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2, openSync as openSync2, closeSync as closeSync2, constants } from "fs";
+import { existsSync as existsSync3, readFileSync as readFileSync2, statSync as statSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2, openSync as openSync2, closeSync as closeSync2, constants } from "fs";
 import { fileURLToPath } from "url";
 
 // src/atomic-json.ts
@@ -14794,6 +14797,95 @@ function isAgentBridgeProcess(pid, lookup = commandForPid) {
   if (cmd === null)
     return false;
   return cmd.includes("agentbridge") || cmd.includes("agent_bridge");
+}
+
+// src/daemon-record.ts
+import { readFileSync } from "fs";
+var defaultRead = (path) => readFileSync(path, "utf-8");
+function writeDaemonRecord(path, record3) {
+  atomicWriteJson(path, record3);
+}
+function readDaemonRecord(path, read = defaultRead) {
+  let parsed;
+  try {
+    parsed = JSON.parse(read(path));
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null)
+    return null;
+  const obj = parsed;
+  if (typeof obj.pid !== "number" || !Number.isFinite(obj.pid))
+    return null;
+  const phase = obj.phase === "ready" ? "ready" : "booting";
+  return { ...obj, pid: obj.pid, phase };
+}
+function synthesizeLegacyRecord(pidFilePath, statusFilePath, read = defaultRead) {
+  let pidFromPidFile = null;
+  try {
+    const raw = read(pidFilePath).trim();
+    const n = Number.parseInt(raw, 10);
+    if (Number.isFinite(n))
+      pidFromPidFile = n;
+  } catch {}
+  let status = null;
+  try {
+    const parsed = JSON.parse(read(statusFilePath));
+    if (typeof parsed === "object" && parsed !== null)
+      status = parsed;
+  } catch {}
+  const pidFromStatus = status && typeof status.pid === "number" && Number.isFinite(status.pid) ? status.pid : null;
+  const pid = pidFromPidFile ?? pidFromStatus;
+  if (pid === null)
+    return null;
+  const record3 = {
+    pid,
+    phase: status ? "ready" : "booting"
+  };
+  if (status) {
+    if (typeof status.proxyUrl === "string")
+      record3.proxyUrl = status.proxyUrl;
+    if (typeof status.appServerUrl === "string")
+      record3.appServerUrl = status.appServerUrl;
+    const controlPort = typeof status.controlPort === "number" ? status.controlPort : undefined;
+    const proxyPort = portFromUrl(status.proxyUrl);
+    const appPort = portFromUrl(status.appServerUrl);
+    if (controlPort !== undefined || proxyPort !== undefined || appPort !== undefined) {
+      record3.ports = {};
+      if (appPort !== undefined)
+        record3.ports.appPort = appPort;
+      if (proxyPort !== undefined)
+        record3.ports.proxyPort = proxyPort;
+      if (controlPort !== undefined)
+        record3.ports.controlPort = controlPort;
+    }
+    if (status.pairId === null || typeof status.pairId === "string")
+      record3.pairId = status.pairId;
+    if (status.cwd === null || typeof status.cwd === "string")
+      record3.cwd = status.cwd;
+    if (status.stateDir === null || typeof status.stateDir === "string")
+      record3.stateDir = status.stateDir;
+    if (typeof status.build === "object" && status.build !== null) {
+      record3.build = status.build;
+    }
+    if (typeof status.turnPhase === "string")
+      record3.turnPhase = status.turnPhase;
+    if (typeof status.turnInProgress === "boolean")
+      record3.turnInProgress = status.turnInProgress;
+    if (typeof status.attentionWindowActive === "boolean") {
+      record3.attentionWindowActive = status.attentionWindowActive;
+    }
+  }
+  return record3;
+}
+function readUnifiedDaemonRecord(paths, read = defaultRead) {
+  return readDaemonRecord(paths.daemonRecordFile, read) ?? synthesizeLegacyRecord(paths.pidFile, paths.statusFile, read);
+}
+function portFromUrl(url) {
+  if (typeof url !== "string")
+    return;
+  const match = url.match(/:(\d+)(?:[/?]|$)/);
+  return match ? Number.parseInt(match[1], 10) : undefined;
 }
 
 // src/daemon-lifecycle.ts
@@ -15024,9 +15116,24 @@ class DaemonLifecycle {
     }
     throw new Error(`Timed out waiting for AgentBridge daemon readiness+identity on ${this.readyUrl} (control port ${this.controlPort})`);
   }
+  readDaemonRecord() {
+    return readUnifiedDaemonRecord({
+      daemonRecordFile: this.stateDir.daemonRecordFile,
+      pidFile: this.stateDir.pidFile,
+      statusFile: this.stateDir.statusFile
+    });
+  }
+  writeDaemonRecord(record3) {
+    writeDaemonRecord(this.stateDir.daemonRecordFile, record3);
+  }
+  removeDaemonRecord() {
+    try {
+      unlinkSync3(this.stateDir.daemonRecordFile);
+    } catch {}
+  }
   readStatus() {
     try {
-      const raw = readFileSync(this.stateDir.statusFile, "utf-8");
+      const raw = readFileSync2(this.stateDir.statusFile, "utf-8");
       return JSON.parse(raw);
     } catch {
       return null;
@@ -15037,7 +15144,7 @@ class DaemonLifecycle {
   }
   readPid() {
     try {
-      const raw = readFileSync(this.stateDir.pidFile, "utf-8").trim();
+      const raw = readFileSync2(this.stateDir.pidFile, "utf-8").trim();
       if (!raw)
         return null;
       const pid = Number.parseInt(raw, 10);
@@ -15089,8 +15196,10 @@ class DaemonLifecycle {
     daemonProc.unref();
   }
   removeStalePidFile() {
-    this.log("Removing stale pid file");
+    this.log("Removing stale daemon identity files");
     this.removePidFile();
+    this.removeStatusFile();
+    this.removeDaemonRecord();
   }
   async replaceUnhealthyDaemon(statusPid) {
     await this.withStartupLockStrict(async (locked) => {
@@ -15150,7 +15259,7 @@ class DaemonLifecycle {
         if (reclaimed)
           return false;
         try {
-          const holderPid = Number.parseInt(readFileSync(this.stateDir.lockFile, "utf-8").trim(), 10);
+          const holderPid = Number.parseInt(readFileSync2(this.stateDir.lockFile, "utf-8").trim(), 10);
           if (Number.isFinite(holderPid) && !isProcessAlive(holderPid)) {
             this.log(`Stale startup lock from dead process ${holderPid}, reclaiming`);
             this.releaseLock();
@@ -15225,6 +15334,7 @@ class DaemonLifecycle {
   cleanup() {
     this.removePidFile();
     this.removeStatusFile();
+    this.removeDaemonRecord();
   }
 }
 async function fetchWithTimeout(url, timeoutMs = HEALTH_FETCH_TIMEOUT_MS) {
@@ -15238,7 +15348,7 @@ async function fetchWithTimeout(url, timeoutMs = HEALTH_FETCH_TIMEOUT_MS) {
 }
 
 // src/config-service.ts
-import { readFileSync as readFileSync2, mkdirSync as mkdirSync3, existsSync as existsSync4 } from "fs";
+import { readFileSync as readFileSync3, mkdirSync as mkdirSync3, existsSync as existsSync4 } from "fs";
 import { join as join2 } from "path";
 var DEFAULT_BUDGET_CONFIG = {
   enabled: true,
@@ -15419,7 +15529,7 @@ class ConfigService {
   load() {
     let raw;
     try {
-      raw = readFileSync2(this.configPath, "utf-8");
+      raw = readFileSync3(this.configPath, "utf-8");
     } catch (err) {
       if (err?.code === "ENOENT") {
         return { state: "absent" };
@@ -15515,7 +15625,7 @@ import {
   lstatSync,
   mkdirSync as mkdirSync4,
   readdirSync,
-  readFileSync as readFileSync3,
+  readFileSync as readFileSync4,
   realpathSync,
   rmSync,
   statSync as statSync3,
@@ -15563,7 +15673,7 @@ function readRegistry(base) {
     return { version: 1, pairs: [] };
   let parsed;
   try {
-    parsed = JSON.parse(readFileSync3(path, "utf-8"));
+    parsed = JSON.parse(readFileSync4(path, "utf-8"));
   } catch (err) {
     throw new PairError("PAIR_REGISTRY_CORRUPT", `Registry JSON is not parseable at ${path}: ${err.message}`, {
       path
@@ -15712,7 +15822,7 @@ function nonEmpty(value) {
 }
 
 // src/control-token.ts
-import { chmodSync, readFileSync as readFileSync4 } from "fs";
+import { chmodSync, readFileSync as readFileSync5 } from "fs";
 import { join as join4 } from "path";
 var CONTROL_TOKEN_FILENAME = "control-token";
 function resolveControlTokenPath(stateDir) {
@@ -15720,7 +15830,7 @@ function resolveControlTokenPath(stateDir) {
 }
 function readControlToken(path) {
   try {
-    const raw = readFileSync4(path, "utf-8").trim();
+    const raw = readFileSync5(path, "utf-8").trim();
     return raw.length > 0 ? raw : null;
   } catch {
     return null;

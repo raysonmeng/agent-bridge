@@ -6,6 +6,11 @@ import { BUILD_INFO, compatibleContractVersion, formatBuildInfo, sameRuntimeCont
 import { StateDirResolver } from "./state-dir";
 import { parsePositiveIntEnv } from "./env-utils";
 import { isAgentBridgeDaemon, isAgentBridgeProcess, isProcessAlive } from "./process-lifecycle";
+import {
+  readUnifiedDaemonRecord,
+  writeDaemonRecord,
+  type DaemonRecord,
+} from "./daemon-record";
 import type { DaemonStatus } from "./control-protocol";
 import type { AgentBridgeBuildInfo } from "./build-info";
 
@@ -389,7 +394,37 @@ export class DaemonLifecycle {
     );
   }
 
-  /** Read daemon status from status.json. */
+  /**
+   * Read the UNIFIED daemon identity (arch-review P2 #536): prefer `daemon.json`,
+   * fall back to the legacy `daemon.pid` + `status.json` pair. This is the
+   * single source consumers should use for proxyUrl / ports / pid / phase.
+   */
+  readDaemonRecord(): DaemonRecord | null {
+    return readUnifiedDaemonRecord({
+      daemonRecordFile: this.stateDir.daemonRecordFile,
+      pidFile: this.stateDir.pidFile,
+      statusFile: this.stateDir.statusFile,
+    });
+  }
+
+  /** Atomically write the unified daemon.json (tmp+rename). */
+  writeDaemonRecord(record: DaemonRecord): void {
+    writeDaemonRecord(this.stateDir.daemonRecordFile, record);
+  }
+
+  /** Remove the unified daemon.json. */
+  removeDaemonRecord(): void {
+    try {
+      unlinkSync(this.stateDir.daemonRecordFile);
+    } catch {}
+  }
+
+  /**
+   * Read daemon status from status.json (LEGACY pair). Kept for one version cycle
+   * so an older on-disk daemon (no daemon.json) is still readable. New callers
+   * should prefer {@link readDaemonRecord}, which reads daemon.json first and
+   * falls back to this file.
+   */
   readStatus(): { proxyUrl?: string; controlPort?: number; pid?: number } | null {
     try {
       const raw = readFileSync(this.stateDir.statusFile, "utf-8");
@@ -399,7 +434,7 @@ export class DaemonLifecycle {
     }
   }
 
-  /** Write daemon status to status.json. */
+  /** Write daemon status to status.json (LEGACY pair, kept in sync for compat). */
   writeStatus(status: Record<string, unknown>): void {
     atomicWriteJson(this.stateDir.statusFile, status);
   }
@@ -472,8 +507,15 @@ export class DaemonLifecycle {
   }
 
   private removeStalePidFile(): void {
-    this.log("Removing stale pid file");
+    this.log("Removing stale daemon identity files");
+    // Remove ALL three identity files so a recycled/stale pid does not leave a
+    // half-state behind (symmetric with cleanup()/kill()). Previously this
+    // removed only daemon.pid, leaving status.json (and now daemon.json) with
+    // the stale pid until the next launch overwrote them — a bounded leak we
+    // close here.
     this.removePidFile();
+    this.removeStatusFile();
+    this.removeDaemonRecord();
   }
 
   /**
@@ -689,6 +731,10 @@ export class DaemonLifecycle {
   private cleanup(): void {
     this.removePidFile();
     this.removeStatusFile();
+    // Unified daemon.json (arch-review P2 #536) must be removed in lockstep with
+    // the legacy pair — otherwise a killed daemon would leave a daemon.json with
+    // a (now-dead) pid that readDaemonRecord/pairDirDaemonAlive could still read.
+    this.removeDaemonRecord();
   }
 }
 

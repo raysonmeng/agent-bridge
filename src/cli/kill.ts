@@ -2,6 +2,7 @@ import { readFileSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { cliInvocationName } from "../cli-invocation";
 import { DaemonLifecycle } from "../daemon-lifecycle";
+import { portFromUrl, readUnifiedDaemonRecord } from "../daemon-record";
 import { PairError, detectLegacyRootDaemon, listPairDirs, type PairEntry, type PairPorts } from "../pair-registry";
 import {
   computeBaseDir,
@@ -207,26 +208,25 @@ function listPairDirsSafe(base: string): string[] {
 
 /**
  * Best-effort port recovery for an UNREGISTERED state dir (no slot to compute
- * from): read what the daemon advertised in its own status.json. Zeroes are
- * fine — kill() targets the pid file, not the ports.
+ * from): read what the daemon advertised in its unified daemon.json record
+ * (falling back to the legacy status.json). Zeroes are fine — kill() targets the
+ * pid, not the ports.
  */
 function portsFromStateDir(stateDir: StateDirResolver): PairPorts {
-  try {
-    const raw = JSON.parse(readFileSync(stateDir.statusFile, "utf-8"));
-    return {
-      appPort: portFromUrl(raw?.appServerUrl) ?? 0,
-      proxyPort: portFromUrl(raw?.proxyUrl) ?? 0,
-      controlPort: typeof raw?.controlPort === "number" ? raw.controlPort : 0,
-    };
-  } catch {
-    return { appPort: 0, proxyPort: 0, controlPort: 0 };
-  }
-}
-
-function portFromUrl(url: unknown): number | null {
-  if (typeof url !== "string") return null;
-  const match = url.match(/:(\d+)(?:[/?]|$)/);
-  return match ? Number.parseInt(match[1]!, 10) : null;
+  const record = readUnifiedDaemonRecord({
+    daemonRecordFile: stateDir.daemonRecordFile,
+    pidFile: stateDir.pidFile,
+    statusFile: stateDir.statusFile,
+  });
+  if (!record) return { appPort: 0, proxyPort: 0, controlPort: 0 };
+  return {
+    // Prefer the explicit ports triple; fall back to parsing the URLs so a
+    // synthesized legacy record (ports derived from proxyUrl/appServerUrl) and a
+    // native daemon.json agree.
+    appPort: record.ports?.appPort ?? portFromUrl(record.appServerUrl) ?? 0,
+    proxyPort: record.ports?.proxyPort ?? portFromUrl(record.proxyUrl) ?? 0,
+    controlPort: record.ports?.controlPort ?? 0,
+  };
 }
 
 async function stopStateDir(label: string, stateDir: StateDirResolver, ports: PairPorts): Promise<StopResult> {
@@ -245,16 +245,17 @@ async function stopStateDir(label: string, stateDir: StateDirResolver, ports: Pa
     });
 
     lifecycle.markKilled();
-    // Prefer the daemon's own status.json proxyUrl over the slot's computed port:
+    // Prefer the daemon's own advertised proxyUrl over the slot's computed port:
     // the legacy/manual kill path resolves ports heuristically (e.g. the legacy
     // root daemon is reported as 4501) and a custom CODEX_PROXY_PORT would not
     // match the slot default. The TUI connected to whatever proxyUrl the daemon
-    // advertised, so that is the URL the orphan scan must match. Read it BEFORE
-    // killing the daemon (kill() deletes status.json). Fall back to the slot port.
-    const status = lifecycle.readStatus();
+    // advertised, so that is the URL the orphan scan must match. Read it from the
+    // unified daemon.json record (falling back to legacy status.json) BEFORE
+    // killing the daemon (kill() deletes those files). Fall back to the slot port.
+    const record = lifecycle.readDaemonRecord();
     const proxyUrl =
-      typeof status?.proxyUrl === "string" && status.proxyUrl.length > 0
-        ? status.proxyUrl
+      typeof record?.proxyUrl === "string" && record.proxyUrl.length > 0
+        ? record.proxyUrl
         : `ws://127.0.0.1:${ports.proxyPort}`;
     const tuiKilled = await killManagedCodexTui(stateDir, proxyUrl, log);
     const daemonKilled = await lifecycle.kill();
