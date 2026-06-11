@@ -299,14 +299,55 @@ export class CodexAdapter extends EventEmitter {
     // in unix mode the relay (not Codex) binds appPort, but the port must still
     // be free for the relay to bind it; proxyPort is always ours.
     await this.checkPorts();
-    this.resolveTransport();
+    // Wrap the rest of bootstrap so a partial failure tears down whatever was
+    // already stood up (relay/socket/spawned child/proxy) BEFORE rethrowing.
+    // Otherwise — in unix mode especially — start() leaks the relay (a net.Server
+    // bound on appPort inside the daemon's OWN process) plus the live codex child
+    // when connectToAppServer rejects. bootCodex then retries start(), whose first
+    // step checkPorts() sees the daemon's own pid holding appPort with a
+    // `bun .../daemon.js` cmdline (NOT a `codex app-server` cmdline), classifies
+    // it as a foreign process and THROWS "already in use by non-Codex process".
+    // Every retry would then fail immediately at checkPorts, wasting the whole
+    // backoff. Making start() idempotent on the failure path lets retries proceed
+    // against a clean slate.
+    try {
+      this.resolveTransport();
 
-    const listen = codexListenArg(this.transport, this.appPort, this.socketPath ?? "");
-    if (this.transport === "unix" && this.socketPath) {
-      ensureSocketDir(this.socketPath);
-      removeSocketFile(this.socketPath); // clear any stale socket from a prior run
+      const listen = codexListenArg(this.transport, this.appPort, this.socketPath ?? "");
+      if (this.transport === "unix" && this.socketPath) {
+        ensureSocketDir(this.socketPath);
+        removeSocketFile(this.socketPath); // clear any stale socket from a prior run
+      }
+      this.log(`Spawning codex app-server (transport=${this.transport}) --listen ${listen}`);
+      this.spawnAppServer(listen);
+
+      if (this.transport === "unix" && this.socketPath) {
+        // Codex's unix listener does NOT serve HTTP /healthz — probe readiness via
+        // a WS upgrade against the socket, then stand up the TCP↔unix relay so the
+        // adapter's unchanged `new WebSocket(ws://127.0.0.1:appPort)` reaches it.
+        await waitForUnixWsReady(this.socketPath);
+        this.relay = new TcpToUnixRelay("127.0.0.1", this.appPort, this.socketPath, (m) => this.log(`[relay] ${m}`));
+        await this.relay.start();
+        this.log(`Transport relay ready: ws://127.0.0.1:${this.appPort} → unix://${this.socketPath}`);
+      } else {
+        await this.waitForHealthy();
+      }
+
+      // Connect to app-server once, keep it alive permanently
+      await this.connectToAppServer();
+
+      this.startProxy();
+      this.log(`Proxy ready on ${this.proxyUrl}`);
+    } catch (err) {
+      const m = err instanceof Error ? err.message : String(err);
+      this.log(`start() failed (${m}) — tearing down partial transport before rethrow`);
+      this.cleanupAfterFailedStart();
+      throw err; // bootCodex still sees the failure and retries — now clean.
     }
-    this.log(`Spawning codex app-server (transport=${this.transport}) --listen ${listen}`);
+  }
+
+  /** Spawn the `codex app-server` child and wire its lifecycle/log handlers. */
+  private spawnAppServer(listen: string) {
     this.proc = spawn("codex", ["app-server", "--listen", listen], {
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -326,24 +367,43 @@ export class CodexAdapter extends EventEmitter {
     stderrRl.on("line", (l) => this.log(`[codex-server] ${l}`));
     const stdoutRl = createInterface({ input: this.proc.stdout! });
     stdoutRl.on("line", (l) => this.log(`[codex-stdout] ${l}`));
+  }
 
-    if (this.transport === "unix" && this.socketPath) {
-      // Codex's unix listener does NOT serve HTTP /healthz — probe readiness via
-      // a WS upgrade against the socket, then stand up the TCP↔unix relay so the
-      // adapter's unchanged `new WebSocket(ws://127.0.0.1:appPort)` reaches it.
-      await waitForUnixWsReady(this.socketPath);
-      this.relay = new TcpToUnixRelay("127.0.0.1", this.appPort, this.socketPath, (m) => this.log(`[relay] ${m}`));
-      await this.relay.start();
-      this.log(`Transport relay ready: ws://127.0.0.1:${this.appPort} → unix://${this.socketPath}`);
-    } else {
-      await this.waitForHealthy();
+  /**
+   * Tear down the proxy + transport relay + unix socket file. Shared by the
+   * graceful disconnect() path and the start()-failure cleanup. Does NOT touch
+   * the spawned codex child (callers decide whether the child should die).
+   */
+  private teardownTransport() {
+    this.proxyServer?.stop();
+    this.proxyServer = null;
+    // #85: tear down the transport relay and remove the unix socket file.
+    if (this.relay) {
+      this.relay.stop();
+      this.relay = null;
     }
+    if (this.socketPath) removeSocketFile(this.socketPath);
+  }
 
-    // Connect to app-server once, keep it alive permanently
-    await this.connectToAppServer();
-
-    this.startProxy();
-    this.log(`Proxy ready on ${this.proxyUrl}`);
+  /**
+   * Idempotent teardown for a partially-constructed start(): tear down the
+   * transport (proxy/relay/socket) AND kill the spawned codex child. Unlike
+   * stop()'s graceful SIGTERM-then-SIGKILL dance, this synchronously SIGKILLs
+   * the child via the retained pid: the daemon is about to retry start(), so the
+   * port (and socket) must be free NOW — a lingering SIGTERM grace window would
+   * keep the next checkPorts/relay.bind failing. Best-effort and non-throwing so
+   * the original start() error is the one that propagates.
+   */
+  private cleanupAfterFailedStart() {
+    try {
+      this.teardownTransport();
+    } catch (e) {
+      this.log(`cleanupAfterFailedStart: teardownTransport error: ${(e as Error).message}`);
+    }
+    // Kill the spawned child synchronously (reuses the retained-pid SIGKILL the
+    // daemon's exit handler relies on) and drop the proc reference.
+    this.forceKillAppServerSync();
+    this.proc = null;
   }
 
   /** #85: resolve the transport (env-driven, `auto` probes ws support) and the unix socket path. */
@@ -375,14 +435,7 @@ export class CodexAdapter extends EventEmitter {
       try { sec.appServerWs?.close(); } catch {}
       this.secondaryConnections.delete(id);
     }
-    this.proxyServer?.stop();
-    this.proxyServer = null;
-    // #85: tear down the transport relay and remove the unix socket file.
-    if (this.relay) {
-      this.relay.stop();
-      this.relay = null;
-    }
-    if (this.socketPath) removeSocketFile(this.socketPath);
+    this.teardownTransport();
     this.clearResponseTrackingState();
     // #69: an intentional disconnect must synchronously drop turn state +
     // watchdog timers. We cannot rely on handleAppServerClose for this: we set

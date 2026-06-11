@@ -4,7 +4,9 @@ import { mkdtempSync } from "node:fs";
 import { createServer, Socket, type AddressInfo, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { existsSync, writeFileSync } from "node:fs";
 import { CodexAdapter } from "../codex-adapter";
+import { TcpToUnixRelay } from "../codex-transport";
 import { CLIENT_REPLY_TIMEOUT_MS, MAX_INTERRUPT_TIMEOUT_MS } from "../interrupt-timing";
 
 // Hermetic log sink: the constructor's default logFile resolves the REAL pair
@@ -3154,5 +3156,137 @@ describe("CodexAdapter agentMessageBuffers lifecycle (LOW-3)", () => {
     });
     expect(adapter.agentMessageBuffers.size).toBe(0);
     expect(emitted).toEqual(["hello"]);
+  });
+});
+
+describe("CodexAdapter.start() teardown-on-failure (idempotent retry)", () => {
+  // Bind a relay on a free port (so we don't collide with the adapter's fixed
+  // 4510/4511 test ports or a live daemon). Returns the port and the relay.
+  async function bindRelayOnFreePort(socketPath: string): Promise<{ port: number; relay: TcpToUnixRelay }> {
+    // Find a free port via an ephemeral net.Server, then close it and reuse the
+    // number for the relay (tiny TOCTOU race acceptable in a unit test).
+    const probe: Server = await new Promise((resolve, reject) => {
+      const s = createServer();
+      s.once("error", reject);
+      s.listen(0, "127.0.0.1", () => resolve(s));
+    });
+    const port = (probe.address() as AddressInfo).port;
+    await new Promise<void>((r) => probe.close(() => r()));
+
+    const relay = new TcpToUnixRelay("127.0.0.1", port, socketPath, () => {});
+    await relay.start();
+    return { port, relay };
+  }
+
+  function portIsBindable(port: number): Promise<boolean> {
+    return new Promise((resolve) => {
+      const s = createServer();
+      s.once("error", () => resolve(false));
+      s.listen(port, "127.0.0.1", () => s.close(() => resolve(true)));
+    });
+  }
+
+  test("cleanupAfterFailedStart releases appPort, removes socket, kills child", async () => {
+    const adapter = createAdapter();
+    const socketPath = join(
+      mkdtempSync(join(tmpdir(), "abg-failstart-")),
+      "codex.sock",
+    );
+    // A real on-disk file standing in for a created unix socket — the cleanup
+    // must remove whatever path it tracks. (The relay binds the TCP side; the
+    // socket file is the unix side the spawn would have created.)
+    writeFileSync(socketPath, "");
+    expect(existsSync(socketPath)).toBe(true);
+
+    const { port, relay } = await bindRelayOnFreePort(socketPath);
+    // Before cleanup the relay holds the port — it is NOT bindable.
+    expect(await portIsBindable(port)).toBe(false);
+
+    // Stand-in for the spawned `codex app-server` child that start() leaves
+    // running when connectToAppServer rejects.
+    const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1 << 30)"], {
+      stdio: "ignore",
+    });
+    const exited = new Promise<{ signal: NodeJS.Signals | null }>((resolve) => {
+      child.on("exit", (_code, signal) => resolve({ signal }));
+    });
+    await sleep(100);
+
+    // Wire the partially-constructed transport exactly as a failed unix start()
+    // would leave it.
+    adapter.relay = relay;
+    adapter.socketPath = socketPath;
+    adapter.appServerPid = child.pid;
+    adapter.proc = child;
+
+    adapter.cleanupAfterFailedStart();
+
+    // Relay torn down → port becomes bindable again (a retry's checkPorts can
+    // proceed instead of hitting "non-Codex process").
+    // The OS may take a moment to release the listening socket.
+    let bindable = false;
+    for (let i = 0; i < 20 && !bindable; i++) {
+      bindable = await portIsBindable(port);
+      if (!bindable) await sleep(50);
+    }
+    expect(bindable).toBe(true);
+
+    // Socket file removed, relay reference cleared.
+    expect(existsSync(socketPath)).toBe(false);
+    expect(adapter.relay).toBeNull();
+
+    // Spawned child SIGKILLed.
+    const result = await Promise.race([
+      exited,
+      sleep(3000).then(() => ({ signal: "TIMEOUT" as unknown as NodeJS.Signals })),
+    ]);
+    expect(result.signal).toBe("SIGKILL");
+  });
+
+  test("start() catch tears down the partial transport and rethrows the original error", async () => {
+    const adapter = createAdapter();
+    let cleanupCalls = 0;
+    const original = adapter.cleanupAfterFailedStart.bind(adapter);
+    adapter.cleanupAfterFailedStart = () => {
+      cleanupCalls++;
+      return original();
+    };
+
+    // Drive start() into its body but fail BEFORE any real `codex` spawn:
+    // checkPorts resolves, then resolveTransport throws. The catch must run
+    // cleanup and rethrow the SAME error (so bootCodex still sees the failure).
+    adapter.checkPorts = async () => {};
+    const boom = new Error("resolveTransport boom");
+    adapter.resolveTransport = () => { throw boom; };
+
+    await expect(adapter.start()).rejects.toBe(boom);
+    expect(cleanupCalls).toBe(1);
+  });
+
+  test("start() does NOT tear down a healthy transport", async () => {
+    const adapter = createAdapter();
+    let cleanupCalls = 0;
+    const original = adapter.cleanupAfterFailedStart.bind(adapter);
+    adapter.cleanupAfterFailedStart = () => {
+      cleanupCalls++;
+      return original();
+    };
+
+    // All steps succeed → the success path must never call cleanup.
+    adapter.checkPorts = async () => {};
+    adapter.resolveTransport = () => { adapter.transport = "ws"; adapter.socketPath = null; };
+    // Skip the real spawn + health wait + connect + proxy.
+    const fakeProc: any = { pid: 4242, stderr: null, stdout: null, on() {} };
+    adapter.spawnAppServer = () => { adapter.proc = fakeProc; adapter.appServerPid = 4242; };
+    adapter.waitForHealthy = async () => {};
+    adapter.connectToAppServer = async () => {};
+    adapter.startProxy = () => {};
+
+    await adapter.start();
+    expect(cleanupCalls).toBe(0);
+
+    // Healthy transport left intact.
+    expect(adapter.proc).toBe(fakeProc);
+    expect(adapter.appServerPid).toBe(4242);
   });
 });

@@ -605,6 +605,15 @@ codex.on("error", (err: Error) => {
 
 codex.on("exit", (code: number | null) => {
   log(`Codex process exited (code ${code})`);
+  // Distinguish "a previously-healthy Codex died" from "a still-booting Codex was
+  // killed by cleanupAfterFailedStart() during an in-progress boot retry". The state
+  // cleanup below is correct either way (the child is gone), but the user-facing
+  // "restart it manually" warning and the boot-deadline re-arm must only fire for the
+  // former — during boot, bootCodex's own retry loop + the boot deadline armed before
+  // bootCodex() already govern recovery, and a retry may bring Codex up cleanly, so
+  // telling the user to restart (and resetting the deadline each failed attempt) would
+  // be misleading.
+  const wasBootstrapped = codexBootstrapped;
   codexBootstrapped = false;
   replyTracker.reset(); // any in-flight require_reply turn is gone with the process
   // The process is gone — every pending/running idempotency key is terminal,
@@ -615,19 +624,23 @@ codex.on("exit", (code: number | null) => {
   statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
   clearPendingClaudeDisconnect("Codex process exited");
-  emitToClaude(
-    systemMessage(
-      "system_codex_exit",
-      `⚠️ Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running. ` +
-        `Restart the Codex side (\`agentbridge codex\`); if it does not come back within ` +
-        `${Math.round(BOOTSTRAP_TIMEOUT_MS / 1000)}s the daemon will self-replace so the next launch starts clean.`,
-    ),
-  );
+  if (wasBootstrapped) {
+    emitToClaude(
+      systemMessage(
+        "system_codex_exit",
+        `⚠️ Codex app-server exited (code ${code ?? "unknown"}). AgentBridge daemon is still running. ` +
+          `Restart the Codex side (\`agentbridge codex\`); if it does not come back within ` +
+          `${Math.round(BOOTSTRAP_TIMEOUT_MS / 1000)}s the daemon will self-replace so the next launch starts clean.`,
+      ),
+    );
+  }
   broadcastStatus();
-  // Codex died after a successful boot (a dead proc is not auto-respawned). Re-arm
-  // the readiness watchdog so that if it does not come back and no TUI is using us,
-  // the daemon self-exits instead of lingering as a healthz-200/readyz-503 zombie.
-  armBootDeadline();
+  if (wasBootstrapped) {
+    // Codex died after a successful boot (a dead proc is not auto-respawned). Re-arm
+    // the readiness watchdog so that if it does not come back and no TUI is using us,
+    // the daemon self-exits instead of lingering as a healthz-200/readyz-503 zombie.
+    armBootDeadline();
+  }
 });
 
 function startControlServer() {

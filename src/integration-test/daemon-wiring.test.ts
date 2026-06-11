@@ -133,6 +133,88 @@ describe("daemon wiring", () => {
     expect(aborted.content).toContain("retry");
   }, 20000);
 
+  // --- Regression: codex 'exit' during a boot retry must NOT warn (S1 fix) ---
+  //
+  // The teardown-on-failed-start fix SIGKILLs a partially-constructed codex child,
+  // which fires the daemon's codex.on("exit") DURING bootCodex's retry loop (before
+  // codexBootstrapped flips true). The pre-fix handler emitted the misleading
+  // "⚠️ Codex app-server exited … restart it manually" warning unconditionally even
+  // though the very next retry brought Codex up cleanly. The gate
+  // (`if (wasBootstrapped) emit(system_codex_exit)`) must suppress that warning.
+  //
+  // Driven end-to-end: the fail-first fixture refuses the FIRST WS upgrade so
+  // start() rejects → cleanupAfterFailedStart SIGKILLs the child → codex 'exit'
+  // with codexBootstrapped===false; the retry boots clean and the harness reaches
+  // readyz-200. A pre-fix unconditional emit would have BUFFERED a system_codex_exit
+  // before the (later) system_waiting, so it would flush to Claude on attach.
+  test("codex 'exit' during a boot retry (codexBootstrapped=false) does NOT emit system_codex_exit", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-bootexit-fixture-"));
+    const failCounter = join(fixtureRoot, "spawn-count.txt");
+    try {
+      const harness = await startHarness({
+        pairId: "main-bootexit1",
+        pairName: "main",
+        extraEnv: {
+          FAKE_CODEX_FAIL_FIRST_BOOT: failCounter,
+          // Keep the self-exit watchdog comfortably above the 1s retry backoff so a
+          // single failed attempt + retry boots well within the bootstrap deadline.
+          AGENTBRIDGE_BOOTSTRAP_TIMEOUT_MS: "20000",
+        },
+      });
+
+      // The harness only returns once readyz-200 with the spawned pid — i.e. the
+      // RETRY succeeded after the first boot was killed. The fixture must have been
+      // spawned at least twice (first failing, second clean).
+      const spawnCount = Number(readFileSync(failCounter, "utf-8").trim());
+      expect(spawnCount).toBeGreaterThanOrEqual(2);
+
+      // Attach: the daemon flushes everything buffered during boot. The genuine
+      // boot notice (system_waiting) must arrive; the misleading boot-retry death
+      // warning (system_codex_exit) must NOT.
+      await harness.attachClaude();
+      await waitForMessage(
+        harness.messages,
+        (message) => message.id.startsWith("system_waiting_"),
+        "system_waiting after a recovered boot retry",
+      );
+      // Give any (erroneously buffered) exit warning the same flush window to land.
+      await sleep(200);
+      expect(harness.messages.some((m) => m.id.startsWith("system_codex_exit"))).toBe(false);
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 45000);
+
+  // --- Regression complement: a POST-bootstrap codex death MUST warn (S1 fix) ---
+  //
+  // The other half of the gate: once codexBootstrapped===true, a real Codex process
+  // death IS a "restart it manually" situation, so the warning must still fire. This
+  // proves the gate suppresses ONLY the boot-retry case, not every exit. The fixture
+  // `exit-process` command makes the live app-server child truly exit after boot.
+  test("codex 'exit' after a successful bootstrap (codexBootstrapped=true) DOES emit system_codex_exit", async () => {
+    const harness = await startHarness({ pairId: "main-postexit1", pairName: "main" });
+
+    await harness.attachClaude();
+    await harness.connectTui();
+    await waitForMessage(
+      harness.messages,
+      (message) => message.id.startsWith("system_waiting_"),
+      "system_waiting after a clean boot",
+    );
+
+    // Kill the app-server PROCESS (not just the WS): codex.on("exit") fires with
+    // codexBootstrapped===true → the genuine post-boot death warning.
+    harness.sendAppCommand("exit-process");
+
+    const exitWarning = await waitForMessage(
+      harness.messages,
+      (message) => message.id.startsWith("system_codex_exit"),
+      "system_codex_exit after a post-bootstrap Codex death",
+    );
+    expect(exitWarning.content).toContain("Codex app-server exited");
+    expect(exitWarning.content).toContain("agentbridge codex");
+  }, 45000);
+
   test("filtered routing buffers STATUS, flushes it on IMPORTANT, then buffers STATUS during attention", async () => {
     const harness = await startHarness({
       pairId: "main-routeabcd",
