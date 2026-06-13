@@ -27,10 +27,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.15", "0.0.0-source"),
-  commit: defineString("85ad89b", "source"),
+  commit: defineString("89d4c9a", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("71ce81854ec9", "source")
+  codeHash: defineString("7b8ff13f1afa", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -4741,12 +4741,12 @@ class QuotaSource {
       return candidates;
     }
     const binDir = join5(this.homeDir, ".budget-guard/bin");
-    const installedBudgetProbe = join5(binDir, "budget-probe");
-    if (existsSync5(installedBudgetProbe))
-      add(installedBudgetProbe, "budget-probe");
     const installedProbeMjs = join5(binDir, "probe.mjs");
     if (existsSync5(installedProbeMjs))
       add(installedProbeMjs, "probe-mjs");
+    const installedBudgetProbe = join5(binDir, "budget-probe");
+    if (existsSync5(installedBudgetProbe))
+      add(installedBudgetProbe, "budget-probe");
     return candidates;
   }
   async fetchAgent(candidates, agent) {

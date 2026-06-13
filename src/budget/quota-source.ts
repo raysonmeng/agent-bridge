@@ -461,10 +461,10 @@ export class QuotaSource {
     }
 
     const binDir = join(this.homeDir, ".budget-guard/bin");
-    const installedBudgetProbe = join(binDir, "budget-probe");
-    if (existsSync(installedBudgetProbe)) add(installedBudgetProbe, "budget-probe");
     const installedProbeMjs = join(binDir, "probe.mjs");
     if (existsSync(installedProbeMjs)) add(installedProbeMjs, "probe-mjs");
+    const installedBudgetProbe = join(binDir, "budget-probe");
+    if (existsSync(installedBudgetProbe)) add(installedBudgetProbe, "budget-probe");
     return candidates;
   }
 

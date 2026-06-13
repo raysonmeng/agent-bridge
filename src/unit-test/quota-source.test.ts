@@ -395,7 +395,7 @@ describe("QuotaSource", () => {
     expect(unknownVersionLines[0]).toContain("999");
   });
 
-  test("uses installed budget-probe when env probes are unset", async () => {
+  test("falls back to installed budget-probe when installed probe.mjs is absent", async () => {
     tempHome = mkdtempSync(join(tmpdir(), "agentbridge-quota-source-test-"));
     const installed = join(tempHome, ".budget-guard/bin/budget-probe");
     mkdirSync(join(tempHome, ".budget-guard/bin"), { recursive: true });
@@ -429,7 +429,7 @@ describe("QuotaSource", () => {
     ]);
   });
 
-  test("falls back per agent from installed budget-probe to installed probe.mjs", async () => {
+  test("prefers installed probe.mjs over installed budget-probe so v2 burn fields are preserved", async () => {
     tempHome = mkdtempSync(join(tmpdir(), "agentbridge-quota-source-test-"));
     const binDir = join(tempHome, ".budget-guard/bin");
     const budgetProbe = join(binDir, "budget-probe");
@@ -444,17 +444,7 @@ describe("QuotaSource", () => {
       homeDir: tempHome,
       runner: async (command, args) => {
         calls.push({ command, args });
-        if (command === budgetProbe && args[1] === "claude") {
-          return {
-            stdout: JSON.stringify({
-              ok: false,
-              error: "schema",
-              message: "no Claude usage buckets found",
-              buckets: [],
-            }),
-          };
-        }
-        if (command === budgetProbe && args[1] === "codex") {
+        if (command === budgetProbe) {
           return {
             stdout: JSON.stringify({
               ok: true,
@@ -470,8 +460,70 @@ describe("QuotaSource", () => {
         return {
           stdout: JSON.stringify({
             ok: true,
+            probe_schema: 2,
             util: 22,
             warn_util: 22,
+            fetched_at: NOW,
+            buckets: [
+              {
+                id: "five_hour",
+                util: 22,
+                reset_epoch: NOW + 1200,
+                burn_rate_pct_per_hour: 1.25,
+                burn_confident: true,
+                runway_seconds: 1800,
+                depleted_at_epoch: NOW + 1800,
+              },
+            ],
+          }),
+        };
+      },
+    });
+
+    const result = await source.fetchBoth();
+    expect(result?.claude?.gateUtil).toBe(22);
+    expect(result?.codex?.gateUtil).toBe(22);
+    expect(result?.claude?.fiveHour).toMatchObject({
+      util: 22,
+      resetEpoch: NOW + 1200,
+      burnRate: 1.25,
+      burnConfident: true,
+      runwaySeconds: 1800,
+      depletedAtEpoch: NOW + 1800,
+    });
+    expect(calls).toEqual([
+      { command: probeMjs, args: ["claude", "probe"] },
+      { command: probeMjs, args: ["codex", "probe"] },
+    ]);
+  });
+
+  test("falls back per agent from installed probe.mjs to installed budget-probe when probe.mjs fails", async () => {
+    tempHome = mkdtempSync(join(tmpdir(), "agentbridge-quota-source-test-"));
+    const binDir = join(tempHome, ".budget-guard/bin");
+    const budgetProbe = join(binDir, "budget-probe");
+    const probeMjs = join(binDir, "probe.mjs");
+    mkdirSync(binDir, { recursive: true });
+    writeFileSync(budgetProbe, "#!/bin/sh\n", "utf-8");
+    writeFileSync(probeMjs, "#!/usr/bin/env node\n", "utf-8");
+
+    const calls: Array<{ command: string; args: string[] }> = [];
+    const source = new QuotaSource({
+      env: {},
+      homeDir: tempHome,
+      runner: async (command, args) => {
+        calls.push({ command, args });
+        if (command === probeMjs && args[0] === "claude") {
+          return { stdout: "" };
+        }
+        if (command === probeMjs && args[0] === "codex") {
+          throw new Error("probe.mjs failed");
+        }
+        return {
+          stdout: JSON.stringify({
+            ok: true,
+            util: 24,
+            hard_util: 24,
+            warn_util: 24,
             fetched_at: NOW,
             reset_epoch: NOW + 1200,
             buckets: [],
@@ -481,12 +533,14 @@ describe("QuotaSource", () => {
     });
 
     const result = await source.fetchBoth();
-    expect(result?.claude?.gateUtil).toBe(22);
+    expect(result?.claude?.gateUtil).toBe(24);
     expect(result?.codex?.gateUtil).toBe(24);
-    expect(calls).toContainEqual({ command: budgetProbe, args: ["--agent", "claude"] });
-    expect(calls).toContainEqual({ command: budgetProbe, args: ["--agent", "codex"] });
-    expect(calls).toContainEqual({ command: probeMjs, args: ["claude", "probe"] });
-    expect(calls).not.toContainEqual({ command: probeMjs, args: ["codex", "probe"] });
+    expect(calls).toEqual([
+      { command: probeMjs, args: ["claude", "probe"] },
+      { command: probeMjs, args: ["codex", "probe"] },
+      { command: budgetProbe, args: ["--agent", "claude"] },
+      { command: budgetProbe, args: ["--agent", "codex"] },
+    ]);
   });
 
   test("uses probe.mjs argument form only when explicitly configured", async () => {
