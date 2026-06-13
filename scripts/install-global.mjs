@@ -3,11 +3,16 @@
  * Install AgentBridge globally in a way that is convenient for local testing.
  *
  * Modes:
- *   local  build + verify this checkout, pack it, install the tarball (`--force`),
- *          THEN stop running daemons and sync the Claude Code plugin
- *   npm    verify npm latest exists, install latest (`--force`), THEN stop daemons
+ *   local  preflight active sessions, build + verify this checkout, pack it,
+ *          install the tarball (`--force`), THEN stop running daemons and sync
+ *          the Claude Code plugin
+ *   npm    preflight active sessions, verify npm latest exists, install latest
+ *          (`--force`), THEN stop daemons
  *
  * Ordering invariant (downtime + failure safety):
+ *   - active Claude frontends / Codex TUIs are detected before build/npm work
+ *     and require explicit confirmation (or `--force`) because stop-running will
+ *     disconnect them once the install succeeds.
  *   - `npm install -g --force` is a full replace, so no separate `npm uninstall`
  *     is needed — dropping it removes the window where no binary is on PATH.
  *   - stop-running fires AFTER the install succeeds, so the old daemon keeps
@@ -23,11 +28,12 @@
  * falling back to npm's default when nothing is installed yet.
  */
 import { spawnSync } from "node:child_process";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
+import { existsSync, mkdtempSync, readFileSync, readdirSync, rmSync } from "node:fs";
+import { homedir, platform, tmpdir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { createRequire } from "node:module";
 import { fileURLToPath, pathToFileURL } from "node:url";
+import { createInterface } from "node:readline";
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
 const require = createRequire(import.meta.url);
@@ -38,10 +44,13 @@ const packageName = pkg.name;
 const args = process.argv.slice(2);
 const dryRun = args.includes("--dry-run");
 const skipPlugin = args.includes("--skip-plugin");
+const force = args.includes("--force");
 const mode = args.find((arg) => !arg.startsWith("-"));
+const PAIR_BASE_PORT = 4500;
+const PAIR_SLOT_STRIDE = 10;
 
 function usage() {
-  process.stderr.write(`Usage: node scripts/install-global.mjs <local|npm> [--dry-run] [--skip-plugin]
+  process.stderr.write(`Usage: node scripts/install-global.mjs <local|npm> [--dry-run] [--skip-plugin] [--force]
 
 Examples:
   bun run install:global:local   # build this checkout, replace the global install, sync the Claude Code plugin
@@ -49,7 +58,250 @@ Examples:
 
 Options:
   --skip-plugin   local mode only: skip the Claude Code plugin sync (\`dev\`) step
+  --force         install even when active AgentBridge frontends/Codex TUIs are running
 `);
+}
+
+function parsePsProcessList(output) {
+  const entries = [];
+  for (const line of output.split(/\r?\n/)) {
+    const match = line.match(/^\s*(\d+)\s+(.+?)\s*$/);
+    if (!match) continue;
+    const pid = Number.parseInt(match[1], 10);
+    if (!Number.isFinite(pid)) continue;
+    entries.push({ pid, command: match[2] });
+  }
+  return entries;
+}
+
+function extractRemoteUrl(command) {
+  const tokens = command.trim().split(/\s+/);
+  for (let i = 0; i < tokens.length; i++) {
+    const token = tokens[i];
+    if (token === "--remote" && tokens[i + 1]) return tokens[i + 1];
+    if (token?.startsWith("--remote=")) return token.slice("--remote=".length);
+  }
+  return null;
+}
+
+function invokesCodexBinary(command) {
+  const tokens = command.trim().split(/\s+/);
+  const exe = tokens[0] ? basename(tokens[0]) : "";
+  if (exe === "codex") return true;
+  if ((exe === "node" || exe === "bun") && tokens[1]) {
+    return basename(tokens[1]) === "codex";
+  }
+  return false;
+}
+
+function commandMatchesManagedCodexTui(command) {
+  if (!invokesCodexBinary(command)) return false;
+  if (!command.includes("tui_app_server")) return false;
+  return extractRemoteUrl(command) !== null;
+}
+
+function commandMatchesBridgeFrontend(command) {
+  return (
+    /(?:^|[\s/\\])bridge-server\.js(?:\s|$)/.test(command) &&
+    (command.includes("agentbridge") || command.includes("agent_bridge"))
+  );
+}
+
+function proxyUrlForSlot(slot) {
+  if (!Number.isInteger(slot) || slot < 0) return null;
+  return `ws://127.0.0.1:${PAIR_BASE_PORT + slot * PAIR_SLOT_STRIDE + 1}`;
+}
+
+function pairSummary(pair) {
+  if (!pair) return { label: "unknown" };
+  const label = pair.pairName && pair.pairId
+    ? `${pair.pairName} (${pair.pairId})`
+    : pair.pairId ?? pair.proxyUrl ?? "unknown";
+  return {
+    label,
+    pairId: pair.pairId,
+    pairName: pair.pairName,
+    cwd: pair.cwd,
+    stateDir: pair.stateDir,
+    proxyUrl: pair.proxyUrl,
+  };
+}
+
+function pairForRemoteUrl(remoteUrl, pairInfos) {
+  return pairInfos.find((pair) => pair.proxyUrl === remoteUrl) ?? null;
+}
+
+export function detectActiveInstallSessionsFromPsOutput(psOutput, pairInfos = []) {
+  const sessions = [];
+  for (const entry of parsePsProcessList(psOutput)) {
+    if (entry.pid === process.pid) continue;
+    if (commandMatchesBridgeFrontend(entry.command)) {
+      sessions.push({
+        kind: "claude-frontend",
+        pid: entry.pid,
+        command: entry.command,
+        pair: pairSummary(null),
+      });
+      continue;
+    }
+    if (commandMatchesManagedCodexTui(entry.command)) {
+      const remoteUrl = extractRemoteUrl(entry.command);
+      sessions.push({
+        kind: "codex-tui",
+        pid: entry.pid,
+        command: entry.command,
+        remoteUrl,
+        pair: pairSummary(pairForRemoteUrl(remoteUrl, pairInfos)),
+      });
+    }
+  }
+  return sessions;
+}
+
+export function decideInstallPreflight({ activeSessionCount, force, dryRun, isTTY }) {
+  if (dryRun) return { action: "allow", reason: "dry-run" };
+  if (activeSessionCount === 0) return { action: "allow", reason: "no-active-sessions" };
+  if (force) return { action: "allow", reason: "force" };
+  if (isTTY) return { action: "prompt", reason: "tty" };
+  return { action: "block", reason: "non-tty" };
+}
+
+function platformBaseDir(env = process.env) {
+  if (platform() === "darwin") {
+    return join(homedir(), "Library", "Application Support", "AgentBridge");
+  }
+  const xdg = env.XDG_STATE_HOME && env.XDG_STATE_HOME.length > 0
+    ? env.XDG_STATE_HOME
+    : join(homedir(), ".local", "state");
+  return join(xdg, "agentbridge");
+}
+
+function computeBaseDir(env = process.env) {
+  return env.AGENTBRIDGE_BASE_DIR || env.AGENTBRIDGE_STATE_DIR || platformBaseDir(env);
+}
+
+function readJsonIfPresent(path) {
+  try {
+    if (!existsSync(path)) return null;
+    return JSON.parse(readFileSync(path, "utf-8"));
+  } catch {
+    return null;
+  }
+}
+
+function pairInfoFromStatusFile(stateDir) {
+  const status = readJsonIfPresent(join(stateDir, "daemon.json")) ?? readJsonIfPresent(join(stateDir, "status.json"));
+  if (!status || typeof status !== "object") return null;
+  const proxyUrl = typeof status.proxyUrl === "string" ? status.proxyUrl : null;
+  if (!proxyUrl) return null;
+  return {
+    pairId: typeof status.pairId === "string" ? status.pairId : undefined,
+    pairName: undefined,
+    cwd: typeof status.cwd === "string" ? status.cwd : undefined,
+    stateDir,
+    proxyUrl,
+  };
+}
+
+function readPairInfos(baseDir = computeBaseDir()) {
+  const pairsRoot = join(baseDir, "pairs");
+  const byProxy = new Map();
+  const registry = readJsonIfPresent(join(pairsRoot, "registry.json"));
+  if (registry && Array.isArray(registry.pairs)) {
+    for (const entry of registry.pairs) {
+      if (!entry || typeof entry !== "object") continue;
+      const pairId = typeof entry.pairId === "string" ? entry.pairId : undefined;
+      const proxyUrl = proxyUrlForSlot(entry.slot);
+      if (!pairId || !proxyUrl) continue;
+      byProxy.set(proxyUrl, {
+        pairId,
+        pairName: typeof entry.name === "string" ? entry.name : undefined,
+        cwd: typeof entry.cwd === "string" ? entry.cwd : undefined,
+        stateDir: join(pairsRoot, pairId),
+        proxyUrl,
+      });
+    }
+  }
+
+  try {
+    for (const dirent of readdirSync(pairsRoot, { withFileTypes: true })) {
+      if (!dirent.isDirectory()) continue;
+      const stateDir = join(pairsRoot, dirent.name);
+      const fromStatus = pairInfoFromStatusFile(stateDir);
+      if (!fromStatus) continue;
+      const existing = byProxy.get(fromStatus.proxyUrl);
+      byProxy.set(fromStatus.proxyUrl, { ...fromStatus, ...existing });
+    }
+  } catch {
+    // Missing/corrupt state is diagnostic-only; ps command lines remain enough
+    // to block safely.
+  }
+  return [...byProxy.values()];
+}
+
+function readActiveInstallSessions() {
+  let output = "";
+  try {
+    output = spawnSync("ps", ["-axo", "pid=,command="], { encoding: "utf-8" }).stdout ?? "";
+  } catch {
+    return [];
+  }
+  return detectActiveInstallSessionsFromPsOutput(output, readPairInfos());
+}
+
+function renderActiveInstallSessions(sessions) {
+  return sessions
+    .map((session) => {
+      const kind = session.kind === "codex-tui" ? "Codex TUI" : "Claude frontend";
+      const remote = session.remoteUrl ? ` remote=${session.remoteUrl}` : "";
+      const cwd = session.pair.cwd ? ` cwd=${session.pair.cwd}` : "";
+      return `  - pid ${session.pid}: ${kind}; pair=${session.pair.label}${remote}${cwd}`;
+    })
+    .join("\n");
+}
+
+function askContinueWithActiveSessions() {
+  return new Promise((resolve) => {
+    const rl = createInterface({ input: process.stdin, output: process.stderr });
+    rl.question("Active sessions will be disconnected. Continue? (y/N) ", (answer) => {
+      rl.close();
+      resolve(/^y(?:es)?$/i.test(answer.trim()));
+    });
+  });
+}
+
+async function runInstallPreflight() {
+  const sessions = readActiveInstallSessions();
+  const decision = decideInstallPreflight({
+    activeSessionCount: sessions.length,
+    force,
+    dryRun,
+    isTTY: Boolean(process.stdin.isTTY && process.stderr.isTTY),
+  });
+  if (decision.action === "allow") {
+    if (decision.reason === "force" && sessions.length > 0) {
+      process.stderr.write(
+        "install-global: --force set; continuing even though active sessions may be disconnected:\n" +
+          `${renderActiveInstallSessions(sessions)}\n`,
+      );
+    }
+    return;
+  }
+  if (sessions.length > 0) {
+    process.stderr.write(
+      "install-global: active AgentBridge sessions detected:\n" +
+        `${renderActiveInstallSessions(sessions)}\n`,
+    );
+  }
+  if (decision.action === "block") {
+    process.stderr.write("install-global: refusing to continue in non-TTY mode; re-run with --force to proceed.\n");
+    process.exit(1);
+  }
+  const ok = await askContinueWithActiveSessions();
+  if (!ok) {
+    process.stderr.write("install-global: cancelled; no changes made.\n");
+    process.exit(1);
+  }
 }
 
 /**
@@ -99,6 +351,12 @@ function printDry(cmd, commandArgs, suffix = "") {
   process.stdout.write(`$ ${commandLine(cmd, commandArgs)}${suffix}\n`);
 }
 
+function printDryPreflight() {
+  process.stdout.write(
+    "# preflight: check active AgentBridge frontends/Codex TUIs; prompt on TTY, refuse in non-TTY (use --force to skip)\n",
+  );
+}
+
 function run(cmd, commandArgs, options = {}) {
   const { allowFailure = false, cwd = root, captureStdout = false, envExtra = {} } = options;
   process.stdout.write(`$ ${commandLine(cmd, commandArgs)}\n`);
@@ -146,9 +404,10 @@ function reportPrefix(prefix) {
   }
 }
 
-function installLocal() {
+async function installLocal() {
   const prefix = dryRun ? resolveInstallPrefix() : null;
   if (dryRun) {
+    printDryPreflight();
     reportPrefix(prefix);
     printDry("bun", ["run", "prepublishOnly"]);
     printDry("node", ["scripts/install-safety.cjs", "verify-built"]);
@@ -162,6 +421,7 @@ function installLocal() {
     return;
   }
 
+  await runInstallPreflight();
   const target = resolveInstallPrefix();
   reportPrefix(target);
   const env = prefixEnv(target);
@@ -243,10 +503,11 @@ function warnAboutSurvivingFrontends() {
   );
 }
 
-function installNpm() {
+async function installNpm() {
   const spec = `${packageName}@latest`;
   const prefix = dryRun ? resolveInstallPrefix() : null;
   if (dryRun) {
+    printDryPreflight();
     reportPrefix(prefix);
     printDry("npm", ["view", spec, "version"]);
     printDry("npm", ["install", "-g", "--force", spec]);
@@ -254,6 +515,7 @@ function installNpm() {
     return;
   }
 
+  await runInstallPreflight();
   const target = resolveInstallPrefix();
   reportPrefix(target);
   const env = prefixEnv(target);
@@ -274,9 +536,9 @@ const invokedDirectly =
   process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
 if (invokedDirectly) {
   if (mode === "local" || mode === "source") {
-    installLocal();
+    await installLocal();
   } else if (mode === "npm" || mode === "registry") {
-    installNpm();
+    await installNpm();
   } else {
     usage();
     process.exit(1);

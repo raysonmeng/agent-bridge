@@ -253,6 +253,7 @@ agent_bridge/
 | `AGENTBRIDGE_DAEMON_ENTRY` | `./daemon.ts` | 覆盖 daemon 入口（插件包使用） |
 | `NO_UPDATE_NOTIFIER` | 未设置 | 设为任意值即关闭「有新版本」提示（生态通用 opt-out） |
 | `AGENTBRIDGE_NO_UPDATE_NOTIFIER` | 未设置 | 命名空间化的关闭开关（效果同 `NO_UPDATE_NOTIFIER`） |
+| `AGENTBRIDGE_UPDATE_PROMPT` | 未设置 | 设为 `0` 可关闭交互询问，恢复纯打印提示 |
 | `AGENTBRIDGE_UPDATE_CHECK_INTERVAL_MS` | `86400000` | `abg claude`/`abg codex` 多久查一次 npm 新版本（默认每天一次）。其余时候只读缓存打印，大多数调用零网络 |
 
 ### 更新提示
@@ -265,7 +266,7 @@ agent_bridge/
   Plugin: /plugin marketplace update agentbridge   (then /reload-plugins)
 ```
 
-该检查是 best-effort,绝不阻塞/拖慢/弄坏你的命令:提示从缓存打印,npm 检查每天最多在后台跑一次,任何网络/registry 失败都静默忽略。非交互(管道)输出和 CI 下自动抑制,可用 `NO_UPDATE_NOTIFIER=1` 关闭。notifier 永远不会自动安装任何东西——只告诉你升级命令。
+该检查是 best-effort：提示从缓存打印，npm 检查每天最多在后台跑一次，任何网络/registry 失败都静默忽略。交互式 TTY 下，命中缓存更新会在启动前询问；输入 `y` 会运行 `npm install -g @raysonmeng/agentbridge@latest`，输入 `N`（或 15 秒内无应答）会记住本版本已拒绝并继续启动。非交互(管道)输出和 CI 下绝不询问，可用 `NO_UPDATE_NOTIFIER=1` 关闭提示，或用 `AGENTBRIDGE_UPDATE_PROMPT=0` 保持纯打印。
 
 ### 状态目录
 

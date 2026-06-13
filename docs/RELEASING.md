@@ -121,11 +121,21 @@ global package, so afterward `npm install -g @raysonmeng/agentbridge@latest`
 cleanly overrides whatever you installed — there is no leftover `bun link` symlink
 to conflict with.
 
-Both install modes (via `scripts/install-global.mjs`) first stop registered
-AgentBridge daemons and managed Codex TUIs directly (`install-safety.cjs
-stop-running`) using a scrubbed install environment, then replace the package.
-Local installs also rebuild `dist/` and plugin bundles, verify required
-artifacts on disk, pack a tarball, and verify the tarball before installing it.
+Both install modes (via `scripts/install-global.mjs`) use the same four-step
+sequence:
+
+1. Preflight active Claude frontends and managed Codex TUIs. If any are running,
+   the installer asks on a TTY, refuses in non-TTY mode, or continues with
+   `--force`.
+2. Build/verify/install succeeds. Local mode rebuilds `dist/` and plugin
+   bundles, verifies required artifacts on disk, packs a tarball, and verifies
+   the tarball before installing it; npm mode verifies `latest` exists and
+   installs it.
+3. Only after the install succeeds, call `install-safety.cjs stop-running` using
+   a scrubbed install environment.
+4. Print the post-install reminder to restart affected AgentBridge/Claude
+   windows.
+
 Use `node scripts/install-global.mjs local --dry-run` to inspect the sequence
 without stopping anything.
 
@@ -135,8 +145,8 @@ Stopping all running AgentBridge daemons/TUIs is destructive, so it is **not**
 triggered by arbitrary installs. There are exactly two paths that stop them:
 
 1. **The intentional installer** — `scripts/install-global.mjs` (`bun run
-   install:global:*`) calls `install-safety.cjs stop-running` directly, in both
-   `local` and `npm` modes.
+   install:global:*`) calls `install-safety.cjs stop-running` directly in both
+   `local` and `npm` modes. It now preflights active sessions before doing so.
 2. **An explicit global self-install via npm `postinstall`** — `scripts/postinstall.cjs`
    stops running daemons **only** when it detects an explicit global signal:
    - `npm_config_global=true` (i.e. `npm install -g …`), or
@@ -154,8 +164,8 @@ for the two intentional paths above.
 
 停掉所有运行中的 daemon/TUI 是破坏性操作,因此**不会**被任意安装触发。只有两条路径会停:
 (1) **有意安装器** `scripts/install-global.mjs`(`bun run install:global:*`)在 `local` 与
-`npm` 两种模式下都直接调用 `install-safety.cjs stop-running`;(2) **经 npm `postinstall`
-的显式全局自安装**——`scripts/postinstall.cjs` 仅在检测到显式全局信号时才停
+`npm` 两种模式下直接调用 `install-safety.cjs stop-running`,且现在会先前置检测活跃会话;
+(2) **经 npm `postinstall` 的显式全局自安装**——`scripts/postinstall.cjs` 仅在检测到显式全局信号时才停
 (`npm_config_global=true` / `npm_config_location=global` / `AGENTBRIDGE_POSTINSTALL_STOP=1`;
 `AGENTBRIDGE_POSTINSTALL_STOP=0` 强制不停,优先级最高)。**任意 `.tgz` / 传递依赖安装
 不会停掉运行中的 daemon**——非全局 `npm install`、或被当作他人依赖拉入时,所有运行中的
