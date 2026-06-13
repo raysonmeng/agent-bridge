@@ -266,6 +266,7 @@ agent_bridge/
 | `AGENTBRIDGE_DAEMON_ENTRY` | `./daemon.ts` | Override daemon entry point (used by plugin bundles) |
 | `NO_UPDATE_NOTIFIER` | unset | Set to any value to disable the "update available" notice (ecosystem-standard opt-out) |
 | `AGENTBRIDGE_NO_UPDATE_NOTIFIER` | unset | Namespaced opt-out for the update notice (same effect as `NO_UPDATE_NOTIFIER`) |
+| `AGENTBRIDGE_UPDATE_PROMPT` | unset | Set to `0` to disable the interactive update prompt and keep pure notice-only behavior |
 | `AGENTBRIDGE_UPDATE_CHECK_INTERVAL_MS` | `86400000` | How often `abg claude`/`abg codex` may check npm for a newer version (default once/day). The notice is otherwise printed from cache — zero network on most runs |
 
 ### Update notifications
@@ -278,7 +279,7 @@ agent_bridge/
   Plugin: /plugin marketplace update agentbridge   (then /reload-plugins)
 ```
 
-The check is best-effort and never blocks, delays, or fails your command: the notice is printed from a cached result, the npm check runs at most once per day in the background, and any network/registry failure is silently ignored. It is suppressed automatically for non-interactive (piped) output and in CI, and can be disabled with `NO_UPDATE_NOTIFIER=1`. The notifier never installs anything — it only shows you the command.
+The check is best-effort: the notice is printed from a cached result, the npm check runs at most once per day in the background, and any network/registry failure is silently ignored. On an interactive TTY, a cached update prompts before launch; answering `y` runs `npm install -g @raysonmeng/agentbridge@latest`, while `N` (or no answer within 15 seconds) records that version as dismissed and continues launching. Non-interactive output and CI never prompt, and the notice can be disabled with `NO_UPDATE_NOTIFIER=1` or kept notice-only with `AGENTBRIDGE_UPDATE_PROMPT=0`.
 
 ### State Directory
 

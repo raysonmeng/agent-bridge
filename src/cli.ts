@@ -66,12 +66,13 @@ export function parseTopLevel(args: string[]): { command: string | undefined; re
 }
 
 async function main(command: string | undefined, restArgs: string[]) {
-  // Best-effort, non-blocking update notice. Fully guarded — never blocks,
-  // delays, or fails the command (see src/update-notifier.ts).
+  // Best-effort update notice. On an interactive TTY it may prompt before the
+  // launcher starts; non-interactive/suppressed runs keep the pure notice path.
   if (command && NOTIFY_COMMANDS.has(command)) {
     try {
       const { maybeNotifyUpdate } = await import("./update-notifier");
-      maybeNotifyUpdate({ refresh: REFRESH_COMMANDS.has(command) });
+      const decision = await maybeNotifyUpdate({ refresh: REFRESH_COMMANDS.has(command) });
+      if (decision === "updated") process.exit(0);
     } catch {
       // ignore — the notifier must never affect the command
     }

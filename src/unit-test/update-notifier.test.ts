@@ -84,36 +84,44 @@ describe("isUpdateCheckSuppressed", () => {
 });
 
 describe("maybeNotifyUpdate — printing", () => {
-  test("prints when cache has a newer stable version", () => {
+  test("prints when cache has a newer stable version", async () => {
     const sd = freshStateDir();
     writeCacheFile(sd, { lastCheckMs: 1000, latest: "0.2.0" });
     const out: string[] = [];
-    maybeNotifyUpdate({ current: "0.1.6", stateDir: sd, isTTY: true, env: CLEAN_ENV, print: (m) => out.push(m), now: () => 1000 });
+    await maybeNotifyUpdate({
+      current: "0.1.6",
+      stateDir: sd,
+      isTTY: true,
+      env: CLEAN_ENV,
+      print: (m) => out.push(m),
+      now: () => 1000,
+      promptUpdate: async () => false,
+    });
     expect(out).toHaveLength(1);
     expect(out[0]).toContain("0.1.6");
     expect(out[0]).toContain("0.2.0");
   });
 
-  test("does NOT print when latest is equal/older/prerelease or cache absent", () => {
+  test("does NOT print when latest is equal/older/prerelease or cache absent", async () => {
     const out: string[] = [];
-    const run = (cache: UpdateCache | null, current = "0.1.6") => {
+    const run = async (cache: UpdateCache | null, current = "0.1.6") => {
       const sd = freshStateDir();
       if (cache) writeCacheFile(sd, cache);
-      maybeNotifyUpdate({ current, stateDir: sd, isTTY: true, env: CLEAN_ENV, print: (m) => out.push(m), now: () => 1000 });
+      await maybeNotifyUpdate({ current, stateDir: sd, isTTY: true, env: CLEAN_ENV, print: (m) => out.push(m), now: () => 1000 });
     };
-    run({ lastCheckMs: 1, latest: "0.1.6" }); // equal
-    run({ lastCheckMs: 1, latest: "0.1.5" }); // older
-    run({ lastCheckMs: 1, latest: "0.2.0-beta.1" }); // prerelease
-    run({ lastCheckMs: 1, latest: null }); // unknown
-    run(null); // no cache file
+    await run({ lastCheckMs: 1, latest: "0.1.6" }); // equal
+    await run({ lastCheckMs: 1, latest: "0.1.5" }); // older
+    await run({ lastCheckMs: 1, latest: "0.2.0-beta.1" }); // prerelease
+    await run({ lastCheckMs: 1, latest: null }); // unknown
+    await run(null); // no cache file
     expect(out).toHaveLength(0);
   });
 
-  test("does NOT print when suppressed even if a newer version is cached", () => {
+  test("does NOT print when suppressed even if a newer version is cached", async () => {
     const sd = freshStateDir();
     writeCacheFile(sd, { lastCheckMs: 1, latest: "9.9.9" });
     const out: string[] = [];
-    maybeNotifyUpdate({ current: "0.1.6", stateDir: sd, isTTY: true, env: { CI: "1" } as any, print: (m) => out.push(m) });
+    await maybeNotifyUpdate({ current: "0.1.6", stateDir: sd, isTTY: true, env: { CI: "1" } as any, print: (m) => out.push(m) });
     expect(out).toHaveLength(0);
   });
 
@@ -126,6 +134,117 @@ describe("maybeNotifyUpdate — printing", () => {
       maybeNotifyUpdate({ current: "0.1.6", stateDir: sd, isTTY: true, env: CLEAN_ENV, print: (m) => out.push(m) }),
     ).not.toThrow();
     expect(out).toHaveLength(0);
+  });
+});
+
+describe("maybeNotifyUpdate — interactive prompt", () => {
+  test("confirmed update runs npm install globally and asks caller to exit", async () => {
+    const sd = freshStateDir();
+    writeCacheFile(sd, { lastCheckMs: 1, latest: "0.2.0" });
+    const out: string[] = [];
+    const installs: string[][] = [];
+
+    const decision = await maybeNotifyUpdate({
+      current: "0.1.6",
+      stateDir: sd,
+      isTTY: true,
+      inputIsTTY: true,
+      env: CLEAN_ENV,
+      print: (m) => out.push(m),
+      promptUpdate: async () => true,
+      installUpdate: (cmd, args) => {
+        installs.push([cmd, ...args]);
+        return { ok: true };
+      },
+    });
+
+    expect(decision).toBe("updated");
+    expect(installs).toEqual([["npm", "install", "-g", `${PACKAGE_NAME}@latest`]]);
+    expect(out.join("\n")).toContain("请重新运行命令");
+    expect(out.join("\n")).toContain("/plugin marketplace update agentbridge");
+  });
+
+  test("declined update records dismissedVersion and the same version only prints a short notice", async () => {
+    const sd = freshStateDir();
+    writeCacheFile(sd, { lastCheckMs: 1, latest: "0.2.0" });
+    const out: string[] = [];
+
+    const decision = await maybeNotifyUpdate({
+      current: "0.1.6",
+      stateDir: sd,
+      isTTY: true,
+      inputIsTTY: true,
+      env: CLEAN_ENV,
+      print: (m) => out.push(m),
+      promptUpdate: async () => false,
+    });
+
+    expect(decision).toBe("continue");
+    expect(readCacheFile(sd).dismissedVersion).toBe("0.2.0");
+
+    const secondOut: string[] = [];
+    await maybeNotifyUpdate({
+      current: "0.1.6",
+      stateDir: sd,
+      isTTY: true,
+      inputIsTTY: true,
+      env: CLEAN_ENV,
+      print: (m) => secondOut.push(m),
+      promptUpdate: async () => {
+        throw new Error("dismissed versions must not prompt again");
+      },
+    });
+
+    expect(secondOut).toHaveLength(1);
+    expect(secondOut[0]).toContain("0.2.0");
+    expect(secondOut[0]).not.toContain("CLI:");
+  });
+
+  test("AGENTBRIDGE_UPDATE_PROMPT=0 keeps pure notice behavior without prompting or dismissing", async () => {
+    const sd = freshStateDir();
+    writeCacheFile(sd, { lastCheckMs: 1, latest: "0.2.0" });
+    const out: string[] = [];
+
+    const decision = await maybeNotifyUpdate({
+      current: "0.1.6",
+      stateDir: sd,
+      isTTY: true,
+      inputIsTTY: true,
+      env: { AGENTBRIDGE_UPDATE_PROMPT: "0" } as any,
+      print: (m) => out.push(m),
+      promptUpdate: async () => {
+        throw new Error("prompt disabled");
+      },
+      installUpdate: () => {
+        throw new Error("install disabled");
+      },
+    });
+
+    expect(decision).toBe("continue");
+    expect(out).toHaveLength(1);
+    expect(out[0]).toContain("CLI:");
+    expect(readCacheFile(sd).dismissedVersion).toBeUndefined();
+  });
+
+  test("failed confirmed update warns and continues without dismissing the version", async () => {
+    const sd = freshStateDir();
+    writeCacheFile(sd, { lastCheckMs: 1, latest: "0.2.0" });
+    const out: string[] = [];
+
+    const decision = await maybeNotifyUpdate({
+      current: "0.1.6",
+      stateDir: sd,
+      isTTY: true,
+      inputIsTTY: true,
+      env: CLEAN_ENV,
+      print: (m) => out.push(m),
+      promptUpdate: async () => true,
+      installUpdate: () => ({ ok: false, status: 1 }),
+    });
+
+    expect(decision).toBe("continue");
+    expect(out.join("\n")).toContain("update failed");
+    expect(readCacheFile(sd).dismissedVersion).toBeUndefined();
   });
 });
 

@@ -2,7 +2,12 @@ import { describe, expect, test } from "bun:test";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { installPrefixFromBinPath, resolveInstallPrefix } from "../../scripts/install-global.mjs";
+import {
+  decideInstallPreflight,
+  detectActiveInstallSessionsFromPsOutput,
+  installPrefixFromBinPath,
+  resolveInstallPrefix,
+} from "../../scripts/install-global.mjs";
 
 const SCRIPT = join(process.cwd(), "scripts/install-global.mjs");
 const PACKAGE_NAME = "@raysonmeng/agentbridge";
@@ -25,7 +30,8 @@ function runRealWithStubs(
   mode: string,
   extraArgs: string[],
   failWhen: string,
-): { status: number | null; record: string[] } {
+  psOutput = "",
+): { status: number | null; record: string[]; stdout: string; stderr: string } {
   const dir = mkdtempSync(join(tmpdir(), "install-global-stub-"));
   const recordFile = join(dir, "record.log");
   const binDir = join(dir, "bin");
@@ -39,6 +45,10 @@ joined="$name $*"
 if [ -n "$FAIL_WHEN" ] && [[ "$joined" == *"$FAIL_WHEN"* ]]; then
   exit 1
 fi
+if [ "$name" = "ps" ]; then
+  printf "%s" "$PS_OUTPUT"
+  exit 0
+fi
 # 'npm pack' parses stdout for the tarball name — emit a plausible one so the
 # local-mode flow can proceed past packing in the success-path-up-to-install case.
 if [ "$name" = "npm" ] && [ "$1" = "pack" ]; then
@@ -48,7 +58,7 @@ exit 0
 `;
   const { mkdirSync } = require("node:fs") as typeof import("node:fs");
   mkdirSync(binDir, { recursive: true });
-  for (const name of ["npm", "node", "bun"]) {
+  for (const name of ["npm", "node", "bun", "ps"]) {
     const p = join(binDir, name);
     writeFileSync(p, stub);
     chmodSync(p, 0o755);
@@ -63,6 +73,7 @@ exit 0
         PATH: `${binDir}:${process.env.PATH ?? ""}`,
         RECORD_FILE: recordFile,
         FAIL_WHEN: failWhen,
+        PS_OUTPUT: psOutput,
       },
     });
     let record: string[] = [];
@@ -71,7 +82,12 @@ exit 0
     } catch {
       record = [];
     }
-    return { status: res.exitCode, record };
+    return {
+      status: res.exitCode,
+      record,
+      stdout: res.stdout.toString(),
+      stderr: res.stderr.toString(),
+    };
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
@@ -104,6 +120,64 @@ function dryRunCommands(mode: string, extraArgs: string[] = []): string[] {
 }
 
 describe("scripts/install-global.mjs", () => {
+  test("detects active Claude frontends and managed Codex TUIs from ps output", () => {
+    const sessions = detectActiveInstallSessionsFromPsOutput(
+      `
+        101 /Users/x/.claude/plugins/agentbridge/server/bridge-server.js
+        102 /usr/local/bin/codex --enable tui_app_server --remote ws://127.0.0.1:4511
+        103 /usr/local/bin/codex app-server --listen ws://127.0.0.1:4500
+        104 /bin/zsh -c echo codex --enable tui_app_server --remote ws://127.0.0.1:4511
+      `,
+      [
+        {
+          pairId: "work-a1b2c3d4",
+          pairName: "work",
+          cwd: "/repo/work",
+          stateDir: "/state/pairs/work-a1b2c3d4",
+          proxyUrl: "ws://127.0.0.1:4511",
+        },
+      ],
+    );
+
+    expect(sessions).toMatchObject([
+      {
+        kind: "claude-frontend",
+        pid: 101,
+        pair: { label: "unknown" },
+      },
+      {
+        kind: "codex-tui",
+        pid: 102,
+        remoteUrl: "ws://127.0.0.1:4511",
+        pair: {
+          label: "work (work-a1b2c3d4)",
+          pairId: "work-a1b2c3d4",
+          pairName: "work",
+          cwd: "/repo/work",
+        },
+      },
+    ]);
+  });
+
+  test("preflight decision blocks active sessions before install unless forced or dry-run", () => {
+    expect(decideInstallPreflight({ activeSessionCount: 1, force: false, dryRun: false, isTTY: false })).toEqual({
+      action: "block",
+      reason: "non-tty",
+    });
+    expect(decideInstallPreflight({ activeSessionCount: 1, force: true, dryRun: false, isTTY: false })).toEqual({
+      action: "allow",
+      reason: "force",
+    });
+    expect(decideInstallPreflight({ activeSessionCount: 1, force: false, dryRun: true, isTTY: false })).toEqual({
+      action: "allow",
+      reason: "dry-run",
+    });
+    expect(decideInstallPreflight({ activeSessionCount: 0, force: false, dryRun: false, isTTY: false })).toEqual({
+      action: "allow",
+      reason: "no-active-sessions",
+    });
+  });
+
   test("local mode builds, verifies and INSTALLS before stopping anything, then syncs the plugin", () => {
     // Ordering contract (P1 downtime reduction):
     //   - stop-running comes AFTER `npm install` succeeds, so the old daemon
@@ -129,6 +203,18 @@ describe("scripts/install-global.mjs", () => {
     const stopIdx = commands.findIndex((l) => l.includes("stop-running"));
     expect(installIdx).toBeGreaterThanOrEqual(0);
     expect(stopIdx).toBeGreaterThan(installIdx);
+  });
+
+  test("dry-run output includes the active-session preflight as the first plan step", () => {
+    const res = runDry("npm");
+    expect(res.status).toBe(0);
+    const lines = res.stdout
+      .split("\n")
+      .map((line) => line.trim())
+      .filter(Boolean);
+    expect(lines[0]).toContain("preflight");
+    expect(lines[0]).toContain("--force");
+    expect(lines.findIndex((line) => line.startsWith("$ npm view"))).toBeGreaterThan(0);
   });
 
   test("local mode --skip-plugin omits the plugin sync step (stop-running still last)", () => {
@@ -177,6 +263,22 @@ describe("scripts/install-global.mjs", () => {
     expect(recordHasStop(record)).toBe(false);
   });
 
+  test("npm mode: active sessions in non-TTY abort BEFORE npm view unless --force is passed", () => {
+    const activePs = "501 /usr/local/bin/codex --enable tui_app_server --remote ws://127.0.0.1:4501\n";
+    const { status, record, stderr } = runRealWithStubs("npm", [], "", activePs);
+
+    expect(status).toBe(1);
+    expect(record).toEqual(["ps -axo pid=,command="]);
+    expect(record.some((l) => l.startsWith("npm view"))).toBe(false);
+    expect(recordHasStop(record)).toBe(false);
+    expect(stderr).toContain("--force");
+
+    const forced = runRealWithStubs("npm", ["--force"], "", activePs);
+    expect(forced.status).toBe(0);
+    expect(forced.record.some((l) => l.startsWith("npm view"))).toBe(true);
+    expect(recordHasStop(forced.record)).toBe(true);
+  });
+
   test("npm mode: a failed `npm install` aborts BEFORE stop-running (daemon untouched)", () => {
     const { status, record } = runRealWithStubs("npm", [], "install -g --force");
     expect(status).not.toBe(0);
@@ -205,6 +307,22 @@ describe("scripts/install-global.mjs", () => {
     // Nothing destructive ran: no install, no stop-running.
     expect(record.some((l) => l.startsWith("npm install"))).toBe(false);
     expect(recordHasStop(record)).toBe(false);
+  });
+
+  test("local mode: active sessions in non-TTY abort BEFORE build unless --force is passed", () => {
+    const activePs = "601 /Users/x/.claude/plugins/agentbridge/server/bridge-server.js\n";
+    const { status, record, stderr } = runRealWithStubs("local", ["--skip-plugin"], "", activePs);
+
+    expect(status).toBe(1);
+    expect(record).toEqual(["ps -axo pid=,command="]);
+    expect(record.some((l) => l.startsWith("bun run prepublishOnly"))).toBe(false);
+    expect(recordHasStop(record)).toBe(false);
+    expect(stderr).toContain("--force");
+
+    const forced = runRealWithStubs("local", ["--skip-plugin", "--force"], "", activePs);
+    expect(forced.status).toBe(0);
+    expect(forced.record.some((l) => l.startsWith("bun run prepublishOnly"))).toBe(true);
+    expect(recordHasStop(forced.record)).toBe(true);
   });
 
   test("local mode: a failed `npm install` aborts BEFORE stop-running (daemon untouched)", () => {

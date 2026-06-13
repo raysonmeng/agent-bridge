@@ -1,5 +1,33 @@
 /** Type declarations for the testable helpers exported by install-global.mjs. */
 
+export interface ActiveInstallPairInfo {
+  pairId?: string;
+  pairName?: string;
+  cwd?: string;
+  stateDir?: string;
+  proxyUrl?: string;
+}
+
+export interface ActiveInstallSession {
+  kind: "claude-frontend" | "codex-tui";
+  pid: number;
+  command: string;
+  remoteUrl?: string | null;
+  pair: ActiveInstallPairInfo & { label: string };
+}
+
+export function detectActiveInstallSessionsFromPsOutput(
+  psOutput: string,
+  pairInfos?: ActiveInstallPairInfo[],
+): ActiveInstallSession[];
+
+export function decideInstallPreflight(opts: {
+  activeSessionCount: number;
+  force: boolean;
+  dryRun: boolean;
+  isTTY: boolean;
+}): { action: "allow" | "prompt" | "block"; reason: string };
+
 /** Derive the install prefix from a resolved bin path like `<prefix>/bin/<name>`. */
 export function installPrefixFromBinPath(binPath: string | null | undefined): string | null;
 
