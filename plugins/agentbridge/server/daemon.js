@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.16", "0.0.0-source"),
-  commit: defineString("69d8dc1", "source"),
+  commit: defineString("d85c9c9", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("091c4809fd1c", "source")
+  codeHash: defineString("9d80360c2afc", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -5006,6 +5006,7 @@ class ResumeInjectionQueue {
   onConfirmed;
   onAbandoned;
   entries = new Map;
+  resetSweepDepth = 0;
   constructor(options) {
     this.inject = options.inject;
     this.scheduler = options.scheduler ?? globalThis;
@@ -5067,15 +5068,20 @@ class ResumeInjectionQueue {
     this.entries.clear();
   }
   onTurnTrackingReset() {
-    for (const entry of [...this.entries.values()]) {
-      if (entry.state === "awaiting_confirm") {
-        this.supersedeAwaiting(entry, "turn_tracking_reset");
-      } else if (entry.state === "pending") {
-        this.clearRetryTimer(entry);
-      } else {
-        continue;
+    this.resetSweepDepth++;
+    try {
+      for (const entry of [...this.entries.values()]) {
+        if (entry.state === "awaiting_confirm") {
+          this.supersedeAwaiting(entry, "turn_tracking_reset");
+        } else if (entry.state === "pending") {
+          this.clearRetryTimer(entry);
+        } else {
+          continue;
+        }
+        this.countRealAttemptOrAbandon(entry, "turn tracking reset before turn/start confirmation");
       }
-      this.countRealAttemptOrAbandon(entry, "turn tracking reset before turn/start confirmation");
+    } finally {
+      this.resetSweepDepth--;
     }
   }
   onBridgeTurnStarted(event) {
@@ -5090,7 +5096,6 @@ class ResumeInjectionQueue {
     }
     this.entries.delete(event.resumeId);
     this.onConfirmed({ resumeId: event.resumeId, requestId: event.requestId, turnId: event.turnId });
-    this.tryInjectNext();
   }
   onBridgeTurnRejected(event) {
     const entry = this.entries.get(event.resumeId);
@@ -5100,6 +5105,8 @@ class ResumeInjectionQueue {
     this.countRealAttemptOrAbandon(entry, event.error);
   }
   tryInjectNext() {
+    if (this.resetSweepDepth > 0)
+      return;
     for (const entry of this.entries.values()) {
       if (entry.state === "awaiting_confirm")
         return;

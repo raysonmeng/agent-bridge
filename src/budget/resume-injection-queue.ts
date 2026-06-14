@@ -78,6 +78,11 @@ export class ResumeInjectionQueue {
   private readonly onConfirmed: NonNullable<ResumeInjectionQueueOptions["onConfirmed"]>;
   private readonly onAbandoned: NonNullable<ResumeInjectionQueueOptions["onAbandoned"]>;
   private readonly entries = new Map<string, InternalEntry>();
+  // Reentrancy guard: while > 0 we are inside an onTurnTrackingReset sweep (a
+  // teardown boundary). tryInjectNext() is a no-op during the sweep so a cleanup
+  // path (abandon → tryInjectNext) can never "jump the queue" and inject the next
+  // pending mid-reset; surviving pending entries advance at the next real drain.
+  private resetSweepDepth = 0;
 
   constructor(options: ResumeInjectionQueueOptions) {
     this.inject = options.inject;
@@ -145,15 +150,35 @@ export class ResumeInjectionQueue {
   }
 
   onTurnTrackingReset(): void {
-    for (const entry of [...this.entries.values()]) {
-      if (entry.state === "awaiting_confirm") {
-        this.supersedeAwaiting(entry, "turn_tracking_reset");
-      } else if (entry.state === "pending") {
-        this.clearRetryTimer(entry);
-      } else {
-        continue;
+    // A reset (app-server close / reconnect / stop) is a teardown boundary. Clean up
+    // every entry — supersede awaiting → pending, clear pending timers,
+    // count-or-abandon — but do NOT inject the next pending mid-sweep: the
+    // resetSweepDepth guard makes any tryInjectNext() reached via abandon() during
+    // the loop a no-op, so a cleanup never "jumps the queue" and fires a spurious
+    // turn/start that the rest of this sweep would just supersede.
+    //
+    // No explicit post-sweep injection is needed (and Option B deliberately does NOT
+    // drain on the daemon `turnAborted` event, which fires BEFORE this reset): each
+    // swept entry that is not abandoned goes through countRealAttemptOrAbandon →
+    // scheduleRetry, so it carries a retry timer that advances it after the reset.
+    // The normal-completion path advances via turnCompleted → onTurnDrained; the
+    // injected-turn-rejected path (turnAborted WITHOUT a reset) advances via
+    // onBridgeTurnRejected. So every lifecycle path advances exactly once — no stall,
+    // no spurious injection.
+    this.resetSweepDepth++;
+    try {
+      for (const entry of [...this.entries.values()]) {
+        if (entry.state === "awaiting_confirm") {
+          this.supersedeAwaiting(entry, "turn_tracking_reset");
+        } else if (entry.state === "pending") {
+          this.clearRetryTimer(entry);
+        } else {
+          continue;
+        }
+        this.countRealAttemptOrAbandon(entry, "turn tracking reset before turn/start confirmation");
       }
-      this.countRealAttemptOrAbandon(entry, "turn tracking reset before turn/start confirmation");
+    } finally {
+      this.resetSweepDepth--;
     }
   }
 
@@ -168,23 +193,19 @@ export class ResumeInjectionQueue {
     }
     this.entries.delete(event.resumeId);
     this.onConfirmed({ resumeId: event.resumeId, requestId: event.requestId, turnId: event.turnId });
-    // Ordering note (PR3 fast-follow analysis): a turn just STARTED in Codex, so
-    // draining the next pending here can race the just-started turn — codex-rs does
-    // not guarantee the turn/start response orders before its turn/started
-    // notification. This is intentionally left self-correcting rather than gated on
-    // a drain-only model, because: (1) the single-flight guard at the top of
-    // tryInjectNext() prevents a second concurrent injection; (2) injecting into a
-    // still-busy Codex makes inject() return null → scheduleRetry (no lost resume,
-    // no double turn); (3) the budget-recovery flow enqueues at most ONE resume per
-    // side, so 2+ simultaneously-pending entries is not a real scenario today.
-    // "Option B" (inject ONLY from onTurnDrained, never at confirm-time) would be
-    // strictly tighter but is NOT adopted unverified: turnAborted does not currently
-    // call onTurnDrained (daemon.ts), so a drain-only model could stall the next
-    // pending if the started turn aborts. Revisit once the PR5 probe
-    // (docs/test-plans/pr5-codex-idle-injection.md) empirically characterizes
-    // codex-rs turn/start ordering; adopting Option B then also requires draining on
-    // turnAborted.
-    this.tryInjectNext();
+    // Option B (drain-only): do NOT advance the queue here. A turn just STARTED in
+    // Codex, and codex-rs does not guarantee the turn/start response orders before
+    // its turn/started notification — injecting the next pending now could race the
+    // just-started turn. The next pending advances only at a terminal boundary, never
+    // here: normal completion → daemon `turnCompleted` → onTurnDrained(); abort /
+    // reconnect / close → daemon `turnTrackingReset` → onTurnTrackingReset(), whose
+    // sweep arms a per-entry retry timer that advances it. (The daemon `turnAborted`
+    // event deliberately does NOT drain — it fires BEFORE turnTrackingReset, so
+    // draining there would inject a turn the sweep then supersedes; see
+    // onTurnTrackingReset.) Injection-rejection advances via onBridgeTurnRejected. So
+    // the queue never injects while a turn is active and the ordering is irrelevant to
+    // correctness. (`turnStalled` has no terminal boundary and intentionally does not
+    // drain — an active stalled turn must not get a second resume.)
   }
 
   onBridgeTurnRejected(event: { resumeId: string; requestId: number; error: string }): void {
@@ -195,6 +216,8 @@ export class ResumeInjectionQueue {
   }
 
   private tryInjectNext(): void {
+    // Never advance the queue from inside a reset sweep (see resetSweepDepth).
+    if (this.resetSweepDepth > 0) return;
     for (const entry of this.entries.values()) {
       if (entry.state === "awaiting_confirm") return;
     }

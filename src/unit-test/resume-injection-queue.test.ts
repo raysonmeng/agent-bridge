@@ -323,7 +323,7 @@ describe("ResumeInjectionQueue", () => {
     expect(injectCalls).toBe(1);
   });
 
-  test("serializes different resumeIds; second waits until first is confirmed", () => {
+  test("serializes different resumeIds; second waits until first DRAINS, not when it confirms (Option B)", () => {
     const scheduler = new FakeScheduler();
     const injected: string[] = [];
     const accepted: Array<{ resumeId: string; requestId: number }> = [];
@@ -347,15 +347,90 @@ describe("ResumeInjectionQueue", () => {
     expect(queue.get("rid-serial-1")?.state).toBe("awaiting_confirm");
     expect(queue.get("rid-serial-2")?.state).toBe("pending");
 
+    // Option B: CONFIRMING the first must NOT advance the queue — a turn just started
+    // in Codex, so injecting the second now could race it. The second stays pending.
     queue.onBridgeTurnStarted({ resumeId: "rid-serial-1", requestId: -91, turnId: "turn-1" });
+    expect(injected).toEqual(["first"]); // second NOT injected on confirm
+    expect(queue.get("rid-serial-1")).toBeUndefined();
+    expect(queue.get("rid-serial-2")?.state).toBe("pending");
 
+    // The first turn DRAINING (turnCompleted → onTurnDrained) is the boundary that
+    // advances the second.
+    queue.onTurnDrained();
     expect(injected).toEqual(["first", "second"]);
     expect(accepted).toEqual([
       { resumeId: "rid-serial-1", requestId: -91 },
       { resumeId: "rid-serial-2", requestId: -92 },
     ]);
-    expect(queue.get("rid-serial-1")).toBeUndefined();
     expect(queue.get("rid-serial-2")?.state).toBe("awaiting_confirm");
+  });
+
+  test("Option B: onTurnTrackingReset never injects the next pending mid-sweep (resetSweepDepth guard)", () => {
+    const scheduler = new FakeScheduler();
+    const injected: string[] = [];
+    const abandoned: string[] = [];
+    const queue = new ResumeInjectionQueue({
+      inject: (prompt) => {
+        injected.push(prompt);
+        return -200 - injected.length;
+      },
+      scheduler,
+      retryMs: 5_000,
+      confirmTimeoutMs: 60_000,
+      maxAttempts: 1, // so the reset abandons the swept entries
+      onAbandoned: (event) => abandoned.push(event.resumeId),
+    });
+
+    queue.enqueue({ resumeId: "rid-sweep-a", prompt: "a" }); // injected → awaiting
+    queue.enqueue({ resumeId: "rid-sweep-b", prompt: "b" }); // pending (single-flight)
+    expect(injected).toEqual(["a"]);
+
+    // During the sweep, abandoning rid-sweep-a calls tryInjectNext via abandon();
+    // the guard must make that a no-op so rid-sweep-b is NOT injected mid-sweep
+    // (which would fire a spurious turn/start the rest of the sweep then tears down).
+    queue.onTurnTrackingReset();
+
+    expect(injected).toEqual(["a"]); // rid-sweep-b never injected during the sweep
+    expect(abandoned.sort()).toEqual(["rid-sweep-a", "rid-sweep-b"]);
+    expect(queue.size).toBe(0);
+  });
+
+  test("Option B: after an abort/reset the surviving pending advances via its retry timer (no stall)", () => {
+    const scheduler = new FakeScheduler();
+    const injected: string[] = [];
+    const queue = new ResumeInjectionQueue({
+      inject: (prompt) => {
+        injected.push(prompt);
+        return -300 - injected.length;
+      },
+      scheduler,
+      retryMs: 5_000,
+      confirmTimeoutMs: 60_000,
+      maxAttempts: 3,
+    });
+
+    queue.enqueue({ resumeId: "rid-abort-1", prompt: "first" }); // injected → awaiting
+    queue.enqueue({ resumeId: "rid-abort-2", prompt: "second" }); // pending, no timer
+    expect(injected).toEqual(["first"]);
+
+    // First turn confirms (deleted); second still pending (Option B), no timer yet.
+    queue.onBridgeTurnStarted({ resumeId: "rid-abort-1", requestId: -301, turnId: "t1" });
+    expect(queue.get("rid-abort-1")).toBeUndefined();
+    expect(queue.get("rid-abort-2")?.state).toBe("pending");
+    expect(injected).toEqual(["first"]);
+
+    // The first turn ABORTS (resetTurnState → turnTrackingReset). The sweep gives the
+    // surviving pending a retry timer (count-or-abandon → scheduleRetry); it must NOT
+    // be injected during the sweep.
+    queue.onTurnTrackingReset();
+    expect(injected).toEqual(["first"]); // not injected mid-sweep
+    expect(queue.get("rid-abort-2")?.state).toBe("pending");
+    expect(scheduler.activeCount()).toBe(1); // a retry timer is armed
+
+    // The retry timer firing advances the second — no stall, no turnAborted drain.
+    scheduler.runNext();
+    expect(injected).toEqual(["first", "second"]);
+    expect(queue.get("rid-abort-2")?.state).toBe("awaiting_confirm");
   });
 
   test("maxAttempts abandons after real transport rejections", () => {
