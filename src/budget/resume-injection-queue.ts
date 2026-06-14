@@ -162,6 +162,22 @@ export class ResumeInjectionQueue {
     }
     this.entries.delete(event.resumeId);
     this.onConfirmed({ resumeId: event.resumeId, requestId: event.requestId, turnId: event.turnId });
+    // Ordering note (PR3 fast-follow analysis): a turn just STARTED in Codex, so
+    // draining the next pending here can race the just-started turn — codex-rs does
+    // not guarantee the turn/start response orders before its turn/started
+    // notification. This is intentionally left self-correcting rather than gated on
+    // a drain-only model, because: (1) the single-flight guard at the top of
+    // tryInjectNext() prevents a second concurrent injection; (2) injecting into a
+    // still-busy Codex makes inject() return null → scheduleRetry (no lost resume,
+    // no double turn); (3) the budget-recovery flow enqueues at most ONE resume per
+    // side, so 2+ simultaneously-pending entries is not a real scenario today.
+    // "Option B" (inject ONLY from onTurnDrained, never at confirm-time) would be
+    // strictly tighter but is NOT adopted unverified: turnAborted does not currently
+    // call onTurnDrained (daemon.ts), so a drain-only model could stall the next
+    // pending if the started turn aborts. Revisit once the PR5 probe
+    // (docs/test-plans/pr5-codex-idle-injection.md) empirically characterizes
+    // codex-rs turn/start ordering; adopting Option B then also requires draining on
+    // turnAborted.
     this.tryInjectNext();
   }
 

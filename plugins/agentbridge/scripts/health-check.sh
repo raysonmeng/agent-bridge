@@ -48,21 +48,58 @@ state_dir="$(resolve_state_dir)"
 resume_sentinel="${state_dir}/resume-ack-degraded.json"
 if [ -f "$resume_sentinel" ]; then
   resume_id="$(grep -o '"resumeId"[[:space:]]*:[[:space:]]*"[^"]*"' "$resume_sentinel" 2>/dev/null | head -n1 | sed 's/.*"resumeId"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/')"
-  rm -f "$resume_sentinel" 2>/dev/null || true
-  # Defense-in-depth (resume_id is daemon-controlled, but harden anyway): only
-  # interpolate it into the JSON heredoc if it matches the known-safe id charset
-  # (system_budget_claude_recovered_<seq> — a plain monotonic sequence, no salt;
-  # the salt lives in BridgeMessage.id, not in the resumeId the sentinel stores).
-  # Anything else (a corrupted or
-  # tampered sentinel carrying " or \) collapses to "unknown" so the emitted hook
-  # JSON can never be broken by the value — mirrors the pair_id guard above.
-  if ! printf '%s' "$resume_id" | grep -Eq '^[A-Za-z0-9._-]+$'; then
-    resume_id="unknown"
+  # Staleness gate: the sentinel carries degradedAt (epoch MILLISECONDS, written by
+  # writeResumeAckDegradedSentinel). A degrade that happened long ago points at a
+  # checkpoint that is probably already handled, so surfacing "continue from
+  # checkpoint" would mislead. Drop (still consuming) a sentinel older than the TTL.
+  # Default 24h survives an overnight away-window (the core use case — wake up and
+  # the recovery notice is still there) yet suppresses multi-day-stale notices;
+  # configurable via AGENTBRIDGE_RESUME_SENTINEL_TTL_SEC. Fail-open: a missing,
+  # non-numeric, or implausibly-long (>16-digit) degradedAt / TTL is treated as
+  # FRESH so a possibly-real recovery is never silently suppressed. (A parseable
+  # but genuinely old timestamp is still aged normally → stale.)
+  degraded_at_ms="$(grep -o '"degradedAt"[[:space:]]*:[[:space:]]*[0-9][0-9]*' "$resume_sentinel" 2>/dev/null | head -n1 | grep -o '[0-9][0-9]*$')"
+  resume_ttl_sec="${AGENTBRIDGE_RESUME_SENTINEL_TTL_SEC:-86400}"
+  resume_stale=0
+  # Accept only a plausible 1–16 digit integer for BOTH operands: 16 digits keeps
+  # every value (epoch-ms ~13 digits, any sane TTL ≤ ~9.99e15) far under bash's
+  # signed 64-bit ceiling, so the subtraction below can never overflow; anything
+  # longer / non-numeric / missing is rejected here → FRESH (fail-open).
+  if printf '%s' "$degraded_at_ms" | grep -Eq '^[0-9]{1,16}$' && printf '%s' "$resume_ttl_sec" | grep -Eq '^[0-9]{1,16}$'; then
+    # Compare in SECONDS (degradedAt is epoch ms → integer-divide by 1000) and never
+    # multiply the user TTL by 1000, so the comparison can't overflow. `10#` forces
+    # base-10 so a leading-zero value (e.g. 0888…) parses decimally instead of as
+    # octal — an octal-invalid operand would otherwise make the $(( )) arithmetic
+    # fail, and in bash a failed arithmetic assignment terminates the enclosing
+    # if-block (regardless of set flags), skipping the consume (rm) below and leaking
+    # the sentinel. The ^[0-9]{1,16}$ guard above + `10#` together make this
+    # arithmetic TOTAL for every accepted input (no octal abort, no int64 overflow),
+    # so age_sec is always assigned and the unconditional rm below always runs
+    # (consume-once holds).
+    now_sec="$(date +%s 2>/dev/null)"
+    age_sec=$(( ${now_sec:-0} - 10#${degraded_at_ms} / 1000 ))
+    if [ "$age_sec" -gt "$resume_ttl_sec" ]; then
+      resume_stale=1
+    fi
   fi
-  cat <<EOF
+  rm -f "$resume_sentinel" 2>/dev/null || true  # consume once, whether surfaced or dropped-as-stale
+  if [ "$resume_stale" -eq 0 ]; then
+    # Defense-in-depth (resume_id is daemon-controlled, but harden anyway): only
+    # interpolate it into the JSON heredoc if it matches the known-safe id charset
+    # (system_budget_claude_recovered_<seq> — a plain monotonic sequence, no salt;
+    # the salt lives in BridgeMessage.id, not in the resumeId the sentinel stores).
+    # Anything else (a corrupted or
+    # tampered sentinel carrying " or \) collapses to "unknown" so the emitted hook
+    # JSON can never be broken by the value — mirrors the pair_id guard above.
+    if ! printf '%s' "$resume_id" | grep -Eq '^[A-Za-z0-9._-]+$'; then
+      resume_id="unknown"
+    fi
+    cat <<EOF
 {"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"AgentBridge: 上次额度刷新后的续接通知未被确认（resume_id=${resume_id:-unknown}），可能上一个会话已空闲或退出。请从 .agent/checkpoint.md 的「下一步」继续未完成的任务。"}}
 EOF
-  exit 0
+    exit 0
+  fi
+  # stale → sentinel consumed above; fall through to the normal health check below.
 fi
 
 if ! command -v curl >/dev/null 2>&1; then

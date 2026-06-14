@@ -14574,10 +14574,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.16", "0.0.0-source"),
-  commit: defineString("305fb62", "source"),
+  commit: defineString("de7098c", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("6e6ae2f59324", "source")
+  codeHash: defineString("1289c3349277", "source")
 });
 function sameRuntimeContract(a, b) {
   if (!a || !b)

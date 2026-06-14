@@ -95,3 +95,12 @@ budget 协调器（`budget-coordinator.ts` + `daemon.ts`）：
 | R4 | bridge 误判已续接（notification 无 ACK） | 必须看到 Claude 真 ACK 才标 resumed |
 | R5 | guard bash/node 双实现漂移 | 两套都改 + 对照测试 |
 | R6 | watchdog 续接 vs bridge 续接重复 | 二选一：bridge 续接为主，guard watchdog 不装（避免两套都唤醒）|
+
+## 8. 实施后补充说明（fast-follow，2026-06-14）
+
+落地后的几条非阻塞决策，记此备查（对应 PR4/PR5 cross-review 的 RECOMMEND/SUSPECT）：
+
+- **降级 sentinel 陈旧门（degradedAt TTL）**：`health-check.sh` 读 sentinel 的 `degradedAt`（epoch 毫秒），超过 `AGENTBRIDGE_RESUME_SENTINEL_TTL_SEC`（默认 **86400s=24h**）即丢弃且仍消费（删除），不再弹「从 checkpoint 续接」误导。默认 24h 的取舍：**覆盖一夜离开的核心场景**（醒来通知还在），又压住多日陈旧。**fail-open**：`degradedAt` 缺失/非数字 → 当作新鲜照常弹（绝不静默吞掉可能真实的恢复）。
+- **bash↔TS 一致性**：`src/integration-test/health-check-resume-sentinel.test.ts` spawn 真实 `health-check.sh` + 真实 `writeResumeAckDegradedSentinel`，端到端钉死「TS 写 → bash 读」（resumeId 提取、charset guard、TTL 门、消费一次）。非 bash 平台（Windows）自动 skip。
+- **`ack_resume` 不做 token 闸门 = 有意为之**：`daemon.ts` 控制开关里 `ack_resume` 与 `status`/`probe_incumbent` 同级、均不过 `validateClaudeClientIdentity`；只有消息注入路径 `claude_to_codex` 是特权。边界 = localhost + Origin/CSWSH 守卫；`ack_resume` 是纯控制面信号、非注入，符合既有信任模型。最坏情形仅「本地进程在 ack 窗口内猜中低熵 resumeId、压掉一次自动续接」，可手动续，影响有界。
+- **Codex 注入 confirm 时序（PR3）**：`ResumeInjectionQueue.onBridgeTurnStarted` 在确认后调 `tryInjectNext()`——此刻 Codex 刚开新 turn，可能与之竞争（codex-rs 不保证 turn/start 响应早于 turn/started 通知）。**保留为自纠正**而非改 drain-only：单飞门挡并发、busy→null→retry 不丢续接、且恢复流每侧至多 1 个 pending。Option B（仅 onTurnDrained 注入）更紧但未采纳——`turnAborted` 目前不 drain，drain-only 会在起的 turn 中止时卡住下一个 pending。待 PR5 probe 实测 codex-rs 时序后再定（采 Option B 需同时给 turnAborted 补 drain）。
