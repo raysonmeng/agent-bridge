@@ -34,6 +34,7 @@
  * throwaway temp dir without touching the real HOME — the same injection seam
  * QuotaSource uses.
  */
+import { createHash } from "node:crypto";
 import { join } from "node:path";
 import { asFiniteNumber, asRecord, numberOr } from "./quota-source";
 import type { AgentName } from "./types";
@@ -102,6 +103,10 @@ export interface PendingEntry {
   warnUtil: number;
   /** Epoch seconds (.at) the pause was written. */
   at: number;
+  /** Absolute path of the pending file this entry came from; empty for pure parser output. */
+  sourcePath: string;
+  /** sha256 of the trimmed pending file content; empty for pure parser output. */
+  contentHash: string;
 }
 
 /**
@@ -134,7 +139,11 @@ export function parsePendingPayload(value: unknown): PendingEntry | null {
     : null;
   if (agent === null) return null;
 
-  return { status, agent, sessionId, cwd, resetEpoch, util, warnUtil, at };
+  return { status, agent, sessionId, cwd, resetEpoch, util, warnUtil, at, sourcePath: "", contentHash: "" };
+}
+
+function sha256(value: string): string {
+  return createHash("sha256").update(value).digest("hex");
 }
 
 /** Resolve the guard state dir: BUDGET_STATE_DIR env override, else ~/.budget-guard. */
@@ -174,7 +183,9 @@ function readPendingFile(path: string, log: (msg: string) => void): PendingEntry
     return null;
   }
 
-  return parsePendingPayload(parsed);
+  const entry = parsePendingPayload(parsed);
+  if (!entry) return null;
+  return { ...entry, sourcePath: path, contentHash: sha256(text) };
 }
 
 /** List per-scope pending files for the agent: pending/<agent>_*.json. */

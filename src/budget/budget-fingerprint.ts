@@ -27,6 +27,7 @@
  */
 import { resumeBlockingEpoch } from "./budget-gate";
 import { isDecisionGrade } from "./budget-state";
+import type { PendingEntry } from "./pending-reader";
 import type { AgentName, AgentUsage, BudgetConfig, BudgetState } from "./types";
 
 /** Active side, identical to the old pauseSide() bijection over activeSides. */
@@ -133,8 +134,12 @@ export interface ResumeSignals {
   tuiReady: Record<AgentName, boolean>;
   /** Per-side: a guard-pending record for THIS agent, scoped to the current pair cwd, exists. */
   pendingExists: Record<AgentName, boolean>;
+  /** Per-side matched pending entry for claim/injection; present when pendingExists is true. */
+  pending?: Partial<Record<AgentName, PendingEntry>>;
   /** fs.existsSync(<pair cwd>/.agent/checkpoint.md) — shared across sides. */
   checkpointExists: boolean;
+  /** Absolute checkpoint path when checkpointExists is true. */
+  checkpointPath?: string;
 }
 
 /**
@@ -146,6 +151,10 @@ export interface ResumeSignals {
 export interface ResumeCandidateDetail {
   /** All four predicates held: window refreshed AND per-side signals AND checkpoint. */
   ready: boolean;
+  /** Matched guard pending entry for the evaluated side, carried for PR3 atomic claim. */
+  pending?: PendingEntry;
+  /** Shared checkpoint path carried so PR3 does not re-resolve it. */
+  checkpointPath?: string;
 }
 
 /**
@@ -454,7 +463,12 @@ export function computeResumeCandidate(
       signals.tuiReady[agent] &&
       signals.checkpointExists;
     candidate[agent] = ready;
-    detail[agent] = { ready };
+    const pending = signals.pending?.[agent];
+    detail[agent] = {
+      ready,
+      ...(pending ? { pending } : {}),
+      ...(signals.checkpointPath ? { checkpointPath: signals.checkpointPath } : {}),
+    };
   }
   if (sides.length > 0) candidate.detail = detail;
   return candidate;

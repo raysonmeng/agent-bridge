@@ -61,6 +61,19 @@ function signals(overrides: Partial<ResumeSignals> = {}): ResumeSignals {
   };
 }
 
+const codexPending = {
+  status: "paused",
+  agent: "codex" as const,
+  sessionId: "sess-codex",
+  cwd: "/repo/project",
+  resetEpoch: NOW + 3600,
+  util: 92,
+  warnUtil: 92,
+  at: NOW - 10,
+  sourcePath: "/tmp/budget/pending/codex_scope.json",
+  contentHash: "pending-hash",
+};
+
 const over = usage({ gateUtil: 95, warnUtil: 95, remaining: 5 });
 const healthy = usage();
 
@@ -101,6 +114,23 @@ describe("computeResumeCandidate — single side exits a pause (refresh poll)", 
     // Only the recovered side gets a per-side entry.
     expect(candidate.claude).toBeUndefined();
     expect(candidate.detail?.codex?.ready).toBe(true);
+  });
+
+  test("ready detail carries matched pending entry and checkpoint path for PR3 claim", () => {
+    const paused = enterPause("codex");
+    const { candidate } = pollCandidate(
+      paused,
+      healthy,
+      healthy,
+      signals({
+        pending: { codex: codexPending },
+        checkpointPath: "/repo/project/.agent/checkpoint.md",
+      }),
+    );
+
+    expect(candidate.codex).toBe(true);
+    expect(candidate.detail?.codex?.pending).toEqual(codexPending);
+    expect(candidate.detail?.codex?.checkpointPath).toBe("/repo/project/.agent/checkpoint.md");
   });
 
   test("claude paused (handoff), then refreshes → exit poll reports claude ready=true", () => {

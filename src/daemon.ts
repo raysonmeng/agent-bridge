@@ -23,6 +23,8 @@ import { BudgetCoordinator } from "./budget/budget-coordinator";
 import { createQuotaSource } from "./budget/quota-source";
 import { readGuardPending } from "./budget/pending-reader";
 import type { ResumeSignals } from "./budget/budget-fingerprint";
+import { ResumeInjectionQueue, tryClaimPendingResume } from "./budget/resume-injection-queue";
+import { RESUME_PROMPT } from "./budget/resume-prompt";
 import {
   CLOSE_CODE_REPLACED,
   CLOSE_CODE_EVICTED_STALE,
@@ -123,6 +125,9 @@ const CODEX_BOOT_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_CODEX_BOOT_RETRIES",
 const ALLOW_IDENTITYLESS_CLIENT = process.env.AGENTBRIDGE_COMPAT_IDENTITYLESS === "1";
 // Budget coordination config: file config normalized + AGENTBRIDGE_BUDGET_* env overlay.
 const BUDGET_CONFIG = applyBudgetEnvOverrides(config.budget);
+const RESUME_INJECT_RETRY_MS = parsePositiveIntEnv("AGENTBRIDGE_RESUME_INJECT_RETRY_MS", 5000, log);
+const RESUME_CONFIRM_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_RESUME_CONFIRM_TIMEOUT_MS", 60000, log);
+const RESUME_INJECT_MAX_ATTEMPTS = parsePositiveIntEnv("AGENTBRIDGE_RESUME_INJECT_MAX_ATTEMPTS", 5, log);
 
 const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 
@@ -164,6 +169,28 @@ const pendingTurnStarts = new Map<
   number,
   { requestId: string; idempotencyKey?: string; threadId: string }
 >();
+const pendingResumeTurnStarts = new Map<number, { resumeId: string }>();
+const resumeInjectionQueue = new ResumeInjectionQueue({
+  inject: (prompt) => codex.injectMessage(prompt),
+  retryMs: RESUME_INJECT_RETRY_MS,
+  confirmTimeoutMs: RESUME_CONFIRM_TIMEOUT_MS,
+  maxAttempts: RESUME_INJECT_MAX_ATTEMPTS,
+  log,
+  onInjectionAccepted: ({ resumeId, requestId }) => {
+    pendingResumeTurnStarts.set(requestId, { resumeId });
+    log(`Budget resume injection accepted: ${resumeId} → request ${requestId}`);
+  },
+  onInjectionSuperseded: ({ resumeId, requestId, reason }) => {
+    pendingResumeTurnStarts.delete(requestId);
+    log(`Budget resume injection superseded: ${resumeId} request ${requestId} (${reason})`);
+  },
+  onConfirmed: ({ resumeId, requestId, turnId }) => {
+    log(`Budget resume injection confirmed: ${resumeId} request ${requestId} → turn ${turnId}`);
+  },
+  onAbandoned: ({ resumeId, reason }) => {
+    log(`Budget resume injection abandoned: ${resumeId}: ${reason}`);
+  },
+});
 // Transport-accepted steers awaiting their JSON-RPC verdict, keyed by the
 // bridge request id the adapter assigned (steerAccepted/steerFailed echo that
 // id). Keying by id — instead of a FIFO that assumes responses arrive in send
@@ -245,6 +272,19 @@ function pairCwd(): string {
   }
 }
 
+function budgetGuardStateDir(): string {
+  const override = process.env.BUDGET_STATE_DIR;
+  if (override && override.trim() !== "") return override.trim();
+  return join(homedir(), ".budget-guard");
+}
+
+function resumeClaimTtlSec(): number {
+  const totalMs =
+    RESUME_CONFIRM_TIMEOUT_MS * RESUME_INJECT_MAX_ATTEMPTS +
+    RESUME_INJECT_RETRY_MS * Math.max(0, RESUME_INJECT_MAX_ATTEMPTS - 1);
+  return Math.max(1, Math.ceil(totalMs / 1000));
+}
+
 /**
  * PR2 (detection only): gather the resume-readiness signals the coordinator's
  * pure reducer needs. ALL IO lives here so the reducer stays pure. Called once
@@ -279,28 +319,72 @@ function readResumeSignals(): ResumeSignals {
   // throws, but the cwd resolution and the call are still fault-isolated.
   let pendingCodex = false;
   let pendingClaude = false;
+  let pendingCodexEntry: ReturnType<typeof readGuardPending>[number] | undefined;
+  let pendingClaudeEntry: ReturnType<typeof readGuardPending>[number] | undefined;
   try {
     const home = homedir();
     const cwd = pairCwd();
-    pendingCodex = readGuardPending({ homeDir: home, agent: "codex", cwd, log }).length > 0;
-    pendingClaude = readGuardPending({ homeDir: home, agent: "claude", cwd, log }).length > 0;
+    pendingCodexEntry = readGuardPending({ homeDir: home, agent: "codex", cwd, log })[0];
+    pendingClaudeEntry = readGuardPending({ homeDir: home, agent: "claude", cwd, log })[0];
+    pendingCodex = pendingCodexEntry !== undefined;
+    pendingClaude = pendingClaudeEntry !== undefined;
   } catch (error) {
     log(`resume signal: pending read failed: ${error instanceof Error ? error.message : String(error)}`);
   }
 
   // checkpointExists: the handoff checkpoint under the pair's project dir.
   let checkpointExists = false;
+  let checkpointPath: string | undefined;
   try {
-    checkpointExists = existsSync(join(pairCwd(), ".agent", "checkpoint.md"));
+    checkpointPath = join(pairCwd(), ".agent", "checkpoint.md");
+    checkpointExists = existsSync(checkpointPath);
   } catch (error) {
     log(`resume signal: checkpoint stat failed: ${error instanceof Error ? error.message : String(error)}`);
+    checkpointPath = undefined;
   }
 
   return {
     tuiReady: { codex: tuiReadyCodex, claude: tuiReadyClaude },
     pendingExists: { codex: pendingCodex, claude: pendingClaude },
+    pending: {
+      ...(pendingCodexEntry ? { codex: pendingCodexEntry } : {}),
+      ...(pendingClaudeEntry ? { claude: pendingClaudeEntry } : {}),
+    },
     checkpointExists,
+    ...(checkpointPath ? { checkpointPath } : {}),
   };
+}
+
+function enqueueCodexBudgetResume(resumeId: string): void {
+  const candidate = budgetCoordinator?.getResumeCandidate();
+  const detail = candidate?.detail?.codex;
+  if (candidate?.codex !== true || detail?.ready !== true) {
+    log(`Budget resume ${resumeId} ignored: Codex resume candidate is not ready`);
+    return;
+  }
+  if (!detail.pending) {
+    log(`Budget resume ${resumeId} ignored: missing Codex guard pending entry`);
+    return;
+  }
+  if (!detail.checkpointPath) {
+    log(`Budget resume ${resumeId} ignored: missing checkpoint path`);
+    return;
+  }
+
+  const claim = tryClaimPendingResume({
+    stateDir: budgetGuardStateDir(),
+    agent: "codex",
+    pending: detail.pending,
+    checkpointPath: detail.checkpointPath,
+    claimTtlSec: resumeClaimTtlSec(),
+    log,
+  });
+  if (!claim.ok) {
+    log(`Budget resume ${resumeId} not enqueued: pending claim ${claim.reason}${claim.error ? ` (${claim.error})` : ""}`);
+    return;
+  }
+
+  resumeInjectionQueue.enqueue({ resumeId, prompt: RESUME_PROMPT, claim: claim.claim });
 }
 
 function ensureBudgetCoordinatorStarted() {
@@ -337,6 +421,14 @@ function ensureBudgetCoordinatorStarted() {
       },
       onSnapshot: () => broadcastStatus(),
       log,
+      onResume: (side, _directive, resumeId) => {
+        if (side === "codex") {
+          enqueueCodexBudgetResume(resumeId);
+          return;
+        }
+        // PR4 wires Claude channel resume + ack_resume. PR3 only owns Codex turn/start.
+        log(`Budget resume ${resumeId} for Claude side deferred to PR4`);
+      },
       // PR2 (detection only): daemon-side readiness signals for the resume
       // candidate. Pure-reducer purity is preserved by gathering all IO here —
       // the coordinator only reads the returned ResumeSignals. The closure
@@ -480,6 +572,13 @@ codex.on("steerAccepted", ({ requestId }: { requestId: number }) => {
 // --- Protocol v2 PR B: turn_started ACK + idempotency terminal wiring ---
 
 codex.on("bridgeTurnStarted", ({ requestId, turnId }: { requestId: number; turnId: string }) => {
+  const pendingResume = pendingResumeTurnStarts.get(requestId);
+  if (pendingResume) {
+    pendingResumeTurnStarts.delete(requestId);
+    resumeInjectionQueue.onBridgeTurnStarted({ resumeId: pendingResume.resumeId, requestId, turnId });
+    return;
+  }
+
   const pending = pendingTurnStarts.get(requestId);
   if (!pending) {
     // Possible after a turnTrackingReset cleared the map while the response
@@ -504,6 +603,13 @@ codex.on("bridgeTurnStarted", ({ requestId, turnId }: { requestId: number; turnI
 });
 
 codex.on("bridgeTurnRejected", ({ requestId, error }: { requestId: number; error: string }) => {
+  const pendingResume = pendingResumeTurnStarts.get(requestId);
+  if (pendingResume) {
+    pendingResumeTurnStarts.delete(requestId);
+    resumeInjectionQueue.onBridgeTurnRejected({ resumeId: pendingResume.resumeId, requestId, error });
+    return;
+  }
+
   const pending = pendingTurnStarts.get(requestId);
   if (!pending) return;
   pendingTurnStarts.delete(requestId);
@@ -536,11 +642,16 @@ codex.on("turnTrackingReset", (reason: string) => {
   if (pendingTurnStarts.size > 0) {
     log(`Cleared ${pendingTurnStarts.size} pending turn-start correlation(s) on turn tracking reset (${reason})`);
   }
+  if (pendingResumeTurnStarts.size > 0) {
+    log(`Cleared ${pendingResumeTurnStarts.size} pending resume turn-start correlation(s) on turn tracking reset (${reason})`);
+  }
   if (pendingSteerDispatches.size > 0) {
     log(`Cleared ${pendingSteerDispatches.size} pending steer dispatch(es) on turn tracking reset (${reason})`);
   }
   pendingTurnStarts.clear();
+  pendingResumeTurnStarts.clear();
   pendingSteerDispatches.clear();
+  resumeInjectionQueue.onTurnTrackingReset();
 });
 
 codex.on("turnStarted", () => {
@@ -610,6 +721,7 @@ codex.on("turnCompleted", () => {
     ),
   );
   startAttentionWindow();
+  resumeInjectionQueue.onTurnDrained();
 });
 
 codex.on("turnAborted", (reason: string) => {
@@ -713,7 +825,9 @@ codex.on("exit", (code: number | null) => {
   // and per-injection correlation can never resolve (PR B).
   idempotencyTracker.terminateAll("aborted");
   pendingTurnStarts.clear();
+  pendingResumeTurnStarts.clear();
   pendingSteerDispatches.clear();
+  resumeInjectionQueue.onTurnTrackingReset();
   statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
   clearPendingClaudeDisconnect("Codex process exited");
@@ -1933,6 +2047,7 @@ function shutdown(reason: string, exitCode = 0) {
   shuttingDown = true;
   log(`Shutting down daemon (${reason})...`);
   clearBootDeadline();
+  resumeInjectionQueue.stop();
   stopBudgetCoordinator();
   idempotencyTracker.dispose();
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);

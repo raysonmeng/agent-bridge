@@ -3,9 +3,9 @@
 var __require = import.meta.require;
 
 // src/daemon.ts
-import { existsSync as existsSync7, realpathSync, rmSync as rmSync2 } from "fs";
+import { existsSync as existsSync8, realpathSync as realpathSync2, rmSync as rmSync2 } from "fs";
 import { homedir as homedir4 } from "os";
-import { join as join8 } from "path";
+import { join as join9 } from "path";
 import { randomUUID as randomUUID4 } from "crypto";
 
 // src/contract-version.ts
@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.16", "0.0.0-source"),
-  commit: defineString("95223ff", "source"),
+  commit: defineString("2c8dc86", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("1680b1c1e99c", "source")
+  codeHash: defineString("907116a9cd8c", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -4074,7 +4074,12 @@ function computeResumeCandidate(sides, state, cfg, signals) {
     const windowRefreshed = canAgentResume(state.perAgent[agent], cfg, state.now);
     const ready = windowRefreshed && signals.pendingExists[agent] && signals.tuiReady[agent] && signals.checkpointExists;
     candidate[agent] = ready;
-    detail[agent] = { ready };
+    const pending = signals.pending?.[agent];
+    detail[agent] = {
+      ready,
+      ...pending ? { pending } : {},
+      ...signals.checkpointPath ? { checkpointPath: signals.checkpointPath } : {}
+    };
   }
   if (sides.length > 0)
     candidate.detail = detail;
@@ -4270,7 +4275,13 @@ class BudgetCoordinator {
     const { detail, ...rest } = this.resumeCandidate;
     return detail ? {
       ...rest,
-      detail: Object.fromEntries(Object.entries(detail).map(([side, value]) => [side, { ...value }]))
+      detail: Object.fromEntries(Object.entries(detail).map(([side, value]) => [
+        side,
+        {
+          ...value,
+          ...value.pending ? { pending: { ...value.pending } } : {}
+        }
+      ]))
     } : { ...rest };
   }
   getCodexTurnOverrides() {
@@ -4859,6 +4870,7 @@ function createQuotaSource(options) {
 }
 
 // src/budget/pending-reader.ts
+import { createHash } from "crypto";
 import { join as join6 } from "path";
 function nodeFs() {
   return __require("fs");
@@ -4891,7 +4903,10 @@ function parsePendingPayload(value) {
   const agent = record.agent === "claude" || record.agent === "codex" ? record.agent : null;
   if (agent === null)
     return null;
-  return { status, agent, sessionId, cwd, resetEpoch, util, warnUtil, at };
+  return { status, agent, sessionId, cwd, resetEpoch, util, warnUtil, at, sourcePath: "", contentHash: "" };
+}
+function sha256(value) {
+  return createHash("sha256").update(value).digest("hex");
 }
 function resolveStateDir(homeDir) {
   const override = process.env.BUDGET_STATE_DIR;
@@ -4917,7 +4932,10 @@ function readPendingFile(path, log) {
     log(`pending reader: skip malformed JSON ${path}`);
     return null;
   }
-  return parsePendingPayload(parsed);
+  const entry = parsePendingPayload(parsed);
+  if (!entry)
+    return null;
+  return { ...entry, sourcePath: path, contentHash: sha256(text) };
 }
 function listScopeFiles(stateDir, agent, log) {
   const pendingDir = join6(stateDir, "pending");
@@ -4955,9 +4973,336 @@ function readGuardPending(opts) {
   return [...bySession.values()];
 }
 
+// src/budget/resume-injection-queue.ts
+import { createHash as createHash2 } from "crypto";
+import { closeSync as closeSync3, existsSync as existsSync6, mkdirSync as mkdirSync5, openSync as openSync3, readFileSync as readFileSync5, realpathSync, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "fs";
+import { join as join7 } from "path";
+
+// src/budget/resume-prompt.ts
+var RESUME_PROMPT = "\u989D\u5EA6\u7A97\u53E3\u5DF2\u5237\u65B0\uFF0C\u7EE7\u7EED\u4E0A\u6B21\u672A\u5B8C\u6210\u7684\u4EFB\u52A1\uFF1A\u4ECE .agent/checkpoint.md \u7684\u300C\u4E0B\u4E00\u6B65\u300D\u63A5\u7740\u505A\uFF1B\u5B8C\u6210\u540E\u505C\u4E0B\u5E76\u6807 DONE\u3002";
+
+// src/budget/resume-injection-queue.ts
+var DEFAULT_RETRY_MS = 5000;
+var DEFAULT_CONFIRM_TIMEOUT_MS = 60000;
+var DEFAULT_MAX_ATTEMPTS = 5;
+var DEFAULT_STALE_CLAIM_TTL_SEC = 300;
+function finitePositive(value, fallback) {
+  return Number.isFinite(value) && value > 0 ? Math.floor(value) : fallback;
+}
+
+class ResumeInjectionQueue {
+  inject;
+  scheduler;
+  retryMs;
+  confirmTimeoutMs;
+  maxAttempts;
+  log;
+  onInjectionAccepted;
+  onInjectionSuperseded;
+  onConfirmed;
+  onAbandoned;
+  entries = new Map;
+  constructor(options) {
+    this.inject = options.inject;
+    this.scheduler = options.scheduler ?? globalThis;
+    this.retryMs = finitePositive(options.retryMs, DEFAULT_RETRY_MS);
+    this.confirmTimeoutMs = finitePositive(options.confirmTimeoutMs, DEFAULT_CONFIRM_TIMEOUT_MS);
+    this.maxAttempts = finitePositive(options.maxAttempts, DEFAULT_MAX_ATTEMPTS);
+    this.log = options.log ?? (() => {});
+    this.onInjectionAccepted = options.onInjectionAccepted ?? (() => {});
+    this.onInjectionSuperseded = options.onInjectionSuperseded ?? (() => {});
+    this.onConfirmed = options.onConfirmed ?? (() => {});
+    this.onAbandoned = options.onAbandoned ?? (() => {});
+  }
+  get size() {
+    return this.entries.size;
+  }
+  get(resumeId) {
+    const entry = this.entries.get(resumeId);
+    if (!entry)
+      return;
+    const { retryTimer: _retryTimer, confirmTimer: _confirmTimer, claim: _claim, ...publicEntry } = entry;
+    return { ...publicEntry };
+  }
+  enqueue(input) {
+    if (this.entries.has(input.resumeId)) {
+      this.log(`resume injection deduped: ${input.resumeId}`);
+      try {
+        input.claim?.release();
+      } catch (error) {
+        this.log(`resume claim release failed (${input.resumeId} dedup): ${error instanceof Error ? error.message : String(error)}`);
+      }
+      return;
+    }
+    this.entries.set(input.resumeId, {
+      resumeId: input.resumeId,
+      prompt: input.prompt ?? RESUME_PROMPT,
+      state: "pending",
+      attempts: 0,
+      ...input.claim ? { claim: input.claim } : {}
+    });
+    this.tryInjectNext();
+  }
+  onTurnDrained() {
+    this.tryInjectNext();
+  }
+  stop() {
+    for (const entry of this.entries.values()) {
+      const requestId = entry.injectionId;
+      this.clearRetryTimer(entry);
+      this.clearConfirmTimer(entry);
+      if (requestId !== undefined) {
+        this.onInjectionSuperseded({ resumeId: entry.resumeId, requestId, reason: "stop" });
+      }
+      try {
+        entry.claim?.release();
+      } catch (error) {
+        this.log(`resume claim release failed (${entry.resumeId}): ${error instanceof Error ? error.message : String(error)}`);
+      }
+    }
+    this.entries.clear();
+  }
+  onTurnTrackingReset() {
+    for (const entry of [...this.entries.values()]) {
+      if (entry.state === "awaiting_confirm") {
+        this.supersedeAwaiting(entry, "turn_tracking_reset");
+      } else if (entry.state === "pending") {
+        this.clearRetryTimer(entry);
+      } else {
+        continue;
+      }
+      this.countRealAttemptOrAbandon(entry, "turn tracking reset before turn/start confirmation");
+    }
+  }
+  onBridgeTurnStarted(event) {
+    const entry = this.entries.get(event.resumeId);
+    if (!entry || entry.state !== "awaiting_confirm" || entry.injectionId !== event.requestId)
+      return;
+    this.clearConfirmTimer(entry);
+    try {
+      entry.claim?.consume();
+    } catch (error) {
+      this.log(`resume claim consume failed (${event.resumeId}): ${error instanceof Error ? error.message : String(error)}`);
+    }
+    this.entries.delete(event.resumeId);
+    this.onConfirmed({ resumeId: event.resumeId, requestId: event.requestId, turnId: event.turnId });
+    this.tryInjectNext();
+  }
+  onBridgeTurnRejected(event) {
+    const entry = this.entries.get(event.resumeId);
+    if (!entry || entry.state !== "awaiting_confirm" || entry.injectionId !== event.requestId)
+      return;
+    this.supersedeAwaiting(entry, "bridge_rejected");
+    this.countRealAttemptOrAbandon(entry, event.error);
+  }
+  tryInjectNext() {
+    for (const entry of this.entries.values()) {
+      if (entry.state === "awaiting_confirm")
+        return;
+    }
+    for (const entry of this.entries.values()) {
+      if (entry.state !== "pending")
+        continue;
+      this.clearRetryTimer(entry);
+      let requestId;
+      try {
+        requestId = this.inject(entry.prompt);
+      } catch (error) {
+        this.countRealAttemptOrAbandon(entry, error instanceof Error ? error.message : String(error));
+        return;
+      }
+      if (requestId === null) {
+        this.scheduleRetry(entry);
+        return;
+      }
+      entry.state = "awaiting_confirm";
+      entry.injectionId = requestId;
+      this.onInjectionAccepted({ resumeId: entry.resumeId, requestId });
+      this.scheduleConfirmTimeout(entry);
+      return;
+    }
+  }
+  countRealAttemptOrAbandon(entry, reason) {
+    entry.attempts += 1;
+    if (entry.attempts >= this.maxAttempts) {
+      this.abandon(entry, reason);
+      return;
+    }
+    this.scheduleRetry(entry);
+  }
+  abandon(entry, reason) {
+    this.clearRetryTimer(entry);
+    this.clearConfirmTimer(entry);
+    this.entries.delete(entry.resumeId);
+    try {
+      entry.claim?.release();
+    } catch (error) {
+      this.log(`resume claim release failed (${entry.resumeId}): ${error instanceof Error ? error.message : String(error)}`);
+    }
+    this.onAbandoned({ resumeId: entry.resumeId, reason });
+    this.tryInjectNext();
+  }
+  supersedeAwaiting(entry, reason) {
+    this.clearConfirmTimer(entry);
+    const requestId = entry.injectionId;
+    delete entry.injectionId;
+    entry.state = "pending";
+    if (requestId !== undefined) {
+      this.onInjectionSuperseded({ resumeId: entry.resumeId, requestId, reason });
+    }
+  }
+  scheduleRetry(entry) {
+    if (!this.entries.has(entry.resumeId))
+      return;
+    this.clearRetryTimer(entry);
+    entry.retryTimer = this.scheduler.setTimeout(() => {
+      delete entry.retryTimer;
+      this.tryInjectNext();
+    }, this.retryMs);
+    entry.retryTimer?.unref?.();
+  }
+  scheduleConfirmTimeout(entry) {
+    this.clearConfirmTimer(entry);
+    entry.confirmTimer = this.scheduler.setTimeout(() => {
+      delete entry.confirmTimer;
+      if (entry.state !== "awaiting_confirm")
+        return;
+      this.supersedeAwaiting(entry, "confirm_timeout");
+      this.countRealAttemptOrAbandon(entry, "turn/start confirmation timed out");
+    }, this.confirmTimeoutMs);
+    entry.confirmTimer?.unref?.();
+  }
+  clearRetryTimer(entry) {
+    if (entry.retryTimer === undefined)
+      return;
+    this.scheduler.clearTimeout(entry.retryTimer);
+    delete entry.retryTimer;
+  }
+  clearConfirmTimer(entry) {
+    if (entry.confirmTimer === undefined)
+      return;
+    this.scheduler.clearTimeout(entry.confirmTimer);
+    delete entry.confirmTimer;
+  }
+}
+function realpathOrRaw(path) {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
+}
+function sha2562(value) {
+  return createHash2("sha256").update(value).digest("hex");
+}
+function writeJsonWx(path, value) {
+  let fd;
+  try {
+    fd = openSync3(path, "wx", 384);
+  } catch (error) {
+    if (error?.code === "EEXIST")
+      return false;
+    throw error;
+  }
+  try {
+    writeFileSync3(fd, JSON.stringify(value, null, 2));
+  } finally {
+    closeSync3(fd);
+  }
+  return true;
+}
+function unlinkIfExists(path) {
+  try {
+    unlinkSync4(path);
+  } catch (error) {
+    if (error?.code === "ENOENT")
+      return;
+    throw error;
+  }
+}
+function readClaimedAt(path) {
+  try {
+    const parsed = JSON.parse(readFileSync5(path, "utf-8"));
+    const claimedAt = parsed?.claimed_at;
+    return typeof claimedAt === "number" && Number.isFinite(claimedAt) ? claimedAt : null;
+  } catch {
+    return null;
+  }
+}
+function tryClaimPendingResume(opts) {
+  const now = opts.now ?? (() => Math.floor(Date.now() / 1000));
+  const claimTtlSec = finitePositive(opts.claimTtlSec, DEFAULT_STALE_CLAIM_TTL_SEC);
+  const cwd = realpathOrRaw(opts.pending.cwd);
+  const sourcePath = opts.pending.sourcePath ?? "";
+  const contentHash = opts.pending.contentHash ?? "";
+  const identity = sha2562([
+    opts.agent,
+    opts.pending.sessionId,
+    cwd,
+    contentHash
+  ].join("\x00"));
+  const claimsDir = join7(opts.stateDir, "claims");
+  const consumedDir = join7(opts.stateDir, "consumed");
+  const claimPath = join7(claimsDir, `${identity}.json`);
+  const consumedPath = join7(consumedDir, `${identity}.json`);
+  mkdirSync5(claimsDir, { recursive: true });
+  mkdirSync5(consumedDir, { recursive: true });
+  if (existsSync6(consumedPath))
+    return { ok: false, reason: "consumed" };
+  const nowSec = now();
+  if (existsSync6(claimPath)) {
+    const claimedAt = readClaimedAt(claimPath);
+    if (claimedAt !== null && nowSec - claimedAt > claimTtlSec) {
+      try {
+        unlinkIfExists(claimPath);
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        opts.log?.(`stale resume claim cleanup failed: ${message}`);
+        return { ok: false, reason: "error", error: message };
+      }
+    } else {
+      return { ok: false, reason: "claimed" };
+    }
+  }
+  const payload = {
+    identity,
+    agent: opts.agent,
+    session_id: opts.pending.sessionId,
+    cwd,
+    pending_path: sourcePath,
+    pending_hash: contentHash,
+    checkpoint_path: opts.checkpointPath,
+    claimed_at: nowSec
+  };
+  try {
+    if (!writeJsonWx(claimPath, payload))
+      return { ok: false, reason: "claimed" };
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    opts.log?.(`resume claim failed: ${message}`);
+    return { ok: false, reason: "error", error: message };
+  }
+  return {
+    ok: true,
+    claim: {
+      identity,
+      claimPath,
+      consumedPath,
+      consume: () => {
+        mkdirSync5(consumedDir, { recursive: true });
+        writeFileSync3(consumedPath, JSON.stringify({ ...payload, consumed_at: now() }, null, 2));
+        unlinkIfExists(claimPath);
+      },
+      release: () => {
+        unlinkIfExists(claimPath);
+      }
+    }
+  };
+}
+
 // src/daemon-identity-ownership.ts
-import { readFileSync as readFileSync5 } from "fs";
-var defaultRead2 = (path) => readFileSync5(path, "utf-8");
+import { readFileSync as readFileSync6 } from "fs";
+var defaultRead2 = (path) => readFileSync6(path, "utf-8");
 function pidFileOwnedByUs(pidFilePath, ourPid, read = defaultRead2) {
   let raw;
   try {
@@ -5125,12 +5470,12 @@ class ReplyRequiredTracker {
 
 // src/thread-state.ts
 import {
-  existsSync as existsSync6,
+  existsSync as existsSync7,
   readdirSync,
-  readFileSync as readFileSync6
+  readFileSync as readFileSync7
 } from "fs";
 import { homedir as homedir3 } from "os";
-import { basename as basename2, join as join7 } from "path";
+import { basename as basename2, join as join8 } from "path";
 function nowIso() {
   return new Date().toISOString();
 }
@@ -5139,11 +5484,11 @@ function threadTag(identity) {
   return `abg:${name}:${identity.cwd}`;
 }
 function codexHome(env = process.env) {
-  return env.CODEX_HOME && env.CODEX_HOME.length > 0 ? env.CODEX_HOME : join7(homedir3(), ".codex");
+  return env.CODEX_HOME && env.CODEX_HOME.length > 0 ? env.CODEX_HOME : join8(homedir3(), ".codex");
 }
 function readRawCurrentThread(stateDir) {
   try {
-    const parsed = JSON.parse(readFileSync6(stateDir.currentThreadFile, "utf-8"));
+    const parsed = JSON.parse(readFileSync7(stateDir.currentThreadFile, "utf-8"));
     if (parsed?.version === 1 && typeof parsed.threadId === "string" && parsed.threadId.length > 0 && (parsed.status === "pending" || parsed.status === "current") && typeof parsed.cwd === "string") {
       return parsed;
     }
@@ -5151,8 +5496,8 @@ function readRawCurrentThread(stateDir) {
   return null;
 }
 function findCodexRolloutFile(threadId, env = process.env, maxEntries = 20000) {
-  const sessionsDir = join7(codexHome(env), "sessions");
-  if (!threadId || !existsSync6(sessionsDir))
+  const sessionsDir = join8(codexHome(env), "sessions");
+  if (!threadId || !existsSync7(sessionsDir))
     return null;
   const exactName = `rollout-${threadId}.jsonl`;
   const stack = [sessionsDir];
@@ -5167,7 +5512,7 @@ function findCodexRolloutFile(threadId, env = process.env, maxEntries = 20000) {
     }
     for (const entry of entries) {
       visited++;
-      const path = join7(dir, entry.name);
+      const path = join8(dir, entry.name);
       if (entry.isDirectory()) {
         stack.push(path);
         continue;
@@ -5356,6 +5701,9 @@ var BOOTSTRAP_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_BOOTSTRAP_TIMEOUT_MS
 var CODEX_BOOT_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_CODEX_BOOT_RETRIES", 2);
 var ALLOW_IDENTITYLESS_CLIENT = process.env.AGENTBRIDGE_COMPAT_IDENTITYLESS === "1";
 var BUDGET_CONFIG = applyBudgetEnvOverrides(config.budget);
+var RESUME_INJECT_RETRY_MS = parsePositiveIntEnv("AGENTBRIDGE_RESUME_INJECT_RETRY_MS", 5000, log);
+var RESUME_CONFIRM_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_RESUME_CONFIRM_TIMEOUT_MS", 60000, log);
+var RESUME_INJECT_MAX_ATTEMPTS = parsePositiveIntEnv("AGENTBRIDGE_RESUME_INJECT_MAX_ATTEMPTS", 5, log);
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 var DAEMON_NONCE = randomUUID4();
 var DAEMON_STARTED_AT = Date.now();
@@ -5373,6 +5721,28 @@ var inAttentionWindow = false;
 var replyTracker = new ReplyRequiredTracker;
 var idempotencyTracker = new IdempotencyTracker;
 var pendingTurnStarts = new Map;
+var pendingResumeTurnStarts = new Map;
+var resumeInjectionQueue = new ResumeInjectionQueue({
+  inject: (prompt) => codex.injectMessage(prompt),
+  retryMs: RESUME_INJECT_RETRY_MS,
+  confirmTimeoutMs: RESUME_CONFIRM_TIMEOUT_MS,
+  maxAttempts: RESUME_INJECT_MAX_ATTEMPTS,
+  log,
+  onInjectionAccepted: ({ resumeId, requestId }) => {
+    pendingResumeTurnStarts.set(requestId, { resumeId });
+    log(`Budget resume injection accepted: ${resumeId} \u2192 request ${requestId}`);
+  },
+  onInjectionSuperseded: ({ resumeId, requestId, reason }) => {
+    pendingResumeTurnStarts.delete(requestId);
+    log(`Budget resume injection superseded: ${resumeId} request ${requestId} (${reason})`);
+  },
+  onConfirmed: ({ resumeId, requestId, turnId }) => {
+    log(`Budget resume injection confirmed: ${resumeId} request ${requestId} \u2192 turn ${turnId}`);
+  },
+  onAbandoned: ({ resumeId, reason }) => {
+    log(`Budget resume injection abandoned: ${resumeId}: ${reason}`);
+  }
+});
 var pendingSteerDispatches = new Map;
 var BUSY_RETRY_ADVISORY_MS = 15000;
 var shuttingDown = false;
@@ -5401,10 +5771,20 @@ var budgetCoordinator = null;
 function pairCwd() {
   const raw = process.cwd();
   try {
-    return realpathSync(raw);
+    return realpathSync2(raw);
   } catch {
     return raw;
   }
+}
+function budgetGuardStateDir() {
+  const override = process.env.BUDGET_STATE_DIR;
+  if (override && override.trim() !== "")
+    return override.trim();
+  return join9(homedir4(), ".budget-guard");
+}
+function resumeClaimTtlSec() {
+  const totalMs = RESUME_CONFIRM_TIMEOUT_MS * RESUME_INJECT_MAX_ATTEMPTS + RESUME_INJECT_RETRY_MS * Math.max(0, RESUME_INJECT_MAX_ATTEMPTS - 1);
+  return Math.max(1, Math.ceil(totalMs / 1000));
 }
 function readResumeSignals() {
   let tuiReadyCodex = false;
@@ -5421,25 +5801,66 @@ function readResumeSignals() {
   }
   let pendingCodex = false;
   let pendingClaude = false;
+  let pendingCodexEntry;
+  let pendingClaudeEntry;
   try {
     const home = homedir4();
     const cwd = pairCwd();
-    pendingCodex = readGuardPending({ homeDir: home, agent: "codex", cwd, log }).length > 0;
-    pendingClaude = readGuardPending({ homeDir: home, agent: "claude", cwd, log }).length > 0;
+    pendingCodexEntry = readGuardPending({ homeDir: home, agent: "codex", cwd, log })[0];
+    pendingClaudeEntry = readGuardPending({ homeDir: home, agent: "claude", cwd, log })[0];
+    pendingCodex = pendingCodexEntry !== undefined;
+    pendingClaude = pendingClaudeEntry !== undefined;
   } catch (error) {
     log(`resume signal: pending read failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   let checkpointExists = false;
+  let checkpointPath;
   try {
-    checkpointExists = existsSync7(join8(pairCwd(), ".agent", "checkpoint.md"));
+    checkpointPath = join9(pairCwd(), ".agent", "checkpoint.md");
+    checkpointExists = existsSync8(checkpointPath);
   } catch (error) {
     log(`resume signal: checkpoint stat failed: ${error instanceof Error ? error.message : String(error)}`);
+    checkpointPath = undefined;
   }
   return {
     tuiReady: { codex: tuiReadyCodex, claude: tuiReadyClaude },
     pendingExists: { codex: pendingCodex, claude: pendingClaude },
-    checkpointExists
+    pending: {
+      ...pendingCodexEntry ? { codex: pendingCodexEntry } : {},
+      ...pendingClaudeEntry ? { claude: pendingClaudeEntry } : {}
+    },
+    checkpointExists,
+    ...checkpointPath ? { checkpointPath } : {}
   };
+}
+function enqueueCodexBudgetResume(resumeId) {
+  const candidate = budgetCoordinator?.getResumeCandidate();
+  const detail = candidate?.detail?.codex;
+  if (candidate?.codex !== true || detail?.ready !== true) {
+    log(`Budget resume ${resumeId} ignored: Codex resume candidate is not ready`);
+    return;
+  }
+  if (!detail.pending) {
+    log(`Budget resume ${resumeId} ignored: missing Codex guard pending entry`);
+    return;
+  }
+  if (!detail.checkpointPath) {
+    log(`Budget resume ${resumeId} ignored: missing checkpoint path`);
+    return;
+  }
+  const claim = tryClaimPendingResume({
+    stateDir: budgetGuardStateDir(),
+    agent: "codex",
+    pending: detail.pending,
+    checkpointPath: detail.checkpointPath,
+    claimTtlSec: resumeClaimTtlSec(),
+    log
+  });
+  if (!claim.ok) {
+    log(`Budget resume ${resumeId} not enqueued: pending claim ${claim.reason}${claim.error ? ` (${claim.error})` : ""}`);
+    return;
+  }
+  resumeInjectionQueue.enqueue({ resumeId, prompt: RESUME_PROMPT, claim: claim.claim });
 }
 function ensureBudgetCoordinatorStarted() {
   if (!BUDGET_CONFIG.enabled)
@@ -5457,6 +5878,13 @@ function ensureBudgetCoordinatorStarted() {
       },
       onSnapshot: () => broadcastStatus(),
       log,
+      onResume: (side, _directive, resumeId) => {
+        if (side === "codex") {
+          enqueueCodexBudgetResume(resumeId);
+          return;
+        }
+        log(`Budget resume ${resumeId} for Claude side deferred to PR4`);
+      },
       resumeSignals: readResumeSignals
     });
   }
@@ -5516,6 +5944,12 @@ codex.on("steerAccepted", ({ requestId }) => {
   }
 });
 codex.on("bridgeTurnStarted", ({ requestId, turnId }) => {
+  const pendingResume = pendingResumeTurnStarts.get(requestId);
+  if (pendingResume) {
+    pendingResumeTurnStarts.delete(requestId);
+    resumeInjectionQueue.onBridgeTurnStarted({ resumeId: pendingResume.resumeId, requestId, turnId });
+    return;
+  }
   const pending = pendingTurnStarts.get(requestId);
   if (!pending) {
     log(`bridgeTurnStarted for unknown injection ${requestId} (turn ${turnId}) \u2014 correlation dropped`);
@@ -5537,6 +5971,12 @@ codex.on("bridgeTurnStarted", ({ requestId, turnId }) => {
   }
 });
 codex.on("bridgeTurnRejected", ({ requestId, error }) => {
+  const pendingResume = pendingResumeTurnStarts.get(requestId);
+  if (pendingResume) {
+    pendingResumeTurnStarts.delete(requestId);
+    resumeInjectionQueue.onBridgeTurnRejected({ resumeId: pendingResume.resumeId, requestId, error });
+    return;
+  }
   const pending = pendingTurnStarts.get(requestId);
   if (!pending)
     return;
@@ -5554,11 +5994,16 @@ codex.on("turnTrackingReset", (reason) => {
   if (pendingTurnStarts.size > 0) {
     log(`Cleared ${pendingTurnStarts.size} pending turn-start correlation(s) on turn tracking reset (${reason})`);
   }
+  if (pendingResumeTurnStarts.size > 0) {
+    log(`Cleared ${pendingResumeTurnStarts.size} pending resume turn-start correlation(s) on turn tracking reset (${reason})`);
+  }
   if (pendingSteerDispatches.size > 0) {
     log(`Cleared ${pendingSteerDispatches.size} pending steer dispatch(es) on turn tracking reset (${reason})`);
   }
   pendingTurnStarts.clear();
+  pendingResumeTurnStarts.clear();
   pendingSteerDispatches.clear();
+  resumeInjectionQueue.onTurnTrackingReset();
 });
 codex.on("turnStarted", () => {
   log("Codex turn started");
@@ -5603,6 +6048,7 @@ codex.on("turnCompleted", () => {
   }
   emitToClaude(systemMessage("system_turn_completed", "\u2705 Codex finished the current turn. You can reply now if needed."));
   startAttentionWindow();
+  resumeInjectionQueue.onTurnDrained();
 });
 codex.on("turnAborted", (reason) => {
   log(`Codex turn aborted (${reason}) \u2014 clearing reply-required state`);
@@ -5662,7 +6108,9 @@ codex.on("exit", (code) => {
   replyTracker.reset();
   idempotencyTracker.terminateAll("aborted");
   pendingTurnStarts.clear();
+  pendingResumeTurnStarts.clear();
   pendingSteerDispatches.clear();
+  resumeInjectionQueue.onTurnTrackingReset();
   statusBuffer.flush("codex exited");
   tuiConnectionState.handleCodexExit();
   clearPendingClaudeDisconnect("Codex process exited");
@@ -6425,6 +6873,7 @@ function shutdown(reason, exitCode = 0) {
   shuttingDown = true;
   log(`Shutting down daemon (${reason})...`);
   clearBootDeadline();
+  resumeInjectionQueue.stop();
   stopBudgetCoordinator();
   idempotencyTracker.dispose();
   tuiConnectionState.dispose(`daemon shutdown (${reason})`);

@@ -236,7 +236,13 @@ export class BudgetCoordinator {
       ? {
           ...rest,
           detail: Object.fromEntries(
-            Object.entries(detail).map(([side, value]) => [side, { ...value }]),
+            Object.entries(detail).map(([side, value]) => [
+              side,
+              {
+                ...value,
+                ...(value.pending ? { pending: { ...value.pending } } : {}),
+              },
+            ]),
           ) as ResumeCandidate["detail"],
         }
       : { ...rest };

@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -183,6 +184,18 @@ describe("readGuardPending — per-scope glob", () => {
     expect(entries).toHaveLength(1);
     expect(entries[0].sessionId).toBe("sess-js-1");
     expect(entries[0].resetEpoch).toBe(1_900_000_000);
+  });
+
+  test("carries source path and content hash for atomic resume claims", () => {
+    const home = tempHome();
+    const payload = jsPending();
+    const path = writeScopePending(home, "claude", "abc123def4567890", payload);
+
+    const entries = readGuardPending({ homeDir: home, agent: "claude" });
+
+    expect(entries).toHaveLength(1);
+    expect(entries[0].sourcePath).toBe(path);
+    expect(entries[0].contentHash).toBe(createHash("sha256").update(JSON.stringify(payload)).digest("hex"));
   });
 
   test("globs pending/<agent>_*.json for the requested agent only", () => {

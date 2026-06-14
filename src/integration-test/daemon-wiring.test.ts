@@ -5,6 +5,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readdirSync,
   readFileSync,
   realpathSync,
   rmSync,
@@ -19,6 +20,7 @@ import { portsForSlot, type PairPorts } from "../pair-registry";
 import { readControlToken, resolveControlTokenPath } from "../control-token";
 import { CONTRACT_VERSION } from "../contract-version";
 import { installFakeCodex } from "./fixtures/fake-codex-install";
+import { RESUME_PROMPT } from "../budget/resume-prompt";
 
 const DAEMON_PATH = join(process.cwd(), "src", "daemon.ts");
 const DEFAULT_TEST_SLOT_START = 2500 + (process.pid % 500);
@@ -372,6 +374,99 @@ describe("daemon wiring", () => {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
   }, 45000);
+
+  test("budget resume with guard pending and checkpoint injects a Codex resume turn", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-budget-resume-fixture-"));
+    const probePath = join(fixtureRoot, "probe.sh");
+    const turnStartLog = join(fixtureRoot, "turn-starts.jsonl");
+    const guardStateDir = join(fixtureRoot, "budget-guard");
+    const readTurnStarts = (): Array<Record<string, any>> =>
+      existsSync(turnStartLog)
+        ? readFileSync(turnStartLog, "utf-8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
+        : [];
+    const writeUsage = (agent: "claude" | "codex", gateUtil: number) => {
+      writeFileSync(
+        join(fixtureRoot, `usage-${agent}.json`),
+        JSON.stringify({
+          ok: true,
+          util: gateUtil,
+          warn_util: gateUtil,
+          fetched_at: Math.floor(Date.now() / 1000),
+          buckets: [
+            { id: "five_hour", util: gateUtil, reset_epoch: Math.floor(Date.now() / 1000) + 600 },
+          ],
+        }),
+      );
+    };
+    writeUsage("claude", 10);
+    writeUsage("codex", 95);
+    writeFileSync(probePath, `#!/bin/sh\ncat "${fixtureRoot}/usage-$2.json"\n`, "utf-8");
+    chmodSync(probePath, 0o755);
+
+    try {
+      const harness = await startHarness({
+        pairId: "main-resumeabc",
+        pairName: "main",
+        extraEnv: {
+          AGENTBRIDGE_BUDGET_ENABLED: "1",
+          AGENTBRIDGE_QUOTA_PROBE: probePath,
+          AGENTBRIDGE_BUDGET_POLL_SECONDS: "5",
+          BUDGET_STATE_DIR: guardStateDir,
+          FAKE_APP_TURNSTART_LOG: turnStartLog,
+        },
+      });
+
+      mkdirSync(join(harness.cwd, ".agent"), { recursive: true });
+      writeFileSync(join(harness.cwd, ".agent", "checkpoint.md"), "# Checkpoint\n## 下一步\n1. continue\n", "utf-8");
+      mkdirSync(join(guardStateDir, "pending"), { recursive: true });
+      writeFileSync(
+        join(guardStateDir, "pending", "codex_scope.json"),
+        JSON.stringify({
+          status: "paused",
+          agent: "codex",
+          session_id: "sess-resume",
+          cwd: harness.cwd,
+          reset_epoch: Math.floor(Date.now() / 1000) + 600,
+          util: 95,
+          warn_util: 95,
+          at: Math.floor(Date.now() / 1000),
+        }),
+        "utf-8",
+      );
+
+      await harness.attachClaude();
+      await harness.connectTui();
+      await waitForMessage(
+        harness.messages,
+        (message) => message.id.startsWith("system_budget_pause_"),
+        "system_budget_pause before resume injection",
+      );
+
+      writeUsage("codex", 5);
+      await waitFor(
+        () => readTurnStarts().length >= 1,
+        "resume turn/start after budget recovery",
+        400,
+        50,
+      );
+
+      const injected = readTurnStarts()[0]!;
+      expect(injected.threadId).toBe("thread-fake-1");
+      expect(injected.input[0].text).toContain(RESUME_PROMPT);
+      expect(injected.model).toBeUndefined();
+      expect(injected.effort).toBeUndefined();
+      expect(harness.statusMessages.some((m) => m.type === "turn_started")).toBe(false);
+
+      await waitFor(
+        () => existsSync(join(guardStateDir, "consumed")) && readdirSync(join(guardStateDir, "consumed")).length === 1,
+        "resume consumed marker",
+        80,
+        50,
+      );
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 60000);
 
   test("budget pause is visible without an attached Claude; STOP is buffered until attach", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-budget-buffer-fixture-"));
