@@ -52,8 +52,8 @@ function resumeAfterEpoch(
 }
 
 /**
- * Strategy-aware pause-entry trigger for one agent. Delegates the whole decision
- * (conserve gateUtil threshold OR maximize per-window dynamic line) to the
+ * Pause-entry trigger for one agent. Delegates the whole decision (per-window
+ * dynamic line, with the gateUtil fallback when burn data is absent) to the
  * single source of truth in budget-decision.ts, so the rendered state here can
  * never diverge from the coordinator's gating in budget-fingerprint.ts.
  */
@@ -113,19 +113,10 @@ export function renderBudgetInterventionDirective(
   cfg: BudgetConfig,
 ): string {
   const resumeText = `预计恢复时间（以实测为准；提前刷新会更早解除）：${formatEpoch(resumeEpoch)}。`;
-  // Q10: the resume CONDITION text must match the active strategy. conserve =
-  // the historical gateUtil<resumeBelow wording (byte-identical); maximize exits
-  // per-window at `util < dynamicPauseAt − resumeHysteresisPct` (or window
-  // reset), NOT at resumeBelow — saying "低于 30%" there misleads Claude into
-  // expecting a days-long wait instead of the dynamic-line / reset recovery.
-  const resumeCondSingle =
-    cfg.strategy === "maximize"
-      ? `各窗口 util 回落至动态暂停线 − ${pct(cfg.maximize.resumeHysteresisPct)} 以下或对应窗口刷新`
-      : `gateUtil 低于 ${pct(cfg.resumeBelow)}`;
-  const resumeCondBoth =
-    cfg.strategy === "maximize"
-      ? `各窗口 util 都回落至动态暂停线 − ${pct(cfg.maximize.resumeHysteresisPct)} 以下或对应窗口刷新`
-      : `gateUtil 都低于 ${pct(cfg.resumeBelow)}`;
+  // v3.2: resume happens per-window at `util < dynamicPauseAt − resumeHysteresisPct`
+  // (or window reset), NOT at resumeBelow — the dynamic line is the sole strategy.
+  const resumeCondSingle = `各窗口 util 回落至动态暂停线 − ${pct(cfg.maximize.resumeHysteresisPct)} 以下或对应窗口刷新`;
+  const resumeCondBoth = `各窗口 util 都回落至动态暂停线 − ${pct(cfg.maximize.resumeHysteresisPct)} 以下或对应窗口刷新`;
   if (side === "claude") {
     return [
       "【预算协调 · 账号级】Claude 侧额度紧张，进入接力模式。",

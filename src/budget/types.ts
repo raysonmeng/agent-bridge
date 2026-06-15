@@ -91,13 +91,6 @@ export type BudgetPhase = "normal" | "balance" | "parallel" | "paused";
 
 export type CodexTier = "full" | "balanced" | "eco";
 
-/**
- * Budget strategy selector (v3). conserve = v2-equivalent gateUtil thresholds.
- * maximize (P2) = per-window time-aware dynamic pause line (§3.1), consumed by
- * budget-decision.ts; every degradation path falls back to conserve.
- */
-export type BudgetStrategy = "conserve" | "maximize";
-
 /** Identifies one of the two quota windows tracked per agent. */
 export type BudgetWindowKey = "fiveHour" | "weekly";
 
@@ -137,18 +130,19 @@ export interface RunwayEstimate {
 }
 
 /**
- * Maximize-strategy parameters (v3 §3.1/§4.1). Only consumed when
- * `strategy:"maximize"`. All have defaults and bounded validation in
- * config-service.ts. P2 consumes every key here; the P3 admission gate adds its
- * own keys (admissionAt / wrapUpQuota) when it lands, so they are intentionally
- * NOT defined yet (no parse-only keys).
+ * Time-aware dynamic-pause-line parameters (v3 §3.1/§4.1). These are the SOLE
+ * budget strategy as of v3.2 (the conserve|maximize selector is gone). All have
+ * defaults + bounded validation in config-service.ts and are tuned via env
+ * escape hatches, not as product-facing config. The P3 admission gate will add
+ * its own keys (admissionAt / wrapUpQuota) when it lands — intentionally not
+ * defined yet (no parse-only keys).
  */
 export interface MaximizeConfig {
-  /** Reset-point target utilization; default 97, range [90, 99]. Must be > pauseAt. */
+  /** Reset-point target utilization (asymptote); default 98, range [90, 99]. Must be > pauseAt. */
   targetUtil: number;
   /** Extra reserve per hour-to-reset; default 0.4 pct/h, range [0, 5] (fractional). */
   reserveSlopePctPerHour: number;
-  /** Reserve ceiling; default 7, range [0, 30]. Far-from-reset → ≈ conserve. */
+  /** Reserve ceiling; default 7, range [0, 30]. Far-from-reset → line floors at pauseAt. */
   reserveMaxPct: number;
   /** Expected in-flight wrap-up duration; default 30 min, range [5, 180]. */
   finishingHorizonMinutes: number;
@@ -161,7 +155,7 @@ export interface BudgetConfig {
   enabled: boolean;
   /** Coordinator poll interval in seconds (first poll fires immediately on start()). */
   pollSeconds: number;
-  /** Joint-pause entry threshold on gateUtil; intentionally below guard's hard=92. */
+  /** Dynamic-line floor + no-burn-data fallback entry threshold on gateUtil; below guard's hard=99. */
   pauseAt: number;
   /** Joint-pause exit threshold; BOTH sides must drop below this on gateUtil. */
   resumeBelow: number;
@@ -178,15 +172,12 @@ export interface BudgetConfig {
   /** Tier → override mapping; `full` must be configured for tier control to activate. */
   codexTiers: CodexTierMap;
   /**
-   * v3 strategy selector. P1: parse-and-validate only — behavior is always
-   * conserve; the value is consumed solely by the doctor Q7 check.
-   *
-   * NOTE (layered amendment): burn-rate collection moved to agent-quota-guard;
-   * the former `burnRate.{enabled,sampleCap}` config keys are gone. Display
-   * follows probe field presence — no toggle needed.
+   * v3.2: pauseAt / resumeBelow above are the FALLBACK gateUtil line (used only
+   * when per-window burn data is unavailable); the time-aware dynamic line below
+   * is the primary, always-on strategy. The legacy `strategy` selector is gone —
+   * an old config that still carries `strategy:"conserve"` is tolerated (the key
+   * is silently ignored — normalizeBudgetConfig only reads known keys).
    */
-  strategy: BudgetStrategy;
-  /** maximize-strategy parameters (only consumed when strategy="maximize"). */
   maximize: MaximizeConfig;
 }
 
@@ -256,10 +247,12 @@ export interface BudgetSnapshot {
    */
   runway?: { claude: RunwayEstimate | null; codex: RunwayEstimate | null };
   /**
-   * v3 P2 (optional, maximize only): the effective numeric dynamic pause line
-   * per agent that tripped (or would trip) the pause this poll. null in
-   * conserve mode, when the agent is not gated by a confident maximize window,
-   * or on legacy daemons. Display-only — never a decision input.
+   * v3.2: the effective numeric dynamic pause line per agent that tripped (or
+   * would trip) the pause this poll. Always present on current daemons (the
+   * dynamic line is the sole strategy); each side is null when no confident
+   * window yields a numeric line. Optional only for backward-compatible
+   * deserialization of legacy daemon snapshots. Display-only — never a decision
+   * input.
    */
   dynamicPauseLine?: { claude: number | null; codex: number | null };
 }

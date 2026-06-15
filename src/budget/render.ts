@@ -18,15 +18,16 @@ import type {
 
 /**
  * Default outer quota-guard hard line (the user's agent-quota-guard
- * BUDGET_HARD default). Display-only context for the v3 Q7 annotation —
- * never feeds any pause/resume decision.
+ * BUDGET_HARD default). v3.2: the guard default moved 92→99 (last fuse above the
+ * bridge's targetUtil 98). Display-only context for the guard annotation — never
+ * feeds any pause/resume decision; AGENTBRIDGE_GUARD_HARD_HINT overrides it.
  */
-export const DEFAULT_GUARD_HARD_PCT = 92;
+export const DEFAULT_GUARD_HARD_PCT = 99;
 
 /**
  * Resolve the guard hard-line DISPLAY hint: AGENTBRIDGE_GUARD_HARD_HINT
- * overrides the default 92; invalid or out-of-range values fall back. Only
- * affects rendering (Q7 enhanced-B), never the strategy layer.
+ * overrides the default; invalid or out-of-range values fall back. Only affects
+ * rendering, never the decision layer.
  */
 export function resolveGuardHardHint(
   env: Record<string, string | undefined> = process.env,
@@ -145,7 +146,7 @@ function formatRunwaySegment(
  *
  * Claude guard annotation (Q7, honesty-first choice): the guard's
  * runway_seconds is the NEUTRAL "to 100%" estimate, but quota-guard
- * hard-stops the Claude process at its own hard line (default 92%) first.
+ * hard-stops the Claude process at its own hard line (default 99%) first.
  * Rather than scaling the number ourselves (a proportional fold assumes
  * linear burn AND breaks when the runway is reset-truncated — effectively a
  * recomputation, which constraint #2 forbids), we display the guard's number
@@ -193,10 +194,10 @@ function formatFiveHourWindowsLeftLine(snapshot: BudgetSnapshot): string | null 
 }
 
 /**
- * v3 P2 (maximize, display-only): the binding dynamic pause line per agent and
- * its headroom to the agent's gateUtil. Present only when the snapshot carries
- * `dynamicPauseLine` (maximize mode) and at least one side has a numeric line.
- * Never a decision input — mirrors the decision layer's effectiveDynamicLine.
+ * v3.2 (display-only): the binding dynamic pause line per agent and its headroom
+ * to the agent's gateUtil. Present when the snapshot carries `dynamicPauseLine`
+ * (always-on since v3.2) and at least one side has a numeric line. Never a
+ * decision input — mirrors the decision layer's effectiveDynamicLine.
  */
 function formatDynamicLineLine(snapshot: BudgetSnapshot): string | null {
   const lines = snapshot.dynamicPauseLine;
@@ -212,7 +213,7 @@ function formatDynamicLineLine(snapshot: BudgetSnapshot): string | null {
     parts.push(`${name} ${line.toFixed(1)}%${headroom}`);
   }
   if (parts.length === 0) return null;
-  return `动态暂停线（maximize）：${parts.join(" · ")}`;
+  return `动态暂停线：${parts.join(" · ")}`;
 }
 
 const PHASE_LABELS: Record<BudgetSnapshot["phase"], string> = {

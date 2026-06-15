@@ -1,7 +1,7 @@
 import { readFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteJson } from "./atomic-json";
-import type { BudgetConfig, BudgetStrategy, CodexTierMap, CodexTurnOverrides, MaximizeConfig } from "./budget/types";
+import type { BudgetConfig, CodexTierMap, CodexTurnOverrides, MaximizeConfig } from "./budget/types";
 
 /** Machine-readable project config schema. */
 export interface AgentBridgeConfig {
@@ -20,9 +20,10 @@ export interface AgentBridgeConfig {
 const DEFAULT_BUDGET_CONFIG: BudgetConfig = {
   enabled: true,
   pollSeconds: 300,
-  // Intentionally below quota-guard's per-agent hard line (92) so the bridge's
-  // coordinated pause fires first and leaves wrap-up headroom; the guard stays
-  // as the per-agent backstop.
+  // v3.2: pauseAt/resumeBelow are the no-burn-data FALLBACK line (the dynamic
+  // line is primary). pauseAt also floors the dynamic line (I1). Kept well below
+  // the outer quota-guard hard line (99) so the bridge pauses first and leaves
+  // wrap-up headroom; the guard 99 is the last-resort fuse.
   pauseAt: 90,
   resumeBelow: 30,
   syncDriftPct: 10,
@@ -38,15 +39,14 @@ const DEFAULT_BUDGET_CONFIG: BudgetConfig = {
     balanced: { effort: "medium" },
     eco: { effort: "low" },
   },
-  // v3: strategy selector. conserve = v2-equivalent gateUtil thresholds (the
-  // default — opt-in is required to change behavior). maximize (P2) activates
-  // the per-window time-aware dynamic pause line. Burn-rate data is consumed
-  // from the guard probe — no collection config on this side.
-  strategy: "conserve",
-  // v3 P2 maximize parameters (only consumed when strategy="maximize"). Defaults
-  // and ranges per design budget-strategy-v3.md §3.1/§4.1.
+  // v3.2: pauseAt(90)/resumeBelow(30) above are now the FALLBACK gateUtil line
+  // (only used when per-window burn data is unavailable). The time-aware dynamic
+  // line below is the sole, always-on strategy — the conserve|maximize selector
+  // is gone. Burn-rate data is consumed from the guard probe.
   maximize: {
-    targetUtil: 97,
+    // Reset-point target (asymptote). 98 leaves ~2% for provider metering jitter;
+    // the bridge paces toward it, the outer guard hard line (99) is the last fuse.
+    targetUtil: 98,
     reserveSlopePctPerHour: 0.4,
     reserveMaxPct: 7,
     finishingHorizonMinutes: 30,
@@ -222,10 +222,9 @@ function hasCustomDecisionValues(config: AgentBridgeConfig): boolean {
     b.parallel.minRemainingPct !== db.parallel.minRemainingPct ||
     b.parallel.timeWindowSec !== db.parallel.timeWindowSec ||
     b.codexTierControl !== db.codexTierControl ||
-    // v3: strategy + maximize parameters are decision-grade — surface them so
-    // `abg doctor` reports "custom values in effect" when the user opts into
-    // maximize or tunes its line, not a misleading "all values match defaults".
-    b.strategy !== db.strategy ||
+    // v3.2: dynamic-line (maximize) parameters are decision-grade — surface them
+    // so `abg doctor` reports "custom values in effect" when the user tunes the
+    // line, not a misleading "all values match defaults".
     b.maximize.targetUtil !== db.maximize.targetUtil ||
     b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour ||
     b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct ||
@@ -279,11 +278,6 @@ export function normalizeBoundedNumber(
   if (!Number.isFinite(parsed)) return fallback;
   if (parsed < min || parsed > max) return fallback;
   return parsed;
-}
-
-/** v3 strategy selector: anything but the two known literals falls back. */
-function normalizeStrategy(value: unknown, fallback: BudgetStrategy): BudgetStrategy {
-  return value === "conserve" || value === "maximize" ? value : fallback;
 }
 
 /**
@@ -425,7 +419,6 @@ function normalizeBudgetConfig(
       normalizeBoolean(budget.codexTierControl, fallback.codexTierControl) &&
       codexTiers.full !== null,
     codexTiers,
-    strategy: normalizeStrategy(budget.strategy, fallback.strategy),
     // Pass the already-resolved pauseAt (post pauseAt<=resumeBelow reset) so the
     // targetUtil > pauseAt relation is checked against the effective floor.
     maximize: normalizeMaximizeConfig(budget.maximize, pauseAt, fallback.maximize),
@@ -456,7 +449,6 @@ export function applyBudgetEnvOverrides(
     // Tier mapping is file-config only (nested structure doesn't fit env vars);
     // re-normalization re-applies the full-restore activation rule.
     codexTiers: budget.codexTiers,
-    strategy: env.AGENTBRIDGE_BUDGET_STRATEGY ?? budget.strategy,
     maximize: {
       targetUtil: env.AGENTBRIDGE_BUDGET_TARGET_UTIL ?? budget.maximize.targetUtil,
       reserveSlopePctPerHour:

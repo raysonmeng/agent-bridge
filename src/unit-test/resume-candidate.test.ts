@@ -25,7 +25,6 @@ const CONFIG: BudgetConfig = {
     balanced: { effort: "medium" },
     eco: { effort: "low" },
   },
-  strategy: "conserve",
   maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
 };
 

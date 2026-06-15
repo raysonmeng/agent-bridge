@@ -1,23 +1,25 @@
 /**
- * Single source of truth for strategy-aware pause/resume decisions (v3 P2).
+ * Single source of truth for pause/resume decisions (v3.2).
  *
  * Both the directive-content path (budget-state.ts `pauseTrigger`) and the
- * coordinator's gating state machine (budget-fingerprint.ts `shouldEnter` /
- * `canAgentResume`) must agree on whether an agent is paused, or the rendered
- * state and the fingerprint state drift apart. This module centralizes that
- * decision so the two callers can never fork.
+ * coordinator's gating state machine (budget-fingerprint.ts) must agree on
+ * whether an agent is paused, or the rendered state and the fingerprint state
+ * drift apart. This module centralizes that decision so the two callers can
+ * never fork.
  *
- * conserve mode is a byte-for-byte port of the previous gateUtil ≥ pauseAt /
- * gateUtil < resumeBelow logic. maximize mode (opt-in `strategy:"maximize"`)
- * replaces the single gateUtil scalar with a per-window time-aware pause line
- * (design budget-strategy-v3.md §3.1). Every maximize degradation path falls
- * back to conserve behavior (invariant I1: maximize never pauses earlier than
- * conserve; invariant I2: missing/stale data never opens a gate).
+ * v3.2: the per-window time-aware dynamic pause line (design §3.1) is the SOLE
+ * strategy — the old `conserve|maximize` selector is gone. When per-window
+ * burn-rate data is unavailable (non-confident / stale / reset-unknown), each
+ * window degrades to a fixed gateUtil FALLBACK line (`util ≥ pauseAt` to enter,
+ * `util < resumeBelow` to resume) — the same safe gating the former conserve
+ * mode used, now an internal fallback rather than a user-selectable mode.
+ * Invariant I1: the dynamic line never pauses earlier than the pauseAt floor;
+ * invariant I2: missing/stale data never opens a gate.
  *
  * Keep this file dependency-light (only ./types + ./budget-gate); it is bundled
  * into the plugin daemon.
  */
-import { matchingGateReset, resumeBlockingEpoch as conserveResumeBlockingEpoch } from "./budget-gate";
+import { matchingGateReset } from "./budget-gate";
 import { STALE_MAX_AGE_SEC } from "./types";
 import type {
   AgentName,
@@ -155,13 +157,13 @@ function confidentRate(window: BudgetWindow): number | null {
 }
 
 /**
- * Evaluate one fresh window for the maximize ENTRY side. Degraded windows
- * (no confident rate) fall back to conserve's per-window `util ≥ pauseAt`.
+ * Evaluate one fresh window for the ENTRY side. Degraded windows (no confident
+ * rate) fall back to the fixed per-window gateUtil line `util ≥ pauseAt`.
  */
 function maximizeWindowEntry(window: BudgetWindow, cfg: BudgetConfig, now: number): WindowEntryVerdict {
   const rate = confidentRate(window);
   if (rate === null) {
-    // Degraded: conserve criterion on THIS window (per design §3.1 degrade path).
+    // Degraded: fixed fallback line on THIS window (per design §3.1 degrade path).
     return { blocks: window.util >= cfg.pauseAt, line: null, admission: false };
   }
   const line = dynamicPauseAt(window, rate, cfg, now);
@@ -175,10 +177,10 @@ function maximizeWindowEntry(window: BudgetWindow, cfg: BudgetConfig, now: numbe
 }
 
 /**
- * Evaluate one fresh window for the maximize RESUME side (symmetric to entry):
- * the window still BLOCKS resume until its util recedes below the relaxed
- * threshold. Degraded windows use conserve's `util ≥ resumeBelow` (asymmetric
- * 90-in/30-out, no hysteresis — matches design "degrade to conserve").
+ * Evaluate one fresh window for the RESUME side (symmetric to entry): the window
+ * still BLOCKS resume until its util recedes below the relaxed threshold.
+ * Degraded windows use the fixed fallback `util ≥ resumeBelow` (asymmetric
+ * 90-in/30-out, no hysteresis — matches the design "degrade to fallback" path).
  */
 function maximizeWindowBlocksResume(window: BudgetWindow, cfg: BudgetConfig, now: number): boolean {
   const rate = confidentRate(window);
@@ -224,14 +226,15 @@ export interface AgentPauseDecision {
 
 const NO_PAUSE: AgentPauseDecision = { pause: false, window: null, line: null, reason: "" };
 
-function conserveReason(agent: AgentName, usage: AgentUsage, cfg: BudgetConfig): string {
-  return `${AGENT_LABEL[agent]} gateUtil ${pct(usage.gateUtil)} ≥ pauseAt ${pct(cfg.pauseAt)}`;
+function fallbackPauseReason(agent: AgentName, usage: AgentUsage, cfg: BudgetConfig): string {
+  return `${AGENT_LABEL[agent]} gateUtil ${pct(usage.gateUtil)} ≥ pauseAt ${pct(cfg.pauseAt)}（兜底判据）`;
 }
 
 /**
- * Decide whether an agent should enter a budget pause. conserve mode is a
- * verbatim port of the old `pauseTrigger`/`shouldEnter`; maximize mode evaluates
- * each fresh window via the dynamic line and trips on the FIRST blocking window.
+ * Decide whether an agent should enter a budget pause. v3.2: always the
+ * per-window time-aware evaluation — trips on the FIRST blocking window. A
+ * window with no confident burn rate degrades to the gateUtil fallback inside
+ * `maximizeWindowEntry`.
  */
 export function agentShouldPause(
   agent: AgentName,
@@ -242,20 +245,12 @@ export function agentShouldPause(
   if (!usage) return NO_PAUSE;
   if (!isDecisionGrade(usage, now)) return NO_PAUSE;
 
-  if (cfg.strategy !== "maximize") {
-    if (usage.gateUtil >= cfg.pauseAt) {
-      return { pause: true, window: null, line: null, reason: conserveReason(agent, usage, cfg) };
-    }
-    return NO_PAUSE;
-  }
-
-  // maximize: per-window evaluation.
   const windows = freshWindows(usage, now);
   if (windows.length === 0) {
     // Defensive: isDecisionGrade guarantees ≥1 fresh window, so this is
-    // unreachable. Degrade to conserve on gateUtil if it ever is reached.
+    // unreachable. Fall back to the gateUtil line if it ever is reached.
     if (usage.gateUtil >= cfg.pauseAt) {
-      return { pause: true, window: null, line: null, reason: conserveReason(agent, usage, cfg) };
+      return { pause: true, window: null, line: null, reason: fallbackPauseReason(agent, usage, cfg) };
     }
     return NO_PAUSE;
   }
@@ -291,24 +286,21 @@ function buildMaximizeReason(
   if (verdict.admission) {
     return `${head} 触发收尾保护硬线（≥ pauseAt ${pct(cfg.pauseAt)}）`;
   }
-  return `${head} ≥ pauseAt ${pct(cfg.pauseAt)}（燃尽率采样中，退保守判据）`;
+  return `${head} ≥ pauseAt ${pct(cfg.pauseAt)}（燃尽率采样中，退兜底判据）`;
 }
 
 /**
- * Decide whether an agent may resume. conserve mode is a verbatim port of the
- * old `canAgentResume`; maximize mode requires that NO fresh window still blocks
- * resume (symmetric to entry, with hysteresis).
+ * Decide whether an agent may resume. v3.2: always per-window — resume only when
+ * NO fresh window still blocks (symmetric to entry, with hysteresis). A window
+ * with no confident burn rate degrades to the gateUtil fallback inside
+ * `maximizeWindowBlocksResume` (`util < resumeBelow`).
  */
 export function agentCanResume(usage: AgentUsage | null, cfg: BudgetConfig, now: number): boolean {
   if (!isDecisionGrade(usage, now)) return false;
   if (usage!.rateLimitedUntil > now) return false;
 
-  if (cfg.strategy !== "maximize") {
-    return usage!.gateUtil < cfg.resumeBelow;
-  }
-
-  // maximize: resume only when every fresh window has receded. A window that has
-  // already reset (resetEpoch <= now) is excluded by freshWindows — that is the
+  // Resume only when every fresh window has receded. A window that has already
+  // reset (resetEpoch <= now) is excluded by freshWindows — that is the
   // "window reset → resume" path (fresh data shows util cliff-dropped, and the
   // expired window no longer blocks).
   const windows = freshWindows(usage!, now);
@@ -319,15 +311,14 @@ export function agentCanResume(usage: AgentUsage | null, cfg: BudgetConfig, now:
 }
 
 /**
- * Display-only (snapshot/render): the binding maximize dynamic line for an
- * agent — the numeric line of the fresh, confident window with the SMALLEST
- * headroom (util − line), i.e. the window closest to (or past) tripping. Returns
- * null in conserve mode, on non-decision-grade data, or when no confident window
- * yields a numeric line (degraded / admission-closed / will-not-fill). NEVER a
- * decision input — `agentShouldPause` owns the gating; this only mirrors it.
+ * Display-only (snapshot/render): the binding dynamic line for an agent — the
+ * numeric line of the fresh, confident window with the SMALLEST headroom
+ * (util − line), i.e. the window closest to (or past) tripping. Returns null on
+ * non-decision-grade data, or when no confident window yields a numeric line
+ * (degraded / admission-closed / will-not-fill). NEVER a decision input —
+ * `agentShouldPause` owns the gating; this only mirrors it.
  */
 export function effectiveDynamicLine(usage: AgentUsage | null, cfg: BudgetConfig, now: number): number | null {
-  if (cfg.strategy !== "maximize") return null;
   if (!usage || !isDecisionGrade(usage, now)) return null;
   let bestLine: number | null = null;
   let bestHeadroom = Number.POSITIVE_INFINITY;
@@ -346,14 +337,13 @@ export function effectiveDynamicLine(usage: AgentUsage | null, cfg: BudgetConfig
 }
 
 /**
- * Strategy-aware "earliest plausible resume" epoch (Q10 alignment). conserve
- * delegates to the existing budget-gate helper. maximize returns the soonest
- * reset among windows that still block resume (the natural recovery point at a
- * 93–96 pause line), the active rate-limit, or 0 when nothing blocks.
+ * "Earliest plausible resume" epoch (Q10 alignment). Returns the active
+ * rate-limit if any, else the soonest reset among windows that still block
+ * resume (the natural recovery point at a ~94–98 pause line), else 0 when
+ * nothing blocks.
  */
 export function resumeBlockingEpochFor(usage: AgentUsage | null, cfg: BudgetConfig, now: number): number {
   if (!usage) return 0;
-  if (cfg.strategy !== "maximize") return conserveResumeBlockingEpoch(usage, cfg, now);
   if (usage.rateLimitedUntil > now) return usage.rateLimitedUntil;
   // Non-decision-grade (stale / all-reset): we cannot evaluate per-window resume,
   // and `agentCanResume` returns false here (phantom-hold keeps the side paused).

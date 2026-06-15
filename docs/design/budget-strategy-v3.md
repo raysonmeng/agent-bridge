@@ -3,6 +3,31 @@
 > 状态：**v3.1 实施中**。Codex 对抗审 2026-06-11（4 REAL + 2 SUSPECT + 2 RECOMMEND 全采纳，Q1-Q10 共识）已落定为实施基线。**进度：P1（燃尽率展示 + Q7 doctor）已上线 master；P2（时间感知暂停线 / maximize）已实现并通过 cross-review（见 §6 P2 实现落点）；P3（三态闸门）/ P4（runway 分配判据）待实施。** 原稿基于 master dfc093b。
 > 作者：Claude；评审：Codex（对抗审记录见 §8，开放问题共识见 §7）。
 
+> **v3.2 修订（2026-06-15，用户指令 + Codex 双方共识）—— 见下方 addendum**：删除 `conserve|maximize` 二选一，时间感知动态线成为**唯一默认策略**；`targetUtil` 97→**98**；外层 guard `BUDGET_HARD` 92→**99**（最后保险丝，bridge pacing 停 ~98 为主）；新增 guard `BUDGET_CHECKPOINT_LEAD≈95` 早写 checkpoint + provider rate-limit/429 也写 pending（强制停可恢复）。
+
+---
+
+## 0. v3.2 addendum — maximize-only / 逼近 98 / 强制停可恢复
+
+> 本节是 §1–§8 之上的修订层，落地时以本节为准（与下文 conserve/maximize 二选一表述冲突处以本节为准）。
+
+**动机**：用户要求「默认就用满额度、不再要 conserve、不再设 92/97 这种限制、写死逼近 99 再停」。澄清：「逼近 99 再停」**正是 §3.1 动态线的渐近语义**（线随窗口刷新临近而升），不是 flat `util≥X` gate（会离刷新远时早早烧满→冻结数天）。所以删的是**策略选择 + 过度配置**，不是 pacing。
+
+**bridge 侧（已实现，feat/budget-v3.2-maximize-default）**：
+1. 删 `BudgetConfig.strategy` 字段 + `BudgetStrategy` 类型；决策恒走时间感知动态线（`budget-decision.ts` 删所有 `cfg.strategy==="maximize"` 分支）。旧 config 残留 `strategy` 键被容忍（忽略）。
+2. `targetUtil` 默认 97→**98**（渐近线；留 2% 给供应商计量抖动，比 99 稳）。reserve*/finishingHorizon/resumeHysteresis 收为内部常量 + env 逃生口。
+3. `pauseAt`(90)/`resumeBelow`(30) 保留**原名**，角色重定义为**无 burn 数据时的固定兜底线**（`fallbackPauseLine`：confident=false/stale/reset-unknown → `util≥pauseAt` 进、`util<resumeBelow` 出），不再是用户可选模式。动态线 floor 仍 = pauseAt（I1）。
+4. doctor Q7：`evaluateBudgetStrategyGuard` 去 strategy 参；guard≥target→OK，guard<target→warn（默认 guard99≥target98 即 OK）。展示侧 `DEFAULT_GUARD_HARD_PCT` 92→99。
+
+**guard 侧（agent-quota-guard 仓库，已实现）**：
+5. `BUDGET_HARD` 默认 92→**99**（bridge target 98 之上 1 点作最后保险丝）；**保留**轮末硬停 `phaseStop continue:false + writePending`。
+6. 新增独立 `BUDGET_CHECKPOINT_LEAD` 默认动态 `clamp(95, warnRepeat, hard-1)`：~95 起强 checkpoint 提醒（不随 hard 抬到 99），保证 agent 有 lead 写 checkpoint 再被停（修「无-checkpoint-lead」缺口）。
+7. provider **rate-limit/429 也写 pending**（pre/post/stop 的 `!usage.ok` 早退前处理，用同一 `writePending` schema，无第二套 identity；含 stale-cache 带 active 429 的边界）（修「429-无-pending → 卡死不自动恢复」缺口）。
+
+**强制停恢复三层防线**：bridge 动态线 pacing 停 ~98（主）→ guard ~95 提醒写 checkpoint → guard 99 轮末硬停保险丝；任一层停下都有 checkpoint+pending，窗口刷新后自动续接（链路 #175 已硬化）。**98/99 是 best-effort 目标上限，非数学极限**（计量延迟/并发/probe lag/轮末停 → 实际 98.x 或偶发更高才停）。
+
+**未并入 v3.2（独立 phase）**：P3 三态 admission 闸门（拒新任务/放收尾 turn/wrapUp 配额/checkpoint baton）—— 碰 live injection/gate 语义、风险面大；v3.2 的 6/7 已兜住强制停恢复。bridge synthetic resume candidate（rateLimited+checkpoint+无pending）= 可选 belt-and-suspenders，记 backlog。
+
 ---
 
 ## 1. 背景与宗旨

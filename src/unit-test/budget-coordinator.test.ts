@@ -21,7 +21,6 @@ const CONFIG: BudgetConfig = {
     balanced: { effort: "medium" },
     eco: { effort: "low" },
   },
-  strategy: "conserve",
   maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
 };
 
@@ -519,7 +518,7 @@ describe("BudgetCoordinator", () => {
   });
 
   test("maximize: recovery directive describes the dynamic line, not resumeBelow (Q10)", async () => {
-    const maximizeConfig: BudgetConfig = { ...CONFIG, strategy: "maximize" };
+    const maximizeConfig: BudgetConfig = { ...CONFIG };
     const source = new FakeSource([
       { claude: usage(), codex: usage() },
       { claude: usage(), codex: usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }) },
@@ -538,7 +537,7 @@ describe("BudgetCoordinator", () => {
   });
 
   test("maximize CONFIDENT path: coordinator enter→exit on the dynamic line", async () => {
-    const maximizeConfig: BudgetConfig = { ...CONFIG, strategy: "maximize" };
+    const maximizeConfig: BudgetConfig = { ...CONFIG };
     // fiveHour with a confident guard burn rate: tH=1h, rate=1.2 → line 95.6.
     const codexUsage = (fiveHourUtil: number): AgentUsage => ({
       ok: true,

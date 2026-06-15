@@ -391,8 +391,7 @@ describe("ConfigService — budget section", () => {
         balanced: { effort: "medium" },
         eco: { effort: "low" },
       },
-      strategy: "conserve",
-      maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
+      maximize: { targetUtil: 98, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
     });
   });
 
@@ -402,6 +401,18 @@ describe("ConfigService — budget section", () => {
     const budget = loadBudget(svc);
     expect(budget.pauseAt).toBe(90);
     expect(budget.enabled).toBe(true);
+  });
+
+  test("v3.2: a legacy config carrying strategy:'conserve' is tolerated (key ignored, not corrupt)", () => {
+    const svc = new ConfigService(tempDir);
+    // The v3.2 default is the always-on dynamic line; the removed `strategy` key
+    // must not break an upgraded user's old config — it parses fine, the key is
+    // silently ignored, and the rest of the budget normalizes as usual.
+    writeRawConfig({ budget: { strategy: "conserve", pauseAt: 85 } });
+    expect(svc.load().state).toBe("parsed");
+    const budget = loadBudget(svc);
+    expect("strategy" in budget).toBe(false); // field is gone, not carried through
+    expect(budget.pauseAt).toBe(85); // the rest still applies
   });
 
   test("load accepts valid custom budget values", () => {
@@ -433,8 +444,7 @@ describe("ConfigService — budget section", () => {
         eco: { effort: "minimal" },
       },
       // v3 P1 keys absent in the raw file normalize to defaults.
-      strategy: "conserve",
-      maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
+      maximize: { targetUtil: 98, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
     });
   });
 
@@ -596,7 +606,6 @@ describe("applyBudgetEnvOverrides", () => {
       balanced: { effort: "medium" },
       eco: { effort: "low" },
     },
-    strategy: "conserve" as const,
     maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
   };
 
@@ -652,7 +661,6 @@ describe("applyBudgetEnvOverrides — boolean spellings", () => {
       balanced: { effort: "medium" },
       eco: { effort: "low" },
     },
-    strategy: "conserve" as const,
     maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
   };
 
@@ -673,7 +681,7 @@ describe("applyBudgetEnvOverrides — boolean spellings", () => {
   });
 });
 
-describe("ConfigService — budget v3 P1 keys (strategy, parse-only)", () => {
+describe("ConfigService — budget v3 P1 keys (legacy key handling)", () => {
   let tempDir: string;
 
   beforeEach(() => {
@@ -696,25 +704,10 @@ describe("ConfigService — budget v3 P1 keys (strategy, parse-only)", () => {
     return result.config.budget;
   }
 
-  test("strategy=maximize is parsed and preserved (consumed only by doctor in P1)", () => {
-    const svc = new ConfigService(tempDir);
-    writeRawConfig({ budget: { strategy: "maximize" } });
-    expect(loadBudget(svc).strategy).toBe("maximize");
-  });
-
-  test("invalid strategy values fall back to conserve", () => {
-    const svc = new ConfigService(tempDir);
-    writeRawConfig({ budget: { strategy: "yolo" } });
-    expect(loadBudget(svc).strategy).toBe("conserve");
-    writeRawConfig({ budget: { strategy: 42 } });
-    expect(loadBudget(svc).strategy).toBe("conserve");
-  });
-
   test("legacy burnRate keys in the raw file are ignored (layered amendment: collection moved to the guard)", () => {
     const svc = new ConfigService(tempDir);
-    writeRawConfig({ budget: { strategy: "maximize", burnRate: { enabled: false, sampleCap: 100 } } });
+    writeRawConfig({ budget: { burnRate: { enabled: false, sampleCap: 100 } } });
     const budget = loadBudget(svc);
-    expect(budget.strategy).toBe("maximize");
     expect("burnRate" in budget).toBe(false);
   });
 });
@@ -763,27 +756,12 @@ describe("applyBudgetEnvOverrides — v3 P1 keys", () => {
       balanced: { effort: "medium" },
       eco: { effort: "low" },
     },
-    strategy: "conserve" as const,
     maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
   };
 
-  test("AGENTBRIDGE_BUDGET_STRATEGY overrides the strategy", () => {
-    const result = applyBudgetEnvOverrides(base, {
-      AGENTBRIDGE_BUDGET_STRATEGY: "maximize",
-    });
-    expect(result.strategy).toBe("maximize");
-  });
-
-  test("invalid AGENTBRIDGE_BUDGET_STRATEGY keeps the base value", () => {
-    const result = applyBudgetEnvOverrides(base, {
-      AGENTBRIDGE_BUDGET_STRATEGY: "turbo",
-    });
-    expect(result.strategy).toBe("conserve");
-  });
-
   test("v3 env keys leave the rest of the config untouched", () => {
     const result = applyBudgetEnvOverrides(base, {
-      AGENTBRIDGE_BUDGET_STRATEGY: "maximize",
+      AGENTBRIDGE_BUDGET_TARGET_UTIL: "95",
     });
     expect(result.pauseAt).toBe(90);
     expect(result.resumeBelow).toBe(30);
@@ -817,7 +795,6 @@ describe("normalizeBudgetConfig — v3 P2 maximize block", () => {
   test("valid custom maximize values pass through (incl. fractional slope)", () => {
     writeRawConfig({
       budget: {
-        strategy: "maximize",
         maximize: {
           targetUtil: 95,
           reserveSlopePctPerHour: 1.25,
@@ -840,14 +817,14 @@ describe("normalizeBudgetConfig — v3 P2 maximize block", () => {
     writeRawConfig({
       budget: {
         maximize: {
-          targetUtil: 200, // > 99 → fallback 97
+          targetUtil: 200, // > 99 → fallback 98
           reserveSlopePctPerHour: -1, // < 0 → fallback 0.4
           finishingHorizonMinutes: 999, // > 180 → fallback 30
         },
       },
     });
     const m = loadBudget().maximize;
-    expect(m.targetUtil).toBe(97);
+    expect(m.targetUtil).toBe(98);
     expect(m.reserveSlopePctPerHour).toBe(0.4);
     expect(m.finishingHorizonMinutes).toBe(30);
   });
@@ -873,8 +850,8 @@ describe("normalizeBudgetConfig — v3 P2 maximize block", () => {
     expect(overridden.maximize.finishingHorizonMinutes).toBe(60);
   });
 
-  test("describeConfig reports custom values when strategy/maximize are tuned", () => {
-    writeRawConfig({ budget: { strategy: "maximize", maximize: { targetUtil: 95 } } });
+  test("describeConfig reports custom values when maximize is tuned", () => {
+    writeRawConfig({ budget: { maximize: { targetUtil: 95 } } });
     expect(new ConfigService(tempDir).describeConfig().customValues).toBe(true);
   });
 

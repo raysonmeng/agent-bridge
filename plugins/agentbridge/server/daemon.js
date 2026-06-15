@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.16", "0.0.0-source"),
-  commit: defineString("2a906d2", "source"),
+  commit: defineString("9861512", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("b2a5ce6d71b3", "source")
+  codeHash: defineString("0c4f360df15e", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -3405,9 +3405,8 @@ var DEFAULT_BUDGET_CONFIG = {
     balanced: { effort: "medium" },
     eco: { effort: "low" }
   },
-  strategy: "conserve",
   maximize: {
-    targetUtil: 97,
+    targetUtil: 98,
     reserveSlopePctPerHour: 0.4,
     reserveMaxPct: 7,
     finishingHorizonMinutes: 30,
@@ -3489,7 +3488,7 @@ function hasCustomDecisionValues(config) {
   const d = DEFAULT_CONFIG;
   const b = config.budget;
   const db = d.budget;
-  return config.idleShutdownSeconds !== d.idleShutdownSeconds || config.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config.codex.appPort !== d.codex.appPort || config.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.strategy !== db.strategy || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct;
+  return config.idleShutdownSeconds !== d.idleShutdownSeconds || config.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config.codex.appPort !== d.codex.appPort || config.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct;
 }
 function normalizeInteger(value, fallback) {
   if (typeof value === "number" && Number.isFinite(value))
@@ -3521,9 +3520,6 @@ function normalizeBoundedNumber(value, fallback, min, max) {
   if (parsed < min || parsed > max)
     return fallback;
   return parsed;
-}
-function normalizeStrategy(value, fallback) {
-  return value === "conserve" || value === "maximize" ? value : fallback;
 }
 function normalizeMaximizeConfig(raw, pauseAt, fallback = DEFAULT_BUDGET_CONFIG.maximize) {
   const m = isRecord(raw) ? raw : {};
@@ -3588,7 +3584,6 @@ function normalizeBudgetConfig(raw, fallback = DEFAULT_BUDGET_CONFIG) {
     },
     codexTierControl: normalizeBoolean(budget.codexTierControl, fallback.codexTierControl) && codexTiers.full !== null,
     codexTiers,
-    strategy: normalizeStrategy(budget.strategy, fallback.strategy),
     maximize: normalizeMaximizeConfig(budget.maximize, pauseAt, fallback.maximize)
   };
 }
@@ -3605,7 +3600,6 @@ function applyBudgetEnvOverrides(budget, env = process.env) {
     },
     codexTierControl: env.AGENTBRIDGE_BUDGET_CODEX_TIER_CONTROL ?? budget.codexTierControl,
     codexTiers: budget.codexTiers,
-    strategy: env.AGENTBRIDGE_BUDGET_STRATEGY ?? budget.strategy,
     maximize: {
       targetUtil: env.AGENTBRIDGE_BUDGET_TARGET_UTIL ?? budget.maximize.targetUtil,
       reserveSlopePctPerHour: env.AGENTBRIDGE_BUDGET_RESERVE_SLOPE_PCT_PER_HOUR ?? budget.maximize.reserveSlopePctPerHour,
@@ -3736,15 +3730,6 @@ function matchingGateReset(usage) {
     return 0;
   return Math.min(...candidates.map((window) => window.resetEpoch));
 }
-function resumeBlockingEpoch(usage, cfg, now) {
-  if (!usage)
-    return 0;
-  if (usage.rateLimitedUntil > now)
-    return usage.rateLimitedUntil;
-  if (usage.gateUtil >= cfg.resumeBelow)
-    return matchingGateReset(usage);
-  return 0;
-}
 function retryAfterMsForResume(resumeAfterEpoch, nowMs) {
   if (resumeAfterEpoch === null)
     return;
@@ -3848,24 +3833,18 @@ function freshWindows(usage, now) {
   return out;
 }
 var NO_PAUSE = { pause: false, window: null, line: null, reason: "" };
-function conserveReason(agent, usage, cfg) {
-  return `${AGENT_LABEL[agent]} gateUtil ${pct(usage.gateUtil)} \u2265 pauseAt ${pct(cfg.pauseAt)}`;
+function fallbackPauseReason(agent, usage, cfg) {
+  return `${AGENT_LABEL[agent]} gateUtil ${pct(usage.gateUtil)} \u2265 pauseAt ${pct(cfg.pauseAt)}\uFF08\u515C\u5E95\u5224\u636E\uFF09`;
 }
 function agentShouldPause(agent, usage, cfg, now) {
   if (!usage)
     return NO_PAUSE;
   if (!isDecisionGrade(usage, now))
     return NO_PAUSE;
-  if (cfg.strategy !== "maximize") {
-    if (usage.gateUtil >= cfg.pauseAt) {
-      return { pause: true, window: null, line: null, reason: conserveReason(agent, usage, cfg) };
-    }
-    return NO_PAUSE;
-  }
   const windows = freshWindows(usage, now);
   if (windows.length === 0) {
     if (usage.gateUtil >= cfg.pauseAt) {
-      return { pause: true, window: null, line: null, reason: conserveReason(agent, usage, cfg) };
+      return { pause: true, window: null, line: null, reason: fallbackPauseReason(agent, usage, cfg) };
     }
     return NO_PAUSE;
   }
@@ -3892,16 +3871,13 @@ function buildMaximizeReason(agent, key, window, verdict, cfg) {
   if (verdict.admission) {
     return `${head} \u89E6\u53D1\u6536\u5C3E\u4FDD\u62A4\u786C\u7EBF\uFF08\u2265 pauseAt ${pct(cfg.pauseAt)}\uFF09`;
   }
-  return `${head} \u2265 pauseAt ${pct(cfg.pauseAt)}\uFF08\u71C3\u5C3D\u7387\u91C7\u6837\u4E2D\uFF0C\u9000\u4FDD\u5B88\u5224\u636E\uFF09`;
+  return `${head} \u2265 pauseAt ${pct(cfg.pauseAt)}\uFF08\u71C3\u5C3D\u7387\u91C7\u6837\u4E2D\uFF0C\u9000\u515C\u5E95\u5224\u636E\uFF09`;
 }
 function agentCanResume(usage, cfg, now) {
   if (!isDecisionGrade(usage, now))
     return false;
   if (usage.rateLimitedUntil > now)
     return false;
-  if (cfg.strategy !== "maximize") {
-    return usage.gateUtil < cfg.resumeBelow;
-  }
   const windows = freshWindows(usage, now);
   for (const { window } of windows) {
     if (maximizeWindowBlocksResume(window, cfg, now))
@@ -3910,8 +3886,6 @@ function agentCanResume(usage, cfg, now) {
   return true;
 }
 function effectiveDynamicLine(usage, cfg, now) {
-  if (cfg.strategy !== "maximize")
-    return null;
   if (!usage || !isDecisionGrade(usage, now))
     return null;
   let bestLine = null;
@@ -3934,8 +3908,6 @@ function effectiveDynamicLine(usage, cfg, now) {
 function resumeBlockingEpochFor(usage, cfg, now) {
   if (!usage)
     return 0;
-  if (cfg.strategy !== "maximize")
-    return resumeBlockingEpoch(usage, cfg, now);
   if (usage.rateLimitedUntil > now)
     return usage.rateLimitedUntil;
   if (!isDecisionGrade(usage, now)) {
@@ -4018,8 +3990,8 @@ function parallelState(claude, codex, cfg, now) {
 }
 function renderBudgetInterventionDirective(claude, codex, side, reason, resumeEpoch, cfg) {
   const resumeText = `\u9884\u8BA1\u6062\u590D\u65F6\u95F4\uFF08\u4EE5\u5B9E\u6D4B\u4E3A\u51C6\uFF1B\u63D0\u524D\u5237\u65B0\u4F1A\u66F4\u65E9\u89E3\u9664\uFF09\uFF1A${formatEpoch(resumeEpoch)}\u3002`;
-  const resumeCondSingle = cfg.strategy === "maximize" ? `\u5404\u7A97\u53E3 util \u56DE\u843D\u81F3\u52A8\u6001\u6682\u505C\u7EBF \u2212 ${pct2(cfg.maximize.resumeHysteresisPct)} \u4EE5\u4E0B\u6216\u5BF9\u5E94\u7A97\u53E3\u5237\u65B0` : `gateUtil \u4F4E\u4E8E ${pct2(cfg.resumeBelow)}`;
-  const resumeCondBoth = cfg.strategy === "maximize" ? `\u5404\u7A97\u53E3 util \u90FD\u56DE\u843D\u81F3\u52A8\u6001\u6682\u505C\u7EBF \u2212 ${pct2(cfg.maximize.resumeHysteresisPct)} \u4EE5\u4E0B\u6216\u5BF9\u5E94\u7A97\u53E3\u5237\u65B0` : `gateUtil \u90FD\u4F4E\u4E8E ${pct2(cfg.resumeBelow)}`;
+  const resumeCondSingle = `\u5404\u7A97\u53E3 util \u56DE\u843D\u81F3\u52A8\u6001\u6682\u505C\u7EBF \u2212 ${pct2(cfg.maximize.resumeHysteresisPct)} \u4EE5\u4E0B\u6216\u5BF9\u5E94\u7A97\u53E3\u5237\u65B0`;
+  const resumeCondBoth = `\u5404\u7A97\u53E3 util \u90FD\u56DE\u843D\u81F3\u52A8\u6001\u6682\u505C\u7EBF \u2212 ${pct2(cfg.maximize.resumeHysteresisPct)} \u4EE5\u4E0B\u6216\u5BF9\u5E94\u7A97\u53E3\u5237\u65B0`;
   if (side === "claude") {
     return [
       "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Claude \u4FA7\u989D\u5EA6\u7D27\u5F20\uFF0C\u8FDB\u5165\u63A5\u529B\u6A21\u5F0F\u3002",
@@ -4665,22 +4637,20 @@ class BudgetCoordinator {
     return renderBudgetInterventionDirective(state.perAgent.claude, state.perAgent.codex, side, reason || "\u9884\u7B97\u63A5\u8FD1\u8017\u5C3D", resumeEpoch, this.config);
   }
   recoveryDirective(state, side) {
-    const maximizeRecoveredText = `\u5404\u7A97\u53E3 util \u5DF2\u56DE\u843D\u81F3\u52A8\u6001\u6682\u505C\u7EBF \u2212 ${pct4(this.config.maximize.resumeHysteresisPct)} \u4EE5\u4E0B\u6216\u5BF9\u5E94\u7A97\u53E3\u5DF2\u5237\u65B0`;
+    const recoveredText = `\u5404\u7A97\u53E3 util \u5DF2\u56DE\u843D\u81F3\u52A8\u6001\u6682\u505C\u7EBF \u2212 ${pct4(this.config.maximize.resumeHysteresisPct)} \u4EE5\u4E0B\u6216\u5BF9\u5E94\u7A97\u53E3\u5DF2\u5237\u65B0`;
     if (side === "claude") {
-      const condClaude = this.config.strategy === "maximize" ? maximizeRecoveredText : `gateUtil \u5DF2\u4F4E\u4E8E ${pct4(this.config.resumeBelow)}`;
       return [
         "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Claude \u4FA7\u9884\u7B97\u5DF2\u6062\u590D\u3002",
         `${usageLine("claude", state.perAgent.claude)}\uFF1B${usageLine("codex", state.perAgent.codex)}\u3002`,
-        `Claude ${condClaude}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
+        `Claude ${recoveredText}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
         "Claude \u53EF\u6062\u590D orchestrator \u89D2\u8272\uFF1B\u540E\u7EED\u5206\u914D\u524D\u8BF7\u91CD\u65B0\u67E5\u8BE2\u5B9E\u65F6\u989D\u5EA6\uFF0C\u4E0D\u8981\u4F9D\u8D56\u65E7\u6570\u5B57\u3002"
       ].join(`
 `);
     }
-    const condCodex = this.config.strategy === "maximize" ? maximizeRecoveredText : `gateUtil \u4F4E\u4E8E ${pct4(this.config.resumeBelow)}`;
     return [
       "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Codex \u4FA7\u9884\u7B97\u95F8\u95E8\u89E3\u9664\u3002",
       `${usageLine("claude", state.perAgent.claude)}\uFF1B${usageLine("codex", state.perAgent.codex)}\u3002`,
-      `\u95F8\u95E8\u5DF2\u653E\u5F00\uFF1ACodex ${condCodex}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
+      `\u95F8\u95E8\u5DF2\u653E\u5F00\uFF1ACodex ${recoveredText}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
       "\u5EFA\u8BAE Claude \u7528 reply \u5E26\u4E0A\u5F53\u524D\u76EE\u6807\u3001checkpoint \u548C\u4E0B\u4E00\u6B65\uFF0C\u5524\u9192 Codex \u63A5\u7EED\u6267\u884C\u3002"
     ].join(`
 `);
@@ -4706,8 +4676,6 @@ class BudgetCoordinator {
     };
   }
   dynamicLineSnapshotFields(state) {
-    if (this.config.strategy !== "maximize")
-      return {};
     return {
       dynamicPauseLine: {
         claude: effectiveDynamicLine(state.perAgent.claude, this.config, state.now),
@@ -6306,7 +6274,7 @@ function ensureBudgetCoordinatorStarted() {
   if (!BUDGET_CONFIG.enabled)
     return;
   if (!budgetCoordinator) {
-    log(`Budget coordinator config: pollSeconds=${BUDGET_CONFIG.pollSeconds} pauseAt=${BUDGET_CONFIG.pauseAt} ` + `resumeBelow=${BUDGET_CONFIG.resumeBelow} syncDriftPct=${BUDGET_CONFIG.syncDriftPct} ` + `parallel=${BUDGET_CONFIG.parallel.minRemainingPct}%/${BUDGET_CONFIG.parallel.timeWindowSec}s ` + `codexTierControl=${BUDGET_CONFIG.codexTierControl} ` + `codexTiersFull=${BUDGET_CONFIG.codexTiers.full ? "configured" : "missing"} ` + `strategy=${BUDGET_CONFIG.strategy}`);
+    log(`Budget coordinator config: pollSeconds=${BUDGET_CONFIG.pollSeconds} pauseAt=${BUDGET_CONFIG.pauseAt} ` + `resumeBelow=${BUDGET_CONFIG.resumeBelow} syncDriftPct=${BUDGET_CONFIG.syncDriftPct} ` + `parallel=${BUDGET_CONFIG.parallel.minRemainingPct}%/${BUDGET_CONFIG.parallel.timeWindowSec}s ` + `codexTierControl=${BUDGET_CONFIG.codexTierControl} ` + `codexTiersFull=${BUDGET_CONFIG.codexTiers.full ? "configured" : "missing"} ` + `targetUtil=${BUDGET_CONFIG.maximize.targetUtil} fallback=${BUDGET_CONFIG.pauseAt}/${BUDGET_CONFIG.resumeBelow}`);
     budgetCoordinator = new BudgetCoordinator({
       source: createQuotaSource({ log }),
       config: BUDGET_CONFIG,
@@ -6340,7 +6308,7 @@ function budgetPauseGateError() {
   const reason = snapshot?.pauseReason ?? "Codex \u4FA7\u989D\u5EA6\u63A5\u8FD1\u8017\u5C3D";
   const resumeAt = snapshot?.resumeAfterEpoch ? new Date(snapshot.resumeAfterEpoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z") : null;
   const sideHint = snapshot?.pauseSide === "both" ? "\u53CC\u4FA7\u989D\u5EA6\u5747\u5DF2\u8017\u5C3D\uFF0C\u8BF7\u5199 checkpoint \u7B49\u5F85\u5237\u65B0" : "\u4F60\u53EF\u7EE7\u7EED solo \u63A8\u8FDB\u53EF\u72EC\u7ACB\u90E8\u5206\uFF0C\u5E76\u5199 checkpoint \u6807\u6CE8\u5206\u5DE5\u65AD\u70B9";
-  const reopenText = BUDGET_CONFIG.strategy === "maximize" ? `Codex \u4FA7\u5404\u7A97\u53E3 util \u56DE\u843D\u81F3\u52A8\u6001\u6682\u505C\u7EBF \u2212 ${BUDGET_CONFIG.maximize.resumeHysteresisPct}% \u4EE5\u4E0B\u6216\u5BF9\u5E94\u7A97\u53E3\u5237\u65B0\u540E\u95F8\u95E8\u81EA\u52A8\u653E\u5F00` : `Codex \u4FA7 gateUtil \u4F4E\u4E8E ${BUDGET_CONFIG.resumeBelow}% \u540E\u95F8\u95E8\u81EA\u52A8\u653E\u5F00`;
+  const reopenText = `Codex \u4FA7\u5404\u7A97\u53E3 util \u56DE\u843D\u81F3\u52A8\u6001\u6682\u505C\u7EBF \u2212 ${BUDGET_CONFIG.maximize.resumeHysteresisPct}% \u4EE5\u4E0B\u6216\u5BF9\u5E94\u7A97\u53E3\u5237\u65B0\u540E\u95F8\u95E8\u81EA\u52A8\u653E\u5F00`;
   return `\u9884\u7B97\u6682\u505C\uFF08\u95F8\u95E8\u5173\u95ED\uFF09\uFF0C\u5DF2\u62D2\u7EDD\u8F6C\u53D1\uFF1A${reason}\u3002` + reopenText + (resumeAt ? `\uFF08\u9884\u8BA1\u6062\u590D ${resumeAt}\uFF0C\u4EE5\u5B9E\u6D4B\u4E3A\u51C6\uFF1B\u63D0\u524D\u5237\u65B0\u4F1A\u66F4\u65E9\u89E3\u9664\uFF09` : "") + `\u3002\u6536\u5230 RESUME \u901A\u77E5\u524D\u8BF7\u52FF\u91CD\u8BD5\u5411 Codex \u53D1\u9001 reply\uFF1B${sideHint}\u3002`;
 }
 var tuiConnectionState = new TuiConnectionState({
