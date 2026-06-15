@@ -308,6 +308,34 @@ describe("QuotaSource", () => {
     expect(isDegradedUsage(expired!, NOW)).toBe(true);
   });
 
+  test("B5: stale fetchedAt with a still-fresh window is degraded (aligned with isDecisionGrade)", () => {
+    const staleFetch = normalizeProbeResult({
+      ok: true,
+      util: 50,
+      warn_util: 50,
+      fetched_at: NOW - 700, // > STALE_MAX_AGE_SEC (600) ago
+      buckets: [{ id: "five_hour", util: 50, reset_epoch: NOW + 3600 }], // window still future
+    });
+    expect(staleFetch).not.toBeNull();
+    // Window is fresh (>now) but the data was fetched too long ago: BOTH the
+    // display-side isDegradedUsage and the decision-side isDecisionGrade must
+    // agree it is stale, so no "recovered to fresh" log fires while the
+    // coordinator keeps the gate held (B5 — previously the two diverged).
+    expect(isDegradedUsage(staleFetch!, NOW)).toBe(true);
+    expect(isDecisionGrade(staleFetch!, NOW)).toBe(false);
+
+    // Control: a freshly-fetched record with the same fresh window is NOT degraded.
+    const freshFetch = normalizeProbeResult({
+      ok: true,
+      util: 50,
+      warn_util: 50,
+      fetched_at: NOW,
+      buckets: [{ id: "five_hour", util: 50, reset_epoch: NOW + 3600 }],
+    });
+    expect(isDegradedUsage(freshFetch!, NOW)).toBe(false);
+    expect(isDecisionGrade(freshFetch!, NOW)).toBe(true);
+  });
+
   test("degraded acceptance is logged on transitions only, with recovery (#103)", async () => {
     const logs: string[] = [];
     let stale = true;

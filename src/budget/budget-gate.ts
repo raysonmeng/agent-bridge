@@ -41,3 +41,18 @@ export function resumeBlockingEpoch(usage: AgentUsage | null, cfg: BudgetConfig,
   if (usage.gateUtil >= cfg.resumeBelow) return matchingGateReset(usage);
   return 0;
 }
+
+/**
+ * Advisory retry delay (ms) for a budget-paused injection rejection. Returns the
+ * time until `resumeAfterEpoch`, or undefined when there is no trustworthy
+ * FUTURE time — NEVER 0 or negative (B4). A resumeAfterEpoch already in the past
+ * (a window reset landed mid poll-interval before the coordinator re-polled to
+ * clear the gate) must not advertise retryAfterMs=0: the client would retry
+ * immediately, be re-rejected by the still-closed gate, and busy-loop until the
+ * next poll. Omitting it lets the client wait for the RESUME push instead.
+ */
+export function retryAfterMsForResume(resumeAfterEpoch: number | null, nowMs: number): number | undefined {
+  if (resumeAfterEpoch === null) return undefined;
+  const remainingMs = resumeAfterEpoch * 1000 - nowMs;
+  return remainingMs > 0 ? remainingMs : undefined;
+}

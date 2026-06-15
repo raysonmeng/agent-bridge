@@ -21,6 +21,7 @@ import { StateDirResolver } from "./state-dir";
 import { ConfigService, applyBudgetEnvOverrides } from "./config-service";
 import { BudgetCoordinator } from "./budget/budget-coordinator";
 import { createQuotaSource } from "./budget/quota-source";
+import { retryAfterMsForResume } from "./budget/budget-gate";
 import { readGuardPending } from "./budget/pending-reader";
 import type { ResumeSignals } from "./budget/budget-fingerprint";
 import { ResumeInjectionQueue, tryClaimPendingResume } from "./budget/resume-injection-queue";
@@ -1217,9 +1218,8 @@ async function handleClaudeToCodex(
     const reason = budgetPauseGateError();
     log(`Injection rejected by budget pause gate`);
     const resumeAfterEpoch = budgetCoordinator?.getSnapshot()?.resumeAfterEpoch ?? null;
-    const retryAfterMs = resumeAfterEpoch !== null
-      ? Math.max(0, resumeAfterEpoch * 1000 - Date.now())
-      : undefined;
+    // B4 fix: only advertise a POSITIVE retry delay (see retryAfterMsForResume).
+    const retryAfterMs = retryAfterMsForResume(resumeAfterEpoch, Date.now());
     sendClaudeToCodexResult(ws, message.requestId, {
       success: false,
       code: "budget_paused",
