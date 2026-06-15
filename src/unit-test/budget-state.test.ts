@@ -20,7 +20,6 @@ const CONFIG: BudgetConfig = {
     balanced: { effort: "medium" },
     eco: { effort: "low" },
   },
-  strategy: "conserve",
   maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
 };
 
@@ -92,9 +91,17 @@ describe("computeBudgetState", () => {
     expect(state.directiveToClaude).toContain("提前刷新会更早解除");
   });
 
-  test("does not pause when warnUtil is high but gateUtil is below pauseAt", () => {
+  test("does not pause when warnUtil is high but every window util is below pauseAt", () => {
+    // warnUtil (96) drives drift/balance only; pause gating is per-window util.
+    // Keep both windows' util low so no window crosses the maximize fallback line.
     const state = computeBudgetState(
-      usage({ gateUtil: 20, warnUtil: 96, remaining: 80 }),
+      usage({
+        gateUtil: 20,
+        warnUtil: 96,
+        remaining: 80,
+        fiveHour: { util: 20, resetEpoch: NOW + 7200 },
+        weekly: { util: 20, resetEpoch: NOW + 500_000 },
+      }),
       usage({ gateUtil: 18, warnUtil: 18, remaining: 82 }),
       CONFIG,
       NOW,

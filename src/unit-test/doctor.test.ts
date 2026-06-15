@@ -97,7 +97,7 @@ describe("doctor command", () => {
         "pair registration",
         "env",
         "config.json",
-        "budget strategy", // v3 P1 Q7 enhanced-B check
+        "budget target", // v3.2 maximize-only target/guard check
         "daemon health",
         "daemon readiness",
         "codex app-server",
@@ -364,29 +364,26 @@ describe("describeBuildDrift (basis annotation)", () => {
   });
 });
 
-describe("evaluateBudgetStrategyGuard (v3 P1 Q7 enhanced-B)", () => {
-  test("strategy=conserve → ok (v2-equivalent behavior)", () => {
-    const check = evaluateBudgetStrategyGuard("conserve", 92);
-    expect(check.name).toBe("budget strategy");
-    expect(check.status).toBe("ok");
-    expect(check.detail).toContain("conserve");
-  });
-
-  test("strategy=maximize with guard hardline below targetUtil → warn", () => {
-    const check = evaluateBudgetStrategyGuard("maximize", 92);
+describe("evaluateBudgetStrategyGuard (v3.2 maximize-only)", () => {
+  test("guard hardline below targetUtil → warn", () => {
+    const check = evaluateBudgetStrategyGuard(92);
+    expect(check.name).toBe("budget target");
     expect(check.status).toBe("warn");
     expect(check.detail).toContain("92");
-    expect(check.detail).toContain("97");
+    expect(check.detail).toContain("98");
     expect(check.hint).toContain("外层 quota-guard 硬线");
   });
 
-  test("strategy=maximize with guard hardline at/above targetUtil → ok", () => {
-    expect(evaluateBudgetStrategyGuard("maximize", 97).status).toBe("ok");
-    expect(evaluateBudgetStrategyGuard("maximize", 98).status).toBe("ok");
+  test("guard hardline at/above targetUtil → ok", () => {
+    const check = evaluateBudgetStrategyGuard(98);
+    expect(check.name).toBe("budget target");
+    expect(check.status).toBe("ok");
+    expect(check.detail).toContain("targetUtil");
+    expect(evaluateBudgetStrategyGuard(99).status).toBe("ok");
   });
 
   test("custom targetUtil is honored", () => {
-    expect(evaluateBudgetStrategyGuard("maximize", 92, 90).status).toBe("ok");
-    expect(evaluateBudgetStrategyGuard("maximize", 89, 90).status).toBe("warn");
+    expect(evaluateBudgetStrategyGuard(92, 90).status).toBe("ok");
+    expect(evaluateBudgetStrategyGuard(89, 90).status).toBe("warn");
   });
 });

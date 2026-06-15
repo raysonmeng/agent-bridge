@@ -10,9 +10,8 @@ import {
   type AgentBridgeBuildInfo,
 } from "../build-info";
 import { cliInvocationName } from "../cli-invocation";
-import { ConfigService, applyBudgetEnvOverrides } from "../config-service";
+import { ConfigService, applyBudgetEnvOverrides, DEFAULT_BUDGET_CONFIG } from "../config-service";
 import { resolveGuardHardHint } from "../budget/render";
-import type { BudgetStrategy } from "../budget/types";
 import { fetchDaemonStatus } from "../daemon-status";
 import { inspectAgentBridgeEnv } from "../env-guard";
 import {
@@ -561,51 +560,45 @@ function configParseabilityCheck(cwd: string, cli: string): DoctorCheck {
 }
 
 /**
- * Default v3 maximize target utilization (design §3.1), used as the fallback
- * when a caller does not pass an explicit targetUtil. Since P2, the resolved
- * value comes from `budget.maximize.targetUtil` (config + env), so this is only
- * the package default mirrored from DEFAULT_BUDGET_CONFIG.maximize.targetUtil.
+ * Default dynamic-line target utilization (design §3.1), used as the fallback
+ * when a caller does not pass an explicit targetUtil. The resolved value comes
+ * from `budget.maximize.targetUtil` (config + env); this mirrors the package
+ * default in DEFAULT_BUDGET_CONFIG.maximize.targetUtil (v3.2: 98).
  */
-export const V3_DEFAULT_TARGET_UTIL = 97;
+export const V3_DEFAULT_TARGET_UTIL = DEFAULT_BUDGET_CONFIG.maximize.targetUtil;
 
 /**
- * Pure verdict for the v3 Q7 enhanced-B doctor check: with strategy=maximize,
- * the OUTER quota-guard hard line (default 92, the guard's BUDGET_HARD
- * default) hard-stops the Claude process BEFORE v3's targetUtil — the
- * 92→targetUtil band is unreachable until the user raises the guard line.
- * v3 never crosses or bypasses the guard (REAL-3); this check makes that
- * boundary visible instead of letting runway displays mislead.
+ * Pure verdict for the budget-target doctor check (v3.2). The bridge paces
+ * toward `targetUtil`; the OUTER quota-guard hard line is the last fuse. When
+ * the guard line covers targetUtil it is fine (OK). When the guard line is BELOW
+ * targetUtil, the band above the guard is unreachable for Claude (the guard
+ * hard-stops the process first). With the v3.2 default (guard 99 ≥ target 98)
+ * the covered case is the norm (OK); the below-target case fires only when a user
+ * lowers the guard below targetUtil — a real misconfiguration that defeats the
+ * feature, so it warns (REAL-3: the bridge never crosses the guard).
  */
 export function evaluateBudgetStrategyGuard(
-  strategy: BudgetStrategy,
   guardHardPct: number,
   targetUtilPct: number = V3_DEFAULT_TARGET_UTIL,
 ): DoctorCheck {
-  if (strategy !== "maximize") {
-    return {
-      name: "budget strategy",
-      status: "ok",
-      detail: "strategy=conserve — v2-equivalent budget behavior (v3 maximize is opt-in)",
-    };
-  }
   if (guardHardPct >= targetUtilPct) {
     return {
-      name: "budget strategy",
+      name: "budget target",
       status: "ok",
       detail:
-        `strategy=maximize — outer guard hard line ${guardHardPct}% covers targetUtil ${targetUtilPct}%`,
+        `dynamic line → targetUtil ${targetUtilPct}%; outer guard hard line ${guardHardPct}% covers it`,
     };
   }
   return {
-    name: "budget strategy",
+    name: "budget target",
     status: "warn",
     detail:
-      `strategy=maximize but the outer quota-guard hard line (${guardHardPct}%) is below ` +
-      `targetUtil (${targetUtilPct}%) — the ${guardHardPct}→${targetUtilPct} band is unreachable for Claude`,
+      `outer quota-guard hard line (${guardHardPct}%) is below targetUtil (${targetUtilPct}%) — ` +
+      `the ${guardHardPct}→${targetUtilPct}% band is unreachable for Claude`,
     hint:
-      "v3 不可越过外层 quota-guard 硬线：Claude 侧达到 guard 硬线时进程会被外层强停，" +
-      `maximize 的 ${guardHardPct}%→${targetUtilPct}% 区间实际烧不到。想真正用到 targetUtil，` +
-      "需自行调高 quota-guard 的 BUDGET_HARD（本仓库不代改外层配置）；展示侧已按 guard 线收口。",
+      "外层 quota-guard 硬线先于 bridge 动态线停 Claude 进程（REAL-3，不可越过）：" +
+      `${guardHardPct}%→${targetUtilPct}% 区间烧不到。想用满到 targetUtil，调高 quota-guard 的 ` +
+      "BUDGET_HARD（本仓库不代改外层配置）；展示侧已按 guard 线收口。",
   };
 }
 
@@ -617,7 +610,6 @@ function budgetStrategyGuardCheck(cwd: string): DoctorCheck {
   const config = new ConfigService(cwd).loadOrDefault();
   const budget = applyBudgetEnvOverrides(config.budget);
   return evaluateBudgetStrategyGuard(
-    budget.strategy,
     resolveGuardHardHint(),
     budget.maximize.targetUtil,
   );

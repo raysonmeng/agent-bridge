@@ -462,31 +462,22 @@ export class BudgetCoordinator {
   }
 
   private recoveryDirective(state: BudgetState, side: AgentName): string {
-    // Q10: the recovery-condition text must match the active strategy. maximize
-    // exits per-window (dynamic line − hysteresis, or window reset), not at
-    // resumeBelow — see renderBudgetInterventionDirective for the same fix.
-    const maximizeRecoveredText = `各窗口 util 已回落至动态暂停线 − ${pct(this.config.maximize.resumeHysteresisPct)} 以下或对应窗口已刷新`;
+    // v3.2: recovery is per-window (dynamic line − hysteresis, or window reset),
+    // not at resumeBelow — the dynamic line is the sole strategy.
+    const recoveredText = `各窗口 util 已回落至动态暂停线 − ${pct(this.config.maximize.resumeHysteresisPct)} 以下或对应窗口已刷新`;
     if (side === "claude") {
-      const condClaude =
-        this.config.strategy === "maximize"
-          ? maximizeRecoveredText
-          : `gateUtil 已低于 ${pct(this.config.resumeBelow)}`;
       return [
         "【预算协调 · 账号级】Claude 侧预算已恢复。",
         `${usageLine("claude", state.perAgent.claude)}；${usageLine("codex", state.perAgent.codex)}。`,
-        `Claude ${condClaude}，且没有有效 rate_limit。`,
+        `Claude ${recoveredText}，且没有有效 rate_limit。`,
         "Claude 可恢复 orchestrator 角色；后续分配前请重新查询实时额度，不要依赖旧数字。",
       ].join("\n");
     }
 
-    const condCodex =
-      this.config.strategy === "maximize"
-        ? maximizeRecoveredText
-        : `gateUtil 低于 ${pct(this.config.resumeBelow)}`;
     return [
       "【预算协调 · 账号级】Codex 侧预算闸门解除。",
       `${usageLine("claude", state.perAgent.claude)}；${usageLine("codex", state.perAgent.codex)}。`,
-      `闸门已放开：Codex ${condCodex}，且没有有效 rate_limit。`,
+      `闸门已放开：Codex ${recoveredText}，且没有有效 rate_limit。`,
       "建议 Claude 用 reply 带上当前目标、checkpoint 和下一步，唤醒 Codex 接续执行。",
     ].join("\n");
   }
@@ -513,12 +504,12 @@ export class BudgetCoordinator {
   }
 
   /**
-   * v3 P2 (display-only): the binding maximize dynamic pause line per agent.
-   * Omitted entirely in conserve mode so the legacy snapshot shape is unchanged;
-   * mirrors the decision layer (effectiveDynamicLine) without ever feeding it.
+   * v3.2 (display-only): the binding dynamic pause line per agent. The dynamic
+   * line is always-on now, so this is always present; each side is null when no
+   * confident window yields a numeric line. Mirrors the decision layer
+   * (effectiveDynamicLine) without ever feeding it.
    */
-  private dynamicLineSnapshotFields(state: BudgetState): Pick<BudgetSnapshot, "dynamicPauseLine"> | Record<never, never> {
-    if (this.config.strategy !== "maximize") return {};
+  private dynamicLineSnapshotFields(state: BudgetState): Pick<BudgetSnapshot, "dynamicPauseLine"> {
     return {
       dynamicPauseLine: {
         claude: effectiveDynamicLine(state.perAgent.claude, this.config, state.now),

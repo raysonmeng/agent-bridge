@@ -437,10 +437,9 @@ function ensureBudgetCoordinatorStarted() {
       // Normalization degrades tier control to false when the sticky-restore
       // point is missing; surface that state so the degrade is diagnosable.
       `codexTiersFull=${BUDGET_CONFIG.codexTiers.full ? "configured" : "missing"} ` +
-      // v3 P1: strategy is parse-only (behavior stays conserve). Burn-rate
-      // data is CONSUMED from the guard probe (layered amendment) — the
-      // daemon collects nothing.
-      `strategy=${BUDGET_CONFIG.strategy}`,
+      // v3.2: the time-aware dynamic line is the sole strategy; targetUtil is the
+      // reset-point asymptote, pauseAt/resumeBelow are the no-burn-data fallback.
+      `targetUtil=${BUDGET_CONFIG.maximize.targetUtil} fallback=${BUDGET_CONFIG.pauseAt}/${BUDGET_CONFIG.resumeBelow}`,
     );
     budgetCoordinator = new BudgetCoordinator({
       source: createQuotaSource({ log }),
@@ -501,13 +500,9 @@ function budgetPauseGateError(): string {
   const sideHint = snapshot?.pauseSide === "both"
     ? "双侧额度均已耗尽，请写 checkpoint 等待刷新"
     : "你可继续 solo 推进可独立部分，并写 checkpoint 标注分工断点";
-  // Q10: the resume-condition text must match the active strategy. maximize
-  // reopens the gate per-window (dynamic line − hysteresis, or window reset),
-  // not at resumeBelow.
-  const reopenText =
-    BUDGET_CONFIG.strategy === "maximize"
-      ? `Codex 侧各窗口 util 回落至动态暂停线 − ${BUDGET_CONFIG.maximize.resumeHysteresisPct}% 以下或对应窗口刷新后闸门自动放开`
-      : `Codex 侧 gateUtil 低于 ${BUDGET_CONFIG.resumeBelow}% 后闸门自动放开`;
+  // v3.2: the gate reopens per-window (dynamic line − hysteresis, or window
+  // reset), not at resumeBelow — the dynamic line is the sole strategy.
+  const reopenText = `Codex 侧各窗口 util 回落至动态暂停线 − ${BUDGET_CONFIG.maximize.resumeHysteresisPct}% 以下或对应窗口刷新后闸门自动放开`;
   return (
     `预算暂停（闸门关闭），已拒绝转发：${reason}。` +
     reopenText +

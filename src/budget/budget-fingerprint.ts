@@ -197,10 +197,9 @@ function agentsToSide(agents: ReadonlySet<AgentName>): PauseSide {
 /**
  * Hysteresis transition over the activeSides set: agentShouldPause adds, an
  * already active side that agentCanResume is removed. Both predicates are the
- * strategy-aware single source of truth in budget-decision.ts (conserve =
- * verbatim port of the former local gateUtil checks; maximize = per-window
- * dynamic line), so the coordinator's gating can never diverge from the
- * rendered state in budget-state.ts.
+ * single source of truth in budget-decision.ts (v3.2: the per-window dynamic
+ * line, with a gateUtil fallback when burn data is absent), so the coordinator's
+ * gating can never diverge from the rendered state in budget-state.ts.
  */
 function nextActiveSide(prevSide: PauseSide, state: BudgetState, cfg: BudgetConfig): PauseSide {
   const active = new Set<AgentName>(sideToAgents(prevSide));
@@ -225,8 +224,8 @@ function activeSideReason(agent: AgentName, usage: AgentUsage | null, cfg: Budge
   if (usage.rateLimitedUntil > now) {
     return `${AGENT_LABEL[agent]} 探针被限流至 ${formatEpoch(usage.rateLimitedUntil)}`;
   }
-  // Delegate the "why paused" text to the strategy-aware decision (conserve =
-  // the old gateUtil≥pauseAt string; maximize = the dynamic-line string).
+  // Delegate the "why paused" text to the decision layer (dynamic-line string,
+  // or the gateUtil fallback string when burn data is absent).
   const decision = agentShouldPause(agent, usage, cfg, now);
   if (decision.pause) return decision.reason;
   // Still in the active set but no longer tripping entry → in the hysteresis

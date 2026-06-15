@@ -1,16 +1,15 @@
 /**
  * Shared resume-gate helpers for the budget coordination layer.
  *
- * `matchingGateReset` and `resumeBlockingEpoch` were previously duplicated
- * verbatim in budget-coordinator.ts and budget-state.ts. types.ts already
- * warns that a fork between the entry-side guard and the coordinator's resume
- * gate is an accident waiting to happen (see STALE_MAX_AGE_SEC); these two
- * helpers are the same shape, so they live here as the single source of truth.
+ * `matchingGateReset` is the single source of truth for "the reset epoch that
+ * explains the current gateUtil". (v3.2 removed the conserve-era
+ * `resumeBlockingEpoch` from here — the strategy-aware `resumeBlockingEpochFor`
+ * in budget-decision.ts is the sole resume-epoch helper now.)
  *
  * Keep this file dependency-free beyond ./types; it is bundled into the plugin
  * daemon.
  */
-import type { AgentUsage, BudgetConfig } from "./types";
+import type { AgentUsage } from "./types";
 
 /**
  * Earliest reset epoch among the windows that explain the current gateUtil.
@@ -28,18 +27,6 @@ export function matchingGateReset(usage: AgentUsage | null): number {
   const candidates = matching.length > 0 ? matching : windows;
   if (candidates.length === 0) return 0;
   return Math.min(...candidates.map((window) => window.resetEpoch));
-}
-
-/**
- * Epoch at which this side stops blocking resume: the active rate-limit if one
- * is in effect, else the gate-window reset while gateUtil is still at/above
- * resumeBelow, else 0 (this side no longer blocks resume).
- */
-export function resumeBlockingEpoch(usage: AgentUsage | null, cfg: BudgetConfig, now: number): number {
-  if (!usage) return 0;
-  if (usage.rateLimitedUntil > now) return usage.rateLimitedUntil;
-  if (usage.gateUtil >= cfg.resumeBelow) return matchingGateReset(usage);
-  return 0;
 }
 
 /**

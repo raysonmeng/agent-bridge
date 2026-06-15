@@ -13895,7 +13895,7 @@ function agentWeeklyFiveHourWindowsLeft(usage, now) {
 }
 
 // src/budget/render.ts
-var DEFAULT_GUARD_HARD_PCT = 92;
+var DEFAULT_GUARD_HARD_PCT = 99;
 function resolveGuardHardHint(env = process.env) {
   const raw = env.AGENTBRIDGE_GUARD_HARD_HINT;
   if (raw === undefined || raw.trim() === "")
@@ -14024,7 +14024,7 @@ function formatDynamicLineLine(snapshot) {
   }
   if (parts.length === 0)
     return null;
-  return `\u52A8\u6001\u6682\u505C\u7EBF\uFF08maximize\uFF09\uFF1A${parts.join(" \xB7 ")}`;
+  return `\u52A8\u6001\u6682\u505C\u7EBF\uFF1A${parts.join(" \xB7 ")}`;
 }
 var PHASE_LABELS = {
   normal: "normal\uFF08\u6B63\u5E38\uFF09",
@@ -14596,10 +14596,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.16", "0.0.0-source"),
-  commit: defineString("2a906d2", "source"),
+  commit: defineString("9861512", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("b2a5ce6d71b3", "source")
+  codeHash: defineString("0c4f360df15e", "source")
 });
 function sameRuntimeContract(a, b) {
   if (!a || !b)
@@ -15634,9 +15634,8 @@ var DEFAULT_BUDGET_CONFIG = {
     balanced: { effort: "medium" },
     eco: { effort: "low" }
   },
-  strategy: "conserve",
   maximize: {
-    targetUtil: 97,
+    targetUtil: 98,
     reserveSlopePctPerHour: 0.4,
     reserveMaxPct: 7,
     finishingHorizonMinutes: 30,
@@ -15718,7 +15717,7 @@ function hasCustomDecisionValues(config2) {
   const d = DEFAULT_CONFIG;
   const b = config2.budget;
   const db = d.budget;
-  return config2.idleShutdownSeconds !== d.idleShutdownSeconds || config2.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config2.codex.appPort !== d.codex.appPort || config2.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.strategy !== db.strategy || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct;
+  return config2.idleShutdownSeconds !== d.idleShutdownSeconds || config2.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config2.codex.appPort !== d.codex.appPort || config2.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct;
 }
 function normalizeInteger(value, fallback) {
   if (typeof value === "number" && Number.isFinite(value))
@@ -15750,9 +15749,6 @@ function normalizeBoundedNumber(value, fallback, min, max) {
   if (parsed < min || parsed > max)
     return fallback;
   return parsed;
-}
-function normalizeStrategy(value, fallback) {
-  return value === "conserve" || value === "maximize" ? value : fallback;
 }
 function normalizeMaximizeConfig(raw, pauseAt, fallback = DEFAULT_BUDGET_CONFIG.maximize) {
   const m = isRecord(raw) ? raw : {};
@@ -15817,7 +15813,6 @@ function normalizeBudgetConfig(raw, fallback = DEFAULT_BUDGET_CONFIG) {
     },
     codexTierControl: normalizeBoolean(budget.codexTierControl, fallback.codexTierControl) && codexTiers.full !== null,
     codexTiers,
-    strategy: normalizeStrategy(budget.strategy, fallback.strategy),
     maximize: normalizeMaximizeConfig(budget.maximize, pauseAt, fallback.maximize)
   };
 }

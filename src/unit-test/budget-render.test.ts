@@ -54,11 +54,11 @@ describe("renderBudgetSnapshot", () => {
     expect(text).toContain("预警 45%");
   });
 
-  test("renders the maximize dynamic line with per-agent headroom", () => {
+  test("renders the dynamic line with per-agent headroom", () => {
     const text = renderBudgetSnapshot(
       snapshot({ dynamicPauseLine: { claude: 93.4, codex: 95.6 } }),
     );
-    expect(text).toContain("动态暂停线（maximize）：");
+    expect(text).toContain("动态暂停线：");
     expect(text).toContain("Claude 93.4%");
     expect(text).toContain("Codex 95.6%");
     // headroom = line - gateUtil (Claude 93.4-42=51.4, Codex 95.6-10=85.6)
@@ -66,7 +66,7 @@ describe("renderBudgetSnapshot", () => {
     expect(text).toContain("余量 85.6");
   });
 
-  test("omits the dynamic line entirely in conserve mode (no field)", () => {
+  test("omits the dynamic line when the snapshot carries no field (legacy daemon)", () => {
     expect(renderBudgetSnapshot(snapshot())).not.toContain("动态暂停线");
   });
 
@@ -249,7 +249,7 @@ describe("renderBudgetSnapshot — burn rate & runway (v3 P1, layered amendment)
     );
     // Honesty-first Q7 wording: the number is the guard's NEUTRAL runway,
     // never rescaled by the bridge (constraint #2) — the caveat is textual.
-    expect(text).toContain("外层 guard 硬线 92%（v3 不可越过；runway 为中性口径，Claude 会先在硬线被外层停住）");
+    expect(text).toContain("外层 guard 硬线 99%（v3 不可越过；runway 为中性口径，Claude 会先在硬线被外层停住）");
     expect(text).not.toContain("窗口刷新即截断");
   });
 
@@ -380,18 +380,18 @@ describe("renderBudgetSnapshot — burn rate & runway (v3 P1, layered amendment)
 });
 
 describe("resolveGuardHardHint", () => {
-  test("defaults to 92 (quota-guard BUDGET_HARD default)", () => {
-    expect(resolveGuardHardHint({})).toBe(92);
+  test("defaults to 99 (v3.2 quota-guard BUDGET_HARD default)", () => {
+    expect(resolveGuardHardHint({})).toBe(99);
   });
 
   test("AGENTBRIDGE_GUARD_HARD_HINT overrides the display value", () => {
     expect(resolveGuardHardHint({ AGENTBRIDGE_GUARD_HARD_HINT: "85" })).toBe(85);
   });
 
-  test("invalid or out-of-range hints fall back to 92", () => {
-    expect(resolveGuardHardHint({ AGENTBRIDGE_GUARD_HARD_HINT: "abc" })).toBe(92);
-    expect(resolveGuardHardHint({ AGENTBRIDGE_GUARD_HARD_HINT: "150" })).toBe(92);
-    expect(resolveGuardHardHint({ AGENTBRIDGE_GUARD_HARD_HINT: "0" })).toBe(92);
-    expect(resolveGuardHardHint({ AGENTBRIDGE_GUARD_HARD_HINT: "" })).toBe(92);
+  test("invalid or out-of-range hints fall back to 99", () => {
+    expect(resolveGuardHardHint({ AGENTBRIDGE_GUARD_HARD_HINT: "abc" })).toBe(99);
+    expect(resolveGuardHardHint({ AGENTBRIDGE_GUARD_HARD_HINT: "150" })).toBe(99);
+    expect(resolveGuardHardHint({ AGENTBRIDGE_GUARD_HARD_HINT: "0" })).toBe(99);
+    expect(resolveGuardHardHint({ AGENTBRIDGE_GUARD_HARD_HINT: "" })).toBe(99);
   });
 });
