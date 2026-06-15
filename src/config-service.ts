@@ -1,7 +1,7 @@
 import { readFileSync, mkdirSync, existsSync } from "node:fs";
 import { join } from "node:path";
 import { atomicWriteJson } from "./atomic-json";
-import type { BudgetConfig, BudgetStrategy, CodexTierMap, CodexTurnOverrides } from "./budget/types";
+import type { BudgetConfig, BudgetStrategy, CodexTierMap, CodexTurnOverrides, MaximizeConfig } from "./budget/types";
 
 /** Machine-readable project config schema. */
 export interface AgentBridgeConfig {
@@ -38,10 +38,20 @@ const DEFAULT_BUDGET_CONFIG: BudgetConfig = {
     balanced: { effort: "medium" },
     eco: { effort: "low" },
   },
-  // v3 P1: strategy is parse-and-validate only (behavior stays conserve; the
-  // value feeds the doctor Q7 guard-hardline check). Burn-rate data is
-  // consumed from the guard probe — no collection config on this side.
+  // v3: strategy selector. conserve = v2-equivalent gateUtil thresholds (the
+  // default — opt-in is required to change behavior). maximize (P2) activates
+  // the per-window time-aware dynamic pause line. Burn-rate data is consumed
+  // from the guard probe — no collection config on this side.
   strategy: "conserve",
+  // v3 P2 maximize parameters (only consumed when strategy="maximize"). Defaults
+  // and ranges per design budget-strategy-v3.md §3.1/§4.1.
+  maximize: {
+    targetUtil: 97,
+    reserveSlopePctPerHour: 0.4,
+    reserveMaxPct: 7,
+    finishingHorizonMinutes: 30,
+    resumeHysteresisPct: 5,
+  },
 };
 
 const DEFAULT_CONFIG: AgentBridgeConfig = {
@@ -165,6 +175,26 @@ function findShapeViolation(raw: Record<string, unknown>): string | null {
         }
       }
     }
+    if ("maximize" in budget) {
+      const maximize = budget.maximize;
+      if (!isRecord(maximize)) {
+        return "budget.maximize is present but not an object";
+      }
+      // Symmetric to budget.parallel: a present-but-garbage maximize numeric
+      // (e.g. targetUtil:"ninety") fails loud instead of silently reverting to
+      // the design default, matching the other decision-grade thresholds.
+      for (const key of [
+        "targetUtil",
+        "reserveSlopePctPerHour",
+        "reserveMaxPct",
+        "finishingHorizonMinutes",
+        "resumeHysteresisPct",
+      ] as const) {
+        if (key in maximize && !isCoercibleNumber(maximize[key])) {
+          return `budget.maximize.${key} is present but not a number`;
+        }
+      }
+    }
   }
   return null;
 }
@@ -191,7 +221,16 @@ function hasCustomDecisionValues(config: AgentBridgeConfig): boolean {
     b.syncDriftPct !== db.syncDriftPct ||
     b.parallel.minRemainingPct !== db.parallel.minRemainingPct ||
     b.parallel.timeWindowSec !== db.parallel.timeWindowSec ||
-    b.codexTierControl !== db.codexTierControl
+    b.codexTierControl !== db.codexTierControl ||
+    // v3: strategy + maximize parameters are decision-grade — surface them so
+    // `abg doctor` reports "custom values in effect" when the user opts into
+    // maximize or tunes its line, not a misleading "all values match defaults".
+    b.strategy !== db.strategy ||
+    b.maximize.targetUtil !== db.maximize.targetUtil ||
+    b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour ||
+    b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct ||
+    b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes ||
+    b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct
   );
 }
 
@@ -245,6 +284,51 @@ export function normalizeBoundedNumber(
 /** v3 strategy selector: anything but the two known literals falls back. */
 function normalizeStrategy(value: unknown, fallback: BudgetStrategy): BudgetStrategy {
   return value === "conserve" || value === "maximize" ? value : fallback;
+}
+
+/**
+ * Normalize the v3 maximize parameter block. Each field is bounds-checked
+ * (out-of-range → fallback). The relation constraint `targetUtil > pauseAt`
+ * (§4.1) is unsatisfiable otherwise — the dynamic line floor is pauseAt, so a
+ * target at/below it leaves no maximize band — so the WHOLE block resets to
+ * defaults when violated. Silent reset mirrors the existing pauseAt<=resumeBelow
+ * handling in normalizeBudgetConfig (both keep normalize pure / logger-free).
+ */
+function normalizeMaximizeConfig(
+  raw: unknown,
+  pauseAt: number,
+  fallback: MaximizeConfig = DEFAULT_BUDGET_CONFIG.maximize,
+): MaximizeConfig {
+  const m = isRecord(raw) ? raw : {};
+  const normalized: MaximizeConfig = {
+    targetUtil: normalizeBoundedInteger(m.targetUtil, fallback.targetUtil, 90, 99),
+    reserveSlopePctPerHour: normalizeBoundedNumber(
+      m.reserveSlopePctPerHour,
+      fallback.reserveSlopePctPerHour,
+      0,
+      5,
+    ),
+    reserveMaxPct: normalizeBoundedInteger(m.reserveMaxPct, fallback.reserveMaxPct, 0, 30),
+    finishingHorizonMinutes: normalizeBoundedInteger(
+      m.finishingHorizonMinutes,
+      fallback.finishingHorizonMinutes,
+      5,
+      180,
+    ),
+    resumeHysteresisPct: normalizeBoundedInteger(
+      m.resumeHysteresisPct,
+      fallback.resumeHysteresisPct,
+      1,
+      30,
+    ),
+  };
+  // Unsatisfiable relation → reset the whole block to the package defaults so a
+  // typo cannot silently produce a maximize line that never pauses (or one that
+  // collapses onto pauseAt for the wrong reason).
+  if (normalized.targetUtil <= pauseAt) {
+    return { ...DEFAULT_BUDGET_CONFIG.maximize };
+  }
+  return normalized;
 }
 
 function normalizeBoolean(value: unknown, fallback: boolean): boolean {
@@ -342,6 +426,9 @@ function normalizeBudgetConfig(
       codexTiers.full !== null,
     codexTiers,
     strategy: normalizeStrategy(budget.strategy, fallback.strategy),
+    // Pass the already-resolved pauseAt (post pauseAt<=resumeBelow reset) so the
+    // targetUtil > pauseAt relation is checked against the effective floor.
+    maximize: normalizeMaximizeConfig(budget.maximize, pauseAt, fallback.maximize),
   };
 }
 
@@ -370,6 +457,16 @@ export function applyBudgetEnvOverrides(
     // re-normalization re-applies the full-restore activation rule.
     codexTiers: budget.codexTiers,
     strategy: env.AGENTBRIDGE_BUDGET_STRATEGY ?? budget.strategy,
+    maximize: {
+      targetUtil: env.AGENTBRIDGE_BUDGET_TARGET_UTIL ?? budget.maximize.targetUtil,
+      reserveSlopePctPerHour:
+        env.AGENTBRIDGE_BUDGET_RESERVE_SLOPE_PCT_PER_HOUR ?? budget.maximize.reserveSlopePctPerHour,
+      reserveMaxPct: env.AGENTBRIDGE_BUDGET_RESERVE_MAX_PCT ?? budget.maximize.reserveMaxPct,
+      finishingHorizonMinutes:
+        env.AGENTBRIDGE_BUDGET_FINISHING_HORIZON_MINUTES ?? budget.maximize.finishingHorizonMinutes,
+      resumeHysteresisPct:
+        env.AGENTBRIDGE_BUDGET_RESUME_HYSTERESIS_PCT ?? budget.maximize.resumeHysteresisPct,
+    },
   };
   return normalizeBudgetConfig(overlay, budget);
 }

@@ -192,6 +192,29 @@ function formatFiveHourWindowsLeftLine(snapshot: BudgetSnapshot): string | null 
   return `按当前节奏，周额度还够 ${byAgent} 个 5h 窗口`;
 }
 
+/**
+ * v3 P2 (maximize, display-only): the binding dynamic pause line per agent and
+ * its headroom to the agent's gateUtil. Present only when the snapshot carries
+ * `dynamicPauseLine` (maximize mode) and at least one side has a numeric line.
+ * Never a decision input — mirrors the decision layer's effectiveDynamicLine.
+ */
+function formatDynamicLineLine(snapshot: BudgetSnapshot): string | null {
+  const lines = snapshot.dynamicPauseLine;
+  if (!lines) return null;
+  const parts: string[] = [];
+  const entries: Array<[string, number | null, AgentUsage | null]> = [
+    ["Claude", lines.claude, snapshot.claude],
+    ["Codex", lines.codex, snapshot.codex],
+  ];
+  for (const [name, line, usage] of entries) {
+    if (line === null) continue;
+    const headroom = usage ? `（util ${usage.gateUtil}%，余量 ${(line - usage.gateUtil).toFixed(1)}）` : "";
+    parts.push(`${name} ${line.toFixed(1)}%${headroom}`);
+  }
+  if (parts.length === 0) return null;
+  return `动态暂停线（maximize）：${parts.join(" · ")}`;
+}
+
 const PHASE_LABELS: Record<BudgetSnapshot["phase"], string> = {
   normal: "normal（正常）",
   balance: "balance（需均衡）",
@@ -237,6 +260,9 @@ export function renderBudgetSnapshot(
   }
   const fiveHourWindowsLeftLine = formatFiveHourWindowsLeftLine(snapshot);
   if (fiveHourWindowsLeftLine) lines.push(fiveHourWindowsLeftLine);
+
+  const dynamicLineLine = formatDynamicLineLine(snapshot);
+  if (dynamicLineLine) lines.push(dynamicLineLine);
 
   if (snapshot.claude && snapshot.codex) {
     const abs = Math.abs(snapshot.driftPct);

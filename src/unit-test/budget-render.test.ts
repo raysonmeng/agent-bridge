@@ -54,6 +54,30 @@ describe("renderBudgetSnapshot", () => {
     expect(text).toContain("预警 45%");
   });
 
+  test("renders the maximize dynamic line with per-agent headroom", () => {
+    const text = renderBudgetSnapshot(
+      snapshot({ dynamicPauseLine: { claude: 93.4, codex: 95.6 } }),
+    );
+    expect(text).toContain("动态暂停线（maximize）：");
+    expect(text).toContain("Claude 93.4%");
+    expect(text).toContain("Codex 95.6%");
+    // headroom = line - gateUtil (Claude 93.4-42=51.4, Codex 95.6-10=85.6)
+    expect(text).toContain("余量 51.4");
+    expect(text).toContain("余量 85.6");
+  });
+
+  test("omits the dynamic line entirely in conserve mode (no field)", () => {
+    expect(renderBudgetSnapshot(snapshot())).not.toContain("动态暂停线");
+  });
+
+  test("shows only the side that has a numeric dynamic line", () => {
+    const text = renderBudgetSnapshot(
+      snapshot({ dynamicPauseLine: { claude: null, codex: 95.6 } }),
+    );
+    expect(text).toContain("Codex 95.6%");
+    expect(text).not.toContain("Claude 93");
+  });
+
   test("shows drift direction with heavier side first", () => {
     const text = renderBudgetSnapshot(snapshot({ driftPct: 31 }));
     expect(text).toContain("Claude 比 Codex 高 31 个百分点");

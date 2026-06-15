@@ -1,6 +1,6 @@
 # Budget 策略 v3 设计稿 — 窗口利用率最大化 + 任务完整性保护
 
-> 状态：**修订版 v3.1**（已吸收 Codex 对抗审 2026-06-11：4 REAL + 2 SUSPECT + 2 RECOMMEND 全采纳，Q1-Q10 共识落定）—— 待 Codex 复核确认后即为实施基线。基于 master dfc093b，纯设计，不含任何代码改动。
+> 状态：**v3.1 实施中**。Codex 对抗审 2026-06-11（4 REAL + 2 SUSPECT + 2 RECOMMEND 全采纳，Q1-Q10 共识）已落定为实施基线。**进度：P1（燃尽率展示 + Q7 doctor）已上线 master；P2（时间感知暂停线 / maximize）已实现并通过 cross-review（见 §6 P2 实现落点）；P3（三态闸门）/ P4（runway 分配判据）待实施。** 原稿基于 master dfc093b。
 > 作者：Claude；评审：Codex（对抗审记录见 §8，开放问题共识见 §7）。
 
 ---
@@ -386,16 +386,18 @@ interface BudgetConfig {
 - **测试要点**：样本对剔除（跨重置/util 回退/时间倒流）；EWMA 收敛与半衰期；ring 截断；corrupt 文件恢复；daemon 重启恢复 confident 状态；snapshot 字段 optional 兼容（旧消费者反序列化不破）；doctor warning 触发矩阵（strategy × guard 硬线组合）；guard 线展示与 runway 展示层 clamp（只影响渲染、不影响内部估计值）。
 - **风险**：低。决策路径零接触；最坏情况是展示一行错误的预估。
 
-### P2 — 时间感知暂停线（opt-in `strategy:"maximize"`）
+### P2 — 时间感知暂停线（opt-in `strategy:"maximize"`）— ✅ 已实现（2026-06-15，feat/budget-v3-p2-maximize-pause-line）
 
-- **改动文件**：`src/budget/budget-state.ts`（按窗口 `pauseTrigger` + `dynamicPauseAt`）；`src/budget/budget-fingerprint.ts`（`shouldEnter`/`canAgentResume` 策略化 + 对称出闸 + 指纹量化）；`src/config-service.ts`（strategy/maximize 键 + 关系约束 + env）；`src/budget/render.ts`（展示生效中的动态线）。
+> **实现落点（与原设计的差异）**：决策逻辑收敛到新模块 `src/budget/budget-decision.ts`（单一决策源：`dynamicPauseAt` / `agentShouldPause` / `agentCanResume` / `resumeBlockingEpochFor` / `effectiveDynamicLine` / `isDecisionGrade`），由 `budget-state.pauseTrigger` 与 `budget-fingerprint.shouldEnter/canAgentResume` 共同消费，杜绝两处分叉（cross-review 共识）。指纹量化采取更严格路线——动态线**完全不进**指纹（见 budget-fingerprint.ts directiveFingerprint 注释），比设计的「量化后进指纹」更稳，无新指纹轴。maximize 块 P2 只落 `targetUtil/reserveSlopePctPerHour/reserveMaxPct/finishingHorizonMinutes/resumeHysteresisPct` 五键，`admissionAt/wrapUpQuota` 留给 P3（不做 parse-only 空键）。
+
+- **改动文件**：`src/budget/budget-decision.ts`（新增，单一决策源）；`src/budget/budget-state.ts`（`pauseTrigger` 委派 + 恢复文案 strategy 化）；`src/budget/budget-fingerprint.ts`（`shouldEnter`/`canAgentResume`/`resumeAfterEpoch` 改调决策源）；`src/budget/budget-coordinator.ts`（snapshot 动态线 + recovery 文案 strategy 化）；`src/config-service.ts`（maximize 键 + 关系约束 + env + shape/doctor 一致性）；`src/budget/render.ts`（展示动态线）；`src/cli/doctor.ts`（Q7 读 config targetUtil）；`src/daemon.ts`（reply gate 错误文案 strategy 化）；`src/budget/types.ts`（MaximizeConfig + snapshot.dynamicPauseLine）。
 - **测试要点**：**今日活案例回归**（codex weekly 92 / tH 6.5h / rate 1.2 → 不暂停）；远期（tH 120h）行为 = conserve；最后 1h 95% 继续（走 (a) 烧不满路径）；降级矩阵全分支（resetEpoch=0 / stale / 非 confident / 双窗口未知）；出闸对称性与窗口重置秒级恢复；不变量 I1 的 property 测试（任意参数下 maximize 线 ≥ pauseAt）。
 - **验收追加（对抗审落定）**：
   - **REAL-1 修正后的标定表回归**：§3.1 标定表全部行逐行断言分支归属 —— (a) 烧不满 return 100（tH=1/util=92）、(b) 触线暂停（tH=1/util=96 → 95.6 线）、(b) 远期 clamp 到 pauseAt（tH=120）、hard cap → admission-closed（util ≥ 97 等 REAL-4 情形）。
   - **不变量 I2 phantom-hold 测试**：closed / admission-closed 后数据转 stale，状态必须维持，绝不开闸。
-  - **Q2 参数标定表**：用 P1 收集的 burn-history 真实样本回放标定 0.4/7 默认参数，标定表本身进验收材料。
-  - **Q10 出闸对称化牵连清单 checklist**（清单待代码核实，核完逐项打勾）：`resumeBlockingEpoch`、budget-gate 的 `canAgentResume`/`shouldBlock`、coordinator 的 STOP/RESUME 指令生成、snapshot 的 `paused`/`gateClosed`/`pauseReason`/`resumeAfterEpoch`、fingerprint 去重、budget CLI/`get_budget` 渲染、reply gate 错误文案、checkpoint/handoff 文案、测试中 gate reopen 断言。
-- **REAL-4 过渡说明**：P2 阶段尚无三态闸门，hard cap 的 `"admission-closed"` 信号暂映射为 closed（此时 util 必然已 ≥ pauseAt，不违反 I1）；P3 合入后切换为真 admission-closed。
+  - **Q2 参数标定表**：✅ 默认 0.4/7 用 2026-06-15 实拍燃尽率做了 sanity 校验（Claude 5h≈1.33%/h·周≈0.44%/h；Codex 5h≈0.37%/h·周≈5.16%/h），标定表四行（今日案例/最后1h (a)+(b)/远期）落 `budget-maximize.test.ts` 逐行断言。**遗留**：用 guard `hist_*.jsonl` 历史样本批量回放的完整参数扫描表延后到参数调优阶段（非阻塞 P2 功能正确性，已显式记此口）。
+  - **Q10 出闸对称化牵连清单 checklist**（✅ 已逐项核实并落代码）：`resumeBlockingEpochFor`（maximize 取阻塞窗口 reset 最小值）、`agentCanResume`（per-window 对称出闸）、coordinator 的 RESUME 指令生成（`recoveryDirective` strategy 化）、snapshot 的 `paused`/`gateClosed`/`pauseReason`/`resumeAfterEpoch`、fingerprint 去重（动态线不进指纹）、budget CLI/`get_budget` 渲染（`render.ts` 动态线行）、reply gate 错误文案（`daemon.ts budgetPauseGateError` strategy 化）、checkpoint/handoff 文案（`renderBudgetInterventionDirective` strategy 化）、测试中 gate reopen 断言（coordinator maximize recovery 测试）。
+- **REAL-4 过渡说明**：P2 阶段尚无三态闸门，hard cap 的 `"admission-closed"` 信号暂映射为 closed —— **但必须过 I1 floor**：`blocks = window.util >= cfg.pauseAt`。hard cap 子情形 1（`util ≥ targetUtil`）因 `targetUtil > pauseAt` 恒满足 floor；子情形 2（临近重置收尾余量带）可能 `util < pauseAt`（如 pauseAt90/target97/finishingHorizon30/rate20/tH0.25/util88 → admission-closed 但 88<90），此时 floor 后**退化为 open**（P2 不暂停），P3 三态闸门接管后才由 `dynamicPauseAt` 返回值直接驱动 admission-closed。代码见 `budget-decision.ts maximizeWindowEntry`。
 - **风险**：中。决策路径核心改动；靠默认 conserve + 全降级路径退 conserve 控制爆炸半径。
 
 ### P3 — 任务完整性 admission（三态闸门）

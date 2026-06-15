@@ -561,9 +561,10 @@ function configParseabilityCheck(cwd: string, cli: string): DoctorCheck {
 }
 
 /**
- * Default v3 maximize target utilization (design §3.1). P1 does not parse the
- * maximize parameter block yet (that lands with P2), so the doctor check
- * compares the guard hard line against this design default.
+ * Default v3 maximize target utilization (design §3.1), used as the fallback
+ * when a caller does not pass an explicit targetUtil. Since P2, the resolved
+ * value comes from `budget.maximize.targetUtil` (config + env), so this is only
+ * the package default mirrored from DEFAULT_BUDGET_CONFIG.maximize.targetUtil.
  */
 export const V3_DEFAULT_TARGET_UTIL = 97;
 
@@ -615,7 +616,11 @@ export function evaluateBudgetStrategyGuard(
 function budgetStrategyGuardCheck(cwd: string): DoctorCheck {
   const config = new ConfigService(cwd).loadOrDefault();
   const budget = applyBudgetEnvOverrides(config.budget);
-  return evaluateBudgetStrategyGuard(budget.strategy, resolveGuardHardHint());
+  return evaluateBudgetStrategyGuard(
+    budget.strategy,
+    resolveGuardHardHint(),
+    budget.maximize.targetUtil,
+  );
 }
 
 function logCheck(name: string, path: string, cli: string): DoctorCheck {

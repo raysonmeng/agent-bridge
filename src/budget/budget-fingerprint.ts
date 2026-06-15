@@ -25,8 +25,12 @@
  * Keep this file dependency-free beyond ./types, ./budget-gate and
  * ./budget-state; it is bundled into the plugin daemon.
  */
-import { resumeBlockingEpoch } from "./budget-gate";
-import { isDecisionGrade } from "./budget-state";
+import {
+  agentCanResume,
+  agentShouldPause,
+  isDecisionGrade,
+  resumeBlockingEpochFor,
+} from "./budget-decision";
 import type { PendingEntry } from "./pending-reader";
 import type { AgentName, AgentUsage, BudgetConfig, BudgetState } from "./types";
 
@@ -190,29 +194,21 @@ function agentsToSide(agents: ReadonlySet<AgentName>): PauseSide {
   return null;
 }
 
-function shouldEnter(usage: AgentUsage | null, cfg: BudgetConfig, now: number): boolean {
-  if (!isDecisionGrade(usage, now)) return false;
-  return usage!.gateUtil >= cfg.pauseAt;
-}
-
-function canAgentResume(usage: AgentUsage | null, cfg: BudgetConfig, now: number): boolean {
-  if (!isDecisionGrade(usage, now)) return false;
-  if (usage!.rateLimitedUntil > now) return false;
-  return usage!.gateUtil < cfg.resumeBelow;
-}
-
 /**
- * Hysteresis transition over the activeSides set: shouldEnter adds, an already
- * active side that canAgentResume is removed. Verbatim port of the old
- * updateActiveSides, made pure over the prior side.
+ * Hysteresis transition over the activeSides set: agentShouldPause adds, an
+ * already active side that agentCanResume is removed. Both predicates are the
+ * strategy-aware single source of truth in budget-decision.ts (conserve =
+ * verbatim port of the former local gateUtil checks; maximize = per-window
+ * dynamic line), so the coordinator's gating can never diverge from the
+ * rendered state in budget-state.ts.
  */
 function nextActiveSide(prevSide: PauseSide, state: BudgetState, cfg: BudgetConfig): PauseSide {
   const active = new Set<AgentName>(sideToAgents(prevSide));
   for (const agent of ["claude", "codex"] as const) {
     const usage = state.perAgent[agent];
-    if (shouldEnter(usage, cfg, state.now)) {
+    if (agentShouldPause(agent, usage, cfg, state.now).pause) {
       active.add(agent);
-    } else if (active.has(agent) && canAgentResume(usage, cfg, state.now)) {
+    } else if (active.has(agent) && agentCanResume(usage, cfg, state.now)) {
       active.delete(agent);
     }
   }
@@ -229,10 +225,13 @@ function activeSideReason(agent: AgentName, usage: AgentUsage | null, cfg: Budge
   if (usage.rateLimitedUntil > now) {
     return `${AGENT_LABEL[agent]} 探针被限流至 ${formatEpoch(usage.rateLimitedUntil)}`;
   }
-  if (usage.gateUtil >= cfg.pauseAt) {
-    return `${AGENT_LABEL[agent]} gateUtil ${pct(usage.gateUtil)} ≥ pauseAt ${pct(cfg.pauseAt)}`;
-  }
-  return `${AGENT_LABEL[agent]} gateUtil ${pct(usage.gateUtil)} 尚未低于 resumeBelow ${pct(cfg.resumeBelow)}`;
+  // Delegate the "why paused" text to the strategy-aware decision (conserve =
+  // the old gateUtil≥pauseAt string; maximize = the dynamic-line string).
+  const decision = agentShouldPause(agent, usage, cfg, now);
+  if (decision.pause) return decision.reason;
+  // Still in the active set but no longer tripping entry → in the hysteresis
+  // exit band, holding until canAgentResume clears.
+  return `${AGENT_LABEL[agent]} gateUtil ${pct(usage.gateUtil)} 尚未满足出闸条件`;
 }
 
 function interventionReason(side: PauseSide, state: BudgetState, cfg: BudgetConfig): string {
@@ -243,7 +242,7 @@ function interventionReason(side: PauseSide, state: BudgetState, cfg: BudgetConf
 
 function resumeAfterEpoch(side: PauseSide, state: BudgetState, cfg: BudgetConfig): number | null {
   const epochs = sideToAgents(side)
-    .map((agent) => resumeBlockingEpoch(state.perAgent[agent], cfg, state.now))
+    .map((agent) => resumeBlockingEpochFor(state.perAgent[agent], cfg, state.now))
     .filter((epoch) => epoch > 0);
   if (epochs.length === 0) return null;
   return Math.max(...epochs);
@@ -264,6 +263,14 @@ function activeSideProbeUncertain(side: PauseSide, state: BudgetState): boolean 
 /**
  * Stable dedup fingerprint for a directive. When `activeSide` is set we are
  * paused; otherwise the phase (balance/parallel) drives the side selection.
+ *
+ * v3 P2 / R6 note: the maximize dynamic line is deliberately NOT folded into the
+ * fingerprint. Design R6 suggested quantizing the line (1 pct) and tH (0.5h) to
+ * avoid re-emit spam; this implementation takes the stricter route — the line
+ * never enters the fingerprint, so a slowly drifting line cannot re-emit a pause
+ * banner at all (the reset-epoch bucket below still distinguishes a real window
+ * reset). Mid-pause drift is additionally frozen by the hold-uncertain path. Net
+ * effect is ≥ as stable as the quantized design, with no extra fingerprint axis.
  */
 export function directiveFingerprint(state: BudgetState, activeSide?: ActivePauseSide): string {
   const side = activeSide ?? (state.phase === "balance"
@@ -430,7 +437,7 @@ export function resumeCandidateSides(effect: CoordinatorEffect): AgentName[] {
  * Pure resume-candidate reducer (PR2 — detection only, no emit/inject). For each
  * EXPLICITLY supplied side, decides whether ALL four readiness predicates hold:
  *
- *   1. window refreshed — reuse the existing hysteresis `canAgentResume`
+ *   1. window refreshed — reuse the existing hysteresis `agentCanResume`
  *      (decision-grade AND gateUtil < resumeBelow AND no live rate_limit). This
  *      is the SINGLE source of truth for "window reset"; we deliberately do NOT
  *      reinvent an epoch-diff detector (a second source would STALE-fork).
@@ -456,7 +463,7 @@ export function computeResumeCandidate(
   const candidate: ResumeCandidate = {};
   const detail: Partial<Record<AgentName, ResumeCandidateDetail>> = {};
   for (const agent of sides) {
-    const windowRefreshed = canAgentResume(state.perAgent[agent], cfg, state.now);
+    const windowRefreshed = agentCanResume(state.perAgent[agent], cfg, state.now);
     const ready =
       windowRefreshed &&
       signals.pendingExists[agent] &&

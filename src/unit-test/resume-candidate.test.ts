@@ -26,6 +26,7 @@ const CONFIG: BudgetConfig = {
     eco: { effort: "low" },
   },
   strategy: "conserve",
+  maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
 };
 
 /** Decision-grade probe with healthy (resumable) defaults — gateUtil 20 < resumeBelow 30. */

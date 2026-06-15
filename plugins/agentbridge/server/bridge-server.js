@@ -13866,7 +13866,8 @@ class StateDirResolver {
 // src/budget/types.ts
 var STALE_MAX_AGE_SEC = 600;
 
-// src/budget/budget-state.ts
+// src/budget/budget-decision.ts
+var MAX_TIME_TO_RESET_HOURS = 7 * 24;
 function isDecisionGrade(usage, now) {
   if (!usage)
     return false;
@@ -13877,7 +13878,6 @@ function isDecisionGrade(usage, now) {
     return false;
   return true;
 }
-
 // src/budget/burn-view.ts
 function agentWeeklyFiveHourWindowsLeft(usage, now) {
   if (!usage || usage.stale || !usage.ok)
@@ -14007,6 +14007,25 @@ function formatFiveHourWindowsLeftLine(snapshot) {
   const byAgent = values.map(([name, value]) => `${name} ~${value.toFixed(1)}`).join(" / ");
   return `\u6309\u5F53\u524D\u8282\u594F\uFF0C\u5468\u989D\u5EA6\u8FD8\u591F ${byAgent} \u4E2A 5h \u7A97\u53E3`;
 }
+function formatDynamicLineLine(snapshot) {
+  const lines = snapshot.dynamicPauseLine;
+  if (!lines)
+    return null;
+  const parts = [];
+  const entries = [
+    ["Claude", lines.claude, snapshot.claude],
+    ["Codex", lines.codex, snapshot.codex]
+  ];
+  for (const [name, line, usage] of entries) {
+    if (line === null)
+      continue;
+    const headroom = usage ? `\uFF08util ${usage.gateUtil}%\uFF0C\u4F59\u91CF ${(line - usage.gateUtil).toFixed(1)}\uFF09` : "";
+    parts.push(`${name} ${line.toFixed(1)}%${headroom}`);
+  }
+  if (parts.length === 0)
+    return null;
+  return `\u52A8\u6001\u6682\u505C\u7EBF\uFF08maximize\uFF09\uFF1A${parts.join(" \xB7 ")}`;
+}
 var PHASE_LABELS = {
   normal: "normal\uFF08\u6B63\u5E38\uFF09",
   balance: "balance\uFF08\u9700\u5747\u8861\uFF09",
@@ -14030,6 +14049,9 @@ function renderBudgetSnapshot(snapshot, options = {}) {
   const fiveHourWindowsLeftLine = formatFiveHourWindowsLeftLine(snapshot);
   if (fiveHourWindowsLeftLine)
     lines.push(fiveHourWindowsLeftLine);
+  const dynamicLineLine = formatDynamicLineLine(snapshot);
+  if (dynamicLineLine)
+    lines.push(dynamicLineLine);
   if (snapshot.claude && snapshot.codex) {
     const abs = Math.abs(snapshot.driftPct);
     if (abs > 0) {
@@ -14574,10 +14596,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.16", "0.0.0-source"),
-  commit: defineString("d85c9c9", "source"),
+  commit: defineString("52a49ef", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("9d80360c2afc", "source")
+  codeHash: defineString("e124596f4642", "source")
 });
 function sameRuntimeContract(a, b) {
   if (!a || !b)
@@ -15612,7 +15634,14 @@ var DEFAULT_BUDGET_CONFIG = {
     balanced: { effort: "medium" },
     eco: { effort: "low" }
   },
-  strategy: "conserve"
+  strategy: "conserve",
+  maximize: {
+    targetUtil: 97,
+    reserveSlopePctPerHour: 0.4,
+    reserveMaxPct: 7,
+    finishingHorizonMinutes: 30,
+    resumeHysteresisPct: 5
+  }
 };
 var DEFAULT_CONFIG = {
   version: "1.0",
@@ -15665,6 +15694,23 @@ function findShapeViolation(raw) {
         }
       }
     }
+    if ("maximize" in budget) {
+      const maximize = budget.maximize;
+      if (!isRecord(maximize)) {
+        return "budget.maximize is present but not an object";
+      }
+      for (const key of [
+        "targetUtil",
+        "reserveSlopePctPerHour",
+        "reserveMaxPct",
+        "finishingHorizonMinutes",
+        "resumeHysteresisPct"
+      ]) {
+        if (key in maximize && !isCoercibleNumber(maximize[key])) {
+          return `budget.maximize.${key} is present but not a number`;
+        }
+      }
+    }
   }
   return null;
 }
@@ -15672,7 +15718,7 @@ function hasCustomDecisionValues(config2) {
   const d = DEFAULT_CONFIG;
   const b = config2.budget;
   const db = d.budget;
-  return config2.idleShutdownSeconds !== d.idleShutdownSeconds || config2.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config2.codex.appPort !== d.codex.appPort || config2.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl;
+  return config2.idleShutdownSeconds !== d.idleShutdownSeconds || config2.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config2.codex.appPort !== d.codex.appPort || config2.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.strategy !== db.strategy || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct;
 }
 function normalizeInteger(value, fallback) {
   if (typeof value === "number" && Number.isFinite(value))
@@ -15690,8 +15736,37 @@ function normalizeBoundedInteger(value, fallback, min, max) {
     return fallback;
   return parsed;
 }
+function normalizeBoundedNumber(value, fallback, min, max) {
+  let parsed;
+  if (typeof value === "number") {
+    parsed = value;
+  } else if (typeof value === "string" && value.trim() !== "") {
+    parsed = Number(value);
+  } else {
+    return fallback;
+  }
+  if (!Number.isFinite(parsed))
+    return fallback;
+  if (parsed < min || parsed > max)
+    return fallback;
+  return parsed;
+}
 function normalizeStrategy(value, fallback) {
   return value === "conserve" || value === "maximize" ? value : fallback;
+}
+function normalizeMaximizeConfig(raw, pauseAt, fallback = DEFAULT_BUDGET_CONFIG.maximize) {
+  const m = isRecord(raw) ? raw : {};
+  const normalized = {
+    targetUtil: normalizeBoundedInteger(m.targetUtil, fallback.targetUtil, 90, 99),
+    reserveSlopePctPerHour: normalizeBoundedNumber(m.reserveSlopePctPerHour, fallback.reserveSlopePctPerHour, 0, 5),
+    reserveMaxPct: normalizeBoundedInteger(m.reserveMaxPct, fallback.reserveMaxPct, 0, 30),
+    finishingHorizonMinutes: normalizeBoundedInteger(m.finishingHorizonMinutes, fallback.finishingHorizonMinutes, 5, 180),
+    resumeHysteresisPct: normalizeBoundedInteger(m.resumeHysteresisPct, fallback.resumeHysteresisPct, 1, 30)
+  };
+  if (normalized.targetUtil <= pauseAt) {
+    return { ...DEFAULT_BUDGET_CONFIG.maximize };
+  }
+  return normalized;
 }
 function normalizeBoolean(value, fallback) {
   if (typeof value === "boolean")
@@ -15742,7 +15817,8 @@ function normalizeBudgetConfig(raw, fallback = DEFAULT_BUDGET_CONFIG) {
     },
     codexTierControl: normalizeBoolean(budget.codexTierControl, fallback.codexTierControl) && codexTiers.full !== null,
     codexTiers,
-    strategy: normalizeStrategy(budget.strategy, fallback.strategy)
+    strategy: normalizeStrategy(budget.strategy, fallback.strategy),
+    maximize: normalizeMaximizeConfig(budget.maximize, pauseAt, fallback.maximize)
   };
 }
 function normalizeConfig(raw) {

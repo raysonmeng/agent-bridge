@@ -1,6 +1,11 @@
-import { matchingGateReset, resumeBlockingEpoch } from "./budget-gate";
-import { STALE_MAX_AGE_SEC } from "./types";
+import { matchingGateReset } from "./budget-gate";
+import { agentShouldPause, isDecisionGrade, resumeBlockingEpochFor } from "./budget-decision";
 import type { AgentName, AgentUsage, BudgetConfig, BudgetState, CodexTier } from "./types";
+
+// isDecisionGrade moved to budget-decision.ts (the strategy-aware decision
+// module needs it too); re-export keeps existing importers (budget-fingerprint,
+// burn-view) working unchanged.
+export { isDecisionGrade } from "./budget-decision";
 
 interface PauseTrigger {
   agent: AgentName;
@@ -39,40 +44,23 @@ function resumeAfterEpoch(
   now: number,
 ): number | null {
   const epochs = [
-    resumeBlockingEpoch(claude, cfg, now),
-    resumeBlockingEpoch(codex, cfg, now),
+    resumeBlockingEpochFor(claude, cfg, now),
+    resumeBlockingEpochFor(codex, cfg, now),
   ].filter((epoch) => epoch > 0);
   if (epochs.length === 0) return null;
   return Math.max(...epochs);
 }
 
 /**
- * Decision-grade data check: a record whose every window has already reset,
- * or that was fetched long ago (stale probe cache during an upstream outage),
- * describes a PAST quota window — its utils must not trigger an intervention
- * now, nor authorize a resume. Single source of truth for both the entry-side
- * guard (here) and the coordinator's resume gate.
+ * Strategy-aware pause-entry trigger for one agent. Delegates the whole decision
+ * (conserve gateUtil threshold OR maximize per-window dynamic line) to the
+ * single source of truth in budget-decision.ts, so the rendered state here can
+ * never diverge from the coordinator's gating in budget-fingerprint.ts.
  */
-export function isDecisionGrade(usage: AgentUsage | null, now: number): boolean {
-  if (!usage) return false;
-  const freshWindow =
-    (usage.fiveHour !== null && usage.fiveHour.resetEpoch > now) ||
-    (usage.weekly !== null && usage.weekly.resetEpoch > now);
-  if (!freshWindow) return false;
-  if (usage.fetchedAt > 0 && now - usage.fetchedAt > STALE_MAX_AGE_SEC) return false;
-  return true;
-}
-
 function pauseTrigger(agent: AgentName, usage: AgentUsage | null, cfg: BudgetConfig, now: number): PauseTrigger | null {
-  if (!usage) return null;
-  if (!isDecisionGrade(usage, now)) return null;
-  if (usage.gateUtil >= cfg.pauseAt) {
-    return {
-      agent,
-      reason: `${AGENT_LABEL[agent]} gateUtil ${pct(usage.gateUtil)} ≥ pauseAt ${pct(cfg.pauseAt)}`,
-    };
-  }
-  return null;
+  const decision = agentShouldPause(agent, usage, cfg, now);
+  if (!decision.pause) return null;
+  return { agent, reason: decision.reason };
 }
 
 function driftFor(
@@ -125,12 +113,25 @@ export function renderBudgetInterventionDirective(
   cfg: BudgetConfig,
 ): string {
   const resumeText = `预计恢复时间（以实测为准；提前刷新会更早解除）：${formatEpoch(resumeEpoch)}。`;
+  // Q10: the resume CONDITION text must match the active strategy. conserve =
+  // the historical gateUtil<resumeBelow wording (byte-identical); maximize exits
+  // per-window at `util < dynamicPauseAt − resumeHysteresisPct` (or window
+  // reset), NOT at resumeBelow — saying "低于 30%" there misleads Claude into
+  // expecting a days-long wait instead of the dynamic-line / reset recovery.
+  const resumeCondSingle =
+    cfg.strategy === "maximize"
+      ? `各窗口 util 回落至动态暂停线 − ${pct(cfg.maximize.resumeHysteresisPct)} 以下或对应窗口刷新`
+      : `gateUtil 低于 ${pct(cfg.resumeBelow)}`;
+  const resumeCondBoth =
+    cfg.strategy === "maximize"
+      ? `各窗口 util 都回落至动态暂停线 − ${pct(cfg.maximize.resumeHysteresisPct)} 以下或对应窗口刷新`
+      : `gateUtil 都低于 ${pct(cfg.resumeBelow)}`;
   if (side === "claude") {
     return [
       "【预算协调 · 账号级】Claude 侧额度紧张，进入接力模式。",
       `触发方：Claude；原因：${reason}。`,
       `${usageSummary("claude", claude)}；${usageSummary("codex", codex)}。`,
-      `恢复参考：Claude gateUtil 低于 ${pct(cfg.resumeBelow)} 且没有有效 rate_limit；${resumeText}`,
+      `恢复参考：Claude ${resumeCondSingle} 且没有有效 rate_limit；${resumeText}`,
       "请立即交接：把剩余任务清单、关键上下文、产出位置、验收标准打包成一条 reply 发给 Codex。",
       "交接后 Claude 停手；要求 Codex 在单 turn 内尽量完成，尾巴写 checkpoint，暂停期不要期待 Claude 回复。",
     ].join("\n");
@@ -141,7 +142,7 @@ export function renderBudgetInterventionDirective(
       "【预算协调 · 账号级】Codex 侧额度紧张，暂停委派。",
       `触发方：Codex；原因：${reason}。`,
       `${usageSummary("claude", claude)}；${usageSummary("codex", codex)}。`,
-      `恢复参考：Codex gateUtil 低于 ${pct(cfg.resumeBelow)} 且没有有效 rate_limit；${resumeText}`,
+      `恢复参考：Codex ${resumeCondSingle} 且没有有效 rate_limit；${resumeText}`,
       "请 Claude 写 checkpoint，并可 solo 推进不依赖 Codex 的独立部分；不要继续向 Codex 委派，标注清楚分工断点。",
     ].join("\n");
   }
@@ -150,7 +151,7 @@ export function renderBudgetInterventionDirective(
     "【预算协调 · 账号级】进入联合暂停。",
     `触发方：双方；原因：${reason}。`,
     `${usageSummary("claude", claude)}；${usageSummary("codex", codex)}。`,
-    `恢复条件：Claude 与 Codex 的 gateUtil 都低于 ${pct(cfg.resumeBelow)}，且没有有效 rate_limit；${resumeText}`,
+    `恢复条件：Claude 与 Codex 的 ${resumeCondBoth}，且没有有效 rate_limit；${resumeText}`,
     "请收尾当前步、写 checkpoint、停止继续委派；pause 期间不要重试向 Codex 发送 reply。",
   ].join("\n");
 }

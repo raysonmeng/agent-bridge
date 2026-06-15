@@ -500,9 +500,16 @@ function budgetPauseGateError(): string {
   const sideHint = snapshot?.pauseSide === "both"
     ? "双侧额度均已耗尽，请写 checkpoint 等待刷新"
     : "你可继续 solo 推进可独立部分，并写 checkpoint 标注分工断点";
+  // Q10: the resume-condition text must match the active strategy. maximize
+  // reopens the gate per-window (dynamic line − hysteresis, or window reset),
+  // not at resumeBelow.
+  const reopenText =
+    BUDGET_CONFIG.strategy === "maximize"
+      ? `Codex 侧各窗口 util 回落至动态暂停线 − ${BUDGET_CONFIG.maximize.resumeHysteresisPct}% 以下或对应窗口刷新后闸门自动放开`
+      : `Codex 侧 gateUtil 低于 ${BUDGET_CONFIG.resumeBelow}% 后闸门自动放开`;
   return (
     `预算暂停（闸门关闭），已拒绝转发：${reason}。` +
-    `Codex 侧 gateUtil 低于 ${BUDGET_CONFIG.resumeBelow}% 后闸门自动放开` +
+    reopenText +
     (resumeAt ? `（预计恢复 ${resumeAt}，以实测为准；提前刷新会更早解除）` : "") +
     `。收到 RESUME 通知前请勿重试向 Codex 发送 reply；${sideHint}。`
   );

@@ -392,6 +392,7 @@ describe("ConfigService — budget section", () => {
         eco: { effort: "low" },
       },
       strategy: "conserve",
+      maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
     });
   });
 
@@ -433,6 +434,7 @@ describe("ConfigService — budget section", () => {
       },
       // v3 P1 keys absent in the raw file normalize to defaults.
       strategy: "conserve",
+      maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
     });
   });
 
@@ -595,6 +597,7 @@ describe("applyBudgetEnvOverrides", () => {
       eco: { effort: "low" },
     },
     strategy: "conserve" as const,
+    maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
   };
 
   test("env values override the base config", () => {
@@ -650,6 +653,7 @@ describe("applyBudgetEnvOverrides — boolean spellings", () => {
       eco: { effort: "low" },
     },
     strategy: "conserve" as const,
+    maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
   };
 
   test('accepts "0"/"1" alongside "true"/"false"', () => {
@@ -760,6 +764,7 @@ describe("applyBudgetEnvOverrides — v3 P1 keys", () => {
       eco: { effort: "low" },
     },
     strategy: "conserve" as const,
+    maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
   };
 
   test("AGENTBRIDGE_BUDGET_STRATEGY overrides the strategy", () => {
@@ -782,5 +787,106 @@ describe("applyBudgetEnvOverrides — v3 P1 keys", () => {
     });
     expect(result.pauseAt).toBe(90);
     expect(result.resumeBelow).toBe(30);
+  });
+});
+
+describe("normalizeBudgetConfig — v3 P2 maximize block", () => {
+  let tempDir: string;
+  beforeEach(() => {
+    tempDir = mkdtempSync(join(tmpdir(), "abg-max-"));
+  });
+  afterEach(() => {
+    rmSync(tempDir, { recursive: true, force: true });
+  });
+  function writeRawConfig(raw: unknown) {
+    mkdirSync(join(tempDir, ".agentbridge"), { recursive: true });
+    writeFileSync(join(tempDir, ".agentbridge", "config.json"), JSON.stringify(raw));
+  }
+  function loadBudget() {
+    const result = new ConfigService(tempDir).load();
+    expect(result.state).toBe("parsed");
+    if (result.state !== "parsed") throw new Error("unreachable");
+    return result.config.budget;
+  }
+
+  test("absent maximize block fills package defaults", () => {
+    writeRawConfig({ version: "1.0" });
+    expect(loadBudget().maximize).toEqual(DEFAULT_CONFIG.budget.maximize);
+  });
+
+  test("valid custom maximize values pass through (incl. fractional slope)", () => {
+    writeRawConfig({
+      budget: {
+        strategy: "maximize",
+        maximize: {
+          targetUtil: 95,
+          reserveSlopePctPerHour: 1.25,
+          reserveMaxPct: 10,
+          finishingHorizonMinutes: 45,
+          resumeHysteresisPct: 8,
+        },
+      },
+    });
+    expect(loadBudget().maximize).toEqual({
+      targetUtil: 95,
+      reserveSlopePctPerHour: 1.25,
+      reserveMaxPct: 10,
+      finishingHorizonMinutes: 45,
+      resumeHysteresisPct: 8,
+    });
+  });
+
+  test("out-of-range fields fall back per field (others preserved)", () => {
+    writeRawConfig({
+      budget: {
+        maximize: {
+          targetUtil: 200, // > 99 → fallback 97
+          reserveSlopePctPerHour: -1, // < 0 → fallback 0.4
+          finishingHorizonMinutes: 999, // > 180 → fallback 30
+        },
+      },
+    });
+    const m = loadBudget().maximize;
+    expect(m.targetUtil).toBe(97);
+    expect(m.reserveSlopePctPerHour).toBe(0.4);
+    expect(m.finishingHorizonMinutes).toBe(30);
+  });
+
+  test("targetUtil <= pauseAt resets the WHOLE maximize block to defaults", () => {
+    writeRawConfig({
+      budget: {
+        pauseAt: 95,
+        maximize: { targetUtil: 94, reserveMaxPct: 20 }, // 94 <= 95 → unsatisfiable
+      },
+    });
+    expect(loadBudget().maximize).toEqual(DEFAULT_CONFIG.budget.maximize);
+  });
+
+  test("env overrides land on the maximize block", () => {
+    const overridden = applyBudgetEnvOverrides(DEFAULT_CONFIG.budget, {
+      AGENTBRIDGE_BUDGET_TARGET_UTIL: "96",
+      AGENTBRIDGE_BUDGET_RESERVE_SLOPE_PCT_PER_HOUR: "0.9",
+      AGENTBRIDGE_BUDGET_FINISHING_HORIZON_MINUTES: "60",
+    });
+    expect(overridden.maximize.targetUtil).toBe(96);
+    expect(overridden.maximize.reserveSlopePctPerHour).toBe(0.9);
+    expect(overridden.maximize.finishingHorizonMinutes).toBe(60);
+  });
+
+  test("describeConfig reports custom values when strategy/maximize are tuned", () => {
+    writeRawConfig({ budget: { strategy: "maximize", maximize: { targetUtil: 95 } } });
+    expect(new ConfigService(tempDir).describeConfig().customValues).toBe(true);
+  });
+
+  test("garbage maximize numeric fails loud as corrupt (not silent default)", () => {
+    writeRawConfig({ budget: { maximize: { targetUtil: "ninety" } } });
+    const result = new ConfigService(tempDir).load();
+    expect(result.state).toBe("corrupt");
+    if (result.state === "corrupt") expect(result.reason).toContain("budget.maximize.targetUtil");
+  });
+
+  test("non-object maximize block fails loud as corrupt", () => {
+    writeRawConfig({ budget: { maximize: 42 } });
+    expect(new ConfigService(tempDir).load().state).toBe("corrupt");
   });
 });

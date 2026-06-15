@@ -48,6 +48,7 @@ const CONFIG: BudgetConfig = {
     eco: { effort: "low" },
   },
   strategy: "conserve",
+  maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
 };
 
 type FetchResult = { claude: AgentUsage | null; codex: AgentUsage | null } | null;

@@ -22,6 +22,7 @@ const CONFIG: BudgetConfig = {
     eco: { effort: "low" },
   },
   strategy: "conserve",
+  maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
 };
 
 type FetchResult = { claude: AgentUsage | null; codex: AgentUsage | null } | null;
@@ -515,6 +516,58 @@ describe("BudgetCoordinator", () => {
     expect(resume?.content).toContain("reply");
     expect(resume?.content).toContain("唤醒 Codex");
     expect(coordinator.getSnapshot()).toMatchObject({ paused: false, gateClosed: false, pauseSide: null });
+  });
+
+  test("maximize: recovery directive describes the dynamic line, not resumeBelow (Q10)", async () => {
+    const maximizeConfig: BudgetConfig = { ...CONFIG, strategy: "maximize" };
+    const source = new FakeSource([
+      { claude: usage(), codex: usage() },
+      { claude: usage(), codex: usage({ gateUtil: 91, warnUtil: 91, remaining: 9 }) },
+      { claude: usage(), codex: usage({ gateUtil: 20, warnUtil: 20, remaining: 80 }) },
+    ]);
+    const { coordinator, emitted } = makeCoordinator(source, maximizeConfig);
+
+    await coordinator.start();
+    await waitFor(() => emitted.some((event) => event.id.startsWith("system_budget_pause")));
+    await waitFor(() => emitted.some((event) => event.id.startsWith("system_budget_resume")));
+    coordinator.stop();
+
+    const resume = emitted.find((event) => event.id.startsWith("system_budget_resume"));
+    expect(resume?.content).toContain("动态暂停线");
+    expect(resume?.content).not.toContain("低于 30%");
+  });
+
+  test("maximize CONFIDENT path: coordinator enter→exit on the dynamic line", async () => {
+    const maximizeConfig: BudgetConfig = { ...CONFIG, strategy: "maximize" };
+    // fiveHour with a confident guard burn rate: tH=1h, rate=1.2 → line 95.6.
+    const codexUsage = (fiveHourUtil: number): AgentUsage => ({
+      ok: true,
+      stale: false,
+      gateUtil: fiveHourUtil,
+      warnUtil: fiveHourUtil,
+      fiveHour: { util: fiveHourUtil, resetEpoch: NOW + 3600, burnRate: 1.2, burnConfident: true },
+      weekly: { util: 10, resetEpoch: NOW + 500_000, burnRate: 0.4, burnConfident: true },
+      remaining: 100 - fiveHourUtil,
+      rateLimitedUntil: 0,
+      fetchedAt: NOW,
+      parsedVia: "id-match",
+    });
+    const source = new FakeSource([
+      { claude: usage(), codex: codexUsage(96) }, // 96 ≥ line 95.6 → pause (confident b-branch)
+      { claude: usage(), codex: codexUsage(88) }, // 88 → projected 89.2 ≤ 97 → won't-fill → resume
+    ]);
+    const { coordinator, emitted, pauseChanges } = makeCoordinator(source, maximizeConfig);
+
+    await coordinator.start();
+    await waitFor(() => emitted.some((e) => e.id.startsWith("system_budget_pause")));
+    await waitFor(() => emitted.some((e) => e.id.startsWith("system_budget_resume")));
+    coordinator.stop();
+
+    expect(pauseChanges).toEqual([true, false]);
+    const pause = emitted.find((e) => e.id.startsWith("system_budget_pause"));
+    expect(pause?.content).toContain("动态暂停线"); // confident path → dynamic-line reason
+    const resume = emitted.find((e) => e.id.startsWith("system_budget_resume"));
+    expect(resume?.content).toContain("动态暂停线");
   });
 
   test("Claude-side handoff keeps intervention visible but leaves the gate open", async () => {

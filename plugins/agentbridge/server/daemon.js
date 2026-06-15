@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.16", "0.0.0-source"),
-  commit: defineString("d85c9c9", "source"),
+  commit: defineString("52a49ef", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("9d80360c2afc", "source")
+  codeHash: defineString("e124596f4642", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -3405,7 +3405,14 @@ var DEFAULT_BUDGET_CONFIG = {
     balanced: { effort: "medium" },
     eco: { effort: "low" }
   },
-  strategy: "conserve"
+  strategy: "conserve",
+  maximize: {
+    targetUtil: 97,
+    reserveSlopePctPerHour: 0.4,
+    reserveMaxPct: 7,
+    finishingHorizonMinutes: 30,
+    resumeHysteresisPct: 5
+  }
 };
 var DEFAULT_CONFIG = {
   version: "1.0",
@@ -3458,6 +3465,23 @@ function findShapeViolation(raw) {
         }
       }
     }
+    if ("maximize" in budget) {
+      const maximize = budget.maximize;
+      if (!isRecord(maximize)) {
+        return "budget.maximize is present but not an object";
+      }
+      for (const key of [
+        "targetUtil",
+        "reserveSlopePctPerHour",
+        "reserveMaxPct",
+        "finishingHorizonMinutes",
+        "resumeHysteresisPct"
+      ]) {
+        if (key in maximize && !isCoercibleNumber(maximize[key])) {
+          return `budget.maximize.${key} is present but not a number`;
+        }
+      }
+    }
   }
   return null;
 }
@@ -3465,7 +3489,7 @@ function hasCustomDecisionValues(config) {
   const d = DEFAULT_CONFIG;
   const b = config.budget;
   const db = d.budget;
-  return config.idleShutdownSeconds !== d.idleShutdownSeconds || config.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config.codex.appPort !== d.codex.appPort || config.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl;
+  return config.idleShutdownSeconds !== d.idleShutdownSeconds || config.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config.codex.appPort !== d.codex.appPort || config.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.strategy !== db.strategy || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct;
 }
 function normalizeInteger(value, fallback) {
   if (typeof value === "number" && Number.isFinite(value))
@@ -3483,8 +3507,37 @@ function normalizeBoundedInteger(value, fallback, min, max) {
     return fallback;
   return parsed;
 }
+function normalizeBoundedNumber(value, fallback, min, max) {
+  let parsed;
+  if (typeof value === "number") {
+    parsed = value;
+  } else if (typeof value === "string" && value.trim() !== "") {
+    parsed = Number(value);
+  } else {
+    return fallback;
+  }
+  if (!Number.isFinite(parsed))
+    return fallback;
+  if (parsed < min || parsed > max)
+    return fallback;
+  return parsed;
+}
 function normalizeStrategy(value, fallback) {
   return value === "conserve" || value === "maximize" ? value : fallback;
+}
+function normalizeMaximizeConfig(raw, pauseAt, fallback = DEFAULT_BUDGET_CONFIG.maximize) {
+  const m = isRecord(raw) ? raw : {};
+  const normalized = {
+    targetUtil: normalizeBoundedInteger(m.targetUtil, fallback.targetUtil, 90, 99),
+    reserveSlopePctPerHour: normalizeBoundedNumber(m.reserveSlopePctPerHour, fallback.reserveSlopePctPerHour, 0, 5),
+    reserveMaxPct: normalizeBoundedInteger(m.reserveMaxPct, fallback.reserveMaxPct, 0, 30),
+    finishingHorizonMinutes: normalizeBoundedInteger(m.finishingHorizonMinutes, fallback.finishingHorizonMinutes, 5, 180),
+    resumeHysteresisPct: normalizeBoundedInteger(m.resumeHysteresisPct, fallback.resumeHysteresisPct, 1, 30)
+  };
+  if (normalized.targetUtil <= pauseAt) {
+    return { ...DEFAULT_BUDGET_CONFIG.maximize };
+  }
+  return normalized;
 }
 function normalizeBoolean(value, fallback) {
   if (typeof value === "boolean")
@@ -3535,7 +3588,8 @@ function normalizeBudgetConfig(raw, fallback = DEFAULT_BUDGET_CONFIG) {
     },
     codexTierControl: normalizeBoolean(budget.codexTierControl, fallback.codexTierControl) && codexTiers.full !== null,
     codexTiers,
-    strategy: normalizeStrategy(budget.strategy, fallback.strategy)
+    strategy: normalizeStrategy(budget.strategy, fallback.strategy),
+    maximize: normalizeMaximizeConfig(budget.maximize, pauseAt, fallback.maximize)
   };
 }
 function applyBudgetEnvOverrides(budget, env = process.env) {
@@ -3551,7 +3605,14 @@ function applyBudgetEnvOverrides(budget, env = process.env) {
     },
     codexTierControl: env.AGENTBRIDGE_BUDGET_CODEX_TIER_CONTROL ?? budget.codexTierControl,
     codexTiers: budget.codexTiers,
-    strategy: env.AGENTBRIDGE_BUDGET_STRATEGY ?? budget.strategy
+    strategy: env.AGENTBRIDGE_BUDGET_STRATEGY ?? budget.strategy,
+    maximize: {
+      targetUtil: env.AGENTBRIDGE_BUDGET_TARGET_UTIL ?? budget.maximize.targetUtil,
+      reserveSlopePctPerHour: env.AGENTBRIDGE_BUDGET_RESERVE_SLOPE_PCT_PER_HOUR ?? budget.maximize.reserveSlopePctPerHour,
+      reserveMaxPct: env.AGENTBRIDGE_BUDGET_RESERVE_MAX_PCT ?? budget.maximize.reserveMaxPct,
+      finishingHorizonMinutes: env.AGENTBRIDGE_BUDGET_FINISHING_HORIZON_MINUTES ?? budget.maximize.finishingHorizonMinutes,
+      resumeHysteresisPct: env.AGENTBRIDGE_BUDGET_RESUME_HYSTERESIS_PCT ?? budget.maximize.resumeHysteresisPct
+    }
   };
   return normalizeBudgetConfig(overlay, budget);
 }
@@ -3688,35 +3749,25 @@ function resumeBlockingEpoch(usage, cfg, now) {
 // src/budget/types.ts
 var STALE_MAX_AGE_SEC = 600;
 
-// src/budget/budget-state.ts
+// src/budget/budget-decision.ts
 var AGENT_LABEL = {
   claude: "Claude",
   codex: "Codex"
 };
-var CODEX_BALANCED_WARN_UTIL = 60;
-var CODEX_ECO_WARN_UTIL = 80;
-var CLAUDE_ADVICE_WARN_UTIL = 80;
+var WINDOW_LABEL = {
+  fiveHour: "5h",
+  weekly: "\u5468"
+};
+var WINDOW_KEYS = ["fiveHour", "weekly"];
+var MAX_TIME_TO_RESET_HOURS = 7 * 24;
+var FINISHING_MARGIN_MIN_PCT = 1;
+var FINISHING_MARGIN_MAX_PCT = 10;
+var DYNAMIC_LINE_CEILING_PCT = 99;
 function pct(value) {
   return `${Math.round(value * 10) / 10}%`;
 }
-function formatEpoch(epoch) {
-  if (!epoch || epoch <= 0)
-    return "\u672A\u77E5";
-  return new Date(epoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
-}
-function usageSummary(name, usage) {
-  if (!usage)
-    return `${AGENT_LABEL[name]} \u672A\u77E5`;
-  return `${AGENT_LABEL[name]} gate=${pct(usage.gateUtil)} warn=${pct(usage.warnUtil)} 5h\u91CD\u7F6E=${formatEpoch(usage.fiveHour?.resetEpoch ?? 0)}`;
-}
-function resumeAfterEpoch(claude, codex, cfg, now) {
-  const epochs = [
-    resumeBlockingEpoch(claude, cfg, now),
-    resumeBlockingEpoch(codex, cfg, now)
-  ].filter((epoch) => epoch > 0);
-  if (epochs.length === 0)
-    return null;
-  return Math.max(...epochs);
+function clamp(value, min, max) {
+  return Math.min(Math.max(value, min), max);
 }
 function isDecisionGrade(usage, now) {
   if (!usage)
@@ -3728,18 +3779,204 @@ function isDecisionGrade(usage, now) {
     return false;
   return true;
 }
-function pauseTrigger(agent, usage, cfg, now) {
-  if (!usage)
-    return null;
-  if (!isDecisionGrade(usage, now))
-    return null;
-  if (usage.gateUtil >= cfg.pauseAt) {
-    return {
-      agent,
-      reason: `${AGENT_LABEL[agent]} gateUtil ${pct(usage.gateUtil)} \u2265 pauseAt ${pct(cfg.pauseAt)}`
-    };
+function dynamicPauseAt(window, burnRatePctPerHour, cfg, now) {
+  const m = cfg.maximize;
+  const rawTimeToResetHours = (window.resetEpoch - now) / 3600;
+  if (rawTimeToResetHours <= 0)
+    return 100;
+  const tH = Math.min(rawTimeToResetHours, MAX_TIME_TO_RESET_HOURS);
+  const finishingMarginPct = clamp(burnRatePctPerHour * (m.finishingHorizonMinutes / 60), FINISHING_MARGIN_MIN_PCT, FINISHING_MARGIN_MAX_PCT);
+  const projectedAtReset = window.util + burnRatePctPerHour * tH;
+  if (projectedAtReset <= m.targetUtil) {
+    if (window.util >= m.targetUtil)
+      return "admission-closed";
+    if (tH < m.finishingHorizonMinutes / 60 && window.util >= m.targetUtil - finishingMarginPct) {
+      return "admission-closed";
+    }
+    return 100;
   }
-  return null;
+  const reservePct = Math.min(m.reserveMaxPct, m.reserveSlopePctPerHour * tH);
+  const line = m.targetUtil - finishingMarginPct - reservePct;
+  return clamp(line, cfg.pauseAt, Math.max(cfg.pauseAt, DYNAMIC_LINE_CEILING_PCT));
+}
+function confidentRate(window) {
+  if (window.burnConfident !== true)
+    return null;
+  if (typeof window.burnRate !== "number" || !Number.isFinite(window.burnRate) || window.burnRate < 0) {
+    return null;
+  }
+  return window.burnRate;
+}
+function maximizeWindowEntry(window, cfg, now) {
+  const rate = confidentRate(window);
+  if (rate === null) {
+    return { blocks: window.util >= cfg.pauseAt, line: null, admission: false };
+  }
+  const line = dynamicPauseAt(window, rate, cfg, now);
+  if (line === "admission-closed") {
+    return { blocks: window.util >= cfg.pauseAt, line: null, admission: true };
+  }
+  return { blocks: window.util >= line, line, admission: false };
+}
+function maximizeWindowBlocksResume(window, cfg, now) {
+  const rate = confidentRate(window);
+  if (rate === null) {
+    return window.util >= cfg.resumeBelow;
+  }
+  const line = dynamicPauseAt(window, rate, cfg, now);
+  const hyst = cfg.maximize.resumeHysteresisPct;
+  if (line === "admission-closed") {
+    return window.util >= cfg.pauseAt - hyst;
+  }
+  if (line === 100)
+    return false;
+  return window.util >= line - hyst;
+}
+function freshWindows(usage, now) {
+  const out = [];
+  for (const key of WINDOW_KEYS) {
+    const window = usage[key];
+    if (window && window.resetEpoch > now)
+      out.push({ key, window });
+  }
+  return out;
+}
+var NO_PAUSE = { pause: false, window: null, line: null, reason: "" };
+function conserveReason(agent, usage, cfg) {
+  return `${AGENT_LABEL[agent]} gateUtil ${pct(usage.gateUtil)} \u2265 pauseAt ${pct(cfg.pauseAt)}`;
+}
+function agentShouldPause(agent, usage, cfg, now) {
+  if (!usage)
+    return NO_PAUSE;
+  if (!isDecisionGrade(usage, now))
+    return NO_PAUSE;
+  if (cfg.strategy !== "maximize") {
+    if (usage.gateUtil >= cfg.pauseAt) {
+      return { pause: true, window: null, line: null, reason: conserveReason(agent, usage, cfg) };
+    }
+    return NO_PAUSE;
+  }
+  const windows = freshWindows(usage, now);
+  if (windows.length === 0) {
+    if (usage.gateUtil >= cfg.pauseAt) {
+      return { pause: true, window: null, line: null, reason: conserveReason(agent, usage, cfg) };
+    }
+    return NO_PAUSE;
+  }
+  for (const { key, window } of windows) {
+    const verdict = maximizeWindowEntry(window, cfg, now);
+    if (verdict.blocks) {
+      return {
+        pause: true,
+        window: key,
+        line: verdict.line,
+        reason: buildMaximizeReason(agent, key, window, verdict, cfg)
+      };
+    }
+  }
+  return NO_PAUSE;
+}
+function buildMaximizeReason(agent, key, window, verdict, cfg) {
+  const head = `${AGENT_LABEL[agent]} ${WINDOW_LABEL[key]}\u7A97\u53E3 util ${pct(window.util)}`;
+  if (verdict.line !== null) {
+    const rate = window.burnRate;
+    const rateText = typeof rate === "number" ? `\uFF0C\u71C3\u5C3D\u7387\u2248${pct(rate)}/h` : "";
+    return `${head} \u2265 \u52A8\u6001\u6682\u505C\u7EBF ${pct(verdict.line)}${rateText}`;
+  }
+  if (verdict.admission) {
+    return `${head} \u89E6\u53D1\u6536\u5C3E\u4FDD\u62A4\u786C\u7EBF\uFF08\u2265 pauseAt ${pct(cfg.pauseAt)}\uFF09`;
+  }
+  return `${head} \u2265 pauseAt ${pct(cfg.pauseAt)}\uFF08\u71C3\u5C3D\u7387\u91C7\u6837\u4E2D\uFF0C\u9000\u4FDD\u5B88\u5224\u636E\uFF09`;
+}
+function agentCanResume(usage, cfg, now) {
+  if (!isDecisionGrade(usage, now))
+    return false;
+  if (usage.rateLimitedUntil > now)
+    return false;
+  if (cfg.strategy !== "maximize") {
+    return usage.gateUtil < cfg.resumeBelow;
+  }
+  const windows = freshWindows(usage, now);
+  for (const { window } of windows) {
+    if (maximizeWindowBlocksResume(window, cfg, now))
+      return false;
+  }
+  return true;
+}
+function effectiveDynamicLine(usage, cfg, now) {
+  if (cfg.strategy !== "maximize")
+    return null;
+  if (!usage || !isDecisionGrade(usage, now))
+    return null;
+  let bestLine = null;
+  let bestHeadroom = Number.POSITIVE_INFINITY;
+  for (const { window } of freshWindows(usage, now)) {
+    const rate = confidentRate(window);
+    if (rate === null)
+      continue;
+    const line = dynamicPauseAt(window, rate, cfg, now);
+    if (line === "admission-closed" || line >= 100)
+      continue;
+    const headroom = line - window.util;
+    if (headroom < bestHeadroom) {
+      bestHeadroom = headroom;
+      bestLine = line;
+    }
+  }
+  return bestLine;
+}
+function resumeBlockingEpochFor(usage, cfg, now) {
+  if (!usage)
+    return 0;
+  if (cfg.strategy !== "maximize")
+    return resumeBlockingEpoch(usage, cfg, now);
+  if (usage.rateLimitedUntil > now)
+    return usage.rateLimitedUntil;
+  if (!isDecisionGrade(usage, now)) {
+    const reset = matchingGateReset(usage);
+    return reset > now ? reset : 0;
+  }
+  const blockingResets = freshWindows(usage, now).filter(({ window }) => maximizeWindowBlocksResume(window, cfg, now)).map(({ window }) => window.resetEpoch).filter((epoch) => epoch > 0);
+  if (blockingResets.length === 0)
+    return 0;
+  return Math.min(...blockingResets);
+}
+
+// src/budget/budget-state.ts
+var AGENT_LABEL2 = {
+  claude: "Claude",
+  codex: "Codex"
+};
+var CODEX_BALANCED_WARN_UTIL = 60;
+var CODEX_ECO_WARN_UTIL = 80;
+var CLAUDE_ADVICE_WARN_UTIL = 80;
+function pct2(value) {
+  return `${Math.round(value * 10) / 10}%`;
+}
+function formatEpoch(epoch) {
+  if (!epoch || epoch <= 0)
+    return "\u672A\u77E5";
+  return new Date(epoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
+}
+function usageSummary(name, usage) {
+  if (!usage)
+    return `${AGENT_LABEL2[name]} \u672A\u77E5`;
+  return `${AGENT_LABEL2[name]} gate=${pct2(usage.gateUtil)} warn=${pct2(usage.warnUtil)} 5h\u91CD\u7F6E=${formatEpoch(usage.fiveHour?.resetEpoch ?? 0)}`;
+}
+function resumeAfterEpoch(claude, codex, cfg, now) {
+  const epochs = [
+    resumeBlockingEpochFor(claude, cfg, now),
+    resumeBlockingEpochFor(codex, cfg, now)
+  ].filter((epoch) => epoch > 0);
+  if (epochs.length === 0)
+    return null;
+  return Math.max(...epochs);
+}
+function pauseTrigger(agent, usage, cfg, now) {
+  const decision = agentShouldPause(agent, usage, cfg, now);
+  if (!decision.pause)
+    return null;
+  return { agent, reason: decision.reason };
 }
 function driftFor(claude, codex, cfg) {
   if (!claude || !codex)
@@ -3770,17 +4007,19 @@ function parallelState(claude, codex, cfg, now) {
   const minutes = Math.ceil(nearestResetSec / 60);
   return {
     recommended: true,
-    reason: `\u53CC\u65B9\u5269\u4F59\u989D\u5EA6\u5747\u9AD8\u4E8E ${pct(cfg.parallel.minRemainingPct)}\uFF0C\u6700\u8FD1 5h \u6876\u7EA6 ${minutes} \u5206\u949F\u540E\u91CD\u7F6E`
+    reason: `\u53CC\u65B9\u5269\u4F59\u989D\u5EA6\u5747\u9AD8\u4E8E ${pct2(cfg.parallel.minRemainingPct)}\uFF0C\u6700\u8FD1 5h \u6876\u7EA6 ${minutes} \u5206\u949F\u540E\u91CD\u7F6E`
   };
 }
 function renderBudgetInterventionDirective(claude, codex, side, reason, resumeEpoch, cfg) {
   const resumeText = `\u9884\u8BA1\u6062\u590D\u65F6\u95F4\uFF08\u4EE5\u5B9E\u6D4B\u4E3A\u51C6\uFF1B\u63D0\u524D\u5237\u65B0\u4F1A\u66F4\u65E9\u89E3\u9664\uFF09\uFF1A${formatEpoch(resumeEpoch)}\u3002`;
+  const resumeCondSingle = cfg.strategy === "maximize" ? `\u5404\u7A97\u53E3 util \u56DE\u843D\u81F3\u52A8\u6001\u6682\u505C\u7EBF \u2212 ${pct2(cfg.maximize.resumeHysteresisPct)} \u4EE5\u4E0B\u6216\u5BF9\u5E94\u7A97\u53E3\u5237\u65B0` : `gateUtil \u4F4E\u4E8E ${pct2(cfg.resumeBelow)}`;
+  const resumeCondBoth = cfg.strategy === "maximize" ? `\u5404\u7A97\u53E3 util \u90FD\u56DE\u843D\u81F3\u52A8\u6001\u6682\u505C\u7EBF \u2212 ${pct2(cfg.maximize.resumeHysteresisPct)} \u4EE5\u4E0B\u6216\u5BF9\u5E94\u7A97\u53E3\u5237\u65B0` : `gateUtil \u90FD\u4F4E\u4E8E ${pct2(cfg.resumeBelow)}`;
   if (side === "claude") {
     return [
       "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Claude \u4FA7\u989D\u5EA6\u7D27\u5F20\uFF0C\u8FDB\u5165\u63A5\u529B\u6A21\u5F0F\u3002",
       `\u89E6\u53D1\u65B9\uFF1AClaude\uFF1B\u539F\u56E0\uFF1A${reason}\u3002`,
       `${usageSummary("claude", claude)}\uFF1B${usageSummary("codex", codex)}\u3002`,
-      `\u6062\u590D\u53C2\u8003\uFF1AClaude gateUtil \u4F4E\u4E8E ${pct(cfg.resumeBelow)} \u4E14\u6CA1\u6709\u6709\u6548 rate_limit\uFF1B${resumeText}`,
+      `\u6062\u590D\u53C2\u8003\uFF1AClaude ${resumeCondSingle} \u4E14\u6CA1\u6709\u6709\u6548 rate_limit\uFF1B${resumeText}`,
       "\u8BF7\u7ACB\u5373\u4EA4\u63A5\uFF1A\u628A\u5269\u4F59\u4EFB\u52A1\u6E05\u5355\u3001\u5173\u952E\u4E0A\u4E0B\u6587\u3001\u4EA7\u51FA\u4F4D\u7F6E\u3001\u9A8C\u6536\u6807\u51C6\u6253\u5305\u6210\u4E00\u6761 reply \u53D1\u7ED9 Codex\u3002",
       "\u4EA4\u63A5\u540E Claude \u505C\u624B\uFF1B\u8981\u6C42 Codex \u5728\u5355 turn \u5185\u5C3D\u91CF\u5B8C\u6210\uFF0C\u5C3E\u5DF4\u5199 checkpoint\uFF0C\u6682\u505C\u671F\u4E0D\u8981\u671F\u5F85 Claude \u56DE\u590D\u3002"
     ].join(`
@@ -3791,7 +4030,7 @@ function renderBudgetInterventionDirective(claude, codex, side, reason, resumeEp
       "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Codex \u4FA7\u989D\u5EA6\u7D27\u5F20\uFF0C\u6682\u505C\u59D4\u6D3E\u3002",
       `\u89E6\u53D1\u65B9\uFF1ACodex\uFF1B\u539F\u56E0\uFF1A${reason}\u3002`,
       `${usageSummary("claude", claude)}\uFF1B${usageSummary("codex", codex)}\u3002`,
-      `\u6062\u590D\u53C2\u8003\uFF1ACodex gateUtil \u4F4E\u4E8E ${pct(cfg.resumeBelow)} \u4E14\u6CA1\u6709\u6709\u6548 rate_limit\uFF1B${resumeText}`,
+      `\u6062\u590D\u53C2\u8003\uFF1ACodex ${resumeCondSingle} \u4E14\u6CA1\u6709\u6709\u6548 rate_limit\uFF1B${resumeText}`,
       "\u8BF7 Claude \u5199 checkpoint\uFF0C\u5E76\u53EF solo \u63A8\u8FDB\u4E0D\u4F9D\u8D56 Codex \u7684\u72EC\u7ACB\u90E8\u5206\uFF1B\u4E0D\u8981\u7EE7\u7EED\u5411 Codex \u59D4\u6D3E\uFF0C\u6807\u6CE8\u6E05\u695A\u5206\u5DE5\u65AD\u70B9\u3002"
     ].join(`
 `);
@@ -3800,18 +4039,18 @@ function renderBudgetInterventionDirective(claude, codex, side, reason, resumeEp
     "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011\u8FDB\u5165\u8054\u5408\u6682\u505C\u3002",
     `\u89E6\u53D1\u65B9\uFF1A\u53CC\u65B9\uFF1B\u539F\u56E0\uFF1A${reason}\u3002`,
     `${usageSummary("claude", claude)}\uFF1B${usageSummary("codex", codex)}\u3002`,
-    `\u6062\u590D\u6761\u4EF6\uFF1AClaude \u4E0E Codex \u7684 gateUtil \u90FD\u4F4E\u4E8E ${pct(cfg.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\uFF1B${resumeText}`,
+    `\u6062\u590D\u6761\u4EF6\uFF1AClaude \u4E0E Codex \u7684 ${resumeCondBoth}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\uFF1B${resumeText}`,
     "\u8BF7\u6536\u5C3E\u5F53\u524D\u6B65\u3001\u5199 checkpoint\u3001\u505C\u6B62\u7EE7\u7EED\u59D4\u6D3E\uFF1Bpause \u671F\u95F4\u4E0D\u8981\u91CD\u8BD5\u5411 Codex \u53D1\u9001 reply\u3002"
   ].join(`
 `);
 }
 function balanceDirective(claude, codex, drift, parallel) {
-  const heavier = drift.heavier ? AGENT_LABEL[drift.heavier] : "\u672A\u77E5";
-  const lighter = drift.lighter ? AGENT_LABEL[drift.lighter] : "\u672A\u77E5";
+  const heavier = drift.heavier ? AGENT_LABEL2[drift.heavier] : "\u672A\u77E5";
+  const lighter = drift.lighter ? AGENT_LABEL2[drift.lighter] : "\u672A\u77E5";
   const lines = [
     "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011\u68C0\u6D4B\u5230\u53CC\u65B9\u7528\u91CF\u6BD4\u4F8B\u6F02\u79FB\u3002",
     `${usageSummary("claude", claude)}\uFF1B${usageSummary("codex", codex)}\u3002`,
-    `${heavier} \u6BD4 ${lighter} \u9AD8 ${pct(Math.abs(drift.pct))}\uFF0C\u8BF7\u4F18\u5148\u628A\u540E\u7EED\u53EF\u62C6\u5206\u4EFB\u52A1\u5206\u7ED9 ${lighter}\uFF0C\u76F4\u5230 warnUtil \u63A5\u8FD1\u3002`
+    `${heavier} \u6BD4 ${lighter} \u9AD8 ${pct2(Math.abs(drift.pct))}\uFF0C\u8BF7\u4F18\u5148\u628A\u540E\u7EED\u53EF\u62C6\u5206\u4EFB\u52A1\u5206\u7ED9 ${lighter}\uFF0C\u76F4\u5230 warnUtil \u63A5\u8FD1\u3002`
   ];
   if (parallel.recommended && parallel.reason) {
     lines.push(`${parallel.reason}\uFF1B\u53EF\u8BA9 ${lighter} \u627F\u62C5\u66F4\u591A\u5E76\u884C\u5B50\u4EFB\u52A1\uFF0C\u517C\u987E\u5747\u8861\u4E0E\u63D0\u901F\u3002`);
@@ -3841,7 +4080,7 @@ function claudeAdviceFor(claude, now) {
     return null;
   if (claude.warnUtil < CLAUDE_ADVICE_WARN_UTIL)
     return null;
-  return `Claude warnUtil ${pct(claude.warnUtil)} \u5DF2\u504F\u9AD8\uFF1B\u540E\u7EED\u53EF\u62C6\u5206 subagent \u5EFA\u8BAE\u964D\u6863\u5230 haiku/sonnet\uFF0C\u5E76\u4FDD\u7559\u9AD8\u96BE\u5EA6\u4E3B\u7EBF\u7ED9\u5F53\u524D\u4F1A\u8BDD\u3002`;
+  return `Claude warnUtil ${pct2(claude.warnUtil)} \u5DF2\u504F\u9AD8\uFF1B\u540E\u7EED\u53EF\u62C6\u5206 subagent \u5EFA\u8BAE\u964D\u6863\u5230 haiku/sonnet\uFF0C\u5E76\u4FDD\u7559\u9AD8\u96BE\u5EA6\u4E3B\u7EBF\u7ED9\u5F53\u524D\u4F1A\u8BDD\u3002`;
 }
 function computeBudgetState(claude, codex, cfg, now) {
   const triggers = [
@@ -3893,11 +4132,11 @@ function computeBudgetState(claude, codex, cfg, now) {
 
 // src/budget/budget-fingerprint.ts
 var RESET_FINGERPRINT_BUCKET_SEC = 600;
-var AGENT_LABEL2 = {
+var AGENT_LABEL3 = {
   claude: "Claude",
   codex: "Codex"
 };
-function pct2(value) {
+function pct3(value) {
   return `${Math.round(value * 10) / 10}%`;
 }
 function formatEpoch2(epoch) {
@@ -3929,25 +4168,13 @@ function agentsToSide(agents) {
     return "codex";
   return null;
 }
-function shouldEnter(usage, cfg, now) {
-  if (!isDecisionGrade(usage, now))
-    return false;
-  return usage.gateUtil >= cfg.pauseAt;
-}
-function canAgentResume(usage, cfg, now) {
-  if (!isDecisionGrade(usage, now))
-    return false;
-  if (usage.rateLimitedUntil > now)
-    return false;
-  return usage.gateUtil < cfg.resumeBelow;
-}
 function nextActiveSide(prevSide, state, cfg) {
   const active = new Set(sideToAgents(prevSide));
   for (const agent of ["claude", "codex"]) {
     const usage = state.perAgent[agent];
-    if (shouldEnter(usage, cfg, state.now)) {
+    if (agentShouldPause(agent, usage, cfg, state.now).pause) {
       active.add(agent);
-    } else if (active.has(agent) && canAgentResume(usage, cfg, state.now)) {
+    } else if (active.has(agent) && agentCanResume(usage, cfg, state.now)) {
       active.delete(agent);
     }
   }
@@ -3959,20 +4186,20 @@ function removedAgents(prevSide, currentSide) {
 }
 function activeSideReason(agent, usage, cfg, now) {
   if (!usage)
-    return `${AGENT_LABEL2[agent]} \u63A2\u6D4B\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u4FDD\u6301\u4E0A\u4E00\u8F6E\u9884\u7B97\u5E72\u9884`;
+    return `${AGENT_LABEL3[agent]} \u63A2\u6D4B\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u4FDD\u6301\u4E0A\u4E00\u8F6E\u9884\u7B97\u5E72\u9884`;
   if (usage.rateLimitedUntil > now) {
-    return `${AGENT_LABEL2[agent]} \u63A2\u9488\u88AB\u9650\u6D41\u81F3 ${formatEpoch2(usage.rateLimitedUntil)}`;
+    return `${AGENT_LABEL3[agent]} \u63A2\u9488\u88AB\u9650\u6D41\u81F3 ${formatEpoch2(usage.rateLimitedUntil)}`;
   }
-  if (usage.gateUtil >= cfg.pauseAt) {
-    return `${AGENT_LABEL2[agent]} gateUtil ${pct2(usage.gateUtil)} \u2265 pauseAt ${pct2(cfg.pauseAt)}`;
-  }
-  return `${AGENT_LABEL2[agent]} gateUtil ${pct2(usage.gateUtil)} \u5C1A\u672A\u4F4E\u4E8E resumeBelow ${pct2(cfg.resumeBelow)}`;
+  const decision = agentShouldPause(agent, usage, cfg, now);
+  if (decision.pause)
+    return decision.reason;
+  return `${AGENT_LABEL3[agent]} gateUtil ${pct3(usage.gateUtil)} \u5C1A\u672A\u6EE1\u8DB3\u51FA\u95F8\u6761\u4EF6`;
 }
 function interventionReason(side, state, cfg) {
   return sideToAgents(side).map((agent) => activeSideReason(agent, state.perAgent[agent], cfg, state.now)).join("\uFF1B");
 }
 function resumeAfterEpoch2(side, state, cfg) {
-  const epochs = sideToAgents(side).map((agent) => resumeBlockingEpoch(state.perAgent[agent], cfg, state.now)).filter((epoch) => epoch > 0);
+  const epochs = sideToAgents(side).map((agent) => resumeBlockingEpochFor(state.perAgent[agent], cfg, state.now)).filter((epoch) => epoch > 0);
   if (epochs.length === 0)
     return null;
   return Math.max(...epochs);
@@ -4071,7 +4298,7 @@ function computeResumeCandidate(sides, state, cfg, signals) {
   const candidate = {};
   const detail = {};
   for (const agent of sides) {
-    const windowRefreshed = canAgentResume(state.perAgent[agent], cfg, state.now);
+    const windowRefreshed = agentCanResume(state.perAgent[agent], cfg, state.now);
     const ready = windowRefreshed && signals.pendingExists[agent] && signals.tuiReady[agent] && signals.checkpointExists;
     candidate[agent] = ready;
     const pending = signals.pending?.[agent];
@@ -4152,17 +4379,17 @@ var REAL_BUDGET_POLL_SCHEDULER = {
     clearTimeout(timer);
   }
 };
-var AGENT_LABEL3 = {
+var AGENT_LABEL4 = {
   claude: "Claude",
   codex: "Codex"
 };
-function pct3(value) {
+function pct4(value) {
   return `${Math.round(value * 10) / 10}%`;
 }
 function usageLine(agent, usage) {
   if (!usage)
-    return `${AGENT_LABEL3[agent]} \u672A\u77E5`;
-  return `${AGENT_LABEL3[agent]} gate=${pct3(usage.gateUtil)} warn=${pct3(usage.warnUtil)}`;
+    return `${AGENT_LABEL4[agent]} \u672A\u77E5`;
+  return `${AGENT_LABEL4[agent]} gate=${pct4(usage.gateUtil)} warn=${pct4(usage.warnUtil)}`;
 }
 function maxPollDelayMs(config) {
   return Math.max(0, config.pollSeconds * 1000);
@@ -4432,19 +4659,22 @@ class BudgetCoordinator {
     return renderBudgetInterventionDirective(state.perAgent.claude, state.perAgent.codex, side, reason || "\u9884\u7B97\u63A5\u8FD1\u8017\u5C3D", resumeEpoch, this.config);
   }
   recoveryDirective(state, side) {
+    const maximizeRecoveredText = `\u5404\u7A97\u53E3 util \u5DF2\u56DE\u843D\u81F3\u52A8\u6001\u6682\u505C\u7EBF \u2212 ${pct4(this.config.maximize.resumeHysteresisPct)} \u4EE5\u4E0B\u6216\u5BF9\u5E94\u7A97\u53E3\u5DF2\u5237\u65B0`;
     if (side === "claude") {
+      const condClaude = this.config.strategy === "maximize" ? maximizeRecoveredText : `gateUtil \u5DF2\u4F4E\u4E8E ${pct4(this.config.resumeBelow)}`;
       return [
         "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Claude \u4FA7\u9884\u7B97\u5DF2\u6062\u590D\u3002",
         `${usageLine("claude", state.perAgent.claude)}\uFF1B${usageLine("codex", state.perAgent.codex)}\u3002`,
-        `Claude gateUtil \u5DF2\u4F4E\u4E8E ${pct3(this.config.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
+        `Claude ${condClaude}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
         "Claude \u53EF\u6062\u590D orchestrator \u89D2\u8272\uFF1B\u540E\u7EED\u5206\u914D\u524D\u8BF7\u91CD\u65B0\u67E5\u8BE2\u5B9E\u65F6\u989D\u5EA6\uFF0C\u4E0D\u8981\u4F9D\u8D56\u65E7\u6570\u5B57\u3002"
       ].join(`
 `);
     }
+    const condCodex = this.config.strategy === "maximize" ? maximizeRecoveredText : `gateUtil \u4F4E\u4E8E ${pct4(this.config.resumeBelow)}`;
     return [
       "\u3010\u9884\u7B97\u534F\u8C03 \xB7 \u8D26\u53F7\u7EA7\u3011Codex \u4FA7\u9884\u7B97\u95F8\u95E8\u89E3\u9664\u3002",
       `${usageLine("claude", state.perAgent.claude)}\uFF1B${usageLine("codex", state.perAgent.codex)}\u3002`,
-      `\u95F8\u95E8\u5DF2\u653E\u5F00\uFF1ACodex gateUtil \u4F4E\u4E8E ${pct3(this.config.resumeBelow)}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
+      `\u95F8\u95E8\u5DF2\u653E\u5F00\uFF1ACodex ${condCodex}\uFF0C\u4E14\u6CA1\u6709\u6709\u6548 rate_limit\u3002`,
       "\u5EFA\u8BAE Claude \u7528 reply \u5E26\u4E0A\u5F53\u524D\u76EE\u6807\u3001checkpoint \u548C\u4E0B\u4E00\u6B65\uFF0C\u5524\u9192 Codex \u63A5\u7EED\u6267\u884C\u3002"
     ].join(`
 `);
@@ -4465,7 +4695,18 @@ class BudgetCoordinator {
       parallelRecommended: paused ? false : state.parallel.recommended,
       codexTier: state.effort.codexTier,
       claudeAdvice: state.effort.claudeAdvice,
-      ...this.burnRateSnapshotFields(state)
+      ...this.burnRateSnapshotFields(state),
+      ...this.dynamicLineSnapshotFields(state)
+    };
+  }
+  dynamicLineSnapshotFields(state) {
+    if (this.config.strategy !== "maximize")
+      return {};
+    return {
+      dynamicPauseLine: {
+        claude: effectiveDynamicLine(state.perAgent.claude, this.config, state.now),
+        codex: effectiveDynamicLine(state.perAgent.codex, this.config, state.now)
+      }
     };
   }
   burnRateSnapshotFields(state) {
@@ -4577,7 +4818,7 @@ function asFiniteNumber(value) {
 function numberOr(value, fallback) {
   return asFiniteNumber(value) ?? fallback;
 }
-function clamp(value, min, max) {
+function clamp2(value, min, max) {
   return Math.min(max, Math.max(min, value));
 }
 function asRecord(value) {
@@ -4598,7 +4839,7 @@ function normalizeBucket(value, fetchedAt) {
   }
   return {
     id,
-    util: clamp(util, 0, 100),
+    util: clamp2(util, 0, 100),
     resetEpoch: Math.max(0, resetEpoch),
     resetAfterSeconds: resetAfter === null ? null : Math.max(0, resetAfter),
     burn: parseBurnFields(bucket)
@@ -4612,7 +4853,7 @@ function normalizeTopLevelBucket(record, util, fetchedAt) {
   }
   return {
     id: "top_level",
-    util: clamp(util, 0, 100),
+    util: clamp2(util, 0, 100),
     resetEpoch: Math.max(0, resetEpoch),
     resetAfterSeconds: resetAfter === null ? null : Math.max(0, resetAfter),
     burn: parseBurnFields(record)
@@ -4679,8 +4920,8 @@ function identifyWindows(buckets) {
 function normalizeTolerantProbeRecord(record) {
   const fetchedAt = numberOr(record.fetched_at ?? record.fetchedAt ?? record.now_epoch ?? record.nowEpoch, 0);
   const hasFiniteUtil = asFiniteNumber(record.util ?? record.hard_util ?? record.hardUtil) !== null || asFiniteNumber(record.warn_util ?? record.warnUtil) !== null;
-  const gateUtil = clamp(numberOr(record.util ?? record.hard_util ?? record.hardUtil, 0), 0, 100);
-  const warnUtil = clamp(numberOr(record.warn_util ?? record.warnUtil, gateUtil), 0, 100);
+  const gateUtil = clamp2(numberOr(record.util ?? record.hard_util ?? record.hardUtil, 0), 0, 100);
+  const warnUtil = clamp2(numberOr(record.warn_util ?? record.warnUtil, gateUtil), 0, 100);
   const rawBuckets = Array.isArray(record.buckets) ? record.buckets : [];
   const buckets = rawBuckets.map((bucket) => normalizeBucket(bucket, fetchedAt)).filter((bucket) => bucket !== null);
   let parsedVia = "id-match";
@@ -4707,7 +4948,7 @@ function normalizeTolerantProbeRecord(record) {
     warnUtil,
     fiveHour,
     weekly,
-    remaining: clamp(100 - gateUtil, 0, 100),
+    remaining: clamp2(100 - gateUtil, 0, 100),
     rateLimitedUntil,
     fetchedAt,
     parsedVia
@@ -6080,7 +6321,8 @@ function budgetPauseGateError() {
   const reason = snapshot?.pauseReason ?? "Codex \u4FA7\u989D\u5EA6\u63A5\u8FD1\u8017\u5C3D";
   const resumeAt = snapshot?.resumeAfterEpoch ? new Date(snapshot.resumeAfterEpoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z") : null;
   const sideHint = snapshot?.pauseSide === "both" ? "\u53CC\u4FA7\u989D\u5EA6\u5747\u5DF2\u8017\u5C3D\uFF0C\u8BF7\u5199 checkpoint \u7B49\u5F85\u5237\u65B0" : "\u4F60\u53EF\u7EE7\u7EED solo \u63A8\u8FDB\u53EF\u72EC\u7ACB\u90E8\u5206\uFF0C\u5E76\u5199 checkpoint \u6807\u6CE8\u5206\u5DE5\u65AD\u70B9";
-  return `\u9884\u7B97\u6682\u505C\uFF08\u95F8\u95E8\u5173\u95ED\uFF09\uFF0C\u5DF2\u62D2\u7EDD\u8F6C\u53D1\uFF1A${reason}\u3002` + `Codex \u4FA7 gateUtil \u4F4E\u4E8E ${BUDGET_CONFIG.resumeBelow}% \u540E\u95F8\u95E8\u81EA\u52A8\u653E\u5F00` + (resumeAt ? `\uFF08\u9884\u8BA1\u6062\u590D ${resumeAt}\uFF0C\u4EE5\u5B9E\u6D4B\u4E3A\u51C6\uFF1B\u63D0\u524D\u5237\u65B0\u4F1A\u66F4\u65E9\u89E3\u9664\uFF09` : "") + `\u3002\u6536\u5230 RESUME \u901A\u77E5\u524D\u8BF7\u52FF\u91CD\u8BD5\u5411 Codex \u53D1\u9001 reply\uFF1B${sideHint}\u3002`;
+  const reopenText = BUDGET_CONFIG.strategy === "maximize" ? `Codex \u4FA7\u5404\u7A97\u53E3 util \u56DE\u843D\u81F3\u52A8\u6001\u6682\u505C\u7EBF \u2212 ${BUDGET_CONFIG.maximize.resumeHysteresisPct}% \u4EE5\u4E0B\u6216\u5BF9\u5E94\u7A97\u53E3\u5237\u65B0\u540E\u95F8\u95E8\u81EA\u52A8\u653E\u5F00` : `Codex \u4FA7 gateUtil \u4F4E\u4E8E ${BUDGET_CONFIG.resumeBelow}% \u540E\u95F8\u95E8\u81EA\u52A8\u653E\u5F00`;
+  return `\u9884\u7B97\u6682\u505C\uFF08\u95F8\u95E8\u5173\u95ED\uFF09\uFF0C\u5DF2\u62D2\u7EDD\u8F6C\u53D1\uFF1A${reason}\u3002` + reopenText + (resumeAt ? `\uFF08\u9884\u8BA1\u6062\u590D ${resumeAt}\uFF0C\u4EE5\u5B9E\u6D4B\u4E3A\u51C6\uFF1B\u63D0\u524D\u5237\u65B0\u4F1A\u66F4\u65E9\u89E3\u9664\uFF09` : "") + `\u3002\u6536\u5230 RESUME \u901A\u77E5\u524D\u8BF7\u52FF\u91CD\u8BD5\u5411 Codex \u53D1\u9001 reply\uFF1B${sideHint}\u3002`;
 }
 var tuiConnectionState = new TuiConnectionState({
   disconnectGraceMs: TUI_DISCONNECT_GRACE_MS,
