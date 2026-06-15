@@ -311,16 +311,21 @@ depleted_at_epoch      : number   // 预计耗尽时刻（unix 秒）
 
 #### 新判据
 
+> **v3.2 refresh**：原稿这里的门槛是 `strategy="maximize"`，v3.2 删了策略选择 → 门槛改成「**双方都有 confident runway**」；否则回退现有 `driftFor`（warnUtil 差）。已上线的 `RunwayEstimate` 是 **`.seconds`**（burn-view `agentRunway`，§3.3）；换算成小时仅用于判据/展示，**不重算燃尽率**。
+
 ```ts
-// strategy="maximize" 且双方燃尽率 confident 时启用；否则回退现状 warnUtil 差
+// 双方都有 confident runway 时启用；否则回退现有 driftFor（warnUtil 差）。
 function allocationDrift(claude: RunwayEstimate, codex: RunwayEstimate, cfg): Drift {
-  const ratio = Math.min(claude.hours, codex.hours) / Math.max(claude.hours, codex.hours);
-  if (ratio >= cfg.allocation.minRunwayRatio /*默认 0.5*/ &&
-      Math.abs(claude.hours - codex.hours) < cfg.allocation.minRunwayGapHours /*默认 2*/) {
-    return { heavier: null, lighter: null };   // 足够均衡
+  const ch = claude.seconds / 3600, xh = codex.seconds / 3600;
+  const ratioPct = Math.round(100 * Math.min(ch, xh) / Math.max(ch, xh));  // 0..100，越低越不均衡
+  const gapHours = Math.abs(ch - xh);
+  // 只有「两者都不均衡」才发 drift（ratio 够低 且 gap 够大），否则 no-op——避免过敏感（Codex）。
+  if (ratioPct < cfg.allocation.minRunwayRatio /*默认 50（整数百分数）*/ &&
+      gapHours >= cfg.allocation.minRunwayGapHours /*默认 2*/) {
+    const shorter = ch < xh ? "claude" : "codex";
+    return { heavier: shorter, lighter: other(shorter) };  // runway 短的一侧是 heavier
   }
-  const shorter = claude.hours < codex.hours ? "claude" : "codex";
-  return { heavier: shorter, lighter: other(shorter) };  // runway 短的一侧是"heavier"
+  return { heavier: null, lighter: null };  // 足够均衡
 }
 ```
 
@@ -328,7 +333,9 @@ balance 指令文案同步改写：「Claude 按当前燃尽率约可再工作 ~
 
 #### 「烧不满」时的加速建议
 
-3.1(a) 检测到 `projectedAtReset ≤ targetUtil`（按当前速度到刷新点用不满，且未触发 REAL-4 hard cap，即真·return 100 路径）时，发 parallel 型指令的强化版：「按当前燃尽率周窗口刷新时只会用到 ~78%，距刷新还有 ~Xh —— 建议拆更多并行子任务/提高委派密度，否则约 19% 额度将作废」。现有 `parallelState`（`budget-state.ts:95-117`）保留为 conserve 模式的形态；maximize 模式下由这条 projected-underutilization 建议取代（指纹机制防刷屏照旧）。
+3.1(a) 检测到 will-not-fill（`projectedAtReset ≤ targetUtil`、未触发 REAL-4 hard cap，即 `dynamicPauseAt` 真·return 100 路径）时，发 underutilization 建议：「按当前燃尽率周窗口刷新时只会用到 ~78%，距刷新还有 ~Xh —— 建议拆更多并行子任务/提高委派密度，否则约 19% 额度将作废」。
+
+> **v3.2 refresh（Codex）**：① **旧 `parallelState` 退役** —— P4 后不再产生独立 `parallel` directive（它和 underutilization 是两套竞争的「加速」语义）；`BudgetSnapshot.parallelRecommended` 暂留为兼容字段/置 false，后续清理，避免强制同步改外部 status/schema 消费方。② 信号源**不能用 `effectiveDynamicLine`** —— 它过滤了 `line ≥ 100`，而 will-not-fill 恰恰是 `line=100`；需新增**结构化** helper（如 `dynamicWindowVerdict`，复用 `dynamicPauseAt` 逻辑返回 `{kind:"will-not-fill", projectedAtReset, ...}`）。
 
 两条护栏：① 加速/欠载类建议受 **per-account advice cooldown** 约束（默认同账号 30 分钟内不重复发同向建议，防多 pair 集体怂恿过度并行，见 R8 / SUSPECT-6）；② 5h 窗口也加一条**弱化版欠载提示**（Q3 共识），但**只做展示、不驱动分配** —— 5h 持续欠载是周欠载的先行指标，提示即可，不值得为它引入新的分配压力。
 
@@ -431,11 +438,26 @@ interface BudgetConfig {
 - **测试要点**：admission-closed 下新 turn 拒 / steer 放 / wrap-up 配额内放、超额拒；running turn 不被打断、完成后才发 directive；closed 优先于 admission-closed；5h 重置后秒级回 open；协议兼容（旧 bridge 不带 wrapUp 字段 → 默认 false）；weekly runway 下限触发 admission（RECOMMEND-7）；closed 态 system-initiated checkpoint baton（REAL-2：每窗口恰好 1 次、`turnPhase=idle` 前提、放行记日志、用过即拒）；wrap-up/baton 配额持久化跨 daemon 重启（Q9 共识，resetEpoch 跳变清零与 R6 抖动护栏共存）。
 - **风险**：中。涉及协议与注入口；wrap-up 配额防后门是验收重点。
 
-### P4 — 分配指令改剩余工作时间判据
+### P4 — 分配指令改剩余工作时间判据 — ❑ 待实施（v3.2 refreshed 2026-06-16）
 
-- **改动文件**：`src/budget/budget-state.ts`（`allocationDrift` + 烧不满加速建议 + 文案）；`src/budget/budget-fingerprint.ts`（balance 指纹兼容新判据）；`src/budget/render.ts`。
-- **测试要点**：runway 截断逻辑（timeToReset 截断后今日案例 Codex 不算「短」）；ratio/gap 双门槛；非 confident 回退 warnUtil 差；directive 防刷屏；underutilization 建议触发与消失。
-- **风险**：低-中。纯建议层（不碰闸门），文案与判据正确性为主。
+> **基线声明**：P4 一律以 **§0 v3.2 addendum** 为准 —— 唯一策略（时间感知动态线，无 conserve/maximize 选择）、`targetUtil=98`、外层 guard `BUDGET_HARD=99`、`pauseAt(90)`/`resumeBelow(30)` 已是「无 burn 数据兜底线」。§3.1/§4/§7-Q7 等存档段里的 `strategy/conserve/97/92` 是 v3.2 前原值，**不要据此实现**。
+
+- **目标**：把 balance 分配判据从「warnUtil 差」升级为「**剩余工作时间(runway)差**」（§3.4），兑现宗旨 3 跨套餐绝对量；并把「烧不满」检测改成 **underutilization 加速建议**。纯建议层。
+- **关键不变量**：
+  1. **绝不碰 v3.2 的 pause/resume/gate**（`budget-decision.ts` 不动）—— P4 只改 balance/parallel **建议**相位。
+  2. **双方都有 confident runway** 才用 `allocationDrift`（runway 差）；否则回退现有 `driftFor`（warnUtil 差）。
+  3. **消费已上线的 burn-view runway**（`agentRunway`→`RunwayEstimate.seconds`），**不自己重算燃尽率**（§3.3 契约）。
+  4. **旧 `parallelState` 退役**：不再产生独立 `parallel` directive；underutilization 建议取代之；`snapshot.parallelRecommended` 暂留兼容/置 false。
+  5. 5h 欠载**只展示弱提示、不驱动分配、不单独注入**（Q3）。
+  6. 所有 advice 只在 **gate open + decision-grade(fresh) + 非 rateLimited** 时发。
+- **实现约束（Codex，必须遵守，否则走偏）**：
+  1. **underutilization 信号源不能用 `effectiveDynamicLine`**（它滤掉 `line≥100`，而 will-not-fill 正是 `line=100`）→ 新增结构化 `dynamicWindowVerdict`（复用 `dynamicPauseAt`，返回 `{kind:"will-not-fill", projectedAtReset, ...}`）。
+  2. **import 防环**：`budget-state.ts` 直接 import burn-view 的 `agentRunway` 会成环（`burn-view.ts → budget-state` 已存在）。两条路任选其一：把 runway 由 **coordinator 算好后传入** `computeBudgetState`，或把 `burn-view.ts` 的 `isDecisionGrade` 改从 `budget-decision.ts` 直接 import（v3.2 已迁那里）打断环。
+  3. **directive fingerprint 不吃精确 runway 小数**（否则每 poll 都变）→ 指纹按 `advice-kind + side/basis + 粗粒度 bucket`，文案可显示精确值。
+  4. **per-account advice cooldown（R8）须账号级共享/持久化**（写盘，类似 pending），不能只靠单 coordinator 的内存 fingerprint —— 否则多 pair 仍会一起劝过度并行。
+- **改动文件**：`src/budget/budget-state.ts`（`allocationDrift` + `dynamicWindowVerdict` 消费 + underutilization 文案 + driftFor 回退）；`src/budget/budget-decision.ts`（`dynamicWindowVerdict` 结构化 helper）；`src/budget/budget-coordinator.ts`（传入 runway / cooldown 持久化）；`src/budget/budget-fingerprint.ts`（balance 指纹兼容）；`src/budget/render.ts`；`src/config-service.ts`（新增 `allocation.{minRunwayRatio=50, minRunwayGapHours=2}` 块 + 校验 + env）。
+- **验收**：① 今日案例（Codex util 高但近刷新 → runway 被 timeToReset 截断后**不算短**、不误判 heavier）；② ratio/gap 双门槛「两者都不均衡才发」；③ 非 confident → 退 `driftFor`；④ underutilization 走结构化 will-not-fill 信号、触发/消失正确；⑤ import 无环（typecheck/bundle 过）；⑥ 指纹防刷屏（runway 抖动不重发）；⑦ cooldown 跨 pair/重启生效；⑧ conserve 已无 → 不得新增任何 strategy 分支。
+- **风险**：低-中。纯建议层（不碰闸门），判据正确性 + 防环 + 防刷屏为主。
 
 依赖关系：P2/P3/P4 都依赖 P1 的燃尽率；P3 与 P2 **可并行开发、但必须按序合入**（分期修订②：P3 依赖 P2 的出闸/指纹语义稳定 —— admission 滞回、hard cap 信号映射、指纹聚合都建立在 P2 落定的语义之上，乱序合入会让回归无法定位）。
 
