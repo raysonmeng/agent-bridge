@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.16", "0.0.0-source"),
-  commit: defineString("52a49ef", "source"),
+  commit: defineString("2a906d2", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("e124596f4642", "source")
+  codeHash: defineString("b2a5ce6d71b3", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -3745,6 +3745,12 @@ function resumeBlockingEpoch(usage, cfg, now) {
     return matchingGateReset(usage);
   return 0;
 }
+function retryAfterMsForResume(resumeAfterEpoch, nowMs) {
+  if (resumeAfterEpoch === null)
+    return;
+  const remainingMs = resumeAfterEpoch * 1000 - nowMs;
+  return remainingMs > 0 ? remainingMs : undefined;
+}
 
 // src/budget/types.ts
 var STALE_MAX_AGE_SEC = 600;
@@ -4996,7 +5002,11 @@ function isDegradedUsage(usage, now = Math.floor(Date.now() / 1000)) {
   if (usage.stale || !usage.ok)
     return true;
   const hasFreshWindow = usage.fiveHour !== null && usage.fiveHour.resetEpoch > now || usage.weekly !== null && usage.weekly.resetEpoch > now;
-  return !hasFreshWindow;
+  if (!hasFreshWindow)
+    return true;
+  if (usage.fetchedAt > 0 && now - usage.fetchedAt > STALE_MAX_AGE_SEC)
+    return true;
+  return false;
 }
 
 class QuotaSource {
@@ -5280,6 +5290,16 @@ class ResumeInjectionQueue {
       }
       return;
     }
+    if (input.claim) {
+      const identity = input.claim.identity;
+      for (const existing of this.entries.values()) {
+        if (existing.claim && existing.claim.identity === identity) {
+          this.log(`resume injection identity-deduped: ${input.resumeId} ~ existing ${existing.resumeId} (identity ${identity})`);
+          existing.claim = input.claim;
+          return;
+        }
+      }
+    }
     this.entries.set(input.resumeId, {
       resumeId: input.resumeId,
       prompt: input.prompt ?? RESUME_PROMPT,
@@ -5314,12 +5334,11 @@ class ResumeInjectionQueue {
       for (const entry of [...this.entries.values()]) {
         if (entry.state === "awaiting_confirm") {
           this.supersedeAwaiting(entry, "turn_tracking_reset");
+          this.countRealAttemptOrAbandon(entry, "turn tracking reset before turn/start confirmation");
         } else if (entry.state === "pending") {
           this.clearRetryTimer(entry);
-        } else {
-          continue;
+          this.scheduleRetry(entry);
         }
-        this.countRealAttemptOrAbandon(entry, "turn tracking reset before turn/start confirmation");
       }
     } finally {
       this.resetSweepDepth--;
@@ -6753,7 +6772,7 @@ async function handleClaudeToCodex(ws, message) {
     const reason = budgetPauseGateError();
     log(`Injection rejected by budget pause gate`);
     const resumeAfterEpoch3 = budgetCoordinator?.getSnapshot()?.resumeAfterEpoch ?? null;
-    const retryAfterMs = resumeAfterEpoch3 !== null ? Math.max(0, resumeAfterEpoch3 * 1000 - Date.now()) : undefined;
+    const retryAfterMs = retryAfterMsForResume(resumeAfterEpoch3, Date.now());
     sendClaudeToCodexResult(ws, message.requestId, {
       success: false,
       code: "budget_paused",

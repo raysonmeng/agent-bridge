@@ -2,6 +2,7 @@ import { execFile } from "node:child_process";
 import { existsSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, join } from "node:path";
+import { STALE_MAX_AGE_SEC } from "./types";
 import type { AgentName, AgentUsage, BudgetWindow, ProbeParsedVia } from "./types";
 
 export interface ProbeRunOptions {
@@ -398,15 +399,23 @@ function withTimeout<T>(promise: Promise<T>, timeoutMs: number): Promise<T> {
 
 /**
  * Is this usage record degraded (usable for display, not for decisions)?
- * Freshness uses `resetEpoch > now` — the same standard as isDecisionGrade —
- * so an expired-window record cannot log a premature "recovered" transition.
+ * Freshness uses `resetEpoch > now` AND the `fetchedAt` staleness cutoff — the
+ * SAME two standards as isDecisionGrade — so an expired-window OR stale-cache
+ * record cannot log a premature "recovered" transition while the coordinator
+ * (which gates on isDecisionGrade) is still phantom-holding.
  */
 export function isDegradedUsage(usage: AgentUsage, now: number = Math.floor(Date.now() / 1000)): boolean {
   if (usage.stale || !usage.ok) return true;
   const hasFreshWindow =
     (usage.fiveHour !== null && usage.fiveHour.resetEpoch > now) ||
     (usage.weekly !== null && usage.weekly.resetEpoch > now);
-  return !hasFreshWindow;
+  if (!hasFreshWindow) return true;
+  // B5 fix: align with isDecisionGrade's fetchedAt cutoff. A record fetched
+  // longer than STALE_MAX_AGE_SEC ago is decision-stale even if a window is still
+  // in the future; without this, isDegradedUsage=false logged "recovered to
+  // fresh data" while isDecisionGrade=false kept the gate held.
+  if (usage.fetchedAt > 0 && now - usage.fetchedAt > STALE_MAX_AGE_SEC) return true;
+  return false;
 }
 
 export class QuotaSource {

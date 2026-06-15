@@ -118,6 +118,29 @@ export class ResumeInjectionQueue {
       }
       return;
     }
+    // B6 fix: identity-level dedup. The stale-claim TTL (tryClaimPendingResume)
+    // exists to recover a CRASHED owner, but it cannot tell a crashed owner from
+    // THIS live daemon's still-queued resume: after claimTtlSec a second recovery
+    // for the same pending unlinks the live claim file and re-grants the SAME
+    // identity under a NEW resumeId. claimPath/consumedPath derive solely from
+    // identity, so resume-1 and resume-2 point at the same on-disk files —
+    // enqueuing both would inject AND confirm the same checkpoint twice. Keep the
+    // existing entry and ADOPT the freshly-granted claim (its write is the current
+    // file on disk, with a fresh non-stale timestamp), dropping the old claim
+    // OBJECT without release(): release() unlinks the shared claim file the
+    // surviving entry still needs, and consume() must fire exactly once.
+    if (input.claim) {
+      const identity = input.claim.identity;
+      for (const existing of this.entries.values()) {
+        if (existing.claim && existing.claim.identity === identity) {
+          this.log(
+            `resume injection identity-deduped: ${input.resumeId} ~ existing ${existing.resumeId} (identity ${identity})`,
+          );
+          existing.claim = input.claim;
+          return;
+        }
+      }
+    }
     this.entries.set(input.resumeId, {
       resumeId: input.resumeId,
       prompt: input.prompt ?? RESUME_PROMPT,
@@ -169,13 +192,23 @@ export class ResumeInjectionQueue {
     try {
       for (const entry of [...this.entries.values()]) {
         if (entry.state === "awaiting_confirm") {
+          // A real injection was in flight (turn/start sent, awaiting confirm);
+          // the reset tore it down → count it as a real failed attempt (which
+          // re-arms retry, or abandons at maxAttempts).
           this.supersedeAwaiting(entry, "turn_tracking_reset");
+          this.countRealAttemptOrAbandon(entry, "turn tracking reset before turn/start confirmation");
         } else if (entry.state === "pending") {
+          // B3 fix: a `pending` entry has NO injection in flight — it is either
+          // soft-deferred (inject() returned null: no TUI/no WS, which by design
+          // does NOT count an attempt) or waiting between retries (its attempt was
+          // already counted when it left awaiting_confirm). Counting an attempt
+          // here violated the soft-defer contract: repeated app-server
+          // reconnects (each fires onTurnTrackingReset) burned maxAttempts and
+          // abandoned a resume that never actually injected. Just re-arm the
+          // retry timer so it still advances after the reset.
           this.clearRetryTimer(entry);
-        } else {
-          continue;
+          this.scheduleRetry(entry);
         }
-        this.countRealAttemptOrAbandon(entry, "turn tracking reset before turn/start confirmation");
       }
     } finally {
       this.resetSweepDepth--;

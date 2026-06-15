@@ -283,7 +283,14 @@ describe("ResumeInjectionQueue", () => {
     expect(queue.get("rid-reset")).toBeUndefined();
   });
 
-  test("turn tracking reset bounds pending retry entries and releases their claim", () => {
+  test("B3: turn tracking reset does NOT burn attempts on a soft-deferred pending entry", () => {
+    // Regression for B3: a `pending` entry whose inject() keeps returning null
+    // (no TUI / no WS) is soft-deferred and by contract does NOT count attempts.
+    // The OLD code called countRealAttemptOrAbandon for pending entries on every
+    // onTurnTrackingReset, so repeated app-server reconnects (each fires a reset)
+    // burned maxAttempts and abandoned a resume that NEVER actually injected,
+    // permanently dropping it (the coordinator had already emitted the recovered
+    // side, so it would not re-enqueue until the next budget transition).
     const scheduler = new FakeScheduler();
     const released: string[] = [];
     const abandoned: string[] = [];
@@ -291,12 +298,12 @@ describe("ResumeInjectionQueue", () => {
     const queue = new ResumeInjectionQueue({
       inject: () => {
         injectCalls += 1;
-        return null;
+        return null; // soft-defer: transport not ready
       },
       scheduler,
       retryMs: 5_000,
       confirmTimeoutMs: 60_000,
-      maxAttempts: 1,
+      maxAttempts: 5,
       onAbandoned: (event) => abandoned.push(event.resumeId),
     });
 
@@ -314,13 +321,96 @@ describe("ResumeInjectionQueue", () => {
     expect(queue.get("rid-pending-reset")?.state).toBe("pending");
     expect(scheduler.activeCount()).toBe(1);
 
+    // Six resets — well past maxAttempts(5). The OLD code abandoned on the 5th.
+    for (let i = 0; i < 6; i++) queue.onTurnTrackingReset();
+
+    expect(abandoned).toEqual([]); // never abandoned — no real injection happened
+    expect(released).toEqual([]); // claim NOT released
+    expect(queue.get("rid-pending-reset")?.state).toBe("pending"); // still queued
+    expect(queue.get("rid-pending-reset")?.attempts).toBe(0); // attempts untouched
+    expect(scheduler.activeCount()).toBe(1); // retry timer re-armed each sweep
+    expect(injectCalls).toBe(1); // only the original enqueue injection probe
+  });
+
+  test("turn tracking reset DOES count + abandon an awaiting_confirm entry (real in-flight attempt)", () => {
+    // Contrast with the B3 case: an entry that actually injected (awaiting_confirm)
+    // and is torn down by a reset DID make a real attempt, so it counts and (at
+    // maxAttempts=1) abandons + releases its claim.
+    const scheduler = new FakeScheduler();
+    const released: string[] = [];
+    const abandoned: string[] = [];
+    const queue = new ResumeInjectionQueue({
+      inject: () => -42, // real injection accepted → awaiting_confirm
+      scheduler,
+      retryMs: 5_000,
+      confirmTimeoutMs: 60_000,
+      maxAttempts: 1,
+      onAbandoned: (event) => abandoned.push(event.resumeId),
+    });
+
+    queue.enqueue({
+      resumeId: "rid-awaiting-reset",
+      prompt: "resume",
+      claim: {
+        identity: "claim-awaiting-reset",
+        claimPath: "/tmp/claim-awaiting-reset.json",
+        consumedPath: "/tmp/consumed-awaiting-reset.json",
+        consume: () => {},
+        release: () => released.push("claim-awaiting-reset"),
+      },
+    });
+    expect(queue.get("rid-awaiting-reset")?.state).toBe("awaiting_confirm");
+
     queue.onTurnTrackingReset();
 
-    expect(abandoned).toEqual(["rid-pending-reset"]);
-    expect(released).toEqual(["claim-pending-reset"]);
-    expect(queue.get("rid-pending-reset")).toBeUndefined();
-    expect(scheduler.activeCount()).toBe(0);
-    expect(injectCalls).toBe(1);
+    expect(abandoned).toEqual(["rid-awaiting-reset"]);
+    expect(released).toEqual(["claim-awaiting-reset"]);
+    expect(queue.get("rid-awaiting-reset")).toBeUndefined();
+  });
+
+  test("B6: identity-dedup prevents the same pending from being queued (and confirmed) twice", () => {
+    // Regression for B6: the stale-claim TTL can re-grant the SAME pending
+    // identity under a NEW resumeId while the original is still queued (live
+    // daemon, soft-deferred). claimPath/consumedPath derive solely from identity,
+    // so both entries would inject AND confirm the same checkpoint twice. enqueue
+    // must dedup by claim.identity, adopt the freshly-granted claim, and drop the
+    // old claim OBJECT without release() (release would unlink the shared file).
+    const scheduler = new FakeScheduler();
+    const consumed: string[] = [];
+    const released: string[] = [];
+    let injectId = 0;
+    const queue = new ResumeInjectionQueue({
+      inject: () => {
+        injectId += 1;
+        return -300 - injectId;
+      },
+      scheduler,
+      retryMs: 5_000,
+      confirmTimeoutMs: 60_000,
+      maxAttempts: 5,
+    });
+    const mkClaim = (tag: string) => ({
+      identity: "same-identity", // SAME identity, distinct claim objects
+      claimPath: "/tmp/claims/same-identity.json",
+      consumedPath: "/tmp/consumed/same-identity.json",
+      consume: () => consumed.push(tag),
+      release: () => released.push(tag),
+    });
+
+    queue.enqueue({ resumeId: "resume-1", prompt: "r", claim: mkClaim("claim-1") });
+    expect(queue.size).toBe(1);
+    expect(queue.get("resume-1")?.state).toBe("awaiting_confirm");
+
+    // TTL reclaim: same identity, new resumeId.
+    queue.enqueue({ resumeId: "resume-2", prompt: "r", claim: mkClaim("claim-2") });
+    expect(queue.size).toBe(1); // resume-2 NOT added
+    expect(queue.get("resume-2")).toBeUndefined();
+    expect(released).toEqual([]); // dropped old claim object WITHOUT release (shared file)
+
+    // Confirm the single surviving entry → exactly ONE consume, on the adopted
+    // (fresh) claim — not two confirmations of the same checkpoint.
+    queue.onBridgeTurnStarted({ resumeId: "resume-1", requestId: -301, turnId: "t1" });
+    expect(consumed).toEqual(["claim-2"]);
   });
 
   test("serializes different resumeIds; second waits until first DRAINS, not when it confirms (Option B)", () => {
@@ -377,7 +467,7 @@ describe("ResumeInjectionQueue", () => {
       scheduler,
       retryMs: 5_000,
       confirmTimeoutMs: 60_000,
-      maxAttempts: 1, // so the reset abandons the swept entries
+      maxAttempts: 1, // so the reset abandons the awaiting_confirm entry (real attempt)
       onAbandoned: (event) => abandoned.push(event.resumeId),
     });
 
@@ -391,8 +481,12 @@ describe("ResumeInjectionQueue", () => {
     queue.onTurnTrackingReset();
 
     expect(injected).toEqual(["a"]); // rid-sweep-b never injected during the sweep
-    expect(abandoned.sort()).toEqual(["rid-sweep-a", "rid-sweep-b"]);
-    expect(queue.size).toBe(0);
+    // rid-sweep-a (awaiting_confirm) made a real attempt → counted → abandoned at
+    // maxAttempts=1. rid-sweep-b (pending, never injected) is NOT abandoned by the
+    // reset (B3 fix); it survives with a re-armed retry timer to advance later.
+    expect(abandoned).toEqual(["rid-sweep-a"]);
+    expect(queue.size).toBe(1);
+    expect(queue.get("rid-sweep-b")?.state).toBe("pending");
   });
 
   test("Option B: after an abort/reset the surviving pending advances via its retry timer (no stall)", () => {
