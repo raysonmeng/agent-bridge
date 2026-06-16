@@ -391,7 +391,7 @@ describe("ConfigService — budget section", () => {
         balanced: { effort: "medium" },
         eco: { effort: "low" },
       },
-      maximize: { targetUtil: 98, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
+      maximize: { targetUtil: 98, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5, admissionAt: 85, wrapUpQuota: 2 },
       allocation: { minRunwayRatio: 50, minRunwayGapHours: 2 },
     });
   });
@@ -445,7 +445,7 @@ describe("ConfigService — budget section", () => {
         eco: { effort: "minimal" },
       },
       // v3 P1 keys absent in the raw file normalize to defaults.
-      maximize: { targetUtil: 98, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
+      maximize: { targetUtil: 98, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5, admissionAt: 85, wrapUpQuota: 2 },
       allocation: { minRunwayRatio: 50, minRunwayGapHours: 2 },
     });
   });
@@ -608,7 +608,7 @@ describe("applyBudgetEnvOverrides", () => {
       balanced: { effort: "medium" },
       eco: { effort: "low" },
     },
-    maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
+    maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5, admissionAt: 85, wrapUpQuota: 2 },
     allocation: { minRunwayRatio: 50, minRunwayGapHours: 2 },
   };
 
@@ -664,7 +664,7 @@ describe("applyBudgetEnvOverrides — boolean spellings", () => {
       balanced: { effort: "medium" },
       eco: { effort: "low" },
     },
-    maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
+    maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5, admissionAt: 85, wrapUpQuota: 2 },
     allocation: { minRunwayRatio: 50, minRunwayGapHours: 2 },
   };
 
@@ -760,7 +760,7 @@ describe("applyBudgetEnvOverrides — v3 P1 keys", () => {
       balanced: { effort: "medium" },
       eco: { effort: "low" },
     },
-    maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
+    maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5, admissionAt: 85, wrapUpQuota: 2 },
     allocation: { minRunwayRatio: 50, minRunwayGapHours: 2 },
   };
 
@@ -815,7 +815,41 @@ describe("normalizeBudgetConfig — v3 P2 maximize block", () => {
       reserveMaxPct: 10,
       finishingHorizonMinutes: 45,
       resumeHysteresisPct: 8,
+      admissionAt: 85,
+      wrapUpQuota: 2,
     });
+  });
+
+  test("valid custom admissionAt / wrapUpQuota pass through", () => {
+    writeRawConfig({
+      budget: { maximize: { admissionAt: 80, wrapUpQuota: 3 } },
+    });
+    const m = loadBudget().maximize;
+    expect(m.admissionAt).toBe(80);
+    expect(m.wrapUpQuota).toBe(3);
+  });
+
+  test("out-of-range admissionAt / wrapUpQuota fall back per field", () => {
+    writeRawConfig({
+      budget: { maximize: { admissionAt: 30, wrapUpQuota: 99 } }, // 30 < 50, 99 > 10
+    });
+    const m = loadBudget().maximize;
+    expect(m.admissionAt).toBe(85);
+    expect(m.wrapUpQuota).toBe(2);
+  });
+
+  test("admissionAt >= targetUtil resets the WHOLE maximize block to defaults", () => {
+    writeRawConfig({
+      budget: { maximize: { targetUtil: 96, admissionAt: 96 } }, // 96 >= 96 → unsatisfiable
+    });
+    expect(loadBudget().maximize).toEqual(DEFAULT_CONFIG.budget.maximize);
+  });
+
+  test("garbage admissionAt fails loud as corrupt (not silent default)", () => {
+    writeRawConfig({ budget: { maximize: { admissionAt: "eighty-five" } } });
+    const result = new ConfigService(tempDir).load();
+    expect(result.state).toBe("corrupt");
+    if (result.state === "corrupt") expect(result.reason).toContain("budget.maximize.admissionAt");
   });
 
   test("out-of-range fields fall back per field (others preserved)", () => {
@@ -853,6 +887,29 @@ describe("normalizeBudgetConfig — v3 P2 maximize block", () => {
     expect(overridden.maximize.targetUtil).toBe(96);
     expect(overridden.maximize.reserveSlopePctPerHour).toBe(0.9);
     expect(overridden.maximize.finishingHorizonMinutes).toBe(60);
+  });
+
+  test("env overrides land on the P3 admission keys", () => {
+    const overridden = applyBudgetEnvOverrides(DEFAULT_CONFIG.budget, {
+      AGENTBRIDGE_BUDGET_ADMISSION_AT: "80",
+      AGENTBRIDGE_BUDGET_WRAP_UP_QUOTA: "4",
+    });
+    expect(overridden.maximize.admissionAt).toBe(80);
+    expect(overridden.maximize.wrapUpQuota).toBe(4);
+  });
+
+  test("out-of-range admission env values are ignored (normalize bounds apply)", () => {
+    const overridden = applyBudgetEnvOverrides(DEFAULT_CONFIG.budget, {
+      AGENTBRIDGE_BUDGET_ADMISSION_AT: "30", // < 50 → fallback 85
+      AGENTBRIDGE_BUDGET_WRAP_UP_QUOTA: "99", // > 10 → fallback 2
+    });
+    expect(overridden.maximize.admissionAt).toBe(85);
+    expect(overridden.maximize.wrapUpQuota).toBe(2);
+  });
+
+  test("fractional wrapUpQuota is floored to an integer", () => {
+    writeRawConfig({ budget: { maximize: { wrapUpQuota: 1.9 } } });
+    expect(loadBudget().maximize.wrapUpQuota).toBe(1);
   });
 
   test("describeConfig reports custom values when maximize is tuned", () => {

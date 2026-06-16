@@ -21,6 +21,8 @@ const CONFIG: BudgetConfig = {
     reserveMaxPct: 7,
     finishingHorizonMinutes: 30,
     resumeHysteresisPct: 5,
+    admissionAt: 85,
+    wrapUpQuota: 2,
   },
   allocation: { minRunwayRatio: 50, minRunwayGapHours: 2 },
 };

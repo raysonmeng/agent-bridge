@@ -429,3 +429,149 @@ export function resumeBlockingEpochFor(usage: AgentUsage | null, cfg: BudgetConf
   if (blockingResets.length === 0) return 0;
   return Math.min(...blockingResets);
 }
+
+// ---------------------------------------------------------------------------
+// v3 P3 (§3.2): admission-gate predicates (three-state finishing protection).
+//
+// Parallel to agentShouldPause / agentCanResume, but for the WIDER, EARLIER
+// `admission-closed` state: it rejects NEW turns at `admissionAt` (default 85),
+// while the pause/`closed` gate only trips at the dynamic line (~95). These are
+// PURE decision functions; the coordinator's fingerprint applies STATE-level
+// hysteresis (phantom-hold included) on top. The per-predicate hysteresis here
+// (resumeHysteresisPct on util; the 2×/3× runway enter/exit band) prevents flap
+// at the thresholds. `closed` > `admission-closed` precedence is resolved by the
+// GATE (coordinator/daemon), never here.
+// ---------------------------------------------------------------------------
+
+/**
+ * Weekly-runway guard multipliers (RECOMMEND-7). Admission CLOSES when the weekly
+ * window will fill before reset AND its depletion runway is under
+ * finishingHorizon×ENTER; it RE-OPENS only once the runway recovers above
+ * finishingHorizon×EXIT — the one-horizon gap is hysteresis so probe jitter at
+ * the floor cannot flap the gate.
+ */
+const ADMISSION_WEEKLY_RUNWAY_ENTER_MULT = 2;
+const ADMISSION_WEEKLY_RUNWAY_EXIT_MULT = 3;
+
+function weeklyRunwayFloorSec(cfg: BudgetConfig, mult: number): number {
+  return cfg.maximize.finishingHorizonMinutes * 60 * mult;
+}
+
+/**
+ * True when the weekly window is genuinely at depletion risk within `floorSec`:
+ * it will FILL before reset (a `will-fill` verdict — not merely reset-truncated)
+ * and its guard runway is under the floor. Returns false for degraded /
+ * will-not-fill / admission-closed verdicts: admission-closed is handled by the
+ * hard-cap branch, and will-not-fill / degraded are not depletion signals. Using
+ * the verdict (not raw `runwaySeconds`) avoids false-triggering near a weekly
+ * RESET, where the guard truncates runway at the reset rather than at depletion.
+ */
+function weeklyRunwayShort(usage: AgentUsage, cfg: BudgetConfig, now: number, floorSec: number): boolean {
+  const weekly = usage.weekly;
+  if (!weekly || weekly.resetEpoch <= now) return false;
+  if (dynamicWindowVerdict(weekly, cfg, now).kind !== "will-fill") return false;
+  const runway = weekly.runwaySeconds;
+  if (typeof runway !== "number" || !Number.isFinite(runway)) return false;
+  return runway < floorSec;
+}
+
+/** First fresh window (stable order) whose §3.1 hard cap fires; null when none. */
+function hardCapWindow(usage: AgentUsage, cfg: BudgetConfig, now: number): BudgetWindowKey | null {
+  for (const { key, window } of freshWindows(usage, now)) {
+    const rate = confidentRate(window);
+    if (rate === null) continue;
+    if (dynamicPauseAt(window, rate, cfg, now) === "admission-closed") return key;
+  }
+  return null;
+}
+
+/** Structured admission-entry decision for one agent (parallel to AgentPauseDecision). */
+export interface AgentAdmissionDecision {
+  /** Should this agent's gate enter admission-closed this poll. */
+  admitClose: boolean;
+  /** Window/condition that tripped (for reason + fingerprint); null when open. */
+  window: BudgetWindowKey | null;
+  /** Human-readable Chinese reason; empty string when not admission-closed. */
+  reason: string;
+}
+
+const NO_ADMIT_CLOSE: AgentAdmissionDecision = { admitClose: false, window: null, reason: "" };
+
+/**
+ * Decide whether an agent's admission gate should CLOSE (reject new turns, allow
+ * wrap-up). Three independent triggers (design §3.2), first match wins the
+ * reason: (1) 5h util ≥ admissionAt — the primary, rate-free finishing line;
+ * (2) a §3.1 hard cap fires on any fresh window (REAL-4); (3) the weekly window
+ * is at depletion risk within finishingHorizon×2 (RECOMMEND-7). Non-decision-grade
+ * data never closes here (I2); the asymmetric "stale never OPENS an already-closed
+ * window" lives in the fingerprint phantom-hold, not here.
+ */
+export function agentShouldAdmitClose(
+  agent: AgentName,
+  usage: AgentUsage | null,
+  cfg: BudgetConfig,
+  now: number,
+): AgentAdmissionDecision {
+  if (!usage) return NO_ADMIT_CLOSE;
+  if (!isDecisionGrade(usage, now)) return NO_ADMIT_CLOSE;
+
+  // (1) 5h util ≥ admissionAt — primary, rate-free.
+  const fiveHour = usage.fiveHour;
+  if (fiveHour && fiveHour.resetEpoch > now && fiveHour.util >= cfg.maximize.admissionAt) {
+    return {
+      admitClose: true,
+      window: "fiveHour",
+      reason: `${AGENT_LABEL[agent]} 5h窗口 util ${pct(fiveHour.util)} ≥ admissionAt ${pct(cfg.maximize.admissionAt)}（收尾保护：拒新任务、放收尾）`,
+    };
+  }
+
+  // (2) §3.1 hard cap on any fresh window (REAL-4).
+  const hard = hardCapWindow(usage, cfg, now);
+  if (hard !== null) {
+    return {
+      admitClose: true,
+      window: hard,
+      reason: `${AGENT_LABEL[agent]} ${WINDOW_LABEL[hard]}窗口触发收尾保护硬线（util 已达 targetUtil 或临近重置收尾带）`,
+    };
+  }
+
+  // (3) weekly window at depletion risk within finishingHorizon×2 (RECOMMEND-7).
+  if (weeklyRunwayShort(usage, cfg, now, weeklyRunwayFloorSec(cfg, ADMISSION_WEEKLY_RUNWAY_ENTER_MULT))) {
+    return {
+      admitClose: true,
+      window: "weekly",
+      reason: `${AGENT_LABEL[agent]} 周窗口 runway 低于 ${ADMISSION_WEEKLY_RUNWAY_ENTER_MULT}×收尾视野（防新长任务撞穿周额度）`,
+    };
+  }
+
+  return NO_ADMIT_CLOSE;
+}
+
+/**
+ * Decide whether an agent's admission gate may RE-OPEN — symmetric to
+ * agentShouldAdmitClose with hysteresis: every trigger must have receded — 5h
+ * util < admissionAt − resumeHysteresisPct, no hard cap firing on any fresh
+ * window, and the weekly runway recovered above finishingHorizon×EXIT (> the
+ * ENTER floor → a one-horizon hold band). A window that has already RESET drops
+ * out of freshWindows (the "window reset → open" path). Non-decision-grade data
+ * never opens (I2: missing/stale data must not release a closed gate).
+ */
+export function agentCanAdmitOpen(usage: AgentUsage | null, cfg: BudgetConfig, now: number): boolean {
+  if (!isDecisionGrade(usage, now)) return false;
+  // A live rate-limit means the provider is throttling probes — do not RELEASE a
+  // protective gate on it (parity with agentCanResume; the stale-flag hold beyond
+  // this is the fingerprint phantom-hold's job in the coordinator layer).
+  if (usage!.rateLimitedUntil > now) return false;
+
+  // (1) 5h util must recede below the hysteresis-relaxed admission line.
+  const fiveHour = usage!.fiveHour;
+  if (fiveHour && fiveHour.resetEpoch > now) {
+    if (fiveHour.util >= cfg.maximize.admissionAt - cfg.maximize.resumeHysteresisPct) return false;
+  }
+  // (2) no §3.1 hard cap may still be firing on any fresh window.
+  if (hardCapWindow(usage!, cfg, now) !== null) return false;
+  // (3) weekly runway must have recovered above the EXIT floor (> ENTER → hysteresis).
+  if (weeklyRunwayShort(usage!, cfg, now, weeklyRunwayFloorSec(cfg, ADMISSION_WEEKLY_RUNWAY_EXIT_MULT))) return false;
+
+  return true;
+}

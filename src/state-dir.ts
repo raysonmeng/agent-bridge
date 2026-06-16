@@ -119,6 +119,16 @@ export class StateDirResolver {
   }
 
   /**
+   * v3 P3 (§3.2): per-5h-window admission-gate quota — wrap-up turn count and
+   * checkpoint-baton flag, keyed to the current 5h reset epoch so a window change
+   * zeroes them. Persisted here (the daemon's own state dir, not the guard's) so
+   * the counts survive a daemon restart within a window but never across one.
+   */
+  get admissionQuotaFile(): string {
+    return join(this.stateDir, "admission-quota.json");
+  }
+
+  /**
    * Cache for the update-notifier: `{ lastCheckMs, latest }`. Machine/user-global
    * (not per-project) so the daily npm check runs once per machine, not once per
    * project — see src/update-notifier.ts.

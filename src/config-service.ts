@@ -51,6 +51,11 @@ const DEFAULT_BUDGET_CONFIG: BudgetConfig = {
     reserveMaxPct: 7,
     finishingHorizonMinutes: 30,
     resumeHysteresisPct: 5,
+    // v3 P3 (§3.2): admission gate. admissionAt is the 5h-util finishing line
+    // (well below targetUtil so new tasks stop before the pace line); wrapUpQuota
+    // bounds the wrap-up turns let through per 5h window.
+    admissionAt: 85,
+    wrapUpQuota: 2,
   },
   // v3 P4 (§3.4): runway-difference balance double gate. A balance directive
   // fires only when the shorter/longer runway ratio is below minRunwayRatio AND
@@ -197,6 +202,8 @@ function findShapeViolation(raw: Record<string, unknown>): string | null {
         "reserveMaxPct",
         "finishingHorizonMinutes",
         "resumeHysteresisPct",
+        "admissionAt",
+        "wrapUpQuota",
       ] as const) {
         if (key in maximize && !isCoercibleNumber(maximize[key])) {
           return `budget.maximize.${key} is present but not a number`;
@@ -250,6 +257,10 @@ function hasCustomDecisionValues(config: AgentBridgeConfig): boolean {
     b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct ||
     b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes ||
     b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct ||
+    // v3 P3: admission gate parameters are decision-grade (they gate new-turn
+    // admission), so a tuned value should report as "custom values in effect".
+    b.maximize.admissionAt !== db.maximize.admissionAt ||
+    b.maximize.wrapUpQuota !== db.maximize.wrapUpQuota ||
     // v3 P4: allocation thresholds are decision-grade (they gate the balance
     // directive), so a tuned value should report as "custom values in effect".
     b.allocation.minRunwayRatio !== db.allocation.minRunwayRatio ||
@@ -306,11 +317,13 @@ export function normalizeBoundedNumber(
 
 /**
  * Normalize the v3 maximize parameter block. Each field is bounds-checked
- * (out-of-range → fallback). The relation constraint `targetUtil > pauseAt`
- * (§4.1) is unsatisfiable otherwise — the dynamic line floor is pauseAt, so a
- * target at/below it leaves no maximize band — so the WHOLE block resets to
- * defaults when violated. Silent reset mirrors the existing pauseAt<=resumeBelow
- * handling in normalizeBudgetConfig (both keep normalize pure / logger-free).
+ * (out-of-range → fallback). Two relation constraints reset the WHOLE block to
+ * defaults when violated (§4.1): `targetUtil > pauseAt` (the dynamic line floor
+ * is pauseAt, so a target at/below it leaves no maximize band) and `admissionAt
+ * < targetUtil` (P3 §3.2 — admission must fire BEFORE the pace target, else the
+ * finishing gate is degenerate). Silent reset mirrors the existing
+ * pauseAt<=resumeBelow handling in normalizeBudgetConfig (both keep normalize
+ * pure / logger-free).
  */
 function normalizeMaximizeConfig(
   raw: unknown,
@@ -339,11 +352,16 @@ function normalizeMaximizeConfig(
       1,
       30,
     ),
+    admissionAt: normalizeBoundedInteger(m.admissionAt, fallback.admissionAt, 50, 99),
+    // wrapUpQuota is a turn COUNT — floor a fractional input (normalizeBoundedInteger
+    // accepts "1.5"); a non-integer cap would let consumeWrapUp admit ceil(quota) turns.
+    wrapUpQuota: Math.floor(normalizeBoundedInteger(m.wrapUpQuota, fallback.wrapUpQuota, 0, 10)),
   };
-  // Unsatisfiable relation → reset the whole block to the package defaults so a
+  // Unsatisfiable relations → reset the whole block to the package defaults so a
   // typo cannot silently produce a maximize line that never pauses (or one that
-  // collapses onto pauseAt for the wrong reason).
-  if (normalized.targetUtil <= pauseAt) {
+  // collapses onto pauseAt for the wrong reason), nor an admission line at/above
+  // the pace target (which would never fire its finishing protection in time).
+  if (normalized.targetUtil <= pauseAt || normalized.admissionAt >= normalized.targetUtil) {
     return { ...DEFAULT_BUDGET_CONFIG.maximize };
   }
   return normalized;
@@ -499,6 +517,8 @@ export function applyBudgetEnvOverrides(
         env.AGENTBRIDGE_BUDGET_FINISHING_HORIZON_MINUTES ?? budget.maximize.finishingHorizonMinutes,
       resumeHysteresisPct:
         env.AGENTBRIDGE_BUDGET_RESUME_HYSTERESIS_PCT ?? budget.maximize.resumeHysteresisPct,
+      admissionAt: env.AGENTBRIDGE_BUDGET_ADMISSION_AT ?? budget.maximize.admissionAt,
+      wrapUpQuota: env.AGENTBRIDGE_BUDGET_WRAP_UP_QUOTA ?? budget.maximize.wrapUpQuota,
     },
     allocation: {
       minRunwayRatio:
