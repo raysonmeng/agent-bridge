@@ -12,6 +12,8 @@
  */
 import { describe, expect, test } from "bun:test";
 import { agentCanAdmitOpen, agentShouldAdmitClose } from "../budget/budget-decision";
+import { classifyAdmission, INITIAL_ADMISSION_STATE } from "../budget/budget-fingerprint";
+import { computeBudgetState } from "../budget/budget-state";
 import type { AgentUsage, BudgetConfig, BudgetWindow } from "../budget/types";
 
 const NOW = 1_000_000;
@@ -218,5 +220,87 @@ describe("agentCanAdmitOpen — open with hysteresis", () => {
     const u = usage({ fiveHour: win(70, 3) });
     u.rateLimitedUntil = NOW + 600;
     expect(agentCanAdmitOpen(u, CFG, NOW)).toBe(false);
+  });
+});
+
+describe("classifyAdmission — admission lane reducer (v3 P3 M2)", () => {
+  function stateFor(claudeU: AgentUsage | null, codexU: AgentUsage | null) {
+    return computeBudgetState(claudeU, codexU, CFG, NOW);
+  }
+
+  test("enters admission-closed for codex when 5h util >= admissionAt", () => {
+    const state = stateFor(null, usage({ fiveHour: win(86, 3) }));
+    const r = classifyAdmission(INITIAL_ADMISSION_STATE, state, CFG);
+    expect(r.next.side).toBe("codex");
+    expect(r.effect.kind).toBe("enter");
+    if (r.effect.kind === "enter") expect(r.effect.emit).toBe(true);
+  });
+
+  test("does NOT re-emit on an identical follow-up poll (fingerprint dedup)", () => {
+    const state = stateFor(null, usage({ fiveHour: win(86, 3) }));
+    const r1 = classifyAdmission(INITIAL_ADMISSION_STATE, state, CFG);
+    const r2 = classifyAdmission(r1.next, state, CFG);
+    expect(r2.next.side).toBe("codex");
+    expect(r2.effect.kind).toBe("enter");
+    if (r2.effect.kind === "enter") expect(r2.effect.emit).toBe(false);
+  });
+
+  test("exits when util recedes below admissionAt - resumeHysteresisPct", () => {
+    const entered = classifyAdmission(INITIAL_ADMISSION_STATE, stateFor(null, usage({ fiveHour: win(86, 3) })), CFG);
+    const r = classifyAdmission(entered.next, stateFor(null, usage({ fiveHour: win(79, 3) })), CFG); // < 85-5=80
+    expect(r.next.side).toBe(null);
+    expect(r.effect.kind).toBe("exit");
+  });
+
+  test("phantom-hold: a non-decision-grade probe HOLDS the closed side (I2)", () => {
+    const entered = classifyAdmission(INITIAL_ADMISSION_STATE, stateFor(null, usage({ fiveHour: win(86, 3) })), CFG);
+    const stale = stateFor(null, usage({ fiveHour: win(50, 3), fetchedAt: NOW - 10_000 }));
+    const r = classifyAdmission(entered.next, stale, CFG);
+    expect(r.next.side).toBe("codex"); // held closed, NOT opened on stale data
+    expect(r.effect.kind).toBe("hold-uncertain");
+  });
+
+  test("both sides 5h util >= admissionAt → side 'both'", () => {
+    const state = stateFor(usage({ fiveHour: win(90, 3) }), usage({ fiveHour: win(90, 3) }));
+    expect(classifyAdmission(INITIAL_ADMISSION_STATE, state, CFG).next.side).toBe("both");
+  });
+
+  test("open stays open / 'none' when nothing trips", () => {
+    const r = classifyAdmission(INITIAL_ADMISSION_STATE, stateFor(null, usage({ fiveHour: win(50, 3) })), CFG);
+    expect(r.next.side).toBe(null);
+    expect(r.effect.kind).toBe("none");
+  });
+});
+
+describe("classifyAdmission — M2 round-1 fixes", () => {
+  function stateFor2(claudeU: AgentUsage | null, codexU: AgentUsage | null) {
+    return computeBudgetState(claudeU, codexU, CFG, NOW);
+  }
+
+  test("a rate-limit-held admission side reports the 限流 reason, not the hysteresis-band reason", () => {
+    const r1 = classifyAdmission(INITIAL_ADMISSION_STATE, stateFor2(null, usage({ fiveHour: win(86, 3) })), CFG);
+    expect(r1.next.side).toBe("codex");
+    // util dropped below admissionAt − hysteresis BUT rate-limited → held closed.
+    const rl = usage({ fiveHour: win(70, 3) });
+    rl.rateLimitedUntil = NOW + 600;
+    const r2 = classifyAdmission(r1.next, stateFor2(null, rl), CFG);
+    expect(r2.next.side).toBe("codex"); // held
+    expect(r2.next.reason).toContain("限流");
+    expect(r2.next.reason).not.toContain("出闸滞回带");
+  });
+
+  test("dedup keys on the gate-explaining window: a weekly-trigger close survives a 5h reset (no re-emit)", () => {
+    // weekly hard cap (util 98, rate 0 → admission-closed) AND weekly is the
+    // gateUtil winner (98 > 5h 50) → matchingGateReset → weekly reset.
+    const close1 = usage({ fiveHour: win(50, 1, { rate: 1, confident: true }), weekly: win(98, 5, { rate: 0, confident: true }) });
+    const r1 = classifyAdmission(INITIAL_ADMISSION_STATE, stateFor2(null, close1), CFG);
+    expect(r1.next.side).toBe("codex");
+    // 5h window RESET to a new epoch (util dropped) but weekly unchanged → the
+    // gate-explaining (weekly) reset is stable → fingerprint stable → no re-emit.
+    const close2 = usage({ fiveHour: win(10, 4, { rate: 1, confident: true }), weekly: win(98, 5, { rate: 0, confident: true }) });
+    const r2 = classifyAdmission(r1.next, stateFor2(null, close2), CFG);
+    expect(r2.next.side).toBe("codex");
+    expect(r2.effect.kind).toBe("enter");
+    if (r2.effect.kind === "enter") expect(r2.effect.emit).toBe(false);
   });
 });

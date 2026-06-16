@@ -278,6 +278,13 @@ export interface BudgetSnapshot {
    * is exhausted ({codex} or {claude,codex}); false for Claude-only handoff.
    */
   gateClosed: boolean;
+  /**
+   * v3 P3 (§3.2): the three-state daemon gate (`open` | `admission-closed` |
+   * `closed`). Optional for backward-compatible deserialization of legacy daemon
+   * snapshots (absent → treat as `open`/`closed` per `gateClosed`). `closed`
+   * mirrors `gateClosed`; `admission-closed` is the new finishing-protection tier.
+   */
+  gateState?: GateState;
   /** Which side(s) are budget-exhausted per the coordinator's activeSides set. */
   pauseSide: AgentName | "both" | null;
   pauseReason: string | null;

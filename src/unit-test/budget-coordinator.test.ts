@@ -1349,3 +1349,38 @@ describe("BudgetCoordinator — v3 P4 underutilization cooldown gate", () => {
     expect(emitted.some((e) => e.id.startsWith("system_budget_underutilized"))).toBe(false);
   });
 });
+
+describe("gateState — v3 P3 three-state gate (M2)", () => {
+  async function gateAfterPoll(claudeU: AgentUsage | null, codexU: AgentUsage | null) {
+    const source = new FakeSource([{ claude: claudeU, codex: codexU }]);
+    const { coordinator } = makeCoordinator(source);
+    await coordinator.start();
+    return coordinator;
+  }
+
+  test("open when neither side is admission-closed or paused", async () => {
+    const c = await gateAfterPoll(usage({ gateUtil: 20 }), usage({ gateUtil: 20 }));
+    expect(c.gateState()).toBe("open");
+    expect(c.getSnapshot()?.gateState).toBe("open");
+  });
+
+  test("admission-closed when Codex 5h util >= admissionAt but below the pause line", async () => {
+    const c = await gateAfterPoll(usage({ gateUtil: 20 }), usage({ gateUtil: 86 }));
+    expect(c.isGateClosed()).toBe(false); // not the pause gate
+    expect(c.gateState()).toBe("admission-closed");
+    expect(c.getSnapshot()?.gateState).toBe("admission-closed");
+  });
+
+  test("closed (pause) takes precedence over admission-closed", async () => {
+    // Codex util 95 → pause (>= pauseAt 90) AND admission (>= 85); closed wins.
+    const c = await gateAfterPoll(usage({ gateUtil: 20 }), usage({ gateUtil: 95 }));
+    expect(c.isGateClosed()).toBe(true);
+    expect(c.gateState()).toBe("closed");
+    expect(c.getSnapshot()?.gateState).toBe("closed");
+  });
+
+  test("Claude-side admission does NOT close the daemon gate (gates Codex turns only)", async () => {
+    const c = await gateAfterPoll(usage({ gateUtil: 86 }), usage({ gateUtil: 20 }));
+    expect(c.gateState()).toBe("open");
+  });
+});

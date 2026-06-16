@@ -4,10 +4,13 @@ import type { RunwayInput } from "./budget-state";
 import { effectiveDynamicLine } from "./budget-decision";
 import { AdviceCooldown, resolveAdviceCooldownSec } from "./advice-cooldown";
 import {
+  classifyAdmission,
   classifyPoll,
   computeResumeCandidate,
   resumeCandidateSides,
+  INITIAL_ADMISSION_STATE,
   INITIAL_FINGERPRINT_STATE,
+  type AdmissionState,
   type FingerprintState,
   type ResumeCandidate,
   type ResumeSignals,
@@ -21,6 +24,7 @@ import type {
   BudgetState,
   CodexTier,
   CodexTurnOverrides,
+  GateState,
 } from "./types";
 import type { QuotaSource } from "./quota-source";
 
@@ -179,6 +183,9 @@ export class BudgetCoordinator {
   // / resume bookkeeping). Replaces the former 4 mutable fields
   // (activeSides, lastDirectiveFingerprint, pauseReason, pauseResumeAfterEpoch).
   private fpState: FingerprintState = INITIAL_FINGERPRINT_STATE;
+  // v3 P3 (§3.2): admission lane, parallel to the pause fpState. In-memory only
+  // (recomputed each poll); the durable per-window quota is in admission-quota.ts.
+  private admissionState: AdmissionState = INITIAL_ADMISSION_STATE;
   // PR2: latest per-side resume candidate (detection only — read-only exposure
   // via getResumeCandidate(); the coordinator never acts on it).
   private resumeCandidate: ResumeCandidate = {};
@@ -230,6 +237,19 @@ export class BudgetCoordinator {
 
   isGateClosed(): boolean {
     return this.fpState.side === "codex" || this.fpState.side === "both";
+  }
+
+  /**
+   * v3 P3 (§3.2): the three-state daemon gate. `closed` (the existing pause gate,
+   * = isGateClosed) takes precedence over `admission-closed`. Both tiers key on
+   * the CODEX side (incl. "both") because the daemon gates Codex turn/start —
+   * Claude self-governs via the prompt. Observability today (snapshot.gateState);
+   * the daemon begins enforcing the admission tier in M3.
+   */
+  gateState(): GateState {
+    if (this.fpState.side === "codex" || this.fpState.side === "both") return "closed";
+    if (this.admissionState.side === "codex" || this.admissionState.side === "both") return "admission-closed";
+    return "open";
   }
 
   getSnapshot(): BudgetSnapshot | null {
@@ -364,6 +384,10 @@ export class BudgetCoordinator {
   private applyState(state: BudgetState): void {
     const { next, effect } = classifyPoll(this.fpState, state, this.config);
     this.fpState = next;
+    // v3 P3 (§3.2): advance the parallel admission lane. M2 stores the state for
+    // gateState() / snapshot observability only; M3 wires the directive emission
+    // (turnPhase-aware) and the daemon's three-state enforcement.
+    this.admissionState = classifyAdmission(this.admissionState, state, this.config).next;
 
     // PR2 (detection only): recompute the per-side resume candidate from the
     // EFFECT, not the post-transition fingerprint. The hysteresis removes a side
@@ -537,6 +561,7 @@ export class BudgetCoordinator {
       driftPct: state.drift.pct,
       paused,
       gateClosed: this.isGateClosed(),
+      gateState: this.gateState(),
       pauseSide: this.fpState.side,
       pauseReason: paused ? this.fpState.reason ?? state.pause.reason : null,
       resumeAfterEpoch: paused ? this.fpState.resumeEpoch ?? state.pause.resumeAfterEpoch : null,

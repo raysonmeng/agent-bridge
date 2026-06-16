@@ -26,7 +26,9 @@
  * ./budget-state; it is bundled into the plugin daemon.
  */
 import {
+  agentCanAdmitOpen,
   agentCanResume,
+  agentShouldAdmitClose,
   agentShouldPause,
   isDecisionGrade,
   resumeBlockingEpochFor,
@@ -479,4 +481,128 @@ export function computeResumeCandidate(
   }
   if (sides.length > 0) candidate.detail = detail;
   return candidate;
+}
+
+// ---------------------------------------------------------------------------
+// v3 P3 (§3.2): admission lane — a SECOND hysteresis state machine, parallel to
+// the pause lane above, for the `admission-closed` gate. Kept separate from
+// classifyPoll (the pause reducer is a battle-tested verbatim port; we do not
+// restructure it). The two lanes SHARE their I2 mechanism: nextAdmissionSide
+// preserves a closed side whenever the predicates abstain on non-decision-grade
+// data (agentShouldAdmitClose / agentCanAdmitOpen both return false there) —
+// identical to how nextActiveSide holds the pause side — and the fingerprint
+// hold reuses activeSideProbeUncertain. Coordinator-held + recomputed each poll
+// (never persisted); the durable per-window quota lives in admission-quota.ts.
+// ---------------------------------------------------------------------------
+
+/** Admission-gate hysteresis state (parallel to the pause fields of FingerprintState). */
+export interface AdmissionState {
+  /** Which side(s) are admission-closed (activeSides rendered as a value); null when open. */
+  side: PauseSide;
+  /** Last emitted admission-directive fingerprint; null when none. */
+  fingerprint: string | null;
+  /** Sticky admission reason while closed; null otherwise. */
+  reason: string | null;
+}
+
+export const INITIAL_ADMISSION_STATE: AdmissionState = { side: null, fingerprint: null, reason: null };
+
+/** What the coordinator must DO after an admission poll (mirrors CoordinatorEffect, narrower). */
+export type AdmissionEffect =
+  | { kind: "enter" | "hold-uncertain"; side: ActivePauseSide; reason: string; emit: boolean }
+  | { kind: "exit"; previousSide: ActivePauseSide }
+  | { kind: "none" };
+
+export interface AdmissionResult {
+  next: AdmissionState;
+  effect: AdmissionEffect;
+}
+
+/**
+ * Hysteresis transition over the admission active set (parallel to
+ * nextActiveSide): agentShouldAdmitClose adds, an already-closed side that
+ * agentCanAdmitOpen removes. On non-decision-grade data BOTH predicates return
+ * false, so a closed side neither adds nor removes → it HOLDS (I2: stale never
+ * opens), exactly as the pause lane behaves.
+ */
+function nextAdmissionSide(prevSide: PauseSide, state: BudgetState, cfg: BudgetConfig): PauseSide {
+  const active = new Set<AgentName>(sideToAgents(prevSide));
+  for (const agent of ["claude", "codex"] as const) {
+    const usage = state.perAgent[agent];
+    if (agentShouldAdmitClose(agent, usage, cfg, state.now).admitClose) {
+      active.add(agent);
+    } else if (active.has(agent) && agentCanAdmitOpen(usage, cfg, state.now)) {
+      active.delete(agent);
+    }
+  }
+  return agentsToSide(active);
+}
+
+function admissionReason(side: PauseSide, state: BudgetState, cfg: BudgetConfig): string {
+  return sideToAgents(side)
+    .map((agent) => {
+      const usage = state.perAgent[agent];
+      if (!usage) return `${AGENT_LABEL[agent]} 探测暂时不可用，保持上一轮收尾保护`;
+      // Rate-limit FIRST, mirroring activeSideReason: a rate-limited probe holds
+      // the side closed via agentCanAdmitOpen (which returns false on
+      // rateLimitedUntil > now) even though agentShouldAdmitClose no longer trips
+      // — without this branch that hold would mislabel as the hysteresis band.
+      if (usage.rateLimitedUntil > state.now) {
+        return `${AGENT_LABEL[agent]} 探针被限流至 ${formatEpoch(usage.rateLimitedUntil)}，保持收尾保护`;
+      }
+      const decision = agentShouldAdmitClose(agent, usage, cfg, state.now);
+      if (decision.admitClose) return decision.reason;
+      // Still closed but no longer tripping entry → in the admission exit band,
+      // holding until agentCanAdmitOpen clears.
+      return `${AGENT_LABEL[agent]} 收尾保护出闸滞回带，尚未满足开闸条件`;
+    })
+    .join("；");
+}
+
+/**
+ * Dedup fingerprint for an admission directive: side + the closed side's
+ * gate-EXPLAINING reset bucket. Keys on `state.pause.resetEpochs`
+ * (= matchingGateReset per agent — the window that explains gateUtil, precomputed
+ * in computeBudgetState), NOT the 5h reset: admission can close on a weekly
+ * trigger (hard-cap / weekly-runway), so a 5h-only key would (a) spuriously
+ * re-emit on a 5h reset while a weekly trigger still holds, and (b) collapse two
+ * distinct weekly episodes across a weekly reset. This mirrors directiveFingerprint
+ * (the pause lane), keeping the two lanes faithful parallels on the reset axis.
+ */
+function admissionFingerprint(state: BudgetState, side: ActivePauseSide): string {
+  let reset = 0;
+  for (const agent of sideToAgents(side)) {
+    reset = Math.max(reset, state.pause.resetEpochs[agent] ?? 0);
+  }
+  return ["admission", side, Math.round(reset / RESET_FINGERPRINT_BUCKET_SEC)].join("|");
+}
+
+/**
+ * Pure reducer for the admission lane (parallel to classifyPoll). Mirrors the
+ * pause lane's enter / hold-uncertain / exit / none transitions and its
+ * fingerprint-hold-on-uncertain dedup, but for `admission-closed`. The side-level
+ * I2 hold lives in nextAdmissionSide (see above); this adds the directive-dedup
+ * hold so a probe-quality flap mid-close cannot re-emit the admission banner.
+ */
+export function classifyAdmission(prev: AdmissionState, state: BudgetState, cfg: BudgetConfig): AdmissionResult {
+  const previousSide = prev.side;
+  const currentSide = nextAdmissionSide(previousSide, state, cfg);
+
+  if (currentSide) {
+    const reason = admissionReason(currentSide, state, cfg);
+    const uncertain =
+      previousSide === currentSide && activeSideProbeUncertain(currentSide, state) && prev.fingerprint;
+    const fingerprint = uncertain ? prev.fingerprint! : admissionFingerprint(state, currentSide);
+    const emit = !previousSide || previousSide !== currentSide || fingerprint !== prev.fingerprint;
+    return {
+      next: { side: currentSide, fingerprint, reason },
+      effect: { kind: uncertain ? "hold-uncertain" : "enter", side: currentSide, reason, emit },
+    };
+  }
+
+  if (previousSide) {
+    return { next: INITIAL_ADMISSION_STATE, effect: { kind: "exit", previousSide } };
+  }
+
+  return { next: INITIAL_ADMISSION_STATE, effect: { kind: "none" } };
 }
