@@ -14161,6 +14161,7 @@ var DEFAULT_MAX_BUFFERED_MESSAGES = 100;
 var DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 var DEFAULT_DEDUPE_CAPACITY = 2048;
 var DEFAULT_DEDUPE_TTL_MS = 20 * 60 * 1000;
+var DEFAULT_BUDGET_FRESH_TTL_MS = 25 * 1000;
 var CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
   "",
@@ -14224,6 +14225,10 @@ class ClaudeAdapter extends EventEmitter {
   monotonicNow;
   deliveredMessageIds = new Map;
   budgetSnapshot = null;
+  budgetFreshTtlMs;
+  wallNow;
+  requestFreshSnapshot = null;
+  pendingBudgetRefresh = null;
   constructor(logFile = new StateDirResolver().logFile, options = {}) {
     super();
     this.logFile = logFile;
@@ -14240,6 +14245,8 @@ class ClaudeAdapter extends EventEmitter {
     this.dedupeCapacity = positiveIntegerOr(options.dedupeCapacity, DEFAULT_DEDUPE_CAPACITY);
     this.dedupeTtlMs = positiveIntegerOr(options.dedupeTtlMs, DEFAULT_DEDUPE_TTL_MS);
     this.monotonicNow = options.now ?? (() => performance.now());
+    this.budgetFreshTtlMs = positiveIntegerOr(options.budgetFreshTtlMs, parsePositiveIntegerEnv("AGENTBRIDGE_BUDGET_FRESH_TTL_SEC", DEFAULT_BUDGET_FRESH_TTL_MS / 1000) * 1000);
+    this.wallNow = options.wallNow ?? (() => Date.now());
     this.server = new Server({ name: "agentbridge", version: "0.1.0" }, {
       capabilities: {
         experimental: { "claude/channel": {} },
@@ -14266,6 +14273,9 @@ class ClaudeAdapter extends EventEmitter {
   }
   setBudgetSnapshot(snapshot) {
     this.budgetSnapshot = snapshot;
+  }
+  setRequestFreshSnapshot(fetcher) {
+    this.requestFreshSnapshot = fetcher;
   }
   async pushNotification(message) {
     this.log(`pushNotification (instance=${this.instanceId}, msgId=${message.id}, len=${message.content.length})`);
@@ -14543,12 +14553,41 @@ chat_id: ${this.sessionId}`);
       content: [{ type: "text", text: `Resume acknowledged (resume_id=${resumeIdRaw}, status=${status}).` }]
     };
   }
-  handleGetBudget() {
-    this.log(`get_budget called (instance=${this.instanceId}, hasSnapshot=${this.budgetSnapshot !== null})`);
-    const text = this.budgetSnapshot ? renderBudgetSnapshot(this.budgetSnapshot) : BUDGET_UNAVAILABLE_TEXT;
+  async handleGetBudget() {
+    let snapshot = this.budgetSnapshot;
+    const fresh = snapshot !== null && this.isBudgetSnapshotFresh(snapshot);
+    this.log(`get_budget called (instance=${this.instanceId}, hasSnapshot=${snapshot !== null}, fresh=${fresh})`);
+    if (!fresh && this.requestFreshSnapshot) {
+      const refreshed = await this.refreshBudgetSnapshot();
+      snapshot = refreshed ?? this.budgetSnapshot;
+    }
+    const text = snapshot ? renderBudgetSnapshot(snapshot) : BUDGET_UNAVAILABLE_TEXT;
     return {
       content: [{ type: "text", text }]
     };
+  }
+  isBudgetSnapshotFresh(snapshot) {
+    if (!snapshot.updatedAt || snapshot.updatedAt <= 0)
+      return false;
+    const ageMs = this.wallNow() - snapshot.updatedAt * 1000;
+    return ageMs < this.budgetFreshTtlMs;
+  }
+  refreshBudgetSnapshot() {
+    if (!this.requestFreshSnapshot)
+      return Promise.resolve(null);
+    if (!this.pendingBudgetRefresh) {
+      this.pendingBudgetRefresh = this.requestFreshSnapshot().then((snapshot) => {
+        if (snapshot)
+          this.budgetSnapshot = snapshot;
+        return snapshot;
+      }).catch((error2) => {
+        this.log(`get_budget refresh failed: ${error2 instanceof Error ? error2.message : String(error2)}`);
+        return null;
+      }).finally(() => {
+        this.pendingBudgetRefresh = null;
+      });
+    }
+    return this.pendingBudgetRefresh;
   }
   async handleReply(args) {
     const text = args?.text;
@@ -14668,10 +14707,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.20", "0.0.0-source"),
-  commit: defineString("d6034c6", "source"),
+  commit: defineString("4ed2279", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("efb5b785c5f9", "source")
+  codeHash: defineString("5ed7b59df613", "source")
 });
 function sameRuntimeContract(a, b) {
   if (!a || !b)
@@ -14875,9 +14914,26 @@ class DaemonClient extends EventEmitter2 {
       send: () => this.send({ type: "probe_incumbent" })
     });
   }
+  async requestBudgetRefresh(timeoutMs = 3000) {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return null;
+    }
+    const requestId = `budget_${Date.now()}_${this.nextRequestId++}`;
+    return this.awaitTypedResponse({
+      key: "budget_refresh",
+      successEvent: "budgetRefresh",
+      match: (payload) => payload.requestId === requestId,
+      successValue: (payload) => payload.snapshot,
+      failValue: null,
+      timeoutMs,
+      send: () => this.send({ type: "request_budget_refresh", requestId })
+    });
+  }
   awaitTypedResponse(opts) {
-    const { key, successEvent, successValue, failValue, timeoutMs, send } = opts;
+    const { key, successEvent, successValue, failValue, timeoutMs, send, match } = opts;
     const onSuccess = (payload) => {
+      if (match && !match(payload))
+        return;
       this.pendingEventWaiters.settle(key, successValue(payload));
     };
     const onRejected = () => {
@@ -14977,6 +15033,9 @@ class DaemonClient extends EventEmitter2 {
           return;
         case "incumbent_status":
           this.emit("incumbentStatus", { connected: message.connected, alive: message.alive });
+          return;
+        case "budget_refresh":
+          this.emit("budgetRefresh", { requestId: message.requestId, snapshot: message.snapshot });
           return;
       }
     };
@@ -15694,6 +15753,8 @@ import { join as join2 } from "path";
 var DEFAULT_BUDGET_CONFIG = {
   enabled: true,
   pollSeconds: 300,
+  budgetFreshTtlSec: 25,
+  idleAdviceActivityWindowSec: 600,
   pauseAt: 90,
   resumeBelow: 30,
   syncDriftPct: 10,
@@ -15755,7 +15816,7 @@ function findShapeViolation(raw) {
     if (!isRecord(budget)) {
       return "budget is present but not an object";
     }
-    const numericKeys = ["pauseAt", "resumeBelow", "pollSeconds", "syncDriftPct"];
+    const numericKeys = ["pauseAt", "resumeBelow", "pollSeconds", "syncDriftPct", "budgetFreshTtlSec", "idleAdviceActivityWindowSec"];
     for (const key of numericKeys) {
       if (key in budget && !isCoercibleNumber(budget[key])) {
         return `budget.${key} is present but not a number`;
@@ -15809,7 +15870,7 @@ function hasCustomDecisionValues(config2) {
   const d = DEFAULT_CONFIG;
   const b = config2.budget;
   const db = d.budget;
-  return config2.idleShutdownSeconds !== d.idleShutdownSeconds || config2.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config2.codex.appPort !== d.codex.appPort || config2.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct || b.maximize.admissionAt !== db.maximize.admissionAt || b.maximize.wrapUpQuota !== db.maximize.wrapUpQuota || b.allocation.minRunwayRatio !== db.allocation.minRunwayRatio || b.allocation.minRunwayGapHours !== db.allocation.minRunwayGapHours;
+  return config2.idleShutdownSeconds !== d.idleShutdownSeconds || config2.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config2.codex.appPort !== d.codex.appPort || config2.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.budgetFreshTtlSec !== db.budgetFreshTtlSec || b.idleAdviceActivityWindowSec !== db.idleAdviceActivityWindowSec || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct || b.maximize.admissionAt !== db.maximize.admissionAt || b.maximize.wrapUpQuota !== db.maximize.wrapUpQuota || b.allocation.minRunwayRatio !== db.allocation.minRunwayRatio || b.allocation.minRunwayGapHours !== db.allocation.minRunwayGapHours;
 }
 function normalizeInteger(value, fallback) {
   if (typeof value === "number" && Number.isFinite(value))
@@ -15905,6 +15966,8 @@ function normalizeBudgetConfig(raw, fallback = DEFAULT_BUDGET_CONFIG) {
   return {
     enabled: normalizeBoolean(budget.enabled, fallback.enabled),
     pollSeconds: normalizeBoundedInteger(budget.pollSeconds, fallback.pollSeconds, 5, 3600),
+    budgetFreshTtlSec: normalizeBoundedInteger(budget.budgetFreshTtlSec, fallback.budgetFreshTtlSec, 1, 300),
+    idleAdviceActivityWindowSec: normalizeBoundedInteger(budget.idleAdviceActivityWindowSec, fallback.idleAdviceActivityWindowSec, 0, 86400),
     pauseAt,
     resumeBelow,
     syncDriftPct: normalizeBoundedInteger(budget.syncDriftPct, fallback.syncDriftPct, 1, 100),
@@ -15917,6 +15980,37 @@ function normalizeBudgetConfig(raw, fallback = DEFAULT_BUDGET_CONFIG) {
     maximize: normalizeMaximizeConfig(budget.maximize, pauseAt, fallback.maximize),
     allocation: normalizeAllocationConfig(budget.allocation, fallback.allocation)
   };
+}
+function applyBudgetEnvOverrides(budget, env = process.env) {
+  const overlay = {
+    enabled: env.AGENTBRIDGE_BUDGET_ENABLED ?? budget.enabled,
+    pollSeconds: env.AGENTBRIDGE_BUDGET_POLL_SECONDS ?? budget.pollSeconds,
+    budgetFreshTtlSec: env.AGENTBRIDGE_BUDGET_FRESH_TTL_SEC ?? budget.budgetFreshTtlSec,
+    idleAdviceActivityWindowSec: env.AGENTBRIDGE_BUDGET_IDLE_ADVICE_ACTIVITY_WINDOW_SEC ?? budget.idleAdviceActivityWindowSec,
+    pauseAt: env.AGENTBRIDGE_BUDGET_PAUSE_AT ?? budget.pauseAt,
+    resumeBelow: env.AGENTBRIDGE_BUDGET_RESUME_BELOW ?? budget.resumeBelow,
+    syncDriftPct: env.AGENTBRIDGE_BUDGET_SYNC_DRIFT_PCT ?? budget.syncDriftPct,
+    parallel: {
+      minRemainingPct: env.AGENTBRIDGE_BUDGET_PARALLEL_MIN_REMAINING_PCT ?? budget.parallel.minRemainingPct,
+      timeWindowSec: env.AGENTBRIDGE_BUDGET_PARALLEL_TIME_WINDOW_SEC ?? budget.parallel.timeWindowSec
+    },
+    codexTierControl: env.AGENTBRIDGE_BUDGET_CODEX_TIER_CONTROL ?? budget.codexTierControl,
+    codexTiers: budget.codexTiers,
+    maximize: {
+      targetUtil: env.AGENTBRIDGE_BUDGET_TARGET_UTIL ?? budget.maximize.targetUtil,
+      reserveSlopePctPerHour: env.AGENTBRIDGE_BUDGET_RESERVE_SLOPE_PCT_PER_HOUR ?? budget.maximize.reserveSlopePctPerHour,
+      reserveMaxPct: env.AGENTBRIDGE_BUDGET_RESERVE_MAX_PCT ?? budget.maximize.reserveMaxPct,
+      finishingHorizonMinutes: env.AGENTBRIDGE_BUDGET_FINISHING_HORIZON_MINUTES ?? budget.maximize.finishingHorizonMinutes,
+      resumeHysteresisPct: env.AGENTBRIDGE_BUDGET_RESUME_HYSTERESIS_PCT ?? budget.maximize.resumeHysteresisPct,
+      admissionAt: env.AGENTBRIDGE_BUDGET_ADMISSION_AT ?? budget.maximize.admissionAt,
+      wrapUpQuota: env.AGENTBRIDGE_BUDGET_WRAP_UP_QUOTA ?? budget.maximize.wrapUpQuota
+    },
+    allocation: {
+      minRunwayRatio: env.AGENTBRIDGE_BUDGET_MIN_RUNWAY_RATIO ?? budget.allocation.minRunwayRatio,
+      minRunwayGapHours: env.AGENTBRIDGE_BUDGET_MIN_RUNWAY_GAP_HOURS ?? budget.allocation.minRunwayGapHours
+    }
+  };
+  return normalizeBudgetConfig(overlay, budget);
 }
 function normalizeConfig(raw) {
   if (!isRecord(raw))
@@ -16397,8 +16491,12 @@ var config2 = configService.loadOrDefault(processLogger.log);
 var CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10);
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 var CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
-var claude = new ClaudeAdapter(stateDir.logFile);
+var effectiveBudget = applyBudgetEnvOverrides(config2.budget);
+var claude = new ClaudeAdapter(stateDir.logFile, {
+  budgetFreshTtlMs: effectiveBudget.budgetFreshTtlSec * 1000
+});
 var daemonClient = new DaemonClient(CONTROL_WS_URL, { identity: currentClientIdentity });
+claude.setRequestFreshSnapshot(() => daemonClient.requestBudgetRefresh());
 var shuttingDown = false;
 var daemonDisabled = false;
 var daemonDisabledReason = null;

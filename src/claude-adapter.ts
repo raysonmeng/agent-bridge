@@ -42,12 +42,21 @@ export interface ClaudeAdapterOptions {
   dedupeTtlMs?: number;
   /** Monotonic milliseconds for internal dedupe TTL; defaults to performance.now(). */
   now?: () => number;
+  /**
+   * Freshness TTL (ms) for the get_budget tool: when the cached snapshot is older
+   * than this, get_budget asks the daemon for a fresh read-only refresh before
+   * rendering. Defaults to AGENTBRIDGE_BUDGET_FRESH_TTL_SEC×1000 or 25000.
+   */
+  budgetFreshTtlMs?: number;
+  /** Wall-clock milliseconds for the budget-freshness check; defaults to Date.now(). */
+  wallNow?: () => number;
 }
 
 const DEFAULT_MAX_BUFFERED_MESSAGES = 100;
 const DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 const DEFAULT_DEDUPE_CAPACITY = 2048;
 const DEFAULT_DEDUPE_TTL_MS = 20 * 60 * 1000;
+const DEFAULT_BUDGET_FRESH_TTL_MS = 25 * 1000;
 
 export const CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
@@ -120,6 +129,14 @@ export class ClaudeAdapter extends EventEmitter {
 
   // Latest budget snapshot, fed by bridge from DaemonStatus.budget broadcasts.
   private budgetSnapshot: BudgetSnapshot | null = null;
+  private readonly budgetFreshTtlMs: number;
+  private readonly wallNow: () => number;
+  // On-demand fresh-snapshot fetch (fresh-if-stale at get_budget). Wired by bridge
+  // to daemonClient.requestBudgetRefresh; absent → get_budget renders the cache.
+  private requestFreshSnapshot: (() => Promise<BudgetSnapshot | null>) | null = null;
+  // Single-flight guard: concurrent get_budget calls share ONE in-flight refresh
+  // (the no-requestId budget_refresh waiter cannot disambiguate parallel requests).
+  private pendingBudgetRefresh: Promise<BudgetSnapshot | null> | null = null;
 
   constructor(logFile = new StateDirResolver().logFile, options: ClaudeAdapterOptions = {}) {
     super();
@@ -149,6 +166,11 @@ export class ClaudeAdapter extends EventEmitter {
     this.dedupeCapacity = positiveIntegerOr(options.dedupeCapacity, DEFAULT_DEDUPE_CAPACITY);
     this.dedupeTtlMs = positiveIntegerOr(options.dedupeTtlMs, DEFAULT_DEDUPE_TTL_MS);
     this.monotonicNow = options.now ?? (() => performance.now());
+    this.budgetFreshTtlMs = positiveIntegerOr(
+      options.budgetFreshTtlMs,
+      parsePositiveIntegerEnv("AGENTBRIDGE_BUDGET_FRESH_TTL_SEC", DEFAULT_BUDGET_FRESH_TTL_MS / 1000) * 1000,
+    );
+    this.wallNow = options.wallNow ?? (() => Date.now());
 
     this.server = new Server(
       { name: "agentbridge", version: "0.1.0" },
@@ -196,6 +218,15 @@ export class ClaudeAdapter extends EventEmitter {
   /** Cache the latest budget snapshot from the daemon (null clears it). */
   setBudgetSnapshot(snapshot: BudgetSnapshot | null) {
     this.budgetSnapshot = snapshot;
+  }
+
+  /**
+   * Register the on-demand budget refresh fetcher (fresh-if-stale at get_budget).
+   * Wired by bridge.ts to daemonClient.requestBudgetRefresh. Absent → get_budget
+   * always renders the broadcast cache (prior behavior).
+   */
+  setRequestFreshSnapshot(fetcher: () => Promise<BudgetSnapshot | null>) {
+    this.requestFreshSnapshot = fetcher;
   }
 
   // ── Message Delivery ───────────────────────────────────────
@@ -548,14 +579,58 @@ export class ClaudeAdapter extends EventEmitter {
     };
   }
 
-  private handleGetBudget() {
-    this.log(`get_budget called (instance=${this.instanceId}, hasSnapshot=${this.budgetSnapshot !== null})`);
-    const text = this.budgetSnapshot
-      ? renderBudgetSnapshot(this.budgetSnapshot)
-      : BUDGET_UNAVAILABLE_TEXT;
+  private async handleGetBudget() {
+    // Fresh-if-stale: a get_budget call is an explicit task-allocation decision
+    // point, so when the broadcast cache is older than budgetFreshTtlMs ask the
+    // daemon for a read-only on-demand refresh. Fresh cache (or no fetcher wired)
+    // → render the cache directly. Refresh failure/timeout → fall back to the
+    // (stale) cache, else the unavailable text.
+    let snapshot = this.budgetSnapshot;
+    const fresh = snapshot !== null && this.isBudgetSnapshotFresh(snapshot);
+    this.log(
+      `get_budget called (instance=${this.instanceId}, hasSnapshot=${snapshot !== null}, fresh=${fresh})`,
+    );
+    if (!fresh && this.requestFreshSnapshot) {
+      const refreshed = await this.refreshBudgetSnapshot();
+      snapshot = refreshed ?? this.budgetSnapshot;
+    }
+    const text = snapshot ? renderBudgetSnapshot(snapshot) : BUDGET_UNAVAILABLE_TEXT;
     return {
       content: [{ type: "text" as const, text }],
     };
+  }
+
+  private isBudgetSnapshotFresh(snapshot: BudgetSnapshot): boolean {
+    if (!snapshot.updatedAt || snapshot.updatedAt <= 0) return false;
+    const ageMs = this.wallNow() - snapshot.updatedAt * 1000;
+    // Negative age (clock skew between daemon poll time and this process) is
+    // treated as fresh — never trigger a refresh on a future-stamped snapshot.
+    return ageMs < this.budgetFreshTtlMs;
+  }
+
+  /**
+   * Single-flight on-demand refresh: concurrent get_budget calls await ONE
+   * in-flight daemon round-trip. A successful refresh updates the cache; a null
+   * result (timeout / unavailable) leaves the existing cache untouched so the
+   * caller can fall back to it.
+   */
+  private refreshBudgetSnapshot(): Promise<BudgetSnapshot | null> {
+    if (!this.requestFreshSnapshot) return Promise.resolve(null);
+    if (!this.pendingBudgetRefresh) {
+      this.pendingBudgetRefresh = this.requestFreshSnapshot()
+        .then((snapshot) => {
+          if (snapshot) this.budgetSnapshot = snapshot;
+          return snapshot;
+        })
+        .catch((error) => {
+          this.log(`get_budget refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+          return null;
+        })
+        .finally(() => {
+          this.pendingBudgetRefresh = null;
+        });
+    }
+    return this.pendingBudgetRefresh;
   }
 
   private async handleReply(args: Record<string, unknown>) {

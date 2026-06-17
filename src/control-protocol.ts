@@ -124,7 +124,15 @@ export type ControlClientMessage =
   // `abg claude` CLI conflict guard so a second session in the same pair errors
   // out up front instead of evicting a live incumbent (issue #68 admission still
   // arbitrates the authoritative live/stale decision at actual attach time).
-  | { type: "probe_incumbent" };
+  | { type: "probe_incumbent" }
+  /**
+   * On-demand budget refresh (fresh-if-stale). The frontend sends this when its
+   * cached snapshot is older than `budgetFreshTtlSec` at a get_budget call, so a
+   * task-allocation decision reads near-live quota rather than the last poll.
+   * The daemon replies with `budget_refresh` carrying a freshly fetched snapshot
+   * (read-only: no directive emission, no coordinator state advance).
+   */
+  | { type: "request_budget_refresh"; requestId: string };
 
 export type ControlServerMessage =
   | { type: "codex_to_claude"; message: BridgeMessage }
@@ -164,7 +172,13 @@ export type ControlServerMessage =
   // Reply to `probe_incumbent`. `connected` = a Claude frontend socket is
   // currently attached; `alive` = it responded to a liveness ping (a half-open
   // dead incumbent reports connected:true, alive:false → safe to take over).
-  | { type: "incumbent_status"; connected: boolean; alive: boolean };
+  | { type: "incumbent_status"; connected: boolean; alive: boolean }
+  // Reply to `request_budget_refresh`. `snapshot` is a freshly fetched, read-only
+  // budget snapshot (null when budget coordination is unavailable, e.g. no Codex
+  // attached or the fetch failed). The frontend renders it and refreshes its cache.
+  // `requestId` echoes the request so a straggler reply from a timed-out request
+  // never settles a LATER waiter on the long-lived control socket.
+  | { type: "budget_refresh"; requestId: string; snapshot: BudgetSnapshot | null };
 
 /** WebSocket close code sent by the daemon when a newer Claude session replaces the current one. */
 export const CLOSE_CODE_REPLACED = 4001;

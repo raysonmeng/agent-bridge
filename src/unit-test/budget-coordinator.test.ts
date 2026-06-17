@@ -13,6 +13,8 @@ const NOW = 1_700_000_000;
 const CONFIG: BudgetConfig = {
   enabled: true,
   pollSeconds: 0.01,
+  budgetFreshTtlSec: 25,
+  idleAdviceActivityWindowSec: 600,
   pauseAt: 90,
   resumeBelow: 30,
   syncDriftPct: 10,
@@ -1655,5 +1657,77 @@ describe("admission directive emission — v3 P3 (M3b, turnPhase-aware)", () => 
     expect(ad).toBeDefined();
     expect(ad!.content).toContain(`对应窗口约 ${formatBeijing(NOW + 3_600)} 刷新`); // codex window
     expect(ad!.content).not.toContain(`对应窗口约 ${formatBeijing(NOW + 20_000)} 刷新`); // not claude's later window
+  });
+});
+
+describe("v3 P5: readonly refresh + idle advise gate", () => {
+  function makeWithActivity(
+    source: FakeSource,
+    hasRecentActivity: (windowSec: number) => boolean,
+    config: BudgetConfig = CONFIG,
+  ) {
+    const emitted: Array<{ id: string; content: string }> = [];
+    const coordinator = new BudgetCoordinator({
+      source,
+      config,
+      emit: (id, content) => emitted.push({ id, content }),
+      onPauseChange: () => {},
+      now: () => NOW,
+      log: () => {},
+      hasRecentActivity,
+    });
+    return { coordinator, emitted };
+  }
+
+  // Same shape as the working "deduplicates ... balance" test: warnUtil drift
+  // (45 vs 20 = 25 > syncDriftPct 10) → balance phase, no burn data needed.
+  const driftPair = (): FetchResult => ({
+    claude: usage({ warnUtil: 45 }),
+    codex: usage({ gateUtil: 20, warnUtil: 20 }),
+  });
+
+  test("refreshSnapshotReadonly returns a fresh snapshot WITHOUT emitting or advancing state", async () => {
+    // A pause-side codex (util 92) would emit a pause directive + pauseChange on a
+    // real poll; the read-only refresh must do neither and must not cache.
+    const source = new FakeSource([
+      { claude: usage(), codex: usage({ gateUtil: 92, warnUtil: 92, remaining: 8 }) },
+    ]);
+    const { coordinator, emitted, pauseChanges } = makeCoordinator(source);
+    const snap = await coordinator.refreshSnapshotReadonly();
+    expect(snap).not.toBeNull();
+    expect(source.calls).toBe(1);
+    expect(emitted).toEqual([]);
+    expect(pauseChanges).toEqual([]);
+    expect(coordinator.getSnapshot()).toBeNull(); // poll never ran → cache untouched
+  });
+
+  test("refreshSnapshotReadonly returns null when the fetch yields no usage", async () => {
+    const { coordinator } = makeCoordinator(new FakeSource([null]));
+    expect(await coordinator.refreshSnapshotReadonly()).toBeNull();
+  });
+
+  test("balance advice is SUPPRESSED when idle (window > 0, no recent activity)", async () => {
+    const { coordinator, emitted } = makeWithActivity(new FakeSource([driftPair()]), () => false);
+    await coordinator.start();
+    coordinator.stop();
+    expect(emitted.find((e) => e.id.startsWith("system_budget_balance"))).toBeUndefined();
+  });
+
+  test("balance advice EMITS when there is recent activity", async () => {
+    const { coordinator, emitted } = makeWithActivity(new FakeSource([driftPair()]), () => true);
+    await coordinator.start();
+    coordinator.stop();
+    expect(emitted.find((e) => e.id.startsWith("system_budget_balance"))).toBeDefined();
+  });
+
+  test("idleAdviceActivityWindowSec = 0 disables the gate — advice emits even when idle", async () => {
+    const { coordinator, emitted } = makeWithActivity(
+      new FakeSource([driftPair()]),
+      () => false,
+      { ...CONFIG, idleAdviceActivityWindowSec: 0 },
+    );
+    await coordinator.start();
+    coordinator.stop();
+    expect(emitted.find((e) => e.id.startsWith("system_budget_balance"))).toBeDefined();
   });
 });

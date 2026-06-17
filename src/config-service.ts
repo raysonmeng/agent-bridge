@@ -20,6 +20,8 @@ export interface AgentBridgeConfig {
 const DEFAULT_BUDGET_CONFIG: BudgetConfig = {
   enabled: true,
   pollSeconds: 300,
+  budgetFreshTtlSec: 25,
+  idleAdviceActivityWindowSec: 600,
   // v3.2: pauseAt/resumeBelow are the no-burn-data FALLBACK line (the dynamic
   // line is primary). pauseAt also floors the dynamic line (I1). Kept well below
   // the outer quota-guard hard line (99) so the bridge pauses first and leaves
@@ -171,7 +173,7 @@ function findShapeViolation(raw: Record<string, unknown>): string | null {
     if (!isRecord(budget)) {
       return "budget is present but not an object";
     }
-    const numericKeys = ["pauseAt", "resumeBelow", "pollSeconds", "syncDriftPct"] as const;
+    const numericKeys = ["pauseAt", "resumeBelow", "pollSeconds", "syncDriftPct", "budgetFreshTtlSec", "idleAdviceActivityWindowSec"] as const;
     for (const key of numericKeys) {
       if (key in budget && !isCoercibleNumber(budget[key])) {
         return `budget.${key} is present but not a number`;
@@ -243,6 +245,8 @@ function hasCustomDecisionValues(config: AgentBridgeConfig): boolean {
     config.codex.proxyPort !== d.codex.proxyPort ||
     b.enabled !== db.enabled ||
     b.pollSeconds !== db.pollSeconds ||
+    b.budgetFreshTtlSec !== db.budgetFreshTtlSec ||
+    b.idleAdviceActivityWindowSec !== db.idleAdviceActivityWindowSec ||
     b.pauseAt !== db.pauseAt ||
     b.resumeBelow !== db.resumeBelow ||
     b.syncDriftPct !== db.syncDriftPct ||
@@ -451,6 +455,18 @@ function normalizeBudgetConfig(
       5,
       3600,
     ),
+    budgetFreshTtlSec: normalizeBoundedInteger(
+      budget.budgetFreshTtlSec,
+      fallback.budgetFreshTtlSec,
+      1,
+      300,
+    ),
+    idleAdviceActivityWindowSec: normalizeBoundedInteger(
+      budget.idleAdviceActivityWindowSec,
+      fallback.idleAdviceActivityWindowSec,
+      0,
+      86400,
+    ),
     pauseAt,
     resumeBelow,
     syncDriftPct: normalizeBoundedInteger(
@@ -495,6 +511,9 @@ export function applyBudgetEnvOverrides(
   const overlay: Record<string, unknown> = {
     enabled: env.AGENTBRIDGE_BUDGET_ENABLED ?? budget.enabled,
     pollSeconds: env.AGENTBRIDGE_BUDGET_POLL_SECONDS ?? budget.pollSeconds,
+    budgetFreshTtlSec: env.AGENTBRIDGE_BUDGET_FRESH_TTL_SEC ?? budget.budgetFreshTtlSec,
+    idleAdviceActivityWindowSec:
+      env.AGENTBRIDGE_BUDGET_IDLE_ADVICE_ACTIVITY_WINDOW_SEC ?? budget.idleAdviceActivityWindowSec,
     pauseAt: env.AGENTBRIDGE_BUDGET_PAUSE_AT ?? budget.pauseAt,
     resumeBelow: env.AGENTBRIDGE_BUDGET_RESUME_BELOW ?? budget.resumeBelow,
     syncDriftPct: env.AGENTBRIDGE_BUDGET_SYNC_DRIFT_PCT ?? budget.syncDriftPct,

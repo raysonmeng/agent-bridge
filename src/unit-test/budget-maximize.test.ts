@@ -30,6 +30,8 @@ const NOW = 1_000_000;
 const MAXIMIZE: BudgetConfig = {
   enabled: true,
   pollSeconds: 300,
+  budgetFreshTtlSec: 25,
+  idleAdviceActivityWindowSec: 600,
   pauseAt: 90,
   resumeBelow: 30,
   syncDriftPct: 10,

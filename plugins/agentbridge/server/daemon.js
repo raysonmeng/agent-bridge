@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.20", "0.0.0-source"),
-  commit: defineString("d6034c6", "source"),
+  commit: defineString("4ed2279", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("efb5b785c5f9", "source")
+  codeHash: defineString("5ed7b59df613", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -3478,6 +3478,8 @@ import { join as join4 } from "path";
 var DEFAULT_BUDGET_CONFIG = {
   enabled: true,
   pollSeconds: 300,
+  budgetFreshTtlSec: 25,
+  idleAdviceActivityWindowSec: 600,
   pauseAt: 90,
   resumeBelow: 30,
   syncDriftPct: 10,
@@ -3539,7 +3541,7 @@ function findShapeViolation(raw) {
     if (!isRecord(budget)) {
       return "budget is present but not an object";
     }
-    const numericKeys = ["pauseAt", "resumeBelow", "pollSeconds", "syncDriftPct"];
+    const numericKeys = ["pauseAt", "resumeBelow", "pollSeconds", "syncDriftPct", "budgetFreshTtlSec", "idleAdviceActivityWindowSec"];
     for (const key of numericKeys) {
       if (key in budget && !isCoercibleNumber(budget[key])) {
         return `budget.${key} is present but not a number`;
@@ -3593,7 +3595,7 @@ function hasCustomDecisionValues(config) {
   const d = DEFAULT_CONFIG;
   const b = config.budget;
   const db = d.budget;
-  return config.idleShutdownSeconds !== d.idleShutdownSeconds || config.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config.codex.appPort !== d.codex.appPort || config.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct || b.maximize.admissionAt !== db.maximize.admissionAt || b.maximize.wrapUpQuota !== db.maximize.wrapUpQuota || b.allocation.minRunwayRatio !== db.allocation.minRunwayRatio || b.allocation.minRunwayGapHours !== db.allocation.minRunwayGapHours;
+  return config.idleShutdownSeconds !== d.idleShutdownSeconds || config.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config.codex.appPort !== d.codex.appPort || config.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.budgetFreshTtlSec !== db.budgetFreshTtlSec || b.idleAdviceActivityWindowSec !== db.idleAdviceActivityWindowSec || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct || b.maximize.admissionAt !== db.maximize.admissionAt || b.maximize.wrapUpQuota !== db.maximize.wrapUpQuota || b.allocation.minRunwayRatio !== db.allocation.minRunwayRatio || b.allocation.minRunwayGapHours !== db.allocation.minRunwayGapHours;
 }
 function normalizeInteger(value, fallback) {
   if (typeof value === "number" && Number.isFinite(value))
@@ -3689,6 +3691,8 @@ function normalizeBudgetConfig(raw, fallback = DEFAULT_BUDGET_CONFIG) {
   return {
     enabled: normalizeBoolean(budget.enabled, fallback.enabled),
     pollSeconds: normalizeBoundedInteger(budget.pollSeconds, fallback.pollSeconds, 5, 3600),
+    budgetFreshTtlSec: normalizeBoundedInteger(budget.budgetFreshTtlSec, fallback.budgetFreshTtlSec, 1, 300),
+    idleAdviceActivityWindowSec: normalizeBoundedInteger(budget.idleAdviceActivityWindowSec, fallback.idleAdviceActivityWindowSec, 0, 86400),
     pauseAt,
     resumeBelow,
     syncDriftPct: normalizeBoundedInteger(budget.syncDriftPct, fallback.syncDriftPct, 1, 100),
@@ -3706,6 +3710,8 @@ function applyBudgetEnvOverrides(budget, env = process.env) {
   const overlay = {
     enabled: env.AGENTBRIDGE_BUDGET_ENABLED ?? budget.enabled,
     pollSeconds: env.AGENTBRIDGE_BUDGET_POLL_SECONDS ?? budget.pollSeconds,
+    budgetFreshTtlSec: env.AGENTBRIDGE_BUDGET_FRESH_TTL_SEC ?? budget.budgetFreshTtlSec,
+    idleAdviceActivityWindowSec: env.AGENTBRIDGE_BUDGET_IDLE_ADVICE_ACTIVITY_WINDOW_SEC ?? budget.idleAdviceActivityWindowSec,
     pauseAt: env.AGENTBRIDGE_BUDGET_PAUSE_AT ?? budget.pauseAt,
     resumeBelow: env.AGENTBRIDGE_BUDGET_RESUME_BELOW ?? budget.resumeBelow,
     syncDriftPct: env.AGENTBRIDGE_BUDGET_SYNC_DRIFT_PCT ?? budget.syncDriftPct,
@@ -4846,6 +4852,7 @@ class BudgetCoordinator {
   resumeSignals;
   adviceCooldown;
   isCodexTurnActive;
+  hasRecentActivity;
   timer = null;
   running = false;
   fpState = INITIAL_FINGERPRINT_STATE;
@@ -4876,6 +4883,7 @@ class BudgetCoordinator {
       log: this.log
     });
     this.isCodexTurnActive = options.isCodexTurnActive ?? (() => false);
+    this.hasRecentActivity = options.hasRecentActivity ?? (() => true);
   }
   async start() {
     if (this.running || !this.config.enabled)
@@ -4907,6 +4915,24 @@ class BudgetCoordinator {
   }
   getSnapshot() {
     return this.latestSnapshot;
+  }
+  async refreshSnapshotReadonly() {
+    let usage;
+    try {
+      usage = await this.source.fetchBoth();
+    } catch (error) {
+      this.log(`budget readonly refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+    if (!usage)
+      return null;
+    const now = this.now();
+    const runway = {
+      claude: agentRunway(usage.claude, now),
+      codex: agentRunway(usage.codex, now)
+    };
+    const state = computeBudgetState(usage.claude, usage.codex, this.config, now, runway);
+    return this.toSnapshot(state, runway);
   }
   getResumeCandidate() {
     const { detail, ...rest } = this.resumeCandidate;
@@ -5022,6 +5048,12 @@ class BudgetCoordinator {
       }
       case "advise": {
         if (this.gateState() !== "open") {
+          this.fpState = { ...this.fpState, fingerprint: null };
+          return;
+        }
+        const activityWindowSec = this.config.idleAdviceActivityWindowSec;
+        if (activityWindowSec > 0 && !this.hasRecentActivity(activityWindowSec)) {
+          this.log(`budget advise suppressed: no agent activity in last ${activityWindowSec}s`);
           this.fpState = { ...this.fpState, fingerprint: null };
           return;
         }
@@ -6795,7 +6827,8 @@ function ensureBudgetCoordinatorStarted() {
         });
       },
       resumeSignals: readResumeSignals,
-      isCodexTurnActive: () => codex.turnInProgress
+      isCodexTurnActive: () => codex.turnInProgress,
+      hasRecentActivity: (windowSec) => codex.turnInProgress || Date.now() - lastActivityEpochMs <= windowSec * 1000
     });
   }
   budgetCoordinator.start();
@@ -6924,6 +6957,7 @@ codex.on("steerFailed", ({ requestId, reason }) => {
 });
 codex.on("steerAccepted", ({ requestId }) => {
   log("Steer accepted by app-server");
+  recordAgentActivity();
   const dispatch = pendingSteerDispatches.get(requestId);
   pendingSteerDispatches.delete(requestId);
   if (dispatch?.requireReply) {
@@ -6993,13 +7027,19 @@ codex.on("turnTrackingReset", (reason) => {
   pendingSteerDispatches.clear();
   resumeInjectionQueue.onTurnTrackingReset();
 });
+var lastActivityEpochMs = 0;
+function recordAgentActivity() {
+  lastActivityEpochMs = Date.now();
+}
 codex.on("turnStarted", () => {
   log("Codex turn started");
+  recordAgentActivity();
   emitToClaude(systemMessage("system_turn_started", "\u23F3 Codex is working on the current task. Wait for completion before sending a reply."));
 });
 codex.on("agentMessage", (msg) => {
   if (msg.source !== "codex")
     return;
+  recordAgentActivity();
   const route = routeCodexMessage(msg.content, {
     mode: FILTER_MODE,
     replyArmed: replyTracker.isArmed,
@@ -7215,6 +7255,11 @@ function handleControlMessage(ws, raw) {
     case "probe_incumbent":
       handleProbeIncumbent(ws).catch((err) => {
         log(`handleProbeIncumbent threw for #${ws.data.clientId}: ${err?.message ?? err}`);
+      });
+      return;
+    case "request_budget_refresh":
+      handleRequestBudgetRefresh(ws, message.requestId).catch((err) => {
+        log(`handleRequestBudgetRefresh threw for #${ws.data.clientId}: ${err?.message ?? err}`);
       });
       return;
     case "claude_to_codex": {
@@ -7574,6 +7619,11 @@ async function handleProbeIncumbent(ws) {
     connected: stillConnected,
     alive: stillConnected && alive
   });
+}
+async function handleRequestBudgetRefresh(ws, requestId) {
+  const snapshot = budgetCoordinator ? await budgetCoordinator.refreshSnapshotReadonly() : null;
+  log(`request_budget_refresh from #${ws.data.clientId}: ${snapshot ? "fresh" : "unavailable"}`);
+  sendProtocolMessage(ws, { type: "budget_refresh", requestId, snapshot });
 }
 async function probeLiveness2(ws, timeoutMs) {
   return probeLiveness({

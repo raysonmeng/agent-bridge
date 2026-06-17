@@ -37,6 +37,8 @@ const CONFIG: BudgetConfig = {
   // Long poll so start() does NOT auto-fire a second poll while we drive each
   // poll explicitly; we advance the loop via pollOnce() to assert per-poll.
   pollSeconds: 300,
+  budgetFreshTtlSec: 25,
+  idleAdviceActivityWindowSec: 600,
   pauseAt: 90,
   resumeBelow: 30,
   syncDriftPct: 10,

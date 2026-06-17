@@ -179,6 +179,22 @@ export interface BudgetConfig {
   enabled: boolean;
   /** Coordinator poll interval in seconds (first poll fires immediately on start()). */
   pollSeconds: number;
+  /**
+   * Freshness TTL (seconds) for the get_budget tool. When the cached snapshot is
+   * older than this at a get_budget call, the frontend asks the daemon for a
+   * read-only on-demand refresh so a task-allocation decision reads near-live
+   * quota instead of the last poll. Default 25; range [1, 300].
+   */
+  budgetFreshTtlSec: number;
+  /**
+   * Idle-noise window (seconds) for the routine advise directives (balance /
+   * underutilization). They are suppressed when the pair has had no agent
+   * activity (a Codex turn in progress, an agentMessage, or an accepted
+   * Claude→Codex forward) within this window. Pause / handoff / resume /
+   * admission are never gated. Default 600; 0 disables the gate (always emit);
+   * range [0, 86400].
+   */
+  idleAdviceActivityWindowSec: number;
   /** Dynamic-line floor + no-burn-data fallback entry threshold on gateUtil; below guard's hard=99. */
   pauseAt: number;
   /** Joint-pause exit threshold; BOTH sides must drop below this on gateUtil. */
