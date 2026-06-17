@@ -1,5 +1,6 @@
 import { EventEmitter } from "node:events";
 import type { BridgeMessage } from "./types";
+import type { BudgetSnapshot } from "./budget/types";
 import {
   CLOSE_CODE_REPLACED,
   CLOSE_CODE_EVICTED_STALE,
@@ -31,6 +32,8 @@ interface DaemonClientEvents {
   rejected: [number];
   status: [DaemonStatus];
   incumbentStatus: [{ connected: boolean; alive: boolean }];
+  /** Reply to request_budget_refresh: the echoed requestId + a fresh read-only snapshot (null if unavailable). */
+  budgetRefresh: [{ requestId: string; snapshot: BudgetSnapshot | null }];
   /** turn_started ACK (protocol v2 PR B): a bridge-injected turn was confirmed started. */
   turnStarted: [{ requestId: string; idempotencyKey?: string; threadId: string; turnId: string }];
 }
@@ -186,6 +189,35 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
   }
 
   /**
+   * Ask the daemon for a FRESH read-only budget snapshot (fresh-if-stale at a
+   * get_budget call). Fail-OPEN: on timeout, a closed socket, a send throw, or an
+   * older daemon that stays silent, this resolves to `null` so get_budget can
+   * fall back to its cached snapshot (or the unavailable text) instead of hanging.
+   */
+  async requestBudgetRefresh(timeoutMs = 3000): Promise<BudgetSnapshot | null> {
+    if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
+      return null;
+    }
+    const requestId = `budget_${Date.now()}_${this.nextRequestId++}`;
+    return this.awaitTypedResponse<BudgetSnapshot | null>({
+      key: "budget_refresh",
+      successEvent: "budgetRefresh",
+      // Drop a straggler reply from a TIMED-OUT earlier request: only the matching
+      // requestId settles THIS waiter. Without it, a late reply from request #1
+      // (whose 3s wait already timed out while a slow daemon probe ran up to ~10s)
+      // would settle a subsequent #2 with #1's snapshot on this long-lived socket
+      // (review MEDIUM). A non-match is ignored — this waiter keeps waiting for its
+      // own reply or its own timeout.
+      match: (payload: { requestId: string; snapshot: BudgetSnapshot | null }) =>
+        payload.requestId === requestId,
+      successValue: (payload: { requestId: string; snapshot: BudgetSnapshot | null }) => payload.snapshot,
+      failValue: null,
+      timeoutMs,
+      send: () => this.send({ type: "request_budget_refresh", requestId }),
+    });
+  }
+
+  /**
    * Shared skeleton for the two event-style request/response waiters
    * (attach-status, probe-incumbent). Each waiter sends a control message and
    * awaits a single typed response, with RESOLVE-ONLY fail-open semantics on
@@ -206,15 +238,24 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
    */
   private awaitTypedResponse<T>(opts: {
     key: string;
-    successEvent: "status" | "incumbentStatus";
+    successEvent: "status" | "incumbentStatus" | "budgetRefresh";
     successValue: (payload: any) => T;
     failValue: T;
     timeoutMs: number;
     send: () => void;
+    /**
+     * Optional correlation filter. When present, a success-event payload that
+     * does NOT match is IGNORED (not settled) — used by requestBudgetRefresh so a
+     * straggler reply from a timed-out earlier request cannot settle a later
+     * waiter sharing the same message-type key. Absent → any payload settles
+     * (the original probe_incumbent / attach behavior).
+     */
+    match?: (payload: any) => boolean;
   }): Promise<T> {
-    const { key, successEvent, successValue, failValue, timeoutMs, send } = opts;
+    const { key, successEvent, successValue, failValue, timeoutMs, send, match } = opts;
 
     const onSuccess = (payload: any) => {
+      if (match && !match(payload)) return;
       this.pendingEventWaiters.settle(key, successValue(payload));
     };
     const onRejected = () => {
@@ -358,6 +399,9 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
           return;
         case "incumbent_status":
           this.emit("incumbentStatus", { connected: message.connected, alive: message.alive });
+          return;
+        case "budget_refresh":
+          this.emit("budgetRefresh", { requestId: message.requestId, snapshot: message.snapshot });
           return;
       }
     };

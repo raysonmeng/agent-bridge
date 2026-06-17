@@ -381,6 +381,8 @@ describe("ConfigService — budget section", () => {
     expect(config.budget).toEqual({
       enabled: true,
       pollSeconds: 300,
+      budgetFreshTtlSec: 25,
+      idleAdviceActivityWindowSec: 600,
       pauseAt: 90,
       resumeBelow: 30,
       syncDriftPct: 10,
@@ -434,6 +436,8 @@ describe("ConfigService — budget section", () => {
     expect(budget).toEqual({
       enabled: false,
       pollSeconds: 120,
+      budgetFreshTtlSec: 25,
+      idleAdviceActivityWindowSec: 600,
       pauseAt: 85,
       resumeBelow: 20,
       syncDriftPct: 8,
@@ -598,6 +602,8 @@ describe("applyBudgetEnvOverrides", () => {
   const base = {
     enabled: true,
     pollSeconds: 60,
+    budgetFreshTtlSec: 25,
+    idleAdviceActivityWindowSec: 600,
     pauseAt: 90,
     resumeBelow: 30,
     syncDriftPct: 10,
@@ -648,12 +654,32 @@ describe("applyBudgetEnvOverrides", () => {
   test("empty env returns the base config unchanged", () => {
     expect(applyBudgetEnvOverrides(base, {})).toEqual(base);
   });
+
+  test("env overrides budgetFreshTtlSec and idleAdviceActivityWindowSec", () => {
+    const result = applyBudgetEnvOverrides(base, {
+      AGENTBRIDGE_BUDGET_FRESH_TTL_SEC: "10",
+      AGENTBRIDGE_BUDGET_IDLE_ADVICE_ACTIVITY_WINDOW_SEC: "0",
+    });
+    expect(result.budgetFreshTtlSec).toBe(10);
+    expect(result.idleAdviceActivityWindowSec).toBe(0); // 0 = gate disabled, a valid value
+  });
+
+  test("out-of-range fresh-TTL / idle-window env values fall back to base (boundary rules)", () => {
+    const result = applyBudgetEnvOverrides(base, {
+      AGENTBRIDGE_BUDGET_FRESH_TTL_SEC: "9000", // > 300 max
+      AGENTBRIDGE_BUDGET_IDLE_ADVICE_ACTIVITY_WINDOW_SEC: "-5", // < 0 min
+    });
+    expect(result.budgetFreshTtlSec).toBe(25);
+    expect(result.idleAdviceActivityWindowSec).toBe(600);
+  });
 });
 
 describe("applyBudgetEnvOverrides — boolean spellings", () => {
   const base = {
     enabled: true,
     pollSeconds: 60,
+    budgetFreshTtlSec: 25,
+    idleAdviceActivityWindowSec: 600,
     pauseAt: 90,
     resumeBelow: 30,
     syncDriftPct: 10,
@@ -750,6 +776,8 @@ describe("applyBudgetEnvOverrides — v3 P1 keys", () => {
   const base = {
     enabled: true,
     pollSeconds: 60,
+    budgetFreshTtlSec: 25,
+    idleAdviceActivityWindowSec: 600,
     pauseAt: 90,
     resumeBelow: 30,
     syncDriftPct: 10,

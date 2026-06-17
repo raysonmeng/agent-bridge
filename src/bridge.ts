@@ -6,7 +6,7 @@ import { BUILD_INFO } from "./build-info";
 import { DaemonClient } from "./daemon-client";
 import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
-import { ConfigService } from "./config-service";
+import { ConfigService, applyBudgetEnvOverrides } from "./config-service";
 import { disabledReplyError, shouldEmitReconnectSuccess, type BridgeDisabledReason } from "./bridge-disabled-state";
 import { guardAgentBridgeEnv, normalizeEnvGuardMode } from "./env-guard";
 import { pairScopedCommand } from "./pair-command";
@@ -45,11 +45,24 @@ const CONTROL_PORT = parseInt(process.env.AGENTBRIDGE_CONTROL_PORT ?? "4502", 10
 const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 const CONTROL_WS_URL = daemonLifecycle.controlWsUrl;
 
-const claude = new ClaudeAdapter(stateDir.logFile);
+// Thread the budget-freshness TTL from config → frontend so a config.json
+// `budget.budgetFreshTtlSec` actually governs get_budget (the daemon/coordinator
+// never read it — it is a frontend-only knob). applyBudgetEnvOverrides keeps the
+// env > config > default precedence consistent with the daemon side.
+const effectiveBudget = applyBudgetEnvOverrides(config.budget);
+const claude = new ClaudeAdapter(stateDir.logFile, {
+  budgetFreshTtlMs: effectiveBudget.budgetFreshTtlSec * 1000,
+});
 // Pass the identity RESOLVER (not a snapshot) so the control token is read from
 // disk on each attach: the daemon may not have written it when bridge.ts starts,
 // and a daemon restart rotates the token (arch-review P1 #283).
 const daemonClient = new DaemonClient(CONTROL_WS_URL, { identity: currentClientIdentity });
+
+// Fresh-if-stale budget (v3 P5): get_budget asks the daemon for a near-live
+// read-only snapshot when its broadcast cache is older than budgetFreshTtlMs.
+// requestBudgetRefresh is fail-open (null on timeout / closed socket / older
+// daemon), so get_budget degrades to its cached snapshot instead of hanging.
+claude.setRequestFreshSnapshot(() => daemonClient.requestBudgetRefresh());
 
 let shuttingDown = false;
 let daemonDisabled = false;

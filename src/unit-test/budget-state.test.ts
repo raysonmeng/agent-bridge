@@ -8,6 +8,8 @@ const NOW = 1_700_000_000;
 const CONFIG: BudgetConfig = {
   enabled: true,
   pollSeconds: 60,
+  budgetFreshTtlSec: 25,
+  idleAdviceActivityWindowSec: 600,
   pauseAt: 90,
   resumeBelow: 30,
   syncDriftPct: 10,

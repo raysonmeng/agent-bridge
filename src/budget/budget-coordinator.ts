@@ -101,6 +101,16 @@ export interface BudgetCoordinatorOptions {
    * emits immediately on entry — the safe default for unit tests.
    */
   isCodexTurnActive?: () => boolean;
+  /**
+   * Idle-noise gate: returns whether the pair had agent activity (a Codex turn,
+   * an agentMessage, or a Claude→Codex forward) within `windowSec`. Used to
+   * SUPPRESS the routine advise directives (balance / underutilization) when both
+   * agents have been idle — those are pacing nudges that only matter while work is
+   * happening. Pause / handoff / resume / admission directives are NEVER gated by
+   * this. Absent (tests / no wiring) → treated as always-active, so advice emits
+   * immediately — the backward-compatible default.
+   */
+  hasRecentActivity?: (windowSec: number) => boolean;
 }
 
 const AGENT_LABEL: Record<AgentName, string> = {
@@ -190,6 +200,7 @@ export class BudgetCoordinator {
   private readonly resumeSignals: (() => ResumeSignals) | null;
   private readonly adviceCooldown: AdviceCooldown;
   private readonly isCodexTurnActive: () => boolean;
+  private readonly hasRecentActivity: (windowSec: number) => boolean;
 
   private timer: BudgetPollTimer | null = null;
   private running = false;
@@ -240,6 +251,9 @@ export class BudgetCoordinator {
         log: this.log,
       });
     this.isCodexTurnActive = options.isCodexTurnActive ?? (() => false);
+    // Default always-active → advice never suppressed when no activity signal is
+    // wired (tests / standalone), preserving prior behavior.
+    this.hasRecentActivity = options.hasRecentActivity ?? (() => true);
   }
 
   async start(): Promise<void> {
@@ -280,6 +294,35 @@ export class BudgetCoordinator {
 
   getSnapshot(): BudgetSnapshot | null {
     return this.latestSnapshot;
+  }
+
+  /**
+   * Fresh, read-only budget snapshot for an on-demand get_budget call
+   * (fresh-if-stale at a task-allocation decision). Does a single fetch + compute
+   * and returns the snapshot, but NEVER advances coordinator state: no directive
+   * emit, no onPauseChange, no fingerprint/admission/sequence mutation, no
+   * setSnapshot/onSnapshot, no pending-override update. Mirrors pollOnce's
+   * fetch+compute (runway computed ONCE, same as the poll) minus every side
+   * effect, so it is safe to call repeatedly and even while polling is stopped.
+   * Returns null when the fetch fails or yields no usage.
+   */
+  async refreshSnapshotReadonly(): Promise<BudgetSnapshot | null> {
+    let usage: Awaited<ReturnType<QuotaSourceLike["fetchBoth"]>>;
+    try {
+      usage = await this.source.fetchBoth();
+    } catch (error) {
+      this.log(`budget readonly refresh failed: ${error instanceof Error ? error.message : String(error)}`);
+      return null;
+    }
+    if (!usage) return null;
+
+    const now = this.now();
+    const runway: RunwayInput = {
+      claude: agentRunway(usage.claude, now),
+      codex: agentRunway(usage.codex, now),
+    };
+    const state = computeBudgetState(usage.claude, usage.codex, this.config, now, runway);
+    return this.toSnapshot(state, runway);
   }
 
   /**
@@ -495,6 +538,22 @@ export class BudgetCoordinator {
           // returns kind:"none" → the legitimate balance/underutilization advice is
           // permanently lost for the episode (round-2 REAL, both review engines).
           // Nulling it makes the next OPEN-gate poll recompute and emit exactly once.
+          this.fpState = { ...this.fpState, fingerprint: null };
+          return;
+        }
+        // Idle-noise gate (v3 P5): balance / underutilization are pacing NUDGES
+        // that only matter while the pair is working. When both agents have been
+        // idle longer than idleAdviceActivityWindowSec, suppress the advice and
+        // RE-ARM the fingerprint (null) — same reasoning as the gate-closed branch:
+        // a bare return burns the dedup key so the advice never re-emits once
+        // activity resumes. Checked BEFORE the underutilization cooldown acquire so
+        // an idle poll never burns the cross-pair cooldown slot either. windowSec
+        // <= 0 disables the gate entirely (always emit — prior behavior). Only the
+        // advise lane is gated; pause / handoff / resume / admission are never
+        // suppressed by idleness (they are handled by their own effect branches).
+        const activityWindowSec = this.config.idleAdviceActivityWindowSec;
+        if (activityWindowSec > 0 && !this.hasRecentActivity(activityWindowSec)) {
+          this.log(`budget advise suppressed: no agent activity in last ${activityWindowSec}s`);
           this.fpState = { ...this.fpState, fingerprint: null };
           return;
         }

@@ -675,27 +675,80 @@ describe("get_budget tool (handleGetBudget)", () => {
     claudeAdvice: null,
   };
 
-  test("returns unavailable text when no snapshot is cached", () => {
+  test("returns unavailable text when no snapshot is cached", async () => {
     const adapter = new ClaudeAdapter() as any;
-    const result = adapter.handleGetBudget();
+    const result = await adapter.handleGetBudget();
     expect(result.content[0].text).toContain("预算感知不可用");
     expect(result.isError).toBeUndefined();
   });
 
-  test("renders the shared renderer output when a snapshot is cached", () => {
+  test("renders the shared renderer output when a snapshot is cached", async () => {
     const adapter = new ClaudeAdapter() as any;
     adapter.setBudgetSnapshot(snapshot);
-    const result = adapter.handleGetBudget();
+    const result = await adapter.handleGetBudget();
     expect(result.content[0].text).toContain("【预算快照 · 账号级】");
     expect(result.content[0].text).toContain("Claude：");
     expect(result.content[0].text).toContain("Codex：未知（探测不可用）");
   });
 
-  test("clearing the snapshot reverts to unavailable text", () => {
+  test("clearing the snapshot reverts to unavailable text", async () => {
     const adapter = new ClaudeAdapter() as any;
     adapter.setBudgetSnapshot(snapshot);
     adapter.setBudgetSnapshot(null);
-    const result = adapter.handleGetBudget();
+    const result = await adapter.handleGetBudget();
     expect(result.content[0].text).toContain("预算感知不可用");
+  });
+
+  // Fresh-if-stale + single-flight (v3 P5). wallNow + budgetFreshTtlMs are
+  // injected so freshness is deterministic regardless of wall-clock.
+  const NOW_MS = 1_780_711_710_000;
+  const NOW_SEC = Math.floor(NOW_MS / 1000);
+  function freshAdapter() {
+    return new ClaudeAdapter(undefined, { wallNow: () => NOW_MS, budgetFreshTtlMs: 25_000 }) as any;
+  }
+
+  test("fresh cache (within TTL) renders the cache WITHOUT calling the refresh fetcher", async () => {
+    const adapter = freshAdapter();
+    let calls = 0;
+    adapter.setRequestFreshSnapshot(async () => { calls++; return null; });
+    adapter.setBudgetSnapshot({ ...snapshot, updatedAt: NOW_SEC - 10 }); // 10s old < 25s TTL
+    const result = await adapter.handleGetBudget();
+    expect(calls).toBe(0);
+    expect(result.content[0].text).toContain("【预算快照 · 账号级】");
+  });
+
+  test("stale cache triggers an on-demand refresh and renders + caches the fresh snapshot", async () => {
+    const adapter = freshAdapter();
+    const fresh = { ...snapshot, updatedAt: NOW_SEC, claude: { ...snapshot.claude, gateUtil: 77 } };
+    let calls = 0;
+    adapter.setRequestFreshSnapshot(async () => { calls++; return fresh; });
+    adapter.setBudgetSnapshot({ ...snapshot, updatedAt: NOW_SEC - 60 }); // 60s old > 25s TTL
+    await adapter.handleGetBudget();
+    expect(calls).toBe(1);
+    expect(adapter.budgetSnapshot.claude.gateUtil).toBe(77); // cache updated to fresh
+  });
+
+  test("refresh returning null falls back to the (stale) cached snapshot", async () => {
+    const adapter = freshAdapter();
+    adapter.setRequestFreshSnapshot(async () => null); // daemon unavailable / timeout
+    adapter.setBudgetSnapshot({ ...snapshot, updatedAt: NOW_SEC - 60 });
+    const result = await adapter.handleGetBudget();
+    expect(result.content[0].text).toContain("【预算快照 · 账号级】"); // rendered from cache, not unavailable
+  });
+
+  test("concurrent stale get_budget calls share ONE in-flight refresh (single-flight)", async () => {
+    const adapter = freshAdapter();
+    let calls = 0;
+    let resolveFetch: (s: unknown) => void = () => {};
+    adapter.setRequestFreshSnapshot(() => {
+      calls++;
+      return new Promise((resolve) => { resolveFetch = resolve; });
+    });
+    adapter.setBudgetSnapshot({ ...snapshot, updatedAt: NOW_SEC - 60 });
+    const p1 = adapter.handleGetBudget();
+    const p2 = adapter.handleGetBudget();
+    resolveFetch({ ...snapshot, updatedAt: NOW_SEC });
+    await Promise.all([p1, p2]);
+    expect(calls).toBe(1);
   });
 });

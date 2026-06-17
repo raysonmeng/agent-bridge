@@ -494,6 +494,13 @@ function ensureBudgetCoordinatorStarted() {
       // v3 P3 (§3.2, M3b): turnPhase-aware admission directive — defer while a
       // Codex turn runs, flush on idle (see turnPhaseChanged → onCodexTurnIdle).
       isCodexTurnActive: () => codex.turnInProgress,
+      // v3 P5 idle-noise gate: routine balance/underutilization advice is
+      // suppressed when the pair has been idle. Active = an in-progress Codex turn
+      // (a long silent turn must NOT read as idle — Codex review REAL #2) OR agent
+      // activity within windowSec. The coordinator only calls this when the
+      // configured window > 0 (window = 0 disables the gate entirely).
+      hasRecentActivity: (windowSec: number) =>
+        codex.turnInProgress || Date.now() - lastActivityEpochMs <= windowSec * 1000,
     });
   }
   void budgetCoordinator.start();
@@ -788,6 +795,7 @@ codex.on("steerFailed", ({ requestId, reason }: { requestId: number; reason: str
 
 codex.on("steerAccepted", ({ requestId }: { requestId: number }) => {
   log("Steer accepted by app-server");
+  recordAgentActivity();
   // require_reply × steer (PR B): the expectation arms only NOW — "a NEW
   // forwarded agentMessage after steer-accept and before the turn's terminal
   // counts as the reply". Arming at dispatch would mis-attribute pre-steer
@@ -889,8 +897,22 @@ codex.on("turnTrackingReset", (reason: string) => {
   resumeInjectionQueue.onTurnTrackingReset();
 });
 
+// Idle-noise gate (v3 P5): last wall-clock ms at which the pair showed agent
+// activity — a Codex turn start, a Codex agentMessage, or an accepted
+// Claude→Codex steer. The budget coordinator reads hasRecentActivity() to
+// suppress the routine balance/underutilization advice while both agents are
+// idle (pause/handoff/resume/admission are never gated). Rejected injections do
+// NOT count (no recordAgentActivity on busy/budget reject) so failed retries
+// cannot keep the pair "active". A long silent Codex turn is still covered by
+// the `codex.turnInProgress` OR in hasRecentActivity below.
+let lastActivityEpochMs = 0;
+function recordAgentActivity(): void {
+  lastActivityEpochMs = Date.now();
+}
+
 codex.on("turnStarted", () => {
   log("Codex turn started");
+  recordAgentActivity();
   emitToClaude(
     systemMessage(
       "system_turn_started",
@@ -901,6 +923,7 @@ codex.on("turnStarted", () => {
 
 codex.on("agentMessage", (msg: BridgeMessage) => {
   if (msg.source !== "codex") return;
+  recordAgentActivity();
   const route = routeCodexMessage(msg.content, {
     mode: FILTER_MODE,
     replyArmed: replyTracker.isArmed,
@@ -1228,6 +1251,11 @@ function handleControlMessage(ws: ServerWebSocket<ControlSocketData>, raw: strin
     case "probe_incumbent":
       handleProbeIncumbent(ws).catch((err) => {
         log(`handleProbeIncumbent threw for #${ws.data.clientId}: ${err?.message ?? err}`);
+      });
+      return;
+    case "request_budget_refresh":
+      handleRequestBudgetRefresh(ws, message.requestId).catch((err) => {
+        log(`handleRequestBudgetRefresh threw for #${ws.data.clientId}: ${err?.message ?? err}`);
       });
       return;
     case "claude_to_codex": {
@@ -1862,6 +1890,22 @@ async function handleProbeIncumbent(ws: ServerWebSocket<ControlSocketData>) {
     connected: stillConnected,
     alive: stillConnected && alive,
   });
+}
+
+/**
+ * Answer an on-demand `request_budget_refresh` (fresh-if-stale): the frontend
+ * asks for a near-live snapshot at a get_budget call. refreshSnapshotReadonly
+ * does a single fetch + compute with NO coordinator state advance (no emit /
+ * pause / admission / setSnapshot / broadcast), so reading the budget never
+ * moves the gate. Null when no coordinator (Codex not attached yet) or the fetch
+ * failed — the frontend then falls back to its cached snapshot (or the
+ * unavailable text). `requestId` is echoed so a slow straggler reply can never
+ * settle a later waiter on the long-lived control socket (review MEDIUM).
+ */
+async function handleRequestBudgetRefresh(ws: ServerWebSocket<ControlSocketData>, requestId: string) {
+  const snapshot = budgetCoordinator ? await budgetCoordinator.refreshSnapshotReadonly() : null;
+  log(`request_budget_refresh from #${ws.data.clientId}: ${snapshot ? "fresh" : "unavailable"}`);
+  sendProtocolMessage(ws, { type: "budget_refresh", requestId, snapshot });
 }
 
 async function probeLiveness(
