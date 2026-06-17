@@ -98,6 +98,15 @@ export type ControlClientMessage =
        * Messages without a key bypass the machine entirely (backward compat).
        */
       idempotencyKey?: string;
+      /**
+       * v3 P3 (§3.2): finishing-turn declaration. When the admission gate is
+       * `admission-closed` (5h finishing protection), new turns are rejected with
+       * `budget_admission` — EXCEPT a reply flagged `wrapUp: true`, which is let
+       * through up to `maximize.wrapUpQuota` per 5h window so an in-flight
+       * collaboration can be wrapped to a checkpoint. Absent/false on an older
+       * client → treated as a normal (non-wrap-up) turn (backward compat).
+       */
+      wrapUp?: boolean;
     }
   | { type: "status" }
   /**
@@ -127,7 +136,7 @@ export type ControlServerMessage =
       /**
        * Structured result (protocol v2 PR B). `ok` mirrors `success` and both
        * are populated for one version; `code` is the machine-readable failure
-       * code (e.g. busy_reject / budget_paused / steer_failed /
+       * code (e.g. busy_reject / budget_paused / budget_admission / steer_failed /
        * interrupt_timeout / interrupt_rejected / interrupt_unavailable /
        * duplicate_in_flight / duplicate_terminal / no_thread); `phase` is the
        * codex turnPhase at result time; `retryAfterMs` is advisory and only

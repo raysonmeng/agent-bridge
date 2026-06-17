@@ -49,7 +49,7 @@ interface Harness {
   sendClaudeToCodex: (
     requestId: string,
     text: string,
-    opts?: { onBusy?: "reject" | "steer" | "interrupt"; requireReply?: boolean; idempotencyKey?: string },
+    opts?: { onBusy?: "reject" | "steer" | "interrupt"; requireReply?: boolean; idempotencyKey?: string; wrapUp?: boolean },
   ) => void;
   /** Send an ack_resume control message over the attached control socket (PR4). */
   sendAckResume: (resumeId: string, status: string) => void;
@@ -746,7 +746,10 @@ describe("daemon wiring", () => {
       );
     };
     writeUsage("claude", 10);
-    writeUsage("codex", 85); // eco band (≥80) but below pauseAt=90 — no pause
+    // eco band (warnUtil ≥80) yet below pauseAt=90 (no pause) AND below
+    // admissionAt=85 (no v3 P3 admission-closed gate) — so the tier-override turn
+    // still injects. (85 would now trip admission-closed and block the turn.)
+    writeUsage("codex", 82);
     writeFileSync(probePath, `#!/bin/sh\ncat "${fixtureRoot}/usage-$2.json"\n`, "utf-8");
     chmodSync(probePath, 0o755);
 
@@ -826,6 +829,177 @@ describe("daemon wiring", () => {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
   }, 60000);
+
+  test("v3 P3 admission gate: new turns rejected with budget_admission; wrap-up allowed", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-budget-admission-fixture-"));
+    const probePath = join(fixtureRoot, "probe.sh");
+    const turnStartLog = join(fixtureRoot, "turn-starts.jsonl");
+    const writeUsage = (agent: "claude" | "codex", gateUtil: number) => {
+      writeFileSync(
+        join(fixtureRoot, `usage-${agent}.json`),
+        JSON.stringify({
+          ok: true,
+          util: gateUtil,
+          warn_util: gateUtil,
+          fetched_at: Math.floor(Date.now() / 1000),
+          buckets: [
+            { id: "five_hour", util: gateUtil, reset_epoch: Math.floor(Date.now() / 1000) + 7200 },
+          ],
+        }),
+      );
+    };
+    const readTurnStarts = (): Array<Record<string, unknown>> => {
+      if (!existsSync(turnStartLog)) return [];
+      return readFileSync(turnStartLog, "utf-8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    };
+    writeUsage("claude", 10);
+    // 5h util 86 ≥ admissionAt(85) → admission-closed, yet < pauseAt(90) → NOT paused.
+    writeUsage("codex", 86);
+    writeFileSync(probePath, `#!/bin/sh\ncat "${fixtureRoot}/usage-$2.json"\n`, "utf-8");
+    chmodSync(probePath, 0o755);
+
+    try {
+      const harness = await startHarness({
+        pairId: "main-budgetadm",
+        pairName: "main",
+        extraEnv: {
+          AGENTBRIDGE_BUDGET_ENABLED: "1",
+          AGENTBRIDGE_QUOTA_PROBE: probePath,
+          AGENTBRIDGE_BUDGET_POLL_SECONDS: "5",
+          FAKE_APP_TURNSTART_LOG: turnStartLog,
+        },
+      });
+      await harness.attachClaude();
+      await harness.connectTui();
+
+      // Wait until the coordinator's first poll computed gateState=admission-closed.
+      await waitFor(async () => {
+        try {
+          const res = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+          if (!res.ok) return false;
+          const status = (await res.json()) as DaemonStatus;
+          return status.budget?.gateState === "admission-closed" && status.budget?.paused === false;
+        } catch {
+          return false;
+        }
+      }, "gateState=admission-closed on /healthz", 200, 100);
+
+      // 1. A normal new turn is rejected with budget_admission (NOT budget_paused).
+      harness.sendClaudeToCodex("req-adm-new", "start a new task");
+      await waitFor(
+        () => harness.statusMessages.some((m) => m.type === "claude_to_codex_result" && m.requestId === "req-adm-new"),
+        "claude_to_codex_result for req-adm-new",
+      );
+      const rejected = harness.statusMessages.find(
+        (m) => m.type === "claude_to_codex_result" && m.requestId === "req-adm-new",
+      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
+      expect(rejected.success).toBe(false);
+      expect(rejected.code).toBe("budget_admission");
+      expect(rejected.error).toContain("收尾保护");
+      expect(readTurnStarts().length).toBe(0); // new task did NOT inject
+
+      // 2. A wrap-up reply is let through the admission gate → injects a turn.
+      harness.sendClaudeToCodex("req-adm-wrap", "wrap the current work to a checkpoint", { wrapUp: true });
+      await waitFor(() => readTurnStarts().length >= 1, "wrap-up turn injected past admission gate", 100, 100);
+
+      // The wrap-up slot is consumed ONLY on the confirmed injection (deferred from
+      // the gate). So after exactly one injected wrap-up the count is 1 — and the
+      // earlier rejected new-turn (step 1) consumed nothing.
+      const quotaFile = join(harness.stateDir, "admission-quota.json");
+      await waitFor(() => existsSync(quotaFile), "admission-quota.json persisted", 100, 100);
+      const quota = JSON.parse(readFileSync(quotaFile, "utf-8"));
+      expect(quota.wrapUpUsed).toBe(1);
+
+      // 3. FAIL CLOSED (M3a round-2 REAL): make the quota file unwritable (replace
+      // it with a directory so atomicWriteJson's rename throws at commit) → a
+      // further wrap-up is REJECTED with budget_admission and does NOT inject — the
+      // gate never lets an UNCOUNTED turn through on a write failure.
+      rmSync(quotaFile, { force: true });
+      mkdirSync(quotaFile);
+      const turnsBefore = readTurnStarts().length;
+      harness.sendClaudeToCodex("req-adm-wrapfail", "wrap up again (commit write fails)", { wrapUp: true });
+      await waitFor(
+        () => harness.statusMessages.some((m) => m.type === "claude_to_codex_result" && m.requestId === "req-adm-wrapfail"),
+        "result for req-adm-wrapfail",
+      );
+      const wrapFail = harness.statusMessages.find(
+        (m) => m.type === "claude_to_codex_result" && m.requestId === "req-adm-wrapfail",
+      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
+      expect(wrapFail.success).toBe(false);
+      expect(wrapFail.code).toBe("budget_admission");
+      expect(readTurnStarts().length).toBe(turnsBefore); // fail-closed: NOT injected
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 45000);
+
+  test("v3 P3 admission gate: weekly-runway trigger (no fresh 5h) still COUNTS wrap-ups (cap not bypassed)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-budget-admweekly-fixture-"));
+    const probePath = join(fixtureRoot, "probe.sh");
+    const turnStartLog = join(fixtureRoot, "turn-starts.jsonl");
+    const now = Math.floor(Date.now() / 1000);
+    const readTurnStarts = (): Array<Record<string, unknown>> => {
+      if (!existsSync(turnStartLog)) return [];
+      return readFileSync(turnStartLog, "utf-8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    };
+    // Claude idle. Codex: an EXPIRED 5h window (reset_epoch = now-100, > 0 yet past —
+    // the round-4 case: a 5h-only ">0" key would mis-key here) plus a fresh weekly
+    // that will-fill (util 70 + rate 30/h over 1h → 100 > targetUtil 98) with a short
+    // runway (3000s < finishingHorizon 30m × 2 = 3600s) → admission-closed via the
+    // weekly-runway trigger, while util 70 < pauseAt 90 keeps it OUT of pause. The
+    // daemon must key the wrap-up quota on the FRESH weekly window, not the expired 5h.
+    writeFileSync(join(fixtureRoot, "usage-claude.json"), JSON.stringify({
+      ok: true, util: 10, warn_util: 10, fetched_at: now,
+      buckets: [{ id: "five_hour", util: 10, reset_epoch: now + 7200 }],
+    }));
+    writeFileSync(join(fixtureRoot, "usage-codex.json"), JSON.stringify({
+      ok: true, util: 70, warn_util: 70, fetched_at: now,
+      buckets: [
+        { id: "five_hour", util: 70, reset_epoch: now - 100 },
+        { id: "seven_day", util: 70, reset_epoch: now + 3600, burn_rate_pct_per_hour: 30, burn_confident: true, runway_seconds: 3000 },
+      ],
+    }));
+    writeFileSync(probePath, `#!/bin/sh\ncat "${fixtureRoot}/usage-$2.json"\n`, "utf-8");
+    chmodSync(probePath, 0o755);
+
+    try {
+      const harness = await startHarness({
+        pairId: "main-budgetadmwk",
+        pairName: "main",
+        extraEnv: {
+          AGENTBRIDGE_BUDGET_ENABLED: "1",
+          AGENTBRIDGE_QUOTA_PROBE: probePath,
+          AGENTBRIDGE_BUDGET_POLL_SECONDS: "5",
+          FAKE_APP_TURNSTART_LOG: turnStartLog,
+        },
+      });
+      await harness.attachClaude();
+      await harness.connectTui();
+
+      await waitFor(async () => {
+        try {
+          const res = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+          if (!res.ok) return false;
+          const status = (await res.json()) as DaemonStatus;
+          return status.budget?.gateState === "admission-closed" && status.budget?.paused === false;
+        } catch {
+          return false;
+        }
+      }, "gateState=admission-closed (weekly trigger) on /healthz", 200, 100);
+
+      // A wrap-up is let through AND counted on the weekly-window key (not uncounted):
+      // the 5h key would be 0 here, so the daemon must fall back to the weekly reset.
+      harness.sendClaudeToCodex("req-admwk-wrap", "wrap up under weekly-triggered admission", { wrapUp: true });
+      await waitFor(() => readTurnStarts().length >= 1, "wrap-up injected under weekly admission", 100, 100);
+      const quotaFile = join(harness.stateDir, "admission-quota.json");
+      await waitFor(() => existsSync(quotaFile), "admission-quota.json persisted on the weekly key", 100, 100);
+      const quota = JSON.parse(readFileSync(quotaFile, "utf-8"));
+      expect(quota.wrapUpUsed).toBe(1); // COUNTED (cap not bypassed)
+      expect(quota.fiveHourResetEpoch).toBe(now + 3600); // keyed on the weekly reset
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 45000);
 
   test("budget status broadcasts follow coordinator snapshot polls, not the daemon interval", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-budget-snapshot-fixture-"));
@@ -1761,7 +1935,7 @@ async function startHarness(opts: {
         }
       }, "bridge ready after TUI handshake", 100, 100);
     },
-    sendClaudeToCodex: (requestId: string, text: string, sendOpts?: { onBusy?: "reject" | "steer" | "interrupt"; requireReply?: boolean; idempotencyKey?: string }) => {
+    sendClaudeToCodex: (requestId: string, text: string, sendOpts?: { onBusy?: "reject" | "steer" | "interrupt"; requireReply?: boolean; idempotencyKey?: string; wrapUp?: boolean }) => {
       harness.controlWs?.send(JSON.stringify({
         type: "claude_to_codex",
         requestId,
@@ -1769,6 +1943,7 @@ async function startHarness(opts: {
         ...(sendOpts?.requireReply ? { requireReply: true } : {}),
         ...(sendOpts?.onBusy && sendOpts.onBusy !== "reject" ? { onBusy: sendOpts.onBusy } : {}),
         ...(sendOpts?.idempotencyKey ? { idempotencyKey: sendOpts.idempotencyKey } : {}),
+        ...(sendOpts?.wrapUp ? { wrapUp: true } : {}),
       }));
     },
     sendAckResume: (resumeId: string, status: string) => {

@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.17", "0.0.0-source"),
-  commit: defineString("ad365c0", "source"),
+  commit: defineString("02064f0", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("c22387f3269f", "source")
+  codeHash: defineString("6cbaf424d274", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -289,6 +289,9 @@ class StateDirResolver {
   }
   get killedFile() {
     return join(this.stateDir, "killed");
+  }
+  get admissionQuotaFile() {
+    return join(this.stateDir, "admission-quota.json");
   }
   get updateCheckFile() {
     return join(this.stateDir, "update-check.json");
@@ -3386,6 +3389,78 @@ async function fetchWithTimeout(url, timeoutMs = HEALTH_FETCH_TIMEOUT_MS) {
   }
 }
 
+// src/budget/admission-quota.ts
+function nodeFs() {
+  return __require("fs");
+}
+function freshState(fiveHourResetEpoch) {
+  return { version: 1, fiveHourResetEpoch, wrapUpUsed: 0, checkpointBatonUsed: false };
+}
+function parseAdmissionQuota(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return null;
+  const record = value;
+  if (record.version !== 1)
+    return null;
+  const epoch = record.fiveHourResetEpoch;
+  const used = record.wrapUpUsed;
+  if (typeof epoch !== "number" || !Number.isFinite(epoch))
+    return null;
+  if (typeof used !== "number" || !Number.isFinite(used) || used < 0)
+    return null;
+  return {
+    version: 1,
+    fiveHourResetEpoch: epoch,
+    wrapUpUsed: Math.floor(used),
+    checkpointBatonUsed: record.checkpointBatonUsed === true
+  };
+}
+function currentWindowState(path, fiveHourResetEpoch, log = () => {}) {
+  let raw;
+  try {
+    raw = nodeFs().readFileSync(path, "utf-8");
+  } catch {
+    return freshState(fiveHourResetEpoch);
+  }
+  const text = String(raw).trim();
+  if (text === "")
+    return freshState(fiveHourResetEpoch);
+  let parsed;
+  try {
+    parsed = JSON.parse(text);
+  } catch {
+    log(`admission-quota: skip malformed JSON ${path}`);
+    return freshState(fiveHourResetEpoch);
+  }
+  const state = parseAdmissionQuota(parsed);
+  if (!state || state.fiveHourResetEpoch !== fiveHourResetEpoch) {
+    return freshState(fiveHourResetEpoch);
+  }
+  return state;
+}
+function persist(path, state, log) {
+  try {
+    atomicWriteJson(path, state);
+    return true;
+  } catch (error) {
+    log(`admission-quota: write failed ${path}: ${error instanceof Error ? error.message : String(error)}`);
+    return false;
+  }
+}
+function consumeWrapUp(path, fiveHourResetEpoch, limit, log = () => {}) {
+  if (!Number.isFinite(fiveHourResetEpoch))
+    return { allowed: false, used: 0, remaining: 0 };
+  const state = currentWindowState(path, fiveHourResetEpoch, log);
+  if (state.wrapUpUsed >= limit) {
+    return { allowed: false, used: state.wrapUpUsed, remaining: Math.max(0, limit - state.wrapUpUsed) };
+  }
+  const next = { ...state, wrapUpUsed: state.wrapUpUsed + 1 };
+  if (!persist(path, next, log)) {
+    return { allowed: false, used: state.wrapUpUsed, remaining: Math.max(0, limit - state.wrapUpUsed) };
+  }
+  return { allowed: true, used: next.wrapUpUsed, remaining: Math.max(0, limit - next.wrapUpUsed) };
+}
+
 // src/config-service.ts
 import { readFileSync as readFileSync4, mkdirSync as mkdirSync4, existsSync as existsSync4 } from "fs";
 import { join as join4 } from "path";
@@ -3410,7 +3485,9 @@ var DEFAULT_BUDGET_CONFIG = {
     reserveSlopePctPerHour: 0.4,
     reserveMaxPct: 7,
     finishingHorizonMinutes: 30,
-    resumeHysteresisPct: 5
+    resumeHysteresisPct: 5,
+    admissionAt: 85,
+    wrapUpQuota: 2
   },
   allocation: {
     minRunwayRatio: 50,
@@ -3478,7 +3555,9 @@ function findShapeViolation(raw) {
         "reserveSlopePctPerHour",
         "reserveMaxPct",
         "finishingHorizonMinutes",
-        "resumeHysteresisPct"
+        "resumeHysteresisPct",
+        "admissionAt",
+        "wrapUpQuota"
       ]) {
         if (key in maximize && !isCoercibleNumber(maximize[key])) {
           return `budget.maximize.${key} is present but not a number`;
@@ -3503,7 +3582,7 @@ function hasCustomDecisionValues(config) {
   const d = DEFAULT_CONFIG;
   const b = config.budget;
   const db = d.budget;
-  return config.idleShutdownSeconds !== d.idleShutdownSeconds || config.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config.codex.appPort !== d.codex.appPort || config.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct || b.allocation.minRunwayRatio !== db.allocation.minRunwayRatio || b.allocation.minRunwayGapHours !== db.allocation.minRunwayGapHours;
+  return config.idleShutdownSeconds !== d.idleShutdownSeconds || config.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config.codex.appPort !== d.codex.appPort || config.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct || b.maximize.admissionAt !== db.maximize.admissionAt || b.maximize.wrapUpQuota !== db.maximize.wrapUpQuota || b.allocation.minRunwayRatio !== db.allocation.minRunwayRatio || b.allocation.minRunwayGapHours !== db.allocation.minRunwayGapHours;
 }
 function normalizeInteger(value, fallback) {
   if (typeof value === "number" && Number.isFinite(value))
@@ -3543,9 +3622,11 @@ function normalizeMaximizeConfig(raw, pauseAt, fallback = DEFAULT_BUDGET_CONFIG.
     reserveSlopePctPerHour: normalizeBoundedNumber(m.reserveSlopePctPerHour, fallback.reserveSlopePctPerHour, 0, 5),
     reserveMaxPct: normalizeBoundedInteger(m.reserveMaxPct, fallback.reserveMaxPct, 0, 30),
     finishingHorizonMinutes: normalizeBoundedInteger(m.finishingHorizonMinutes, fallback.finishingHorizonMinutes, 5, 180),
-    resumeHysteresisPct: normalizeBoundedInteger(m.resumeHysteresisPct, fallback.resumeHysteresisPct, 1, 30)
+    resumeHysteresisPct: normalizeBoundedInteger(m.resumeHysteresisPct, fallback.resumeHysteresisPct, 1, 30),
+    admissionAt: normalizeBoundedInteger(m.admissionAt, fallback.admissionAt, 50, 99),
+    wrapUpQuota: Math.floor(normalizeBoundedInteger(m.wrapUpQuota, fallback.wrapUpQuota, 0, 10))
   };
-  if (normalized.targetUtil <= pauseAt) {
+  if (normalized.targetUtil <= pauseAt || normalized.admissionAt >= normalized.targetUtil) {
     return { ...DEFAULT_BUDGET_CONFIG.maximize };
   }
   return normalized;
@@ -3628,7 +3709,9 @@ function applyBudgetEnvOverrides(budget, env = process.env) {
       reserveSlopePctPerHour: env.AGENTBRIDGE_BUDGET_RESERVE_SLOPE_PCT_PER_HOUR ?? budget.maximize.reserveSlopePctPerHour,
       reserveMaxPct: env.AGENTBRIDGE_BUDGET_RESERVE_MAX_PCT ?? budget.maximize.reserveMaxPct,
       finishingHorizonMinutes: env.AGENTBRIDGE_BUDGET_FINISHING_HORIZON_MINUTES ?? budget.maximize.finishingHorizonMinutes,
-      resumeHysteresisPct: env.AGENTBRIDGE_BUDGET_RESUME_HYSTERESIS_PCT ?? budget.maximize.resumeHysteresisPct
+      resumeHysteresisPct: env.AGENTBRIDGE_BUDGET_RESUME_HYSTERESIS_PCT ?? budget.maximize.resumeHysteresisPct,
+      admissionAt: env.AGENTBRIDGE_BUDGET_ADMISSION_AT ?? budget.maximize.admissionAt,
+      wrapUpQuota: env.AGENTBRIDGE_BUDGET_WRAP_UP_QUOTA ?? budget.maximize.wrapUpQuota
     },
     allocation: {
       minRunwayRatio: env.AGENTBRIDGE_BUDGET_MIN_RUNWAY_RATIO ?? budget.allocation.minRunwayRatio,
@@ -3966,6 +4049,79 @@ function resumeBlockingEpochFor(usage, cfg, now) {
   if (blockingResets.length === 0)
     return 0;
   return Math.min(...blockingResets);
+}
+var ADMISSION_WEEKLY_RUNWAY_ENTER_MULT = 2;
+var ADMISSION_WEEKLY_RUNWAY_EXIT_MULT = 3;
+function weeklyRunwayFloorSec(cfg, mult) {
+  return cfg.maximize.finishingHorizonMinutes * 60 * mult;
+}
+function weeklyRunwayShort(usage, cfg, now, floorSec) {
+  const weekly = usage.weekly;
+  if (!weekly || weekly.resetEpoch <= now)
+    return false;
+  if (dynamicWindowVerdict(weekly, cfg, now).kind !== "will-fill")
+    return false;
+  const runway = weekly.runwaySeconds;
+  if (typeof runway !== "number" || !Number.isFinite(runway))
+    return false;
+  return runway < floorSec;
+}
+function hardCapWindow(usage, cfg, now) {
+  for (const { key, window } of freshWindows(usage, now)) {
+    const rate = confidentRate(window);
+    if (rate === null)
+      continue;
+    if (dynamicPauseAt(window, rate, cfg, now) === "admission-closed")
+      return key;
+  }
+  return null;
+}
+var NO_ADMIT_CLOSE = { admitClose: false, window: null, reason: "" };
+function agentShouldAdmitClose(agent, usage, cfg, now) {
+  if (!usage)
+    return NO_ADMIT_CLOSE;
+  if (!isDecisionGrade(usage, now))
+    return NO_ADMIT_CLOSE;
+  const fiveHour = usage.fiveHour;
+  if (fiveHour && fiveHour.resetEpoch > now && fiveHour.util >= cfg.maximize.admissionAt) {
+    return {
+      admitClose: true,
+      window: "fiveHour",
+      reason: `${AGENT_LABEL[agent]} 5h\u7A97\u53E3 util ${pct(fiveHour.util)} \u2265 admissionAt ${pct(cfg.maximize.admissionAt)}\uFF08\u6536\u5C3E\u4FDD\u62A4\uFF1A\u62D2\u65B0\u4EFB\u52A1\u3001\u653E\u6536\u5C3E\uFF09`
+    };
+  }
+  const hard = hardCapWindow(usage, cfg, now);
+  if (hard !== null) {
+    return {
+      admitClose: true,
+      window: hard,
+      reason: `${AGENT_LABEL[agent]} ${WINDOW_LABEL[hard]}\u7A97\u53E3\u89E6\u53D1\u6536\u5C3E\u4FDD\u62A4\u786C\u7EBF\uFF08util \u5DF2\u8FBE targetUtil \u6216\u4E34\u8FD1\u91CD\u7F6E\u6536\u5C3E\u5E26\uFF09`
+    };
+  }
+  if (weeklyRunwayShort(usage, cfg, now, weeklyRunwayFloorSec(cfg, ADMISSION_WEEKLY_RUNWAY_ENTER_MULT))) {
+    return {
+      admitClose: true,
+      window: "weekly",
+      reason: `${AGENT_LABEL[agent]} \u5468\u7A97\u53E3 runway \u4F4E\u4E8E ${ADMISSION_WEEKLY_RUNWAY_ENTER_MULT}\xD7\u6536\u5C3E\u89C6\u91CE\uFF08\u9632\u65B0\u957F\u4EFB\u52A1\u649E\u7A7F\u5468\u989D\u5EA6\uFF09`
+    };
+  }
+  return NO_ADMIT_CLOSE;
+}
+function agentCanAdmitOpen(usage, cfg, now) {
+  if (!isDecisionGrade(usage, now))
+    return false;
+  if (usage.rateLimitedUntil > now)
+    return false;
+  const fiveHour = usage.fiveHour;
+  if (fiveHour && fiveHour.resetEpoch > now) {
+    if (fiveHour.util >= cfg.maximize.admissionAt - cfg.maximize.resumeHysteresisPct)
+      return false;
+  }
+  if (hardCapWindow(usage, cfg, now) !== null)
+    return false;
+  if (weeklyRunwayShort(usage, cfg, now, weeklyRunwayFloorSec(cfg, ADMISSION_WEEKLY_RUNWAY_EXIT_MULT)))
+    return false;
+  return true;
 }
 
 // src/budget/budget-state.ts
@@ -4445,6 +4601,58 @@ function computeResumeCandidate(sides, state, cfg, signals) {
     candidate.detail = detail;
   return candidate;
 }
+var INITIAL_ADMISSION_STATE = { side: null, fingerprint: null, reason: null };
+function nextAdmissionSide(prevSide, state, cfg) {
+  const active = new Set(sideToAgents(prevSide));
+  for (const agent of ["claude", "codex"]) {
+    const usage = state.perAgent[agent];
+    if (agentShouldAdmitClose(agent, usage, cfg, state.now).admitClose) {
+      active.add(agent);
+    } else if (active.has(agent) && agentCanAdmitOpen(usage, cfg, state.now)) {
+      active.delete(agent);
+    }
+  }
+  return agentsToSide(active);
+}
+function admissionReason(side, state, cfg) {
+  return sideToAgents(side).map((agent) => {
+    const usage = state.perAgent[agent];
+    if (!usage)
+      return `${AGENT_LABEL3[agent]} \u63A2\u6D4B\u6682\u65F6\u4E0D\u53EF\u7528\uFF0C\u4FDD\u6301\u4E0A\u4E00\u8F6E\u6536\u5C3E\u4FDD\u62A4`;
+    if (usage.rateLimitedUntil > state.now) {
+      return `${AGENT_LABEL3[agent]} \u63A2\u9488\u88AB\u9650\u6D41\u81F3 ${formatEpoch2(usage.rateLimitedUntil)}\uFF0C\u4FDD\u6301\u6536\u5C3E\u4FDD\u62A4`;
+    }
+    const decision = agentShouldAdmitClose(agent, usage, cfg, state.now);
+    if (decision.admitClose)
+      return decision.reason;
+    return `${AGENT_LABEL3[agent]} \u6536\u5C3E\u4FDD\u62A4\u51FA\u95F8\u6EDE\u56DE\u5E26\uFF0C\u5C1A\u672A\u6EE1\u8DB3\u5F00\u95F8\u6761\u4EF6`;
+  }).join("\uFF1B");
+}
+function admissionFingerprint(state, side) {
+  let reset = 0;
+  for (const agent of sideToAgents(side)) {
+    reset = Math.max(reset, state.pause.resetEpochs[agent] ?? 0);
+  }
+  return ["admission", side, Math.round(reset / RESET_FINGERPRINT_BUCKET_SEC)].join("|");
+}
+function classifyAdmission(prev, state, cfg) {
+  const previousSide = prev.side;
+  const currentSide = nextAdmissionSide(previousSide, state, cfg);
+  if (currentSide) {
+    const reason = admissionReason(currentSide, state, cfg);
+    const uncertain = previousSide === currentSide && activeSideProbeUncertain(currentSide, state) && prev.fingerprint;
+    const fingerprint = uncertain ? prev.fingerprint : admissionFingerprint(state, currentSide);
+    const emit = !previousSide || previousSide !== currentSide || fingerprint !== prev.fingerprint;
+    return {
+      next: { side: currentSide, fingerprint, reason },
+      effect: { kind: uncertain ? "hold-uncertain" : "enter", side: currentSide, reason, emit }
+    };
+  }
+  if (previousSide) {
+    return { next: INITIAL_ADMISSION_STATE, effect: { kind: "exit", previousSide } };
+  }
+  return { next: INITIAL_ADMISSION_STATE, effect: { kind: "none" } };
+}
 
 // src/budget/burn-view.ts
 function windowBurnRate(window) {
@@ -4589,6 +4797,7 @@ class BudgetCoordinator {
   timer = null;
   running = false;
   fpState = INITIAL_FINGERPRINT_STATE;
+  admissionState = INITIAL_ADMISSION_STATE;
   resumeCandidate = {};
   latestSnapshot = null;
   pendingOverrideTier = null;
@@ -4633,6 +4842,13 @@ class BudgetCoordinator {
   }
   isGateClosed() {
     return this.fpState.side === "codex" || this.fpState.side === "both";
+  }
+  gateState() {
+    if (this.fpState.side === "codex" || this.fpState.side === "both")
+      return "closed";
+    if (this.admissionState.side === "codex" || this.admissionState.side === "both")
+      return "admission-closed";
+    return "open";
   }
   getSnapshot() {
     return this.latestSnapshot;
@@ -4722,6 +4938,7 @@ class BudgetCoordinator {
   applyState(state) {
     const { next, effect } = classifyPoll(this.fpState, state, this.config);
     this.fpState = next;
+    this.admissionState = classifyAdmission(this.admissionState, state, this.config).next;
     this.resumeCandidate = this.resumeSignals ? computeResumeCandidate(resumeCandidateSides(effect), state, this.config, this.resumeSignals()) : {};
     for (const side of effect.recoveredSides) {
       const { id, directive } = this.emitRecovery(side, state);
@@ -4836,6 +5053,7 @@ class BudgetCoordinator {
       driftPct: state.drift.pct,
       paused,
       gateClosed: this.isGateClosed(),
+      gateState: this.gateState(),
       pauseSide: this.fpState.side,
       pauseReason: paused ? this.fpState.reason ?? state.pause.reason : null,
       resumeAfterEpoch: paused ? this.fpState.resumeEpoch ?? state.pause.resumeAfterEpoch : null,
@@ -5258,14 +5476,14 @@ function createQuotaSource(options) {
 // src/budget/pending-reader.ts
 import { createHash } from "crypto";
 import { join as join7 } from "path";
-function nodeFs() {
+function nodeFs2() {
   return __require("fs");
 }
 function cwdMatches(entryCwd, optsCwd) {
   if (entryCwd === optsCwd)
     return true;
   try {
-    const fs2 = nodeFs();
+    const fs2 = nodeFs2();
     return fs2.realpathSync(entryCwd) === fs2.realpathSync(optsCwd);
   } catch {
     return false;
@@ -5303,7 +5521,7 @@ function resolveStateDir2(homeDir) {
 function readPendingFile(path, log) {
   let raw;
   try {
-    raw = nodeFs().readFileSync(path, "utf-8");
+    raw = nodeFs2().readFileSync(path, "utf-8");
   } catch (error) {
     log(`pending reader: skip unreadable ${path}: ${error instanceof Error ? error.message : String(error)}`);
     return null;
@@ -5327,7 +5545,7 @@ function listScopeFiles(stateDir, agent, log) {
   const pendingDir = join7(stateDir, "pending");
   let names;
   try {
-    names = nodeFs().readdirSync(pendingDir);
+    names = nodeFs2().readdirSync(pendingDir);
   } catch {
     return [];
   }
@@ -6478,6 +6696,14 @@ function budgetPauseGateError() {
   const reopenText = `Codex \u4FA7\u5404\u7A97\u53E3 util \u56DE\u843D\u81F3\u52A8\u6001\u6682\u505C\u7EBF \u2212 ${BUDGET_CONFIG.maximize.resumeHysteresisPct}% \u4EE5\u4E0B\u6216\u5BF9\u5E94\u7A97\u53E3\u5237\u65B0\u540E\u95F8\u95E8\u81EA\u52A8\u653E\u5F00`;
   return `\u9884\u7B97\u6682\u505C\uFF08\u95F8\u95E8\u5173\u95ED\uFF09\uFF0C\u5DF2\u62D2\u7EDD\u8F6C\u53D1\uFF1A${reason}\u3002` + reopenText + (resumeAt ? `\uFF08\u9884\u8BA1\u6062\u590D ${resumeAt}\uFF0C\u4EE5\u5B9E\u6D4B\u4E3A\u51C6\uFF1B\u63D0\u524D\u5237\u65B0\u4F1A\u66F4\u65E9\u89E3\u9664\uFF09` : "") + `\u3002\u6536\u5230 RESUME \u901A\u77E5\u524D\u8BF7\u52FF\u91CD\u8BD5\u5411 Codex \u53D1\u9001 reply\uFF1B${sideHint}\u3002`;
 }
+function budgetAdmissionGateError(windowResetEpoch, wrapUpLeft, quotaExhausted) {
+  const resetAt = windowResetEpoch > 0 ? new Date(windowResetEpoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z") : "\u672A\u77E5";
+  const quota = BUDGET_CONFIG.maximize.wrapUpQuota;
+  if (quotaExhausted) {
+    return `\u989D\u5EA6\u7A97\u53E3\u6536\u5C3E\u4FDD\u62A4\u4E2D\uFF08admission-closed\uFF09\uFF1A\u672C\u7A97\u53E3 wrap-up \u914D\u989D\uFF08\u6BCF\u7A97\u53E3 ${quota} \u4E2A\uFF09\u5DF2\u7528\u5C3D\uFF0C\u5DF2\u62D2\u7EDD\u8F6C\u53D1\u3002` + `\u8BF7\u52FF\u518D\u6D3E\u65B0\u4EFB\u52A1\uFF1B\u5199 checkpoint\uFF0C\u7B49\u989D\u5EA6\u7A97\u53E3\u5237\u65B0\uFF08\u7EA6 ${resetAt}\uFF09\u540E\u518D\u7EE7\u7EED\u3002`;
+  }
+  return `\u989D\u5EA6\u7A97\u53E3\u6536\u5C3E\u4FDD\u62A4\u4E2D\uFF08admission-closed\uFF09\uFF1A\u4EC5\u63A5\u6536\u6536\u5C3E\u7C7B\u6CE8\u5165\uFF0C\u5DF2\u62D2\u7EDD\u8BE5\u65B0\u4EFB\u52A1\u3002` + `\u5982\u9700\u628A\u5F53\u524D\u534F\u4F5C\u6536\u5C3E\u5230 checkpoint\uFF0C\u53EF\u7528 reply \u5E26 wrap_up=true \u91CD\u53D1\uFF08\u672C\u7A97\u53E3\u8FD8\u5269 ${wrapUpLeft} \u4E2A\u6536\u5C3E\u914D\u989D\uFF09\uFF1Bsteer \u4FEE\u6B63\u4E0D\u53D7\u9650\u3002` + `\u65B0\u4EFB\u52A1\u8BF7\u7B49\u989D\u5EA6\u7A97\u53E3\u5237\u65B0\uFF08\u7EA6 ${resetAt}\uFF09\u540E\u518D\u6D3E\u3002`;
+}
 var tuiConnectionState = new TuiConnectionState({
   disconnectGraceMs: TUI_DISCONNECT_GRACE_MS,
   log,
@@ -6903,7 +7129,9 @@ async function handleClaudeToCodex(ws, message) {
     });
     return;
   }
-  if (budgetCoordinator?.isGateClosed()) {
+  let pendingWrapUpReset = null;
+  const gateState = budgetCoordinator?.gateState() ?? "open";
+  if (gateState === "closed") {
     const reason = budgetPauseGateError();
     log(`Injection rejected by budget pause gate`);
     const resumeAfterEpoch3 = budgetCoordinator?.getSnapshot()?.resumeAfterEpoch ?? null;
@@ -6915,6 +7143,49 @@ async function handleClaudeToCodex(ws, message) {
       ...retryAfterMs !== undefined ? { retryAfterMs } : {}
     });
     return;
+  }
+  if (gateState === "admission-closed") {
+    const isSteer = codex.turnInProgress && message.onBusy === "steer";
+    if (!isSteer) {
+      const nowSec = Math.floor(Date.now() / 1000);
+      const admSnap = budgetCoordinator?.getSnapshot()?.codex;
+      const admFiveHour = admSnap?.fiveHour?.resetEpoch ?? 0;
+      const admWeekly = admSnap?.weekly?.resetEpoch ?? 0;
+      const admissionWindowReset = admFiveHour > nowSec ? admFiveHour : admWeekly > nowSec ? admWeekly : 0;
+      if (admissionWindowReset <= 0) {
+        log(`Injection rejected by admission gate: no fresh quota window (probe stale / snapshot lost)`);
+        sendClaudeToCodexResult(ws, message.requestId, {
+          success: false,
+          code: "budget_admission",
+          error: budgetAdmissionGateError(0, 0, true)
+        });
+        return;
+      }
+      const willInject = !codex.turnInProgress || message.onBusy === "interrupt";
+      if (message.wrapUp === true && willInject) {
+        const peek = currentWindowState(stateDir.admissionQuotaFile, admissionWindowReset, log);
+        if (peek.wrapUpUsed >= BUDGET_CONFIG.maximize.wrapUpQuota) {
+          log(`Injection rejected by admission gate: wrap-up quota exhausted`);
+          sendClaudeToCodexResult(ws, message.requestId, {
+            success: false,
+            code: "budget_admission",
+            error: budgetAdmissionGateError(admissionWindowReset, 0, true)
+          });
+          return;
+        }
+        pendingWrapUpReset = admissionWindowReset;
+        log(`Admission-closed: wrap-up permitted (${peek.wrapUpUsed}/${BUDGET_CONFIG.maximize.wrapUpQuota} used; slot committed on inject)`);
+      } else if (message.wrapUp === true && !willInject) {} else {
+        const left = Math.max(0, BUDGET_CONFIG.maximize.wrapUpQuota - currentWindowState(stateDir.admissionQuotaFile, admissionWindowReset, log).wrapUpUsed);
+        log(`Injection rejected by admission gate: new task (set wrap_up to finish the current work)`);
+        sendClaudeToCodexResult(ws, message.requestId, {
+          success: false,
+          code: "budget_admission",
+          error: budgetAdmissionGateError(admissionWindowReset, left, false)
+        });
+        return;
+      }
+    }
   }
   const requireReply = !!message.requireReply;
   let contentToSend = message.message.content;
@@ -7005,6 +7276,19 @@ async function handleClaudeToCodex(ws, message) {
     }
   }
   const injectThreadId = codex.activeThreadId;
+  if (pendingWrapUpReset !== null) {
+    const committed = consumeWrapUp(stateDir.admissionQuotaFile, pendingWrapUpReset, BUDGET_CONFIG.maximize.wrapUpQuota, log);
+    if (!committed.allowed) {
+      log(`Injection rejected by admission gate: wrap-up slot not durably recorded (write failure or raced to cap)`);
+      sendClaudeToCodexResult(ws, message.requestId, {
+        success: false,
+        code: "budget_admission",
+        error: budgetAdmissionGateError(pendingWrapUpReset, 0, true)
+      });
+      return;
+    }
+    log(`Admission wrap-up slot committed (${committed.used}/${BUDGET_CONFIG.maximize.wrapUpQuota})`);
+  }
   const injectionId = codex.injectMessage(contentToSend, tierOverrides);
   if (injectionId === null) {
     if (idempotencyKey && injectThreadId) {

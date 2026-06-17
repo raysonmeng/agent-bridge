@@ -18,6 +18,7 @@ import {
 import { TuiConnectionState } from "./tui-connection-state";
 import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
+import { consumeWrapUp, currentWindowState } from "./budget/admission-quota";
 import { ConfigService, applyBudgetEnvOverrides } from "./config-service";
 import { BudgetCoordinator } from "./budget/budget-coordinator";
 import { createQuotaSource } from "./budget/quota-source";
@@ -508,6 +509,37 @@ function budgetPauseGateError(): string {
     reopenText +
     (resumeAt ? `（预计恢复 ${resumeAt}，以实测为准；提前刷新会更早解除）` : "") +
     `。收到 RESUME 通知前请勿重试向 Codex 发送 reply；${sideHint}。`
+  );
+}
+
+/**
+ * v3 P3 (§3.2): error text for the `admission-closed` gate. New turns are
+ * declined; the model may bring the current collaboration to a checkpoint by
+ * resending with wrap_up=true (up to maximize.wrapUpQuota per quota window).
+ * Steer (mid-turn correction) is unaffected. The quota window is the 5h window
+ * (or the weekly window when admission fired from a weekly trigger), so the
+ * wording is window-agnostic. `wrapUpLeft` is the remaining quota for the
+ * new-task case; `quotaExhausted` switches to the "no budget left" wording.
+ */
+function budgetAdmissionGateError(
+  windowResetEpoch: number,
+  wrapUpLeft: number,
+  quotaExhausted: boolean,
+): string {
+  const resetAt = windowResetEpoch > 0
+    ? new Date(windowResetEpoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z")
+    : "未知";
+  const quota = BUDGET_CONFIG.maximize.wrapUpQuota;
+  if (quotaExhausted) {
+    return (
+      `额度窗口收尾保护中（admission-closed）：本窗口 wrap-up 配额（每窗口 ${quota} 个）已用尽，已拒绝转发。` +
+      `请勿再派新任务；写 checkpoint，等额度窗口刷新（约 ${resetAt}）后再继续。`
+    );
+  }
+  return (
+    `额度窗口收尾保护中（admission-closed）：仅接收收尾类注入，已拒绝该新任务。` +
+    `如需把当前协作收尾到 checkpoint，可用 reply 带 wrap_up=true 重发（本窗口还剩 ${wrapUpLeft} 个收尾配额）；steer 修正不受限。` +
+    `新任务请等额度窗口刷新（约 ${resetAt}）后再派。`
   );
 }
 
@@ -1204,12 +1236,18 @@ async function handleClaudeToCodex(
     return;
   }
 
-  // Budget pause gate (plan v2.4 side-aware R4): the gate protects the
-  // TARGET side's quota, so it closes only when the Codex side is exhausted
-  // (gateClosed = pauseSide codex/both). A Claude-only handoff keeps the
-  // gate OPEN so the baton reply can reach Codex. Same rejection shape as
-  // the busy-guard below.
-  if (budgetCoordinator?.isGateClosed()) {
+  // Budget gate (v3 P3 §3.2 three-state). `closed` (Codex side exhausted) →
+  // reject budget_paused (unchanged v2.4 side-aware semantics: a Claude-only
+  // handoff keeps the gate OPEN so the baton reaches Codex). `admission-closed`
+  // (5h finishing protection) → reject NEW turns with budget_admission, but let
+  // a `wrapUp` reply through up to maximize.wrapUpQuota per 5h window, and let a
+  // steer feed a RUNNING turn (steer is handled below; not a new task).
+  // Set when an admission wrap-up turn is PERMITTED but its quota slot is deferred
+  // to the post-injection commit below (so a failed interrupt / null injection
+  // never burns a slot). null = nothing to commit.
+  let pendingWrapUpReset: number | null = null;
+  const gateState = budgetCoordinator?.gateState() ?? "open";
+  if (gateState === "closed") {
     const reason = budgetPauseGateError();
     log(`Injection rejected by budget pause gate`);
     const resumeAfterEpoch = budgetCoordinator?.getSnapshot()?.resumeAfterEpoch ?? null;
@@ -1222,6 +1260,81 @@ async function handleClaudeToCodex(
       ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
     });
     return;
+  }
+  if (gateState === "admission-closed") {
+    // A steer feeds a RUNNING turn (handled below) — never a new task, always
+    // allowed through admission. A "steer" with no running turn is a new turn and
+    // is gated like any other (isSteer stays false).
+    const isSteer = codex.turnInProgress && message.onBusy === "steer";
+    if (!isSteer) {
+      // Key the wrap-up quota on a FRESH admission window (resetEpoch > now): the
+      // 5h window when fresh, else the weekly window. admission-closed can fire from
+      // a WEEKLY trigger with no fresh 5h window (round-3 REAL), and an EXISTING but
+      // EXPIRED 5h epoch must NOT be used (>0 yet past — it would mis-key vs the fresh
+      // weekly, and the next poll's fresh 5h would reset the counter; round-4 REAL).
+      // admission-closed normally implies ≥1 fresh window, BUT a total probe failure
+      // nulls latestSnapshot while admissionState stays phantom-held → no key → we
+      // FAIL CLOSED just below (never fall back to an uncounted bypass; round-4 REAL).
+      const nowSec = Math.floor(Date.now() / 1000);
+      const admSnap = budgetCoordinator?.getSnapshot()?.codex;
+      const admFiveHour = admSnap?.fiveHour?.resetEpoch ?? 0;
+      const admWeekly = admSnap?.weekly?.resetEpoch ?? 0;
+      const admissionWindowReset = admFiveHour > nowSec ? admFiveHour : (admWeekly > nowSec ? admWeekly : 0);
+      if (admissionWindowReset <= 0) {
+        // No fresh window to key the per-window quota on (probe outage while the
+        // gate is held, or all windows stale). FAIL CLOSED: reject — admitting an
+        // UNCOUNTED turn here would bypass the cap. Transient: recovers as soon as
+        // the next probe restores a fresh window.
+        log(`Injection rejected by admission gate: no fresh quota window (probe stale / snapshot lost)`);
+        sendClaudeToCodexResult(ws, message.requestId, {
+          success: false,
+          code: "budget_admission",
+          error: budgetAdmissionGateError(0, 0, true),
+        });
+        return;
+      }
+      // Only a turn that will actually INJECT consumes a wrap-up slot: a direct
+      // turn (no turn running) or an interrupt (which terminates then injects).
+      // A wrap-up while a turn is running on the default/reject busy policy is
+      // NOT consumed — it falls through to the busy guard (busy_reject) and Claude
+      // resends once Codex is idle.
+      const willInject = !codex.turnInProgress || message.onBusy === "interrupt";
+      if (message.wrapUp === true && willInject) {
+        // PRE-CHECK availability here, but DEFER the actual consume to the pre-inject
+        // commit below — a wrapUp+interrupt whose interrupt fails (5 non-injecting
+        // exits) must NOT burn a slot (round-1 REAL); the commit is FAIL CLOSED
+        // (round-2 REAL). admissionWindowReset is guaranteed > 0 (checked above).
+        const peek = currentWindowState(stateDir.admissionQuotaFile, admissionWindowReset, log);
+        if (peek.wrapUpUsed >= BUDGET_CONFIG.maximize.wrapUpQuota) {
+          log(`Injection rejected by admission gate: wrap-up quota exhausted`);
+          sendClaudeToCodexResult(ws, message.requestId, {
+            success: false,
+            code: "budget_admission",
+            error: budgetAdmissionGateError(admissionWindowReset, 0, true),
+          });
+          return;
+        }
+        pendingWrapUpReset = admissionWindowReset; // committed only after a confirmed inject
+        log(`Admission-closed: wrap-up permitted (${peek.wrapUpUsed}/${BUDGET_CONFIG.maximize.wrapUpQuota} used; slot committed on inject)`);
+        // fall through to inject the wrap-up turn normally.
+      } else if (message.wrapUp === true && !willInject) {
+        // Turn running + reject policy: let the busy guard answer; do not consume.
+        // (fall through)
+      } else {
+        // A new task while admission-closed → reject.
+        const left = Math.max(
+          0,
+          BUDGET_CONFIG.maximize.wrapUpQuota - currentWindowState(stateDir.admissionQuotaFile, admissionWindowReset, log).wrapUpUsed,
+        );
+        log(`Injection rejected by admission gate: new task (set wrap_up to finish the current work)`);
+        sendClaudeToCodexResult(ws, message.requestId, {
+          success: false,
+          code: "budget_admission",
+          error: budgetAdmissionGateError(admissionWindowReset, left, false),
+        });
+        return;
+      }
+    }
   }
 
   const requireReply = !!message.requireReply;
@@ -1406,6 +1519,31 @@ async function handleClaudeToCodex(
   }
 
   const injectThreadId = codex.activeThreadId;
+  // v3 P3: commit the admission wrap-up slot HERE — after the interrupt block
+  // (every interrupt-failure exit already returned above, so no slot is burned on
+  // a non-injecting path) and JUST BEFORE the inject. FAIL CLOSED: if the slot
+  // cannot be durably recorded (write failure) or another request raced it to the
+  // cap, REJECT rather than inject an uncounted turn (which would silently bypass
+  // the cap — M3a round-2 REAL). The only residual is the safe over-protect
+  // direction: a rare injectMessage===null right after this burns one slot.
+  if (pendingWrapUpReset !== null) {
+    const committed = consumeWrapUp(
+      stateDir.admissionQuotaFile,
+      pendingWrapUpReset,
+      BUDGET_CONFIG.maximize.wrapUpQuota,
+      log,
+    );
+    if (!committed.allowed) {
+      log(`Injection rejected by admission gate: wrap-up slot not durably recorded (write failure or raced to cap)`);
+      sendClaudeToCodexResult(ws, message.requestId, {
+        success: false,
+        code: "budget_admission",
+        error: budgetAdmissionGateError(pendingWrapUpReset, 0, true),
+      });
+      return;
+    }
+    log(`Admission wrap-up slot committed (${committed.used}/${BUDGET_CONFIG.maximize.wrapUpQuota})`);
+  }
   const injectionId = codex.injectMessage(contentToSend, tierOverrides);
   if (injectionId === null) {
     // No wire attempt happened — any upfront interrupt-path accept() must not

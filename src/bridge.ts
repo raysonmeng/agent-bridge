@@ -104,6 +104,7 @@ claude.setReplySender(async (
   requireReply?: boolean,
   onBusy?: "reject" | "steer" | "interrupt",
   idempotencyKey?: string,
+  wrapUp?: boolean,
 ) => {
   if (msg.source !== "claude") {
     return { success: false, error: "Invalid message source" };
@@ -116,7 +117,7 @@ claude.setReplySender(async (
     };
   }
 
-  return daemonClient.sendReply(msg, requireReply, onBusy, idempotencyKey);
+  return daemonClient.sendReply(msg, requireReply, onBusy, idempotencyKey, wrapUp);
 });
 
 // PR4: forward Claude's budget-resume ack to the daemon's ResumeAckTracker.
