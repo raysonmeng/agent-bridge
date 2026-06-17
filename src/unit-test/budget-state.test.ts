@@ -20,7 +20,7 @@ const CONFIG: BudgetConfig = {
     balanced: { effort: "medium" },
     eco: { effort: "low" },
   },
-  maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
+  maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5, admissionAt: 85, wrapUpQuota: 2 },
   allocation: { minRunwayRatio: 50, minRunwayGapHours: 2 },
 };
 
@@ -184,6 +184,30 @@ describe("computeBudgetState", () => {
     expect(codexHeavy.phase).toBe("balance");
     expect(codexHeavy.drift).toMatchObject({ pct: -20, heavier: "codex", lighter: "claude" });
     expect(codexHeavy.directiveToClaude).toContain("Claude");
+  });
+
+  test("v3 P3 (M3b): routing advice is suppressed when a side is admission-closing", () => {
+    // REAL (cross-engine): balance/underutilization advice moves work DENSITY between
+    // sides and directly contradicts the admission gate ("no new Codex tasks"). A side
+    // at 5h util ≥ admissionAt(85) but < pauseAt(90) is admission-closed yet NOT paused,
+    // so without this guard adviceEligible stayed true and phase=balance fired alongside
+    // the admission directive. Contrast: util 84 (not admit-closing) still balances.
+    const notClosing = computeBudgetState(
+      usage({ gateUtil: 20, warnUtil: 20, remaining: 80 }),
+      usage({ gateUtil: 84, warnUtil: 84, remaining: 16 }),
+      CONFIG,
+      NOW,
+    );
+    expect(notClosing.phase).toBe("balance"); // baseline: drift would route to Claude
+
+    const admissionClosing = computeBudgetState(
+      usage({ gateUtil: 20, warnUtil: 20, remaining: 80 }),
+      usage({ gateUtil: 86, warnUtil: 86, remaining: 14 }), // codex 5h util 86 ≥ admissionAt
+      CONFIG,
+      NOW,
+    );
+    expect(admissionClosing.phase).toBe("normal"); // advice suppressed
+    expect(admissionClosing.directiveToClaude).toBeNull();
   });
 
   test("balances reverse 20/40 drift toward Claude", () => {

@@ -136,9 +136,7 @@ export interface RunwayEstimate {
  * Time-aware dynamic-pause-line parameters (v3 §3.1/§4.1). These are the SOLE
  * budget strategy as of v3.2 (the conserve|maximize selector is gone). All have
  * defaults + bounded validation in config-service.ts and are tuned via env
- * escape hatches, not as product-facing config. The P3 admission gate will add
- * its own keys (admissionAt / wrapUpQuota) when it lands — intentionally not
- * defined yet (no parse-only keys).
+ * escape hatches, not as product-facing config.
  */
 export interface MaximizeConfig {
   /** Reset-point target utilization (asymptote); default 98, range [90, 99]. Must be > pauseAt. */
@@ -151,7 +149,30 @@ export interface MaximizeConfig {
   finishingHorizonMinutes: number;
   /** Symmetric-resume hysteresis below the dynamic line; default 5, range [1, 30]. */
   resumeHysteresisPct: number;
+  /**
+   * v3 P3 (§3.2): 5h-window util at/above which the admission gate enters
+   * `admission-closed` (reject new turns, allow wrap-up). Default 85, range
+   * [50, 99]. Must be < targetUtil (else the whole maximize block resets).
+   */
+  admissionAt: number;
+  /**
+   * v3 P3 (§3.2): max wrap-up turns let through `admission-closed` per 5h
+   * window (persisted, survives daemon restart). Default 2, range [0, 10].
+   */
+  wrapUpQuota: number;
 }
+
+/**
+ * v3 P3 (§3.2): three-state admission gate.
+ * - `open`: admit everything.
+ * - `admission-closed`: reject NEW turns (error `budget_admission`), allow
+ *   `on_busy:"steer"` and `wrapUp:true` replies (bounded by `wrapUpQuota` per
+ *   5h window); never interrupt a running turn.
+ * - `closed`: the existing pause gate — reject all (error `budget_paused`),
+ *   except the system-initiated checkpoint baton.
+ * `closed` takes precedence over `admission-closed`.
+ */
+export type GateState = "open" | "admission-closed" | "closed";
 
 /** Budget section of AgentBridgeConfig (defaults in config-service.ts). */
 export interface BudgetConfig {
@@ -257,6 +278,13 @@ export interface BudgetSnapshot {
    * is exhausted ({codex} or {claude,codex}); false for Claude-only handoff.
    */
   gateClosed: boolean;
+  /**
+   * v3 P3 (§3.2): the three-state daemon gate (`open` | `admission-closed` |
+   * `closed`). Optional for backward-compatible deserialization of legacy daemon
+   * snapshots (absent → treat as `open`/`closed` per `gateClosed`). `closed`
+   * mirrors `gateClosed`; `admission-closed` is the new finishing-protection tier.
+   */
+  gateState?: GateState;
   /** Which side(s) are budget-exhausted per the coordinator's activeSides set. */
   pauseSide: AgentName | "both" | null;
   pauseReason: string | null;

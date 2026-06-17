@@ -1,5 +1,6 @@
 import { matchingGateReset } from "./budget-gate";
 import {
+  agentShouldAdmitClose,
   agentShouldPause,
   dynamicWindowVerdict,
   isDecisionGrade,
@@ -263,6 +264,40 @@ export function renderBudgetInterventionDirective(
   ].join("\n");
 }
 
+/**
+ * v3 P3 (§3.2): the `admission-closed` directive to Claude — the Codex-side
+ * finishing-protection notice. Emitted (turnPhase-aware: only when Codex is not
+ * mid-turn) when the admission lane closes the codex/both side. Tells Claude the
+ * daemon will now decline NEW Codex turns (`budget_admission`) while still
+ * accepting wrap-up replies, so Claude routes toward winding the collaboration
+ * down rather than starting new Codex work. Pure render; the emission/dedup and
+ * the daemon gate live in the coordinator and daemon respectively. `side` is
+ * always "codex" or "both" here (the daemon gate is codex-scoped — Claude
+ * self-governs its own line via the always-on budget prompt).
+ */
+export function renderBudgetAdmissionDirective(
+  claude: AgentUsage | null,
+  codex: AgentUsage | null,
+  side: AgentName | "both",
+  reason: string,
+  resetEpoch: number | null,
+  cfg: BudgetConfig,
+): string {
+  const resetText = `对应窗口约 ${formatEpoch(resetEpoch)} 刷新（以实测为准；提前刷新会更早解除）`;
+  const head =
+    side === "both"
+      ? "【预算协调 · 账号级】双方进入收尾保护（admission-closed）。"
+      : "【预算协调 · 账号级】Codex 侧进入收尾保护（admission-closed）。";
+  return [
+    head,
+    `触发原因：${reason}。`,
+    `${usageSummary("claude", claude)}；${usageSummary("codex", codex)}。`,
+    `闸门已收紧：新的 Codex 任务会被拒（budget_admission），但仍可用 reply 带 wrap_up=true 把当前协作收尾到 checkpoint` +
+      `（每窗口至多 ${cfg.maximize.wrapUpQuota} 个），steer 修正不受限；${resetText}。`,
+    "建议：不要再向 Codex 派新任务；把当前 Codex 协作收尾、写 checkpoint，可独立推进的部分 Claude 可 solo 继续。",
+  ].join("\n");
+}
+
 function balanceDirective(
   claude: AgentUsage,
   codex: AgentUsage,
@@ -340,7 +375,18 @@ export function computeBudgetState(
     // this is not a send-path fix — it keeps the rendered snapshot.phase honest
     // (no balance/underutilized label on stale data via get_budget / abg budget).
     isDecisionGrade(claude, now) &&
-    isDecisionGrade(codex, now);
+    isDecisionGrade(codex, now) &&
+    // v3 P3 (M3b): the routing advice (balance / underutilization) moves work
+    // DENSITY between the two sides; it is meaningless — and directly
+    // contradictory — while EITHER side is in admission-closed finishing
+    // protection (the daemon gate would reject new turns the advice routes
+    // toward that side). Suppress at the source so snapshot.phase stays honest
+    // AND classifyPoll never produces an advise effect whose fingerprint would
+    // otherwise get advanced-but-suppressed. Uses the raw predicate (the
+    // hysteresis lives in the coordinator); the coordinator additionally hard-
+    // gates the advise EMISSION on gateState()==="open" to cover the exit band.
+    !agentShouldAdmitClose("claude", claude, cfg, now).admitClose &&
+    !agentShouldAdmitClose("codex", codex, cfg, now).admitClose;
   const balanceActive = adviceEligible && drift.heavier !== null && drift.lighter !== null;
   // Compute underutilization only when it could actually become the phase (not
   // paused, advice-eligible, and balance has not already claimed the advise

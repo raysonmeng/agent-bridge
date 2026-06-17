@@ -47,7 +47,7 @@ const CONFIG: BudgetConfig = {
     balanced: { effort: "medium" },
     eco: { effort: "low" },
   },
-  maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
+  maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5, admissionAt: 85, wrapUpQuota: 2 },
   allocation: { minRunwayRatio: 50, minRunwayGapHours: 2 },
 };
 

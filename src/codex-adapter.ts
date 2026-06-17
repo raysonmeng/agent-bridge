@@ -284,6 +284,22 @@ export class CodexAdapter extends EventEmitter {
   get proxyUrl() { return `ws://127.0.0.1:${this.proxyPort}`; }
   get activeThreadId() { return this.threadId; }
   /**
+   * True iff {@link injectMessage} would currently reach the wire — i.e. its three
+   * synchronous pre-send guards (active thread, app-server socket OPEN, no turn in
+   * progress) all hold. Lets a caller PRECHECK before consuming an irreplaceable
+   * once-per-window token (the P3 checkpoint baton): without this, a closed-gate
+   * poll fired while the TUI is disconnected would burn the baton flag and then get
+   * a null inject, losing the window's only baton. Mirrors the guards at
+   * {@link injectMessage} (codex-adapter L504/508/512) exactly.
+   */
+  canInject(): boolean {
+    return (
+      !!this.threadId &&
+      this.appServerWs?.readyState === WebSocket.OPEN &&
+      !this.turnInProgress
+    );
+  }
+  /**
    * Captured Codex app-server identity (P1 #5). null until the first
    * `initialize` handshake response is observed. Read by the daemon's status
    * builder so /healthz + status.json + `abg doctor` can surface which

@@ -32,6 +32,7 @@ export type ReplySender = (
   requireReply?: boolean,
   onBusy?: "reject" | "steer" | "interrupt",
   idempotencyKey?: string,
+  wrapUp?: boolean,
 ) => Promise<{ success: boolean; error?: string; code?: string; phase?: string; retryAfterMs?: number }>;
 
 export interface ClaudeAdapterOptions {
@@ -82,7 +83,8 @@ export const CLAUDE_INSTRUCTIONS = [
   "",
   "## Budget awareness",
   "- Use the get_budget tool to check both agents' subscription quota (5h/weekly windows, drift, pause state).",
-  "- If the reply tool returns a budget-pause error, do NOT retry; checkpoint your work and wait for the resume notice.",
+  "- If the reply tool returns a budget-pause error (code budget_paused), do NOT retry; checkpoint your work and wait for the resume notice.",
+  "- If the reply tool returns a budget_admission error, the 5h window is in finishing-protection: new tasks are declined, but you may bring the CURRENT collaboration to a checkpoint by resending with wrap_up=true (a small per-window quota). Do NOT start new work; once the quota is used or you are done, write a checkpoint and wait for the 5h window to refresh.",
 ].join("\n");
 
 export class ClaudeAdapter extends EventEmitter {
@@ -417,6 +419,10 @@ export class ClaudeAdapter extends EventEmitter {
                 type: "string",
                 description: "Optional client-generated key (non-empty, max 128 chars) that makes this reply idempotent: a retry carrying the same key is NOT re-injected — the bridge answers duplicate_in_flight / duplicate_terminal instead. Use a fresh key per logical message.",
               },
+              wrap_up: {
+                type: "boolean",
+                description: "Set true ONLY to declare a finishing turn when the budget gate is in 5h finishing-protection (you got a budget_admission error or a system_budget_admission notice). A wrap-up reply is let through the admission gate up to a small per-5h-window quota so you can bring the current collaboration to a checkpoint; do NOT use it to start new work. Leave false/unset for normal replies.",
+              },
             },
             required: ["text"],
           },
@@ -608,7 +614,8 @@ export class ClaudeAdapter extends EventEmitter {
       };
     }
 
-    const result = await this.replySender(bridgeMsg, requireReply, onBusy, idempotencyKey);
+    const wrapUp = args?.wrap_up === true;
+    const result = await this.replySender(bridgeMsg, requireReply, onBusy, idempotencyKey, wrapUp);
     if (!result.success) {
       this.log(`Reply delivery failed: ${result.error}${result.code ? ` (code=${result.code})` : ""}`);
       // Surface the machine-readable code (PR B structured result) alongside

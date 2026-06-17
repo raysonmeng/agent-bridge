@@ -42,6 +42,8 @@ const MAXIMIZE: BudgetConfig = {
     reserveMaxPct: 7,
     finishingHorizonMinutes: 30,
     resumeHysteresisPct: 5,
+    admissionAt: 85,
+    wrapUpQuota: 2,
   },
   allocation: { minRunwayRatio: 50, minRunwayGapHours: 2 },
 };
@@ -210,6 +212,8 @@ describe("invariant I1 — the dynamic line never pauses below pauseAt (property
           reserveMaxPct: i % 20,
           finishingHorizonMinutes: 5 + (i % 170),
           resumeHysteresisPct: 1 + (i % 29),
+          admissionAt: 50,
+          wrapUpQuota: 2,
         },
       };
       const rate = (i % 25) * 0.5;
@@ -244,6 +248,8 @@ describe("invariant I1 — the dynamic line never pauses below pauseAt (property
           reserveMaxPct: i % 20,
           finishingHorizonMinutes: 5 + (i % 170),
           resumeHysteresisPct: 1 + (i % 29),
+          admissionAt: 50,
+          wrapUpQuota: 2,
         },
       };
       const u = usage({

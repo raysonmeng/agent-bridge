@@ -13858,6 +13858,9 @@ class StateDirResolver {
   get killedFile() {
     return join(this.stateDir, "killed");
   }
+  get admissionQuotaFile() {
+    return join(this.stateDir, "admission-quota.json");
+  }
   get updateCheckFile() {
     return join(this.stateDir, "update-check.json");
   }
@@ -14156,7 +14159,8 @@ var CLAUDE_INSTRUCTIONS = [
   "",
   "## Budget awareness",
   "- Use the get_budget tool to check both agents' subscription quota (5h/weekly windows, drift, pause state).",
-  "- If the reply tool returns a budget-pause error, do NOT retry; checkpoint your work and wait for the resume notice."
+  "- If the reply tool returns a budget-pause error (code budget_paused), do NOT retry; checkpoint your work and wait for the resume notice.",
+  "- If the reply tool returns a budget_admission error, the 5h window is in finishing-protection: new tasks are declined, but you may bring the CURRENT collaboration to a checkpoint by resending with wrap_up=true (a small per-window quota). Do NOT start new work; once the quota is used or you are done, write a checkpoint and wait for the 5h window to refresh."
 ].join(`
 `);
 
@@ -14400,6 +14404,10 @@ chat_id: ${this.sessionId}`);
               idempotency_key: {
                 type: "string",
                 description: "Optional client-generated key (non-empty, max 128 chars) that makes this reply idempotent: a retry carrying the same key is NOT re-injected \u2014 the bridge answers duplicate_in_flight / duplicate_terminal instead. Use a fresh key per logical message."
+              },
+              wrap_up: {
+                type: "boolean",
+                description: "Set true ONLY to declare a finishing turn when the budget gate is in 5h finishing-protection (you got a budget_admission error or a system_budget_admission notice). A wrap-up reply is let through the admission gate up to a small per-5h-window quota so you can bring the current collaboration to a checkpoint; do NOT use it to start new work. Leave false/unset for normal replies."
               }
             },
             required: ["text"]
@@ -14552,7 +14560,8 @@ chat_id: ${this.sessionId}`);
         isError: true
       };
     }
-    const result = await this.replySender(bridgeMsg, requireReply, onBusy, idempotencyKey);
+    const wrapUp = args?.wrap_up === true;
+    const result = await this.replySender(bridgeMsg, requireReply, onBusy, idempotencyKey, wrapUp);
     if (!result.success) {
       this.log(`Reply delivery failed: ${result.error}${result.code ? ` (code=${result.code})` : ""}`);
       const codePrefix = result.code ? ` [${result.code}]` : "";
@@ -14623,10 +14632,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.18", "0.0.0-source"),
-  commit: defineString("0d1e1bd", "source"),
+  commit: defineString("44137b8", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("46a6407023f0", "source")
+  codeHash: defineString("36e830f077b2", "source")
 });
 function sameRuntimeContract(a, b) {
   if (!a || !b)
@@ -14873,7 +14882,7 @@ class DaemonClient extends EventEmitter2 {
     this.ws = null;
     this.rejectPendingReplies("Daemon connection closed");
   }
-  async sendReply(message, requireReply, onBusy, idempotencyKey) {
+  async sendReply(message, requireReply, onBusy, idempotencyKey, wrapUp) {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return { success: false, error: "AgentBridge daemon is not connected." };
     }
@@ -14888,7 +14897,8 @@ class DaemonClient extends EventEmitter2 {
       message,
       ...requireReply ? { requireReply: true } : {},
       ...onBusy && onBusy !== "reject" ? { onBusy } : {},
-      ...idempotencyKey ? { idempotencyKey } : {}
+      ...idempotencyKey ? { idempotencyKey } : {},
+      ...wrapUp ? { wrapUp: true } : {}
     });
     return pending;
   }
@@ -15666,7 +15676,9 @@ var DEFAULT_BUDGET_CONFIG = {
     reserveSlopePctPerHour: 0.4,
     reserveMaxPct: 7,
     finishingHorizonMinutes: 30,
-    resumeHysteresisPct: 5
+    resumeHysteresisPct: 5,
+    admissionAt: 85,
+    wrapUpQuota: 2
   },
   allocation: {
     minRunwayRatio: 50,
@@ -15734,7 +15746,9 @@ function findShapeViolation(raw) {
         "reserveSlopePctPerHour",
         "reserveMaxPct",
         "finishingHorizonMinutes",
-        "resumeHysteresisPct"
+        "resumeHysteresisPct",
+        "admissionAt",
+        "wrapUpQuota"
       ]) {
         if (key in maximize && !isCoercibleNumber(maximize[key])) {
           return `budget.maximize.${key} is present but not a number`;
@@ -15759,7 +15773,7 @@ function hasCustomDecisionValues(config2) {
   const d = DEFAULT_CONFIG;
   const b = config2.budget;
   const db = d.budget;
-  return config2.idleShutdownSeconds !== d.idleShutdownSeconds || config2.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config2.codex.appPort !== d.codex.appPort || config2.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct || b.allocation.minRunwayRatio !== db.allocation.minRunwayRatio || b.allocation.minRunwayGapHours !== db.allocation.minRunwayGapHours;
+  return config2.idleShutdownSeconds !== d.idleShutdownSeconds || config2.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config2.codex.appPort !== d.codex.appPort || config2.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct || b.maximize.admissionAt !== db.maximize.admissionAt || b.maximize.wrapUpQuota !== db.maximize.wrapUpQuota || b.allocation.minRunwayRatio !== db.allocation.minRunwayRatio || b.allocation.minRunwayGapHours !== db.allocation.minRunwayGapHours;
 }
 function normalizeInteger(value, fallback) {
   if (typeof value === "number" && Number.isFinite(value))
@@ -15799,9 +15813,11 @@ function normalizeMaximizeConfig(raw, pauseAt, fallback = DEFAULT_BUDGET_CONFIG.
     reserveSlopePctPerHour: normalizeBoundedNumber(m.reserveSlopePctPerHour, fallback.reserveSlopePctPerHour, 0, 5),
     reserveMaxPct: normalizeBoundedInteger(m.reserveMaxPct, fallback.reserveMaxPct, 0, 30),
     finishingHorizonMinutes: normalizeBoundedInteger(m.finishingHorizonMinutes, fallback.finishingHorizonMinutes, 5, 180),
-    resumeHysteresisPct: normalizeBoundedInteger(m.resumeHysteresisPct, fallback.resumeHysteresisPct, 1, 30)
+    resumeHysteresisPct: normalizeBoundedInteger(m.resumeHysteresisPct, fallback.resumeHysteresisPct, 1, 30),
+    admissionAt: normalizeBoundedInteger(m.admissionAt, fallback.admissionAt, 50, 99),
+    wrapUpQuota: Math.floor(normalizeBoundedInteger(m.wrapUpQuota, fallback.wrapUpQuota, 0, 10))
   };
-  if (normalized.targetUtil <= pauseAt) {
+  if (normalized.targetUtil <= pauseAt || normalized.admissionAt >= normalized.targetUtil) {
     return { ...DEFAULT_BUDGET_CONFIG.maximize };
   }
   return normalized;
@@ -16383,7 +16399,7 @@ if (process.env.AGENTBRIDGE_TRACE === "1") {
     });
   } catch {}
 }
-claude.setReplySender(async (msg, requireReply, onBusy, idempotencyKey) => {
+claude.setReplySender(async (msg, requireReply, onBusy, idempotencyKey, wrapUp) => {
   if (msg.source !== "claude") {
     return { success: false, error: "Invalid message source" };
   }
@@ -16393,7 +16409,7 @@ claude.setReplySender(async (msg, requireReply, onBusy, idempotencyKey) => {
       error: disabledReplyError(daemonDisabledReason ?? "killed")
     };
   }
-  return daemonClient.sendReply(msg, requireReply, onBusy, idempotencyKey);
+  return daemonClient.sendReply(msg, requireReply, onBusy, idempotencyKey, wrapUp);
 });
 claude.setResumeAckHandler((resumeId, status) => {
   if (daemonDisabled) {

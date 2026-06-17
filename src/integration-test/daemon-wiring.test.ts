@@ -49,7 +49,7 @@ interface Harness {
   sendClaudeToCodex: (
     requestId: string,
     text: string,
-    opts?: { onBusy?: "reject" | "steer" | "interrupt"; requireReply?: boolean; idempotencyKey?: string },
+    opts?: { onBusy?: "reject" | "steer" | "interrupt"; requireReply?: boolean; idempotencyKey?: string; wrapUp?: boolean },
   ) => void;
   /** Send an ack_resume control message over the attached control socket (PR4). */
   sendAckResume: (resumeId: string, status: string) => void;
@@ -445,14 +445,19 @@ describe("daemon wiring", () => {
       );
 
       writeUsage("codex", 5);
+      // While the gate was CLOSED + Codex idle, the v3 P3 checkpoint baton (M3b)
+      // legitimately injects one turn before recovery — so the resume turn is no
+      // longer guaranteed to be turn-start [0]. Match the RESUME turn explicitly.
+      const findResume = () =>
+        readTurnStarts().find((p) => typeof p.input?.[0]?.text === "string" && p.input[0].text.includes(RESUME_PROMPT));
       await waitFor(
-        () => readTurnStarts().length >= 1,
+        () => findResume() !== undefined,
         "resume turn/start after budget recovery",
         400,
         50,
       );
 
-      const injected = readTurnStarts()[0]!;
+      const injected = findResume()!;
       expect(injected.threadId).toBe("thread-fake-1");
       expect(injected.input[0].text).toContain(RESUME_PROMPT);
       expect(injected.model).toBeUndefined();
@@ -746,7 +751,10 @@ describe("daemon wiring", () => {
       );
     };
     writeUsage("claude", 10);
-    writeUsage("codex", 85); // eco band (≥80) but below pauseAt=90 — no pause
+    // eco band (warnUtil ≥80) yet below pauseAt=90 (no pause) AND below
+    // admissionAt=85 (no v3 P3 admission-closed gate) — so the tier-override turn
+    // still injects. (85 would now trip admission-closed and block the turn.)
+    writeUsage("codex", 82);
     writeFileSync(probePath, `#!/bin/sh\ncat "${fixtureRoot}/usage-$2.json"\n`, "utf-8");
     chmodSync(probePath, 0o755);
 
@@ -822,6 +830,358 @@ describe("daemon wiring", () => {
       const third = readTurnStarts()[2]!;
       expect(third.effort).toBeUndefined();
       expect(third.model).toBeUndefined();
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 60000);
+
+  test("v3 P3 admission gate: new turns rejected with budget_admission; wrap-up allowed", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-budget-admission-fixture-"));
+    const probePath = join(fixtureRoot, "probe.sh");
+    const turnStartLog = join(fixtureRoot, "turn-starts.jsonl");
+    const writeUsage = (agent: "claude" | "codex", gateUtil: number) => {
+      writeFileSync(
+        join(fixtureRoot, `usage-${agent}.json`),
+        JSON.stringify({
+          ok: true,
+          util: gateUtil,
+          warn_util: gateUtil,
+          fetched_at: Math.floor(Date.now() / 1000),
+          buckets: [
+            { id: "five_hour", util: gateUtil, reset_epoch: Math.floor(Date.now() / 1000) + 7200 },
+          ],
+        }),
+      );
+    };
+    const readTurnStarts = (): Array<Record<string, unknown>> => {
+      if (!existsSync(turnStartLog)) return [];
+      return readFileSync(turnStartLog, "utf-8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    };
+    writeUsage("claude", 10);
+    // 5h util 86 ≥ admissionAt(85) → admission-closed, yet < pauseAt(90) → NOT paused.
+    writeUsage("codex", 86);
+    writeFileSync(probePath, `#!/bin/sh\ncat "${fixtureRoot}/usage-$2.json"\n`, "utf-8");
+    chmodSync(probePath, 0o755);
+
+    try {
+      const harness = await startHarness({
+        pairId: "main-budgetadm",
+        pairName: "main",
+        extraEnv: {
+          AGENTBRIDGE_BUDGET_ENABLED: "1",
+          AGENTBRIDGE_QUOTA_PROBE: probePath,
+          AGENTBRIDGE_BUDGET_POLL_SECONDS: "5",
+          FAKE_APP_TURNSTART_LOG: turnStartLog,
+        },
+      });
+      await harness.attachClaude();
+      await harness.connectTui();
+
+      // Wait until the coordinator's first poll computed gateState=admission-closed.
+      await waitFor(async () => {
+        try {
+          const res = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+          if (!res.ok) return false;
+          const status = (await res.json()) as DaemonStatus;
+          return status.budget?.gateState === "admission-closed" && status.budget?.paused === false;
+        } catch {
+          return false;
+        }
+      }, "gateState=admission-closed on /healthz", 200, 100);
+
+      // 1. A normal new turn is rejected with budget_admission (NOT budget_paused).
+      harness.sendClaudeToCodex("req-adm-new", "start a new task");
+      await waitFor(
+        () => harness.statusMessages.some((m) => m.type === "claude_to_codex_result" && m.requestId === "req-adm-new"),
+        "claude_to_codex_result for req-adm-new",
+      );
+      const rejected = harness.statusMessages.find(
+        (m) => m.type === "claude_to_codex_result" && m.requestId === "req-adm-new",
+      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
+      expect(rejected.success).toBe(false);
+      expect(rejected.code).toBe("budget_admission");
+      expect(rejected.error).toContain("收尾保护");
+      expect(readTurnStarts().length).toBe(0); // new task did NOT inject
+
+      // 2. A wrap-up reply is let through the admission gate → injects a turn.
+      harness.sendClaudeToCodex("req-adm-wrap", "wrap the current work to a checkpoint", { wrapUp: true });
+      await waitFor(() => readTurnStarts().length >= 1, "wrap-up turn injected past admission gate", 100, 100);
+
+      // The wrap-up slot is consumed ONLY on the confirmed injection (deferred from
+      // the gate). So after exactly one injected wrap-up the count is 1 — and the
+      // earlier rejected new-turn (step 1) consumed nothing.
+      const quotaFile = join(harness.stateDir, "admission-quota.json");
+      await waitFor(() => existsSync(quotaFile), "admission-quota.json persisted", 100, 100);
+      const quota = JSON.parse(readFileSync(quotaFile, "utf-8"));
+      expect(quota.wrapUpUsed).toBe(1);
+      // The checkpoint baton is a CLOSED-state action only; admission-closed must
+      // never fire it (M3b). The single turn-start so far is the wrap-up, not a baton.
+      expect(quota.checkpointBatonUsed).toBe(false);
+      expect(
+        readTurnStarts().some((p) => {
+          const input = (p.input as Array<{ text?: string }> | undefined) ?? [];
+          return input.some((i) => typeof i.text === "string" && i.text.includes("系统发起"));
+        }),
+      ).toBe(false);
+
+      // 3. FAIL CLOSED (M3a round-2 REAL): make the quota file unwritable (replace
+      // it with a directory so atomicWriteJson's rename throws at commit) → a
+      // further wrap-up is REJECTED with budget_admission and does NOT inject — the
+      // gate never lets an UNCOUNTED turn through on a write failure.
+      rmSync(quotaFile, { force: true });
+      mkdirSync(quotaFile);
+      const turnsBefore = readTurnStarts().length;
+      harness.sendClaudeToCodex("req-adm-wrapfail", "wrap up again (commit write fails)", { wrapUp: true });
+      await waitFor(
+        () => harness.statusMessages.some((m) => m.type === "claude_to_codex_result" && m.requestId === "req-adm-wrapfail"),
+        "result for req-adm-wrapfail",
+      );
+      const wrapFail = harness.statusMessages.find(
+        (m) => m.type === "claude_to_codex_result" && m.requestId === "req-adm-wrapfail",
+      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
+      expect(wrapFail.success).toBe(false);
+      expect(wrapFail.code).toBe("budget_admission");
+      expect(readTurnStarts().length).toBe(turnsBefore); // fail-closed: NOT injected
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 45000);
+
+  test("v3 P3 admission gate: weekly-runway trigger (no fresh 5h) still COUNTS wrap-ups (cap not bypassed)", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-budget-admweekly-fixture-"));
+    const probePath = join(fixtureRoot, "probe.sh");
+    const turnStartLog = join(fixtureRoot, "turn-starts.jsonl");
+    const now = Math.floor(Date.now() / 1000);
+    const readTurnStarts = (): Array<Record<string, unknown>> => {
+      if (!existsSync(turnStartLog)) return [];
+      return readFileSync(turnStartLog, "utf-8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    };
+    // Claude idle. Codex: an EXPIRED 5h window (reset_epoch = now-100, > 0 yet past —
+    // the round-4 case: a 5h-only ">0" key would mis-key here) plus a fresh weekly
+    // that will-fill (util 70 + rate 30/h over 1h → 100 > targetUtil 98) with a short
+    // runway (3000s < finishingHorizon 30m × 2 = 3600s) → admission-closed via the
+    // weekly-runway trigger, while util 70 < pauseAt 90 keeps it OUT of pause. The
+    // daemon must key the wrap-up quota on the FRESH weekly window, not the expired 5h.
+    writeFileSync(join(fixtureRoot, "usage-claude.json"), JSON.stringify({
+      ok: true, util: 10, warn_util: 10, fetched_at: now,
+      buckets: [{ id: "five_hour", util: 10, reset_epoch: now + 7200 }],
+    }));
+    writeFileSync(join(fixtureRoot, "usage-codex.json"), JSON.stringify({
+      ok: true, util: 70, warn_util: 70, fetched_at: now,
+      buckets: [
+        { id: "five_hour", util: 70, reset_epoch: now - 100 },
+        { id: "seven_day", util: 70, reset_epoch: now + 3600, burn_rate_pct_per_hour: 30, burn_confident: true, runway_seconds: 3000 },
+      ],
+    }));
+    writeFileSync(probePath, `#!/bin/sh\ncat "${fixtureRoot}/usage-$2.json"\n`, "utf-8");
+    chmodSync(probePath, 0o755);
+
+    try {
+      const harness = await startHarness({
+        pairId: "main-budgetadmwk",
+        pairName: "main",
+        extraEnv: {
+          AGENTBRIDGE_BUDGET_ENABLED: "1",
+          AGENTBRIDGE_QUOTA_PROBE: probePath,
+          AGENTBRIDGE_BUDGET_POLL_SECONDS: "5",
+          FAKE_APP_TURNSTART_LOG: turnStartLog,
+        },
+      });
+      await harness.attachClaude();
+      await harness.connectTui();
+
+      await waitFor(async () => {
+        try {
+          const res = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+          if (!res.ok) return false;
+          const status = (await res.json()) as DaemonStatus;
+          return status.budget?.gateState === "admission-closed" && status.budget?.paused === false;
+        } catch {
+          return false;
+        }
+      }, "gateState=admission-closed (weekly trigger) on /healthz", 200, 100);
+
+      // A wrap-up is let through AND counted on the weekly-window key (not uncounted):
+      // the 5h key would be 0 here, so the daemon must fall back to the weekly reset.
+      harness.sendClaudeToCodex("req-admwk-wrap", "wrap up under weekly-triggered admission", { wrapUp: true });
+      await waitFor(() => readTurnStarts().length >= 1, "wrap-up injected under weekly admission", 100, 100);
+      const quotaFile = join(harness.stateDir, "admission-quota.json");
+      await waitFor(() => existsSync(quotaFile), "admission-quota.json persisted on the weekly key", 100, 100);
+      const quota = JSON.parse(readFileSync(quotaFile, "utf-8"));
+      expect(quota.wrapUpUsed).toBe(1); // COUNTED (cap not bypassed)
+      expect(quota.fiveHourResetEpoch).toBe(now + 3600); // keyed on the weekly reset
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 45000);
+
+  test("v3 P3 (M3b): closed gate fires the checkpoint baton ONCE per window when Codex is idle", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-budget-baton-fixture-"));
+    const probePath = join(fixtureRoot, "probe.sh");
+    const turnStartLog = join(fixtureRoot, "turn-starts.jsonl");
+    const now = Math.floor(Date.now() / 1000);
+    const readTurnStarts = (): Array<Record<string, unknown>> => {
+      if (!existsSync(turnStartLog)) return [];
+      return readFileSync(turnStartLog, "utf-8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line));
+    };
+    // A baton turn carries the system-initiated marker in its input text.
+    const batonStarts = () =>
+      readTurnStarts().filter((p) => {
+        const input = (p.input as Array<{ text?: string }> | undefined) ?? [];
+        return input.some((i) => typeof i.text === "string" && i.text.includes("系统发起"));
+      });
+    writeFileSync(join(fixtureRoot, "usage-claude.json"), JSON.stringify({
+      ok: true, util: 10, warn_util: 10, fetched_at: now,
+      buckets: [{ id: "five_hour", util: 10, reset_epoch: now + 7200 }],
+    }));
+    // Codex 5h util 95 ≥ pauseAt(90) → fully CLOSED (not just admission-closed).
+    writeFileSync(join(fixtureRoot, "usage-codex.json"), JSON.stringify({
+      ok: true, util: 95, warn_util: 95, fetched_at: now,
+      buckets: [{ id: "five_hour", util: 95, reset_epoch: now + 7200 }],
+    }));
+    writeFileSync(probePath, `#!/bin/sh\ncat "${fixtureRoot}/usage-$2.json"\n`, "utf-8");
+    chmodSync(probePath, 0o755);
+
+    try {
+      const harness = await startHarness({
+        pairId: "main-budgetbaton",
+        pairName: "main",
+        extraEnv: {
+          AGENTBRIDGE_BUDGET_ENABLED: "1",
+          AGENTBRIDGE_QUOTA_PROBE: probePath,
+          // 5s poll (the config minimum) so the once-per-window assertion below can
+          // OBSERVE a SECOND poll cycle (onSnapshot → maybeFireCheckpointBaton) — the
+          // poll where a regressed dedup would re-fire the baton.
+          AGENTBRIDGE_BUDGET_POLL_SECONDS: "5",
+          FAKE_APP_TURNSTART_LOG: turnStartLog,
+        },
+      });
+      await harness.attachClaude();
+      await harness.connectTui();
+
+      // Gate closes on the first poll; the onSnapshot edge fires the baton while
+      // Codex is idle (the fake app-server never emits turn/started, so the baton's
+      // turn/start cannot re-arm a turn or re-trigger the listener).
+      await waitFor(() => batonStarts().length >= 1, "checkpoint baton injected once", 200, 100);
+      const quotaFile = join(harness.stateDir, "admission-quota.json");
+      await waitFor(() => existsSync(quotaFile), "admission-quota.json persisted (baton)", 100, 100);
+      const quota = JSON.parse(readFileSync(quotaFile, "utf-8"));
+      expect(quota.checkpointBatonUsed).toBe(true);
+      expect(quota.fiveHourResetEpoch).toBe(now + 7200);
+
+      // ONCE per window across MULTIPLE polls: require the coordinator to have polled
+      // (each onSnapshot calls maybeFireCheckpointBaton) at least 2 MORE times after
+      // the baton fired — distinct budget.updatedAt values prove distinct poll cycles.
+      // If the once-per-window dedup regressed (consumeCheckpointBaton always-true),
+      // the baton would re-fire on those polls and the count would exceed 1. (The
+      // earlier 5s-poll version returned before a 2nd poll and was vacuous on this axis.)
+      const seenUpdatedAt = new Set<number>();
+      await waitFor(async () => {
+        const res = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+        if (!res.ok) return false;
+        const status = (await res.json()) as DaemonStatus;
+        if (status.budget?.gateState !== "closed") return false;
+        if (typeof status.budget.updatedAt === "number") seenUpdatedAt.add(status.budget.updatedAt);
+        return seenUpdatedAt.size >= 2; // the firing poll + ≥1 further poll cycle
+      }, "≥2 closed-gate budget poll cycles observed", 200, 100);
+      expect(batonStarts().length).toBe(1);
+      // The baton instructs Codex to write .agent/checkpoint.md.
+      const input = (batonStarts()[0]!.input as Array<{ text?: string }>);
+      expect(input[0]!.text).toContain(".agent/checkpoint.md");
+    } finally {
+      rmSync(fixtureRoot, { recursive: true, force: true });
+    }
+  }, 45000);
+
+  test("v3 P3 (round-4): interrupt RE-CHECKS the gate after the await — a flip to admission-closed during the wait rejects the injection", async () => {
+    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-int-gateflip-"));
+    const probePath = join(fixtureRoot, "probe.sh");
+    const turnStartLog = join(fixtureRoot, "turn-starts.jsonl");
+    const interruptLog = join(fixtureRoot, "turninterrupt.jsonl");
+    const writeUsage = (agent: "claude" | "codex", util: number) => {
+      writeFileSync(
+        join(fixtureRoot, `usage-${agent}.json`),
+        JSON.stringify({
+          ok: true,
+          util,
+          warn_util: util,
+          fetched_at: Math.floor(Date.now() / 1000),
+          buckets: [{ id: "five_hour", util, reset_epoch: Math.floor(Date.now() / 1000) + 7200 }],
+        }),
+      );
+    };
+    const readTurnStarts = () =>
+      existsSync(turnStartLog)
+        ? readFileSync(turnStartLog, "utf-8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l))
+        : [];
+    writeUsage("claude", 10);
+    writeUsage("codex", 20); // gate OPEN initially → interrupt is admitted into the await
+    writeFileSync(probePath, `#!/bin/sh\ncat "${fixtureRoot}/usage-$2.json"\n`, "utf-8");
+    chmodSync(probePath, 0o755);
+
+    try {
+      const harness = await startHarness({
+        pairId: "main-gateflip",
+        pairName: "main",
+        extraEnv: {
+          AGENTBRIDGE_BUDGET_ENABLED: "1",
+          AGENTBRIDGE_QUOTA_PROBE: probePath,
+          AGENTBRIDGE_BUDGET_POLL_SECONDS: "5",
+          // Raise the interrupt terminal-boundary timeout to its 13s ceiling so the
+          // fake's deferred boundary (9s, below) is NOT pre-empted by interrupt_timeout.
+          AGENTBRIDGE_INTERRUPT_TIMEOUT_MS: "13000",
+          FAKE_APP_TURNSTART_LOG: turnStartLog,
+          FAKE_APP_TURNINTERRUPT_LOG: interruptLog,
+          // Defer the interrupt terminal boundary 9s: comfortably ABOVE the 5s budget
+          // poll (so the gate reliably flips to admission-closed mid-await, ~3s margin)
+          // and BELOW the 13s interrupt timeout (so the boundary fires normally rather
+          // than timing out, ~4s margin). gateState propagates to the coordinator's
+          // in-memory value that both /healthz and the post-await re-check read.
+          FAKE_APP_INTERRUPT_DELAY_MS: "9000",
+        },
+      });
+      await harness.attachClaude();
+      await harness.connectTui();
+
+      const gateState = async () => {
+        const res = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+        return res.ok ? (await res.json() as DaemonStatus).budget?.gateState : undefined;
+      };
+      await waitFor(async () => (await gateState()) === "open", "gateState=open initially", 200, 100);
+
+      // Drive a running turn so the interrupt path (not direct inject) activates.
+      harness.sendAppCommand("start-turn");
+      await waitForMessage(harness.messages, (m) => m.id.startsWith("system_turn_started"), "system_turn_started");
+
+      // Interrupt + inject a NEW task. Gate is OPEN at the top → admitted; the fake
+      // defers the terminal boundary, so the daemon now parks in waitForInterruptOutcome.
+      harness.sendClaudeToCodex("req-gateflip", "new task via interrupt", { onBusy: "interrupt" });
+      await waitFor(
+        () => existsSync(interruptLog) && readFileSync(interruptLog, "utf-8").trim() !== "",
+        "interrupt dispatched (daemon parked in the await)",
+        100,
+        100,
+      );
+
+      // FLIP the gate to admission-closed DURING the await, and confirm the poll landed.
+      writeUsage("codex", 86);
+      await waitFor(async () => (await gateState()) === "admission-closed", "gate flipped to admission-closed mid-await", 200, 100);
+
+      // When the terminal boundary fires, the post-await re-check must REJECT (the
+      // top-of-handler check ran against the now-stale OPEN gate). Without the re-check
+      // the new turn would inject past the gate.
+      await waitFor(
+        () => harness.statusMessages.some((m) => m.type === "claude_to_codex_result" && m.requestId === "req-gateflip"),
+        "result for req-gateflip after the terminal boundary",
+        250,
+        100,
+      );
+      const result = harness.statusMessages.find(
+        (m) => m.type === "claude_to_codex_result" && m.requestId === "req-gateflip",
+      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
+      expect(result.success).toBe(false);
+      expect(result.code).toBe("budget_admission"); // gate re-checked AFTER the await
+      expect(readTurnStarts().length).toBe(0); // the new turn was NOT injected (no bypass)
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
@@ -1761,7 +2121,7 @@ async function startHarness(opts: {
         }
       }, "bridge ready after TUI handshake", 100, 100);
     },
-    sendClaudeToCodex: (requestId: string, text: string, sendOpts?: { onBusy?: "reject" | "steer" | "interrupt"; requireReply?: boolean; idempotencyKey?: string }) => {
+    sendClaudeToCodex: (requestId: string, text: string, sendOpts?: { onBusy?: "reject" | "steer" | "interrupt"; requireReply?: boolean; idempotencyKey?: string; wrapUp?: boolean }) => {
       harness.controlWs?.send(JSON.stringify({
         type: "claude_to_codex",
         requestId,
@@ -1769,6 +2129,7 @@ async function startHarness(opts: {
         ...(sendOpts?.requireReply ? { requireReply: true } : {}),
         ...(sendOpts?.onBusy && sendOpts.onBusy !== "reject" ? { onBusy: sendOpts.onBusy } : {}),
         ...(sendOpts?.idempotencyKey ? { idempotencyKey: sendOpts.idempotencyKey } : {}),
+        ...(sendOpts?.wrapUp ? { wrapUp: true } : {}),
       }));
     },
     sendAckResume: (resumeId: string, status: string) => {

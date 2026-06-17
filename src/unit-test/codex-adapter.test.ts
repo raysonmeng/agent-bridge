@@ -401,6 +401,26 @@ describe("CodexAdapter turn state machine", () => {
     expect(injectionId).toBeLessThan(0);
   });
 
+  test("canInject mirrors injectMessage's three synchronous pre-send guards (P3 baton precheck)", () => {
+    const adapter = createAdapter();
+    // No thread → not injectable.
+    expect(adapter.canInject()).toBe(false);
+    adapter.threadId = "thread-1";
+    // Thread but no open socket → not injectable.
+    expect(adapter.canInject()).toBe(false);
+    adapter.appServerWs = { readyState: WebSocket.OPEN, send: () => {} } as any;
+    // Thread + open socket + idle → injectable.
+    expect(adapter.canInject()).toBe(true);
+    // A turn in progress → not injectable (injectMessage would reject too).
+    adapter.handleServerNotification({ method: "turn/started", params: { turn: { id: "t1" } } });
+    expect(adapter.canInject()).toBe(false);
+    // Closed socket → not injectable.
+    adapter.activeTurnIds.clear();
+    adapter.turnInProgress = false;
+    adapter.appServerWs = { readyState: WebSocket.CLOSED, send: () => {} } as any;
+    expect(adapter.canInject()).toBe(false);
+  });
+
   test("clearResponseTrackingState + turn reset simulates onclose behavior", () => {
     const adapter = createAdapter();
     // Start a turn and track a response

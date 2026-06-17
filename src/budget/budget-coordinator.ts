@@ -1,13 +1,20 @@
 import { homedir } from "node:os";
-import { computeBudgetState, renderBudgetInterventionDirective } from "./budget-state";
+import {
+  computeBudgetState,
+  renderBudgetAdmissionDirective,
+  renderBudgetInterventionDirective,
+} from "./budget-state";
 import type { RunwayInput } from "./budget-state";
 import { effectiveDynamicLine } from "./budget-decision";
 import { AdviceCooldown, resolveAdviceCooldownSec } from "./advice-cooldown";
 import {
+  classifyAdmission,
   classifyPoll,
   computeResumeCandidate,
   resumeCandidateSides,
+  INITIAL_ADMISSION_STATE,
   INITIAL_FINGERPRINT_STATE,
+  type AdmissionState,
   type FingerprintState,
   type ResumeCandidate,
   type ResumeSignals,
@@ -21,6 +28,7 @@ import type {
   BudgetState,
   CodexTier,
   CodexTurnOverrides,
+  GateState,
 } from "./types";
 import type { QuotaSource } from "./quota-source";
 
@@ -84,6 +92,15 @@ export interface BudgetCoordinatorOptions {
    * guard state dir (BUDGET_STATE_DIR ?? ~/.budget-guard), shared across pairs.
    */
   adviceCooldown?: AdviceCooldown;
+  /**
+   * v3 P3 (§3.2, M3b): whether Codex currently has a turn in progress (daemon
+   * passes `codex.turnInProgress`). Read at poll time to make the admission
+   * directive turnPhase-aware: while a Codex turn runs the directive is DEFERRED
+   * (not emitted mid-turn) and flushed by {@link onCodexTurnIdle} when the turn
+   * ends. Absent (tests / no wiring) → treated as never-active, so the directive
+   * emits immediately on entry — the safe default for unit tests.
+   */
+  isCodexTurnActive?: () => boolean;
 }
 
 const AGENT_LABEL: Record<AgentName, string> = {
@@ -172,6 +189,7 @@ export class BudgetCoordinator {
   private readonly onResume: (side: AgentName, directive: string, resumeId: string) => void;
   private readonly resumeSignals: (() => ResumeSignals) | null;
   private readonly adviceCooldown: AdviceCooldown;
+  private readonly isCodexTurnActive: () => boolean;
 
   private timer: BudgetPollTimer | null = null;
   private running = false;
@@ -179,6 +197,20 @@ export class BudgetCoordinator {
   // / resume bookkeeping). Replaces the former 4 mutable fields
   // (activeSides, lastDirectiveFingerprint, pauseReason, pauseResumeAfterEpoch).
   private fpState: FingerprintState = INITIAL_FINGERPRINT_STATE;
+  // v3 P3 (§3.2): admission lane, parallel to the pause fpState. In-memory only
+  // (recomputed each poll); the durable per-window quota is in admission-quota.ts.
+  private admissionState: AdmissionState = INITIAL_ADMISSION_STATE;
+  // v3 P3 (§3.2, M3b): the admission directive deferred because a Codex turn was
+  // running when the admission lane closed (turnPhase-aware emission). Flushed by
+  // onCodexTurnIdle() when the turn ends; dropped if the gate reopens/escalates
+  // first. Holds the LATEST rendered content + its fingerprint (a later poll that
+  // changes the fingerprint mid-turn overwrites it).
+  private pendingAdmissionDirective: { content: string; fingerprint: string } | null = null;
+  // Fingerprint of the last admission directive actually emitted — dedup guard so
+  // a deferred-then-flushed directive (or a phantom re-decide) never double-emits
+  // for the same admission episode. Cleared on admission exit so a fresh episode
+  // emits again.
+  private lastEmittedAdmissionFingerprint: string | null = null;
   // PR2: latest per-side resume candidate (detection only — read-only exposure
   // via getResumeCandidate(); the coordinator never acts on it).
   private resumeCandidate: ResumeCandidate = {};
@@ -207,6 +239,7 @@ export class BudgetCoordinator {
         cooldownSec: resolveAdviceCooldownSec(),
         log: this.log,
       });
+    this.isCodexTurnActive = options.isCodexTurnActive ?? (() => false);
   }
 
   async start(): Promise<void> {
@@ -230,6 +263,19 @@ export class BudgetCoordinator {
 
   isGateClosed(): boolean {
     return this.fpState.side === "codex" || this.fpState.side === "both";
+  }
+
+  /**
+   * v3 P3 (§3.2): the three-state daemon gate. `closed` (the existing pause gate,
+   * = isGateClosed) takes precedence over `admission-closed`. Both tiers key on
+   * the CODEX side (incl. "both") because the daemon gates Codex turn/start —
+   * Claude self-governs via the prompt. Observability today (snapshot.gateState);
+   * the daemon begins enforcing the admission tier in M3.
+   */
+  gateState(): GateState {
+    if (this.fpState.side === "codex" || this.fpState.side === "both") return "closed";
+    if (this.admissionState.side === "codex" || this.admissionState.side === "both") return "admission-closed";
+    return "open";
   }
 
   getSnapshot(): BudgetSnapshot | null {
@@ -364,6 +410,11 @@ export class BudgetCoordinator {
   private applyState(state: BudgetState): void {
     const { next, effect } = classifyPoll(this.fpState, state, this.config);
     this.fpState = next;
+    // v3 P3 (§3.2): advance the parallel admission lane and apply its directive
+    // effect (M3b — turnPhase-aware emission). The daemon's three-state gate reads
+    // gateState(); this only governs the advisory directive to Claude.
+    this.admissionState = classifyAdmission(this.admissionState, state, this.config).next;
+    this.applyAdmissionDirective(state);
 
     // PR2 (detection only): recompute the per-side resume candidate from the
     // EFFECT, not the post-transition fingerprint. The hysteresis removes a side
@@ -379,6 +430,25 @@ export class BudgetCoordinator {
       : {};
 
     for (const side of effect.recoveredSides) {
+      // v3 P3 (M3b, round-2 REAL): a side recovering from PAUSE may still be
+      // ADMISSION-closed — the closed→admission-closed de-escalation (codex util
+      // crosses below the pause-resume line into the admission hold band). Firing
+      // the codex recovery here would (a) tell Claude codex is fully recovered and
+      // (b) route an auto-resume turn through enqueueCodexBudgetResume → the resume
+      // queue → codex.injectMessage, which BYPASSES the codex_to_codex admission
+      // gate and would inject an unbounded continuation that never consumes a wrap-up
+      // slot — both wrong while codex is still in finishing protection. HOLD the
+      // codex recovery until the admission lane also opens. (admission is
+      // codex-scoped, so a claude recovery is never gated by it.) Trade-off: in a
+      // monotonic recovery (pause → admission-closed → open with no re-pause) the
+      // codex auto-resume is skipped for this episode; it re-fires on the next
+      // genuine pause-recovery cycle, and once the gate is open Claude can resume
+      // Codex manually via reply. The SAFE direction — no gate bypass. (follow-up:
+      // optionally re-fire the held resume on the admission-exit transition.)
+      if (side === "codex" && (this.admissionState.side === "codex" || this.admissionState.side === "both")) {
+        this.log(`Budget recovery for Codex held: pause cleared but still admission-closed`);
+        continue;
+      }
       const { id, directive } = this.emitRecovery(side, state);
       this.onResume(side, directive, id);
     }
@@ -400,6 +470,25 @@ export class BudgetCoordinator {
         return;
       }
       case "advise": {
+        // v3 P3 (M3b): hard-gate routing advice on an OPEN gate. computeBudgetState
+        // already suppresses the advise PHASE when either side admit-closes (raw
+        // predicate), so an advise effect normally never reaches here while the gate
+        // is admission-closed. This catches the residual hysteresis EXIT band: the
+        // raw predicate reads "open" (advise phase produced) while the coordinator's
+        // admissionState still HOLDS admission-closed — emitting "route work to
+        // Codex" then would contradict the still-active daemon admission gate.
+        if (this.gateState() !== "open") {
+          // RE-ARM the advice fingerprint (null) instead of a plain return.
+          // classifyPoll already committed `this.fpState = next` with the advise
+          // fingerprint (budget-fingerprint.ts advise branch), so a bare return
+          // would burn the dedup key WITHOUT emitting — and once the gate opens the
+          // same persistent drift yields an identical fingerprint → classifyPoll
+          // returns kind:"none" → the legitimate balance/underutilization advice is
+          // permanently lost for the episode (round-2 REAL, both review engines).
+          // Nulling it makes the next OPEN-gate poll recompute and emit exactly once.
+          this.fpState = { ...this.fpState, fingerprint: null };
+          return;
+        }
         // state.directiveToClaude is non-null whenever the reducer emits advise.
         if (effect.phase === "underutilized") {
           // v3 P4: the accelerate/underutilization advice is account-level — gate
@@ -427,6 +516,115 @@ export class BudgetCoordinator {
       case "none":
         return;
     }
+  }
+
+  /**
+   * v3 P3 (§3.2, M3b): decide the admission directive each poll. The daemon gate
+   * (gateState) is independent of this — this only governs the advisory
+   * `system_budget_admission` directive to Claude.
+   *
+   * IDEMPOTENT by design: the emit decision is driven off the coordinator's own
+   * `lastEmittedAdmissionFingerprint`, NOT the reducer's one-shot `emit` flag. The
+   * one-shot flag fires only on the poll an episode first enters; if THAT poll is
+   * blocked (a pause is active, or a Codex turn is running) the directive must
+   * still emit on a LATER poll once the blocker clears. The classic miss this
+   * prevents: codex enters pause+admission together (admission suppressed by the
+   * pause), then de-escalates to admission-only (burn-data regime: util in
+   * [admissionAt, dynamicLine−hysteresis) clears pause but holds admission) — with
+   * a one-shot flag the directive would NEVER emit yet the daemon rejects every new
+   * Codex turn. Driving off lastEmitted re-evaluates every poll until it lands.
+   *
+   * Suppression cases do NOT advance lastEmitted, so they re-arm naturally:
+   *   - admission open / claude-only → reset bookkeeping (a fresh codex episode
+   *     re-emits; the daemon gate is codex-scoped, Claude self-governs its line).
+   *   - a pause is active → pause has display priority (its directive covers
+   *     winding down); HOLD (re-evaluated next poll once the pause clears).
+   *   - a Codex turn is running → DEFER (store the rendered directive; flushed by
+   *     onCodexTurnIdle when the turn ends, with a poll-driven backstop here).
+   */
+  private applyAdmissionDirective(state: BudgetState): void {
+    const side = this.admissionState.side;
+    if (side !== "codex" && side !== "both") {
+      // Gate open on the codex axis (or claude-only) → nothing to announce; clear
+      // bookkeeping so a future codex episode emits fresh.
+      this.pendingAdmissionDirective = null;
+      this.lastEmittedAdmissionFingerprint = null;
+      return;
+    }
+    const fingerprint = this.admissionState.fingerprint;
+    // Already announced this episode (fingerprint unchanged) → no-op. Drop any
+    // stale pending (e.g. the directive was already flushed by onCodexTurnIdle).
+    if (fingerprint === null || fingerprint === this.lastEmittedAdmissionFingerprint) {
+      this.pendingAdmissionDirective = null;
+      return;
+    }
+    // Pause display priority: HOLD without marking emitted, so it re-fires the
+    // poll the pause clears. Drop any deferred copy (the pause directive supersedes).
+    if (this.isPaused()) {
+      this.pendingAdmissionDirective = null;
+      return;
+    }
+    const content = renderBudgetAdmissionDirective(
+      state.perAgent.claude,
+      state.perAgent.codex,
+      side,
+      this.admissionState.reason ?? "额度窗口收尾保护",
+      this.admissionResetEpoch(state),
+      this.config,
+    );
+    // turnPhase-aware: defer while a Codex turn runs (re-rendered each poll so the
+    // deferred copy never goes stale); onCodexTurnIdle flushes it the moment the
+    // turn ends, and the next poll here is the backstop if that event is missed.
+    if (this.isCodexTurnActive()) {
+      this.pendingAdmissionDirective = { content, fingerprint };
+      return;
+    }
+    this.emitAdmission(content, fingerprint);
+  }
+
+  private emitAdmission(content: string, fingerprint: string): void {
+    this.emitDirective("system_budget_admission", content);
+    this.lastEmittedAdmissionFingerprint = fingerprint;
+    this.pendingAdmissionDirective = null;
+  }
+
+  /**
+   * The reset epoch for the admission directive's "window refreshes at" line. ALWAYS
+   * the CODEX fresh window (fresh 5h, else fresh weekly) — the admission gate is
+   * codex-scoped (the daemon rejects Codex turns and keys the wrap-up/baton quota on
+   * exactly this codex window), and Claude self-governs its own line. Even for a
+   * side="both" directive the actionable "when can I delegate to Codex again" answer
+   * is the codex window, NOT max(claude,codex): a later-resetting Claude window would
+   * mislead Claude into waiting past the point Codex's gate actually reopens (round-2
+   * REAL). NOT matchingGateReset (state.pause.resetEpochs): that admits a window whose
+   * epoch is merely > 0, so a weekly-triggered admission with an EXPIRED 5h window
+   * would display the stale 5h time. `now` from state keeps it consistent with the poll.
+   */
+  private admissionResetEpoch(state: BudgetState): number | null {
+    const usage = state.perAgent.codex;
+    const now = state.now;
+    const fiveHour = usage?.fiveHour?.resetEpoch ?? 0;
+    const weekly = usage?.weekly?.resetEpoch ?? 0;
+    const fresh = fiveHour > now ? fiveHour : weekly > now ? weekly : 0;
+    return fresh > 0 ? fresh : null;
+  }
+
+  /**
+   * v3 P3 (§3.2, M3b): flush a deferred admission directive when the Codex turn
+   * ends (daemon calls this on turnPhaseChanged → idle/aborted) — the immediacy
+   * optimization over the poll-driven backstop in applyAdmissionDirective. `pending`
+   * is poll-managed: every poll re-evaluates it and CLEARS it on a pause escalation
+   * or an admission exit, so a non-null `pending` already means the last poll
+   * confirmed admission-closed + not paused. The isPaused()/gateState() re-check is
+   * defense-in-depth against future event/poll interleaving; it never fires today.
+   * No-op when nothing is pending.
+   */
+  onCodexTurnIdle(): void {
+    const pending = this.pendingAdmissionDirective;
+    if (!pending) return;
+    this.pendingAdmissionDirective = null;
+    if (this.isPaused() || this.gateState() !== "admission-closed") return;
+    this.emitAdmission(pending.content, pending.fingerprint);
   }
 
   private tierControlEnabled(): boolean {
@@ -537,6 +735,7 @@ export class BudgetCoordinator {
       driftPct: state.drift.pct,
       paused,
       gateClosed: this.isGateClosed(),
+      gateState: this.gateState(),
       pauseSide: this.fpState.side,
       pauseReason: paused ? this.fpState.reason ?? state.pause.reason : null,
       resumeAfterEpoch: paused ? this.fpState.resumeEpoch ?? state.pause.resumeAfterEpoch : null,

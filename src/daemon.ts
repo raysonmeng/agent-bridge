@@ -18,6 +18,7 @@ import {
 import { TuiConnectionState } from "./tui-connection-state";
 import { DaemonLifecycle } from "./daemon-lifecycle";
 import { StateDirResolver } from "./state-dir";
+import { consumeCheckpointBaton, consumeWrapUp, currentWindowState } from "./budget/admission-quota";
 import { ConfigService, applyBudgetEnvOverrides } from "./config-service";
 import { BudgetCoordinator } from "./budget/budget-coordinator";
 import { createQuotaSource } from "./budget/quota-source";
@@ -455,7 +456,17 @@ function ensureBudgetCoordinatorStarted() {
           `(gate ${budgetCoordinator?.isGateClosed() ? "CLOSED" : "OPEN"})`,
         );
       },
-      onSnapshot: () => broadcastStatus(),
+      onSnapshot: () => {
+        broadcastStatus();
+        // v3 P3 (§3.2, M3b): the gate closing while Codex is already idle emits no
+        // turnPhaseChanged event, so re-check the checkpoint baton every poll here.
+        // onSnapshot fires AFTER the coordinator commits latestSnapshot (unlike
+        // onPauseChange, which runs mid-applyState before the snapshot is set), so
+        // maybeFireCheckpointBaton can read the fresh 5h/weekly reset to key on.
+        // Self-gates on gateState()==="closed" + Codex idle; consumeCheckpointBaton
+        // dedups to once per window, so polling it every snapshot is harmless.
+        maybeFireCheckpointBaton("snapshot");
+      },
       log,
       onResume: (side, _directive, resumeId) => {
         // Side-aware routing lives in the pure, exported routeResume so the
@@ -479,6 +490,9 @@ function ensureBudgetCoordinatorStarted() {
       // booleans. Each read is fault-isolated so a transient fs error never
       // breaks the poll loop.
       resumeSignals: readResumeSignals,
+      // v3 P3 (§3.2, M3b): turnPhase-aware admission directive — defer while a
+      // Codex turn runs, flush on idle (see turnPhaseChanged → onCodexTurnIdle).
+      isCodexTurnActive: () => codex.turnInProgress,
     });
   }
   void budgetCoordinator.start();
@@ -509,6 +523,173 @@ function budgetPauseGateError(): string {
     (resumeAt ? `（预计恢复 ${resumeAt}，以实测为准；提前刷新会更早解除）` : "") +
     `。收到 RESUME 通知前请勿重试向 Codex 发送 reply；${sideHint}。`
   );
+}
+
+/**
+ * v3 P3 (§3.2): error text for the `admission-closed` gate. New turns are
+ * declined; the model may bring the current collaboration to a checkpoint by
+ * resending with wrap_up=true (up to maximize.wrapUpQuota per quota window).
+ * Steer (mid-turn correction) is unaffected. The quota window is the 5h window
+ * (or the weekly window when admission fired from a weekly trigger), so the
+ * wording is window-agnostic. `wrapUpLeft` is the remaining quota for the
+ * new-task case; `quotaExhausted` switches to the "no budget left" wording.
+ */
+function budgetAdmissionGateError(
+  windowResetEpoch: number,
+  wrapUpLeft: number,
+  quotaExhausted: boolean,
+): string {
+  const resetAt = windowResetEpoch > 0
+    ? new Date(windowResetEpoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z")
+    : "未知";
+  const quota = BUDGET_CONFIG.maximize.wrapUpQuota;
+  if (quotaExhausted) {
+    return (
+      `额度窗口收尾保护中（admission-closed）：本窗口 wrap-up 配额（每窗口 ${quota} 个）已用尽，已拒绝转发。` +
+      `请勿再派新任务；写 checkpoint，等额度窗口刷新（约 ${resetAt}）后再继续。`
+    );
+  }
+  return (
+    `额度窗口收尾保护中（admission-closed）：仅接收收尾类注入，已拒绝该新任务。` +
+    `如需把当前协作收尾到 checkpoint，可用 reply 带 wrap_up=true 重发（本窗口还剩 ${wrapUpLeft} 个收尾配额）；steer 修正不受限。` +
+    `新任务请等额度窗口刷新（约 ${resetAt}）后再派。`
+  );
+}
+
+/** A budget-gate decision for one Claude→Codex injection attempt. */
+type BudgetGateDecision =
+  | { allow: false; code: "budget_paused" | "budget_admission"; error: string; retryAfterMs?: number }
+  | { allow: true; pendingWrapUpReset: number | null };
+
+/**
+ * v3 P3 (§3.2): evaluate the three-state budget gate for a Claude→Codex injection.
+ * A pure DECISION (reads only the coordinator snapshot + a quota-file PEEK — never
+ * consumes; the caller sends the result and commits any wrap-up slot). Extracted so
+ * the SAME logic runs at the top of the handler AND is RE-EVALUATED after the
+ * interrupt path awaits its terminal boundary — the gate can flip during that await
+ * (a budget poll lands while waitForInterruptOutcome blocks), and re-checking is the
+ * only thing that stops a tightened gate from being bypassed (P3 plan §1.5; the
+ * re-check was missed in M3a and caught by the cross-engine round-4 review).
+ *
+ *   - willInject: whether THIS attempt will actually inject (top: !turnInProgress ||
+ *     interrupt; post-interrupt-await: always true). Only an injecting wrap-up
+ *     reserves a quota slot; a wrap-up that will bounce off the busy guard does not.
+ *   - isSteer: a steer feeding a RUNNING turn — admission lets it through (the steer
+ *     path handles it; it is not a new task). Always false on the post-await path.
+ *     A fully `closed` gate still rejects everything (steer included), unchanged.
+ */
+function evaluateInjectionBudgetGate(
+  message: { wrapUp?: boolean },
+  willInject: boolean,
+  isSteer: boolean,
+): BudgetGateDecision {
+  const gateState = budgetCoordinator?.gateState() ?? "open";
+  if (gateState === "closed") {
+    log(`Injection rejected by budget pause gate`);
+    const resumeAfterEpoch = budgetCoordinator?.getSnapshot()?.resumeAfterEpoch ?? null;
+    // B4 fix: only advertise a POSITIVE retry delay (see retryAfterMsForResume).
+    const retryAfterMs = retryAfterMsForResume(resumeAfterEpoch, Date.now());
+    return {
+      allow: false,
+      code: "budget_paused",
+      error: budgetPauseGateError(),
+      ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
+    };
+  }
+  if (gateState === "admission-closed" && !isSteer) {
+    // Key the wrap-up quota on a FRESH admission window (resetEpoch > now): the 5h
+    // window when fresh, else the weekly window. EXPIRED 5h epochs are excluded (>0
+    // yet past) and a total probe outage (no fresh window) FAILS CLOSED below — both
+    // are M3a round-3/round-4 REALs, preserved verbatim by this extraction.
+    const nowSec = Math.floor(Date.now() / 1000);
+    const admSnap = budgetCoordinator?.getSnapshot()?.codex;
+    const admFiveHour = admSnap?.fiveHour?.resetEpoch ?? 0;
+    const admWeekly = admSnap?.weekly?.resetEpoch ?? 0;
+    const admissionWindowReset = admFiveHour > nowSec ? admFiveHour : admWeekly > nowSec ? admWeekly : 0;
+    if (admissionWindowReset <= 0) {
+      log(`Injection rejected by admission gate: no fresh quota window (probe stale / snapshot lost)`);
+      return { allow: false, code: "budget_admission", error: budgetAdmissionGateError(0, 0, true) };
+    }
+    if (message.wrapUp === true && willInject) {
+      // PEEK availability; the actual consume is deferred to the pre-inject commit
+      // (fail-closed) so a failed interrupt / null inject never burns a slot.
+      const peek = currentWindowState(stateDir.admissionQuotaFile, admissionWindowReset, log);
+      if (peek.wrapUpUsed >= BUDGET_CONFIG.maximize.wrapUpQuota) {
+        log(`Injection rejected by admission gate: wrap-up quota exhausted`);
+        return { allow: false, code: "budget_admission", error: budgetAdmissionGateError(admissionWindowReset, 0, true) };
+      }
+      log(`Admission-closed: wrap-up permitted (${peek.wrapUpUsed}/${BUDGET_CONFIG.maximize.wrapUpQuota} used; slot committed on inject)`);
+      return { allow: true, pendingWrapUpReset: admissionWindowReset };
+    }
+    if (message.wrapUp === true && !willInject) {
+      // Turn running + reject policy: let the busy guard answer; do not consume.
+      return { allow: true, pendingWrapUpReset: null };
+    }
+    const left = Math.max(
+      0,
+      BUDGET_CONFIG.maximize.wrapUpQuota - currentWindowState(stateDir.admissionQuotaFile, admissionWindowReset, log).wrapUpUsed,
+    );
+    log(`Injection rejected by admission gate: new task (set wrap_up to finish the current work)`);
+    return { allow: false, code: "budget_admission", error: budgetAdmissionGateError(admissionWindowReset, left, false) };
+  }
+  return { allow: true, pendingWrapUpReset: null };
+}
+
+/**
+ * v3 P3 (§3.2, REAL-2): the system-initiated checkpoint baton injected into Codex
+ * once per quota window when the gate is fully `closed`. A last useful turn before
+ * the side goes dark: have Codex capture its own progress so a fresh session can
+ * resume. Deliberately self-describing as system-initiated and "no reply needed".
+ */
+const CHECKPOINT_BATON_PROMPT =
+  "【预算协调 · 系统发起】账号级额度即将耗尽，闸门已关闭。这是本额度窗口唯一一次系统提醒：" +
+  "请立即把当前进度写入 checkpoint（.agent/checkpoint.md：任务 / 已完成 / 进行中断点 / 下一步 / 关键决策与约束），" +
+  "然后停手等待额度窗口刷新；刷新前不要再开新任务。此为系统提醒，无需回复 Claude。";
+
+/**
+ * v3 P3 (§3.2, REAL-2): fire the closed-state checkpoint baton at most ONCE per
+ * quota window. Triggers: turnPhaseChanged → idle/aborted (a turn just ended) and
+ * onSnapshot (every poll — catches the gate closing while Codex was already idle,
+ * which emits no turnPhaseChanged). Both self-gate + consumeCheckpointBaton dedups,
+ * so over-calling is harmless. Guards, in order:
+ *   - gate must be fully `closed` (not admission-closed / open).
+ *   - Codex must NOT have a turn in progress (idle/aborted) — never interrupt;
+ *     injectMessage would reject a busy turn anyway.
+ *   - a FRESH quota window (5h if fresh, else weekly) must exist to key the
+ *     per-window flag on — keyed identically to the wrap-up gate so the two
+ *     counters never thrash a divergent key on the shared admission-quota record.
+ *     No fresh window (probe outage while phantom-held closed) → skip (degraded).
+ *   - consumeCheckpointBaton is FAIL-CLOSED once-per-window (true only on a
+ *     durable write). Consume BEFORE inject: a rare post-consume inject failure
+ *     costs one advisory baton (the over-protect direction) but the "at most once
+ *     per window" anti-spam invariant is absolute — re-firing a checkpoint nudge
+ *     at a budget-exhausted Codex every idle would be the worse failure.
+ */
+function maybeFireCheckpointBaton(trigger: string): void {
+  if (!budgetCoordinator) return;
+  if (budgetCoordinator.gateState() !== "closed") return;
+  // Injectability PRECHECK before consuming the once-per-window token. canInject()
+  // covers all three of injectMessage's synchronous pre-send guards (active thread,
+  // app-server socket OPEN, no turn in progress). Without it, a closed-gate poll
+  // fired while the TUI/app-server is disconnected would consumeCheckpointBaton
+  // (durable write) and then get a null inject — permanently burning the window's
+  // only baton (REAL: cross-engine + workflow). The whole body below is synchronous
+  // (no await between canInject(), the sync consume write, and injectMessage), so
+  // there is no TOCTOU gap to reopen the socket-closed race.
+  if (!codex.canInject()) return;
+  const nowSec = Math.floor(Date.now() / 1000);
+  const snap = budgetCoordinator.getSnapshot()?.codex;
+  const fiveHour = snap?.fiveHour?.resetEpoch ?? 0;
+  const weekly = snap?.weekly?.resetEpoch ?? 0;
+  const windowReset = fiveHour > nowSec ? fiveHour : weekly > nowSec ? weekly : 0;
+  if (windowReset <= 0) return;
+  if (!consumeCheckpointBaton(stateDir.admissionQuotaFile, windowReset, log)) return;
+  const injectionId = codex.injectMessage(CHECKPOINT_BATON_PROMPT);
+  if (injectionId === null) {
+    log(`Checkpoint baton (${trigger}): inject failed after consume — baton lost this window (reset ${windowReset})`);
+    return;
+  }
+  log(`Checkpoint baton fired (${trigger}, window reset ${windowReset})`);
 }
 
 const tuiConnectionState = new TuiConnectionState({
@@ -556,6 +737,14 @@ function tryWriteStatusFile(reason: string) {
 codex.on("turnPhaseChanged", ({ phase, previous }: { phase: string; previous: string }) => {
   log(`Codex turn phase: ${previous} → ${phase}`);
   tryWriteStatusFile(`turnPhase:${phase}`);
+  // v3 P3 (§3.2, M3b): a turn just ended (Codex is now injectable). This is the
+  // natural decision point — flush any deferred admission directive to Claude and
+  // give the closed-state checkpoint baton its idle window. Both self-gate, so
+  // running→stalled / stalled→running transitions fall through harmlessly.
+  if (phase === "idle" || phase === "aborted") {
+    budgetCoordinator?.onCodexTurnIdle();
+    maybeFireCheckpointBaton("turnIdle");
+  }
   broadcastStatus();
 });
 
@@ -1204,24 +1393,32 @@ async function handleClaudeToCodex(
     return;
   }
 
-  // Budget pause gate (plan v2.4 side-aware R4): the gate protects the
-  // TARGET side's quota, so it closes only when the Codex side is exhausted
-  // (gateClosed = pauseSide codex/both). A Claude-only handoff keeps the
-  // gate OPEN so the baton reply can reach Codex. Same rejection shape as
-  // the busy-guard below.
-  if (budgetCoordinator?.isGateClosed()) {
-    const reason = budgetPauseGateError();
-    log(`Injection rejected by budget pause gate`);
-    const resumeAfterEpoch = budgetCoordinator?.getSnapshot()?.resumeAfterEpoch ?? null;
-    // B4 fix: only advertise a POSITIVE retry delay (see retryAfterMsForResume).
-    const retryAfterMs = retryAfterMsForResume(resumeAfterEpoch, Date.now());
-    sendClaudeToCodexResult(ws, message.requestId, {
-      success: false,
-      code: "budget_paused",
-      error: reason,
-      ...(retryAfterMs !== undefined ? { retryAfterMs } : {}),
-    });
-    return;
+  // Budget gate (v3 P3 §3.2 three-state). `closed` (Codex side exhausted) →
+  // reject budget_paused (unchanged v2.4 side-aware semantics: a Claude-only
+  // handoff keeps the gate OPEN so the baton reaches Codex). `admission-closed`
+  // (5h finishing protection) → reject NEW turns with budget_admission, but let
+  // a `wrapUp` reply through up to maximize.wrapUpQuota per 5h window, and let a
+  // steer feed a RUNNING turn (steer is handled below; not a new task). The full
+  // decision lives in evaluateInjectionBudgetGate so the interrupt path can
+  // RE-EVALUATE it after its await (the gate can flip during the wait). On an
+  // admission wrap-up the reserved window is carried in `pendingWrapUpReset` and
+  // committed (fail-closed) only just before the inject, so a failed interrupt /
+  // null injection never burns a slot. null = nothing to commit.
+  let pendingWrapUpReset: number | null = null;
+  {
+    const isSteer = codex.turnInProgress && message.onBusy === "steer";
+    const willInject = !codex.turnInProgress || message.onBusy === "interrupt";
+    const gate = evaluateInjectionBudgetGate(message, willInject, isSteer);
+    if (!gate.allow) {
+      sendClaudeToCodexResult(ws, message.requestId, {
+        success: false,
+        code: gate.code,
+        error: gate.error,
+        ...(gate.retryAfterMs !== undefined ? { retryAfterMs: gate.retryAfterMs } : {}),
+      });
+      return;
+    }
+    pendingWrapUpReset = gate.pendingWrapUpReset;
   }
 
   const requireReply = !!message.requireReply;
@@ -1402,10 +1599,59 @@ async function handleClaudeToCodex(
     if (interruptThreadId && codex.activeThreadId !== interruptThreadId) {
       releaseInterruptKey();
     }
+    // v3 P3 (§3.2, plan §1.5): RE-EVALUATE the budget gate after the await. The
+    // top-of-handler check ran against the PRE-await gate, but waitForInterruptOutcome
+    // yields to the event loop, during which a budget poll can tighten the gate to
+    // admission-closed or closed. Without this re-check the interrupt would inject a
+    // NEW turn past the freshly-tightened gate — bypassing budget_admission / the
+    // wrap-up quota, or injecting into a fully-closed gate (round-4 cross-engine REAL).
+    // An interrupt always starts a NEW turn (willInject=true, isSteer=false); re-derive
+    // pendingWrapUpReset so a now-open gate drops a stale reservation and a now-closed
+    // gate rejects. Mirrors the post-await attach re-check above.
+    {
+      const gate = evaluateInjectionBudgetGate(message, true, false);
+      if (!gate.allow) {
+        releaseInterruptKey();
+        log(`Interrupt-path injection rejected by budget gate after await (${gate.code})`);
+        sendClaudeToCodexResult(ws, message.requestId, {
+          success: false,
+          code: gate.code,
+          error: gate.error,
+          ...(gate.retryAfterMs !== undefined ? { retryAfterMs: gate.retryAfterMs } : {}),
+        });
+        return;
+      }
+      pendingWrapUpReset = gate.pendingWrapUpReset;
+    }
     // Fall through to the shared injection block.
   }
 
   const injectThreadId = codex.activeThreadId;
+  // v3 P3: commit the admission wrap-up slot HERE — after the interrupt block
+  // (every interrupt-failure exit already returned above, so no slot is burned on
+  // a non-injecting path) and JUST BEFORE the inject. FAIL CLOSED: if the slot
+  // cannot be durably recorded (write failure) or another request raced it to the
+  // cap, REJECT rather than inject an uncounted turn (which would silently bypass
+  // the cap — M3a round-2 REAL). The only residual is the safe over-protect
+  // direction: a rare injectMessage===null right after this burns one slot.
+  if (pendingWrapUpReset !== null) {
+    const committed = consumeWrapUp(
+      stateDir.admissionQuotaFile,
+      pendingWrapUpReset,
+      BUDGET_CONFIG.maximize.wrapUpQuota,
+      log,
+    );
+    if (!committed.allowed) {
+      log(`Injection rejected by admission gate: wrap-up slot not durably recorded (write failure or raced to cap)`);
+      sendClaudeToCodexResult(ws, message.requestId, {
+        success: false,
+        code: "budget_admission",
+        error: budgetAdmissionGateError(pendingWrapUpReset, 0, true),
+      });
+      return;
+    }
+    log(`Admission wrap-up slot committed (${committed.used}/${BUDGET_CONFIG.maximize.wrapUpQuota})`);
+  }
   const injectionId = codex.injectMessage(contentToSend, tierOverrides);
   if (injectionId === null) {
     // No wire attempt happened — any upfront interrupt-path accept() must not

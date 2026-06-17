@@ -5,7 +5,7 @@ import { join } from "node:path";
 import { BudgetCoordinator, nextBudgetPollDelayMs } from "../budget/budget-coordinator";
 import { AdviceCooldown } from "../budget/advice-cooldown";
 import type { ResumeSignals } from "../budget/budget-fingerprint";
-import type { AgentUsage, BudgetConfig } from "../budget/types";
+import type { AgentName, AgentUsage, BudgetConfig } from "../budget/types";
 
 const NOW = 1_700_000_000;
 
@@ -25,7 +25,7 @@ const CONFIG: BudgetConfig = {
     balanced: { effort: "medium" },
     eco: { effort: "low" },
   },
-  maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5 },
+  maximize: { targetUtil: 97, reserveSlopePctPerHour: 0.4, reserveMaxPct: 7, finishingHorizonMinutes: 30, resumeHysteresisPct: 5, admissionAt: 85, wrapUpQuota: 2 },
   allocation: { minRunwayRatio: 50, minRunwayGapHours: 2 },
 };
 
@@ -572,7 +572,12 @@ describe("BudgetCoordinator", () => {
     });
     const source = new FakeSource([
       { claude: usage(), codex: codexUsage(96) }, // 96 ≥ line 95.6 → pause (confident b-branch)
-      { claude: usage(), codex: codexUsage(88) }, // 88 → projected 89.2 ≤ 97 → won't-fill → resume
+      // 78 < line−hysteresis (90.6) → pause resumes, AND < admissionAt−hysteresis
+      // (80) → admission lane also opens, so gateState() is fully "open" and the
+      // codex recovery directive fires. (v3 P3 M3b: a value in [80,90.6) would
+      // clear pause but HOLD admission-closed, so the recovery is correctly held —
+      // see the de-escalation regression test below.)
+      { claude: usage(), codex: codexUsage(78) },
     ]);
     const { coordinator, emitted, pauseChanges } = makeCoordinator(source, maximizeConfig);
 
@@ -1347,5 +1352,305 @@ describe("BudgetCoordinator — v3 P4 underutilization cooldown gate", () => {
     // The phase is still computed (snapshot reflects it), but emission is gated.
     expect(coordinator.getSnapshot()!.phase).toBe("underutilized");
     expect(emitted.some((e) => e.id.startsWith("system_budget_underutilized"))).toBe(false);
+  });
+});
+
+describe("gateState — v3 P3 three-state gate (M2)", () => {
+  async function gateAfterPoll(claudeU: AgentUsage | null, codexU: AgentUsage | null) {
+    const source = new FakeSource([{ claude: claudeU, codex: codexU }]);
+    const { coordinator } = makeCoordinator(source);
+    await coordinator.start();
+    return coordinator;
+  }
+
+  test("open when neither side is admission-closed or paused", async () => {
+    const c = await gateAfterPoll(usage({ gateUtil: 20 }), usage({ gateUtil: 20 }));
+    expect(c.gateState()).toBe("open");
+    expect(c.getSnapshot()?.gateState).toBe("open");
+  });
+
+  test("admission-closed when Codex 5h util >= admissionAt but below the pause line", async () => {
+    const c = await gateAfterPoll(usage({ gateUtil: 20 }), usage({ gateUtil: 86 }));
+    expect(c.isGateClosed()).toBe(false); // not the pause gate
+    expect(c.gateState()).toBe("admission-closed");
+    expect(c.getSnapshot()?.gateState).toBe("admission-closed");
+  });
+
+  test("closed (pause) takes precedence over admission-closed", async () => {
+    // Codex util 95 → pause (>= pauseAt 90) AND admission (>= 85); closed wins.
+    const c = await gateAfterPoll(usage({ gateUtil: 20 }), usage({ gateUtil: 95 }));
+    expect(c.isGateClosed()).toBe(true);
+    expect(c.gateState()).toBe("closed");
+    expect(c.getSnapshot()?.gateState).toBe("closed");
+  });
+
+  test("Claude-side admission does NOT close the daemon gate (gates Codex turns only)", async () => {
+    const c = await gateAfterPoll(usage({ gateUtil: 86 }), usage({ gateUtil: 20 }));
+    expect(c.gateState()).toBe("open");
+  });
+});
+
+describe("admission directive emission — v3 P3 (M3b, turnPhase-aware)", () => {
+  function makeAdmissionCoordinator(results: FetchResult[], turnActive: { value: boolean }) {
+    const emitted: Array<{ id: string; content: string }> = [];
+    const logs: string[] = [];
+    const scheduler = new FakeScheduler();
+    const source = new FakeSource(results);
+    const coordinator = new BudgetCoordinator({
+      source,
+      config: CONFIG,
+      emit: (id, content) => emitted.push({ id, content }),
+      onPauseChange: () => {},
+      now: () => NOW,
+      scheduler,
+      log: (m) => logs.push(m),
+      isCodexTurnActive: () => turnActive.value,
+    });
+    return { coordinator, emitted, logs, scheduler };
+  }
+
+  const admissionEmits = (emitted: Array<{ id: string; content: string }>) =>
+    emitted.filter((e) => e.id.startsWith("system_budget_admission"));
+
+  test("emits system_budget_admission when Codex idle and admission closes", async () => {
+    const { coordinator, emitted } = makeAdmissionCoordinator(
+      [{ claude: usage({ gateUtil: 20 }), codex: usage({ gateUtil: 86 }) }],
+      { value: false },
+    );
+    await coordinator.start();
+    expect(coordinator.gateState()).toBe("admission-closed");
+    const ads = admissionEmits(emitted);
+    expect(ads).toHaveLength(1);
+    expect(ads[0]!.content).toContain("收尾保护");
+    expect(ads[0]!.content).toContain("budget_admission");
+    expect(ads[0]!.content).toContain("wrap_up");
+  });
+
+  test("defers the directive while a Codex turn runs, flushes on idle", async () => {
+    const turnActive = { value: true };
+    const { coordinator, emitted } = makeAdmissionCoordinator(
+      [{ claude: usage({ gateUtil: 20 }), codex: usage({ gateUtil: 86 }) }],
+      turnActive,
+    );
+    await coordinator.start();
+    expect(coordinator.gateState()).toBe("admission-closed");
+    expect(admissionEmits(emitted)).toHaveLength(0); // deferred while the turn runs
+    turnActive.value = false;
+    coordinator.onCodexTurnIdle(); // turn ended → flush
+    expect(admissionEmits(emitted)).toHaveLength(1);
+  });
+
+  test("does not double-emit after a deferred flush (dedup across later polls)", async () => {
+    const turnActive = { value: true };
+    const { coordinator, emitted, scheduler } = makeAdmissionCoordinator(
+      [
+        { claude: usage({ gateUtil: 20 }), codex: usage({ gateUtil: 86 }) },
+        { claude: usage({ gateUtil: 20 }), codex: usage({ gateUtil: 86 }) },
+      ],
+      turnActive,
+    );
+    await coordinator.start(); // poll 1 → deferred
+    turnActive.value = false;
+    coordinator.onCodexTurnIdle(); // emit #1
+    await scheduler.runNext(); // poll 2: same admission fingerprint → no re-emit
+    expect(admissionEmits(emitted)).toHaveLength(1);
+  });
+
+  test("drops the deferred directive if admission exits during the turn", async () => {
+    const { coordinator, emitted, scheduler } = makeAdmissionCoordinator(
+      [
+        { claude: usage({ gateUtil: 20 }), codex: usage({ gateUtil: 86 }) }, // admission-closed
+        { claude: usage({ gateUtil: 20 }), codex: usage({ gateUtil: 20 }) }, // reopened
+      ],
+      { value: true },
+    );
+    await coordinator.start(); // deferred
+    await scheduler.runNext(); // exit clears the pending directive
+    coordinator.onCodexTurnIdle(); // nothing to flush
+    expect(admissionEmits(emitted)).toHaveLength(0);
+    expect(coordinator.gateState()).toBe("open");
+  });
+
+  test("suppresses the admission directive while a pause (handoff) is active", async () => {
+    // Claude paused (handoff) + Codex admission-closed: pause takes display
+    // priority, so no admission directive — but the handoff directive still fires.
+    const { coordinator, emitted } = makeAdmissionCoordinator(
+      [{ claude: usage({ gateUtil: 95 }), codex: usage({ gateUtil: 86 }) }],
+      { value: false },
+    );
+    await coordinator.start();
+    expect(coordinator.gateState()).toBe("admission-closed");
+    expect(admissionEmits(emitted)).toHaveLength(0);
+    expect(emitted.some((e) => e.id.startsWith("system_budget_handoff"))).toBe(true);
+  });
+
+  test("claude-only admission close emits no directive (daemon gate is codex-scoped)", async () => {
+    const { coordinator, emitted } = makeAdmissionCoordinator(
+      [{ claude: usage({ gateUtil: 86 }), codex: usage({ gateUtil: 20 }) }],
+      { value: false },
+    );
+    await coordinator.start();
+    expect(coordinator.gateState()).toBe("open");
+    expect(admissionEmits(emitted)).toHaveLength(0);
+  });
+
+  test("onCodexTurnIdle is a no-op when nothing is pending", async () => {
+    const { coordinator, emitted } = makeAdmissionCoordinator(
+      [{ claude: usage({ gateUtil: 20 }), codex: usage({ gateUtil: 20 }) }],
+      { value: false },
+    );
+    await coordinator.start();
+    coordinator.onCodexTurnIdle();
+    expect(emitted).toHaveLength(0);
+  });
+
+  // Confident-burn-data codex usage: the 5h dynamic pause line is 90, so pause
+  // resumes at util < 85 (line − resumeHysteresisPct) while admission holds until
+  // util < 80 (admissionAt − hysteresis) — the de-escalation band [80,85). The
+  // weekly window MUST sit below resumeBelow(30): a degraded weekly at util ≥ 30
+  // would block resume on its own (maximizeWindowBlocksResume fallback) and the
+  // 5h-only de-escalation could never surface.
+  const burnCodex = (util: number): AgentUsage =>
+    usage({
+      gateUtil: util,
+      warnUtil: util,
+      fiveHour: { util, resetEpoch: NOW + 3600, burnRate: 20, burnConfident: true },
+      weekly: { util: 20, resetEpoch: NOW + 500_000 },
+    });
+
+  test("re-emits when a pause de-escalates to admission-only (REAL: missed-emit on de-escalation)", async () => {
+    // Burn regime: dynamic line ≈90, so pause clears at util < 85 (line−hysteresis)
+    // while admission holds until util < 80. poll1 util 96 → pause+admission (admission
+    // suppressed by pause display priority); poll2 util 82 ∈ [80,85) → pause clears,
+    // admission holds. The one-shot reducer emit flag is false on poll2 (same
+    // fingerprint), so this ONLY emits because applyAdmissionDirective drives off
+    // lastEmittedAdmissionFingerprint — the regression guard for the missed-emit fix.
+    const { coordinator, emitted, scheduler } = makeAdmissionCoordinator(
+      [
+        { claude: usage({ gateUtil: 20 }), codex: burnCodex(96) },
+        { claude: usage({ gateUtil: 20 }), codex: burnCodex(82) },
+      ],
+      { value: false },
+    );
+    await coordinator.start();
+    expect(coordinator.gateState()).toBe("closed"); // paused
+    expect(admissionEmits(emitted)).toHaveLength(0); // admission suppressed by pause
+    await scheduler.runNext();
+    expect(coordinator.gateState()).toBe("admission-closed"); // pause cleared, admission holds
+    expect(admissionEmits(emitted)).toHaveLength(1); // NOW emitted (regression guard)
+  });
+
+  test("drops a deferred admission directive when the gate escalates to a full pause", async () => {
+    // defer at admission-closed (turn running) → escalate to closed → the escalation
+    // poll clears pending, so onCodexTurnIdle emits no stale admission directive; the
+    // pause directive fires instead. (workflow REAL: previously-untested transition.)
+    const turnActive = { value: true };
+    const { coordinator, emitted, scheduler } = makeAdmissionCoordinator(
+      [
+        { claude: usage({ gateUtil: 20 }), codex: usage({ gateUtil: 86 }) }, // admission-closed → defer
+        { claude: usage({ gateUtil: 20 }), codex: usage({ gateUtil: 95 }) }, // escalate → closed (pause)
+      ],
+      turnActive,
+    );
+    await coordinator.start();
+    expect(admissionEmits(emitted)).toHaveLength(0); // deferred
+    await scheduler.runNext();
+    expect(coordinator.gateState()).toBe("closed");
+    turnActive.value = false;
+    coordinator.onCodexTurnIdle();
+    expect(admissionEmits(emitted)).toHaveLength(0); // no stale admission directive
+    expect(emitted.some((e) => e.id.startsWith("system_budget_pause"))).toBe(true);
+  });
+
+  test("emit-path dedup: a second poll on the same admission episode does not re-emit", async () => {
+    // Drives the lastEmittedAdmissionFingerprint guard directly (idle path, no defer):
+    // emit on poll1, identical state on poll2 → exactly one emit. Removing the guard
+    // makes poll2 re-emit (the dedup is no longer vacuous under the idempotent rewrite).
+    const { coordinator, emitted, scheduler } = makeAdmissionCoordinator(
+      [
+        { claude: usage({ gateUtil: 20 }), codex: usage({ gateUtil: 86 }) },
+        { claude: usage({ gateUtil: 20 }), codex: usage({ gateUtil: 86 }) },
+      ],
+      { value: false },
+    );
+    await coordinator.start();
+    expect(admissionEmits(emitted)).toHaveLength(1);
+    await scheduler.runNext();
+    expect(admissionEmits(emitted)).toHaveLength(1);
+  });
+
+  test("holds the Codex pause-recovery while still admission-closed (R2-1: no resume bypass)", async () => {
+    // closed→admission-closed de-escalation: pause clears (burn band) but admission
+    // holds. The pause-lane recovery must NOT fire emitRecovery/onResume for codex —
+    // onResume routes enqueueCodexBudgetResume → the resume queue → codex.injectMessage,
+    // which BYPASSES the admission gate and would inject an unbounded continuation.
+    const emitted: Array<{ id: string; content: string }> = [];
+    const resumeCalls: AgentName[] = [];
+    const scheduler = new FakeScheduler();
+    const source = new FakeSource([
+      { claude: usage({ gateUtil: 20 }), codex: burnCodex(96) }, // pause + admission
+      { claude: usage({ gateUtil: 20 }), codex: burnCodex(82) }, // pause clears, admission holds
+    ]);
+    const coordinator = new BudgetCoordinator({
+      source,
+      config: CONFIG,
+      emit: (id, content) => emitted.push({ id, content }),
+      onPauseChange: () => {},
+      now: () => NOW,
+      scheduler,
+      log: () => {},
+      onResume: (side) => resumeCalls.push(side),
+      resumeSignals: () => readySignals(), // ready → without the fix, onResume(codex) WOULD route a resume
+    });
+    await coordinator.start();
+    expect(coordinator.gateState()).toBe("closed");
+    await scheduler.runNext();
+    expect(coordinator.gateState()).toBe("admission-closed");
+    // Recovery HELD: no resume directive, no resume routing (no bypass).
+    expect(emitted.some((e) => e.id.startsWith("system_budget_resume"))).toBe(false);
+    expect(resumeCalls).not.toContain("codex");
+    // The correct signal fires instead.
+    expect(emitted.some((e) => e.id.startsWith("system_budget_admission"))).toBe(true);
+  });
+
+  test("re-emits suppressed balance advice once the admission gate opens (R2-2)", async () => {
+    // codex 86→82→78 with a persistent drift vs a low Claude. 86: layer-1 suppresses
+    // (admit-close → phase normal). 82: hold band — phase=balance but gate
+    // admission-closed → layer-2 suppresses AND re-arms the fingerprint. 78: gate
+    // opens → balance emits exactly once. Without the re-arm, the committed-but-
+    // suppressed fingerprint would dedup poll-3 to silence (permanent miss).
+    const { coordinator, emitted, scheduler } = makeAdmissionCoordinator(
+      [
+        { claude: usage({ gateUtil: 20, warnUtil: 20 }), codex: usage({ gateUtil: 86, warnUtil: 86 }) },
+        { claude: usage({ gateUtil: 20, warnUtil: 20 }), codex: usage({ gateUtil: 82, warnUtil: 82 }) },
+        { claude: usage({ gateUtil: 20, warnUtil: 20 }), codex: usage({ gateUtil: 78, warnUtil: 78 }) },
+      ],
+      { value: false },
+    );
+    const balanceEmits = () => emitted.filter((e) => e.id.startsWith("system_budget_balance"));
+    await coordinator.start();
+    expect(balanceEmits()).toHaveLength(0); // admit-close: layer-1 suppressed
+    await scheduler.runNext();
+    expect(coordinator.gateState()).toBe("admission-closed");
+    expect(balanceEmits()).toHaveLength(0); // hold band: layer-2 suppressed (re-armed, not lost)
+    await scheduler.runNext();
+    expect(coordinator.gateState()).toBe("open");
+    expect(balanceEmits()).toHaveLength(1); // re-emitted on gate open (regression guard)
+  });
+
+  test("admission directive reset shows the CODEX window even for side=both (R2-3)", async () => {
+    // Both sides admission-closed; Claude's 5h window resets LATER than Codex's. The
+    // directive's "对应窗口约 X 刷新" line must show CODEX's reset (the codex-scoped gate
+    // the daemon actually keys on), not max(claude,codex) — else Claude waits too long.
+    const claude = usage({ gateUtil: 86, warnUtil: 86, fiveHour: { util: 86, resetEpoch: NOW + 20_000 } });
+    const codex = usage({ gateUtil: 86, warnUtil: 86, fiveHour: { util: 86, resetEpoch: NOW + 3_600 } });
+    const { coordinator, emitted } = makeAdmissionCoordinator([{ claude, codex }], { value: false });
+    await coordinator.start();
+    expect(coordinator.gateState()).toBe("admission-closed");
+    const ad = emitted.find((e) => e.id.startsWith("system_budget_admission"));
+    expect(ad).toBeDefined();
+    const fmt = (epoch: number) => new Date(epoch * 1000).toISOString().replace("T", " ").replace(/\.\d+Z$/, "Z");
+    expect(ad!.content).toContain(`对应窗口约 ${fmt(NOW + 3_600)} 刷新`); // codex window
+    expect(ad!.content).not.toContain(`对应窗口约 ${fmt(NOW + 20_000)} 刷新`); // not claude's later window
   });
 });

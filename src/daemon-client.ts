@@ -273,6 +273,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     requireReply?: boolean,
     onBusy?: "reject" | "steer" | "interrupt",
     idempotencyKey?: string,
+    wrapUp?: boolean,
   ): Promise<SendReplyResult> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return { success: false, error: "AgentBridge daemon is not connected." };
@@ -299,6 +300,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       ...(requireReply ? { requireReply: true } : {}),
       ...(onBusy && onBusy !== "reject" ? { onBusy } : {}),
       ...(idempotencyKey ? { idempotencyKey } : {}),
+      ...(wrapUp ? { wrapUp: true } : {}),
     });
     return pending;
   }
