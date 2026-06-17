@@ -1609,6 +1609,9 @@ describe("admission directive emission — v3 P3 (M3b, turnPhase-aware)", () => 
     // Recovery HELD: no resume directive, no resume routing (no bypass).
     expect(emitted.some((e) => e.id.startsWith("system_budget_resume"))).toBe(false);
     expect(resumeCalls).not.toContain("codex");
+    // Backlog: the read-only resume candidate must NOT expose codex while held —
+    // the de-escalation poll filters codex out of the candidate sides.
+    expect(coordinator.getResumeCandidate().codex).not.toBe(true);
     // The correct signal fires instead.
     expect(emitted.some((e) => e.id.startsWith("system_budget_admission"))).toBe(true);
   });

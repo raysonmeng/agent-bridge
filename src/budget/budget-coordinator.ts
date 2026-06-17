@@ -425,27 +425,36 @@ export class BudgetCoordinator {
     // side. When no signal provider is wired the candidate stays empty — nothing
     // can be a candidate without the readiness signals. This populates state
     // only; committed recovered sides emit below, but injection remains PR3/PR4.
+    // v3 P3 (M3b round-2 REAL + backlog): codex is HELD when it recovers from PAUSE
+    // but the admission lane still gates it (the closed→admission-closed
+    // de-escalation: codex util crosses below the pause-resume line into the
+    // admission hold band). A held codex is neither emitted as recovered (loop
+    // below) NOR exposed as a resume candidate here — otherwise getResumeCandidate()
+    // .codex would briefly read true on the de-escalation poll even though the
+    // recovery is suppressed. (Today the only consumer, enqueueCodexBudgetResume, is
+    // reached via the skipped onResume, so it is unconsumed; filtering keeps the
+    // read-only exposure honest so a future consumer cannot mis-read it.)
+    const codexAdmissionHeld = this.admissionState.side === "codex" || this.admissionState.side === "both";
+    const candidateSides = resumeCandidateSides(effect).filter(
+      (side) => !(side === "codex" && codexAdmissionHeld),
+    );
     this.resumeCandidate = this.resumeSignals
-      ? computeResumeCandidate(resumeCandidateSides(effect), state, this.config, this.resumeSignals())
+      ? computeResumeCandidate(candidateSides, state, this.config, this.resumeSignals())
       : {};
 
     for (const side of effect.recoveredSides) {
-      // v3 P3 (M3b, round-2 REAL): a side recovering from PAUSE may still be
-      // ADMISSION-closed — the closed→admission-closed de-escalation (codex util
-      // crosses below the pause-resume line into the admission hold band). Firing
-      // the codex recovery here would (a) tell Claude codex is fully recovered and
-      // (b) route an auto-resume turn through enqueueCodexBudgetResume → the resume
-      // queue → codex.injectMessage, which BYPASSES the codex_to_codex admission
-      // gate and would inject an unbounded continuation that never consumes a wrap-up
-      // slot — both wrong while codex is still in finishing protection. HOLD the
-      // codex recovery until the admission lane also opens. (admission is
-      // codex-scoped, so a claude recovery is never gated by it.) Trade-off: in a
-      // monotonic recovery (pause → admission-closed → open with no re-pause) the
-      // codex auto-resume is skipped for this episode; it re-fires on the next
-      // genuine pause-recovery cycle, and once the gate is open Claude can resume
-      // Codex manually via reply. The SAFE direction — no gate bypass. (follow-up:
-      // optionally re-fire the held resume on the admission-exit transition.)
-      if (side === "codex" && (this.admissionState.side === "codex" || this.admissionState.side === "both")) {
+      // Firing the codex recovery while HELD would (a) tell Claude codex is fully
+      // recovered and (b) route an auto-resume turn through enqueueCodexBudgetResume
+      // → the resume queue → codex.injectMessage, which BYPASSES the admission gate
+      // and would inject an unbounded continuation that never consumes a wrap-up slot
+      // — both wrong while codex is still in finishing protection. HOLD the codex
+      // recovery until the admission lane also opens. (admission is codex-scoped, so
+      // a claude recovery is never gated by it.) Trade-off: in a monotonic recovery
+      // (pause → admission-closed → open with no re-pause) the codex auto-resume is
+      // skipped for this episode; it re-fires on the next genuine pause-recovery cycle,
+      // and once the gate is open Claude can resume Codex manually via reply. The SAFE
+      // direction — no gate bypass. (follow-up: optionally re-fire on admission-exit.)
+      if (side === "codex" && codexAdmissionHeld) {
         this.log(`Budget recovery for Codex held: pause cleared but still admission-closed`);
         continue;
       }

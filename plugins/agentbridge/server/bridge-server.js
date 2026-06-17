@@ -14102,6 +14102,8 @@ function renderBudgetSnapshot(snapshot, options = {}) {
     } else {
       lines.push(`\u6682\u505C\uFF1A\u53CC\u4FA7\u8054\u5408\u6682\u505C\uFF08\u95F8\u95E8\u5173\u95ED\uFF09 \u2014 ${reason}${resume}`);
     }
+  } else if (snapshot.gateState === "admission-closed") {
+    lines.push("\u6682\u505C\uFF1A\u5426 \xB7 \u6536\u5C3E\u4FDD\u62A4\uFF1Aadmission-closed\uFF08Codex \u4FA7\u4EC5\u653E\u884C wrap-up/steer\uFF0C\u65B0\u4EFB\u52A1\u4F1A\u88AB\u62D2 budget_admission\uFF09");
   } else {
     lines.push("\u6682\u505C\uFF1A\u5426");
   }
@@ -14632,10 +14634,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.18", "0.0.0-source"),
-  commit: defineString("44137b8", "source"),
+  commit: defineString("5c9f7d0", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("36e830f077b2", "source")
+  codeHash: defineString("f85e311a26c7", "source")
 });
 function sameRuntimeContract(a, b) {
   if (!a || !b)

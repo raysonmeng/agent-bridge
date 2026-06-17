@@ -329,6 +329,13 @@ export function renderBudgetSnapshot(
     } else {
       lines.push(`暂停：双侧联合暂停（闸门关闭） — ${reason}${resume}`);
     }
+  } else if (snapshot.gateState === "admission-closed") {
+    // v3 P3 backlog: the gate can be admission-closed WITHOUT being paused (5h
+    // finishing protection on the Codex side). A bare "暂停：否" would hide that new
+    // Codex tasks are being declined, so surface the finishing-protection state.
+    // `gateState` is optional (back-compat): an old snapshot without it falls
+    // through to the plain "暂停：否" below.
+    lines.push("暂停：否 · 收尾保护：admission-closed（Codex 侧仅放行 wrap-up/steer，新任务会被拒 budget_admission）");
   } else {
     lines.push("暂停：否");
   }

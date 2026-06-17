@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.18", "0.0.0-source"),
-  commit: defineString("44137b8", "source"),
+  commit: defineString("5c9f7d0", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("36e830f077b2", "source")
+  codeHash: defineString("f85e311a26c7", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -4967,9 +4967,11 @@ class BudgetCoordinator {
     this.fpState = next;
     this.admissionState = classifyAdmission(this.admissionState, state, this.config).next;
     this.applyAdmissionDirective(state);
-    this.resumeCandidate = this.resumeSignals ? computeResumeCandidate(resumeCandidateSides(effect), state, this.config, this.resumeSignals()) : {};
+    const codexAdmissionHeld = this.admissionState.side === "codex" || this.admissionState.side === "both";
+    const candidateSides = resumeCandidateSides(effect).filter((side) => !(side === "codex" && codexAdmissionHeld));
+    this.resumeCandidate = this.resumeSignals ? computeResumeCandidate(candidateSides, state, this.config, this.resumeSignals()) : {};
     for (const side of effect.recoveredSides) {
-      if (side === "codex" && (this.admissionState.side === "codex" || this.admissionState.side === "both")) {
+      if (side === "codex" && codexAdmissionHeld) {
         this.log(`Budget recovery for Codex held: pause cleared but still admission-closed`);
         continue;
       }

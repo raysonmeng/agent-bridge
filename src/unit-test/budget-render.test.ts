@@ -54,6 +54,20 @@ describe("renderBudgetSnapshot", () => {
     expect(text).toContain("预警 45%");
   });
 
+  test("surfaces admission-closed (5h finishing protection) when not paused", () => {
+    const text = renderBudgetSnapshot(snapshot({ gateState: "admission-closed", paused: false }));
+    expect(text).toContain("收尾保护：admission-closed");
+    expect(text).toContain("budget_admission");
+  });
+
+  test("plain '暂停：否' when gate is open or gateState is absent (back-compat)", () => {
+    expect(renderBudgetSnapshot(snapshot({ gateState: "open" }))).toContain("暂停：否");
+    expect(renderBudgetSnapshot(snapshot({ gateState: "open" }))).not.toContain("收尾保护");
+    // Old snapshot without gateState → unchanged plain line.
+    expect(renderBudgetSnapshot(snapshot())).toContain("暂停：否");
+    expect(renderBudgetSnapshot(snapshot())).not.toContain("收尾保护");
+  });
+
   test("renders the dynamic line with per-agent headroom", () => {
     const text = renderBudgetSnapshot(
       snapshot({ dynamicPauseLine: { claude: 93.4, codex: 95.6 } }),
