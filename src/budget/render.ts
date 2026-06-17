@@ -193,6 +193,37 @@ function formatFiveHourWindowsLeftLine(snapshot: BudgetSnapshot): string | null 
   return `按当前节奏，周额度还够 ${byAgent} 个 5h 窗口`;
 }
 
+/** Seconds in one 5h window — the rate-limit window length. */
+const FIVE_HOUR_WINDOW_SEC = 5 * 3600;
+
+/**
+ * "Clock-windows": how many 5h windows physically fit before each side's WEEKLY
+ * reset = (weekly reset − now) ÷ 5h. Pure time arithmetic (no burn data needed),
+ * rendered alongside the burn-based "周额度还够 ~N 个" line so the model can apply
+ * the even-pacing test (budget-windows vs clock-windows) without doing the
+ * date math itself. Null when no weekly reset is known / already past.
+ */
+function clockWindowsLeft(usage: AgentUsage | null, snapshotAt: number): number | null {
+  const weekly = usage?.weekly;
+  if (!weekly || weekly.resetEpoch <= snapshotAt) return null;
+  return (weekly.resetEpoch - snapshotAt) / FIVE_HOUR_WINDOW_SEC;
+}
+
+function formatClockWindowsLine(snapshot: BudgetSnapshot): string | null {
+  const values: Array<[string, number]> = [];
+  const claude = clockWindowsLeft(snapshot.claude, snapshot.updatedAt);
+  const codex = clockWindowsLeft(snapshot.codex, snapshot.updatedAt);
+  if (claude !== null) values.push(["Claude", claude]);
+  if (codex !== null) values.push(["Codex", codex]);
+  if (values.length === 0) return null;
+
+  const unique = [...new Set(values.map(([, value]) => value.toFixed(1)))];
+  if (unique.length === 1) return `距周刷新还能容纳 ~${unique[0]} 个 5h 窗口（时钟）`;
+
+  const byAgent = values.map(([name, value]) => `${name} ~${value.toFixed(1)}`).join(" / ");
+  return `距周刷新还能容纳 ${byAgent} 个 5h 窗口（时钟）`;
+}
+
 /**
  * v3.2 (display-only): the binding dynamic pause line per agent and its headroom
  * to the agent's gateUtil. Present when the snapshot carries `dynamicPauseLine`
@@ -267,6 +298,8 @@ export function renderBudgetSnapshot(
   }
   const fiveHourWindowsLeftLine = formatFiveHourWindowsLeftLine(snapshot);
   if (fiveHourWindowsLeftLine) lines.push(fiveHourWindowsLeftLine);
+  const clockWindowsLine = formatClockWindowsLine(snapshot);
+  if (clockWindowsLine) lines.push(clockWindowsLine);
 
   const dynamicLineLine = formatDynamicLineLine(snapshot);
   if (dynamicLineLine) lines.push(dynamicLineLine);

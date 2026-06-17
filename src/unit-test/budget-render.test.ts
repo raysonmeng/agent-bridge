@@ -332,6 +332,27 @@ describe("renderBudgetSnapshot — burn rate & runway (v3 P1, layered amendment)
     expect(text).toContain("按当前节奏，周额度还够 ~2.4 个 5h 窗口");
   });
 
+  test("renders clock-windows (5h windows that physically fit before the weekly reset)", () => {
+    const text = renderBudgetSnapshot(
+      snapshot({
+        // weekly resets 2.5 × 5h after the snapshot's updatedAt → 2.5 clock-windows
+        claude: usage({ weekly: { util: 19, resetEpoch: 1_780_711_700 + Math.round(2.5 * 5 * 3600) } }),
+      }),
+    );
+    expect(text).toContain("距周刷新还能容纳");
+    expect(text).toContain("~2.5");
+  });
+
+  test("omits clock-windows when both sides' weekly reset is already past", () => {
+    const text = renderBudgetSnapshot(
+      snapshot({
+        claude: usage({ weekly: { util: 19, resetEpoch: 1_780_711_700 - 100 } }),
+        codex: usage({ weekly: { util: 10, resetEpoch: 1_780_711_700 - 100 } }),
+      }),
+    );
+    expect(text).not.toContain("距周刷新");
+  });
+
   test("omits weekly five-hour window count when the guard field is absent", () => {
     const text = renderBudgetSnapshot(snapshot());
     expect(text).not.toContain("周额度还够");

@@ -14007,6 +14007,29 @@ function formatFiveHourWindowsLeftLine(snapshot) {
   const byAgent = values.map(([name, value]) => `${name} ~${value.toFixed(1)}`).join(" / ");
   return `\u6309\u5F53\u524D\u8282\u594F\uFF0C\u5468\u989D\u5EA6\u8FD8\u591F ${byAgent} \u4E2A 5h \u7A97\u53E3`;
 }
+var FIVE_HOUR_WINDOW_SEC = 5 * 3600;
+function clockWindowsLeft(usage, snapshotAt) {
+  const weekly = usage?.weekly;
+  if (!weekly || weekly.resetEpoch <= snapshotAt)
+    return null;
+  return (weekly.resetEpoch - snapshotAt) / FIVE_HOUR_WINDOW_SEC;
+}
+function formatClockWindowsLine(snapshot) {
+  const values = [];
+  const claude = clockWindowsLeft(snapshot.claude, snapshot.updatedAt);
+  const codex = clockWindowsLeft(snapshot.codex, snapshot.updatedAt);
+  if (claude !== null)
+    values.push(["Claude", claude]);
+  if (codex !== null)
+    values.push(["Codex", codex]);
+  if (values.length === 0)
+    return null;
+  const unique = [...new Set(values.map(([, value]) => value.toFixed(1)))];
+  if (unique.length === 1)
+    return `\u8DDD\u5468\u5237\u65B0\u8FD8\u80FD\u5BB9\u7EB3 ~${unique[0]} \u4E2A 5h \u7A97\u53E3\uFF08\u65F6\u949F\uFF09`;
+  const byAgent = values.map(([name, value]) => `${name} ~${value.toFixed(1)}`).join(" / ");
+  return `\u8DDD\u5468\u5237\u65B0\u8FD8\u80FD\u5BB9\u7EB3 ${byAgent} \u4E2A 5h \u7A97\u53E3\uFF08\u65F6\u949F\uFF09`;
+}
 function formatDynamicLineLine(snapshot) {
   const lines = snapshot.dynamicPauseLine;
   if (!lines)
@@ -14050,6 +14073,9 @@ function renderBudgetSnapshot(snapshot, options = {}) {
   const fiveHourWindowsLeftLine = formatFiveHourWindowsLeftLine(snapshot);
   if (fiveHourWindowsLeftLine)
     lines.push(fiveHourWindowsLeftLine);
+  const clockWindowsLine = formatClockWindowsLine(snapshot);
+  if (clockWindowsLine)
+    lines.push(clockWindowsLine);
   const dynamicLineLine = formatDynamicLineLine(snapshot);
   if (dynamicLineLine)
     lines.push(dynamicLineLine);
@@ -14597,10 +14623,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.17", "0.0.0-source"),
-  commit: defineString("ad365c0", "source"),
+  commit: defineString("0d1e1bd", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("c22387f3269f", "source")
+  codeHash: defineString("8c19ce8879bd", "source")
 });
 function sameRuntimeContract(a, b) {
   if (!a || !b)

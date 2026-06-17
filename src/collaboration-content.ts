@@ -4,12 +4,31 @@
  * These are injected by `abg init` into project-level instruction files
  * so that agents auto-discover the multi-agent collaboration setup.
  *
- * Content must be generic (not project-specific) and under ~30 lines each.
- * Tool usage details are already covered by MCP server instructions —
- * these sections focus on *when* and *why* to collaborate.
+ * Content must be generic (not project-specific). The collaboration intro is
+ * kept short; the shared BUDGET_PACING governance block below is longer by
+ * design (it encodes the quota-pacing policy both agents follow). Tool usage
+ * details are otherwise covered by MCP server instructions — these sections
+ * focus on *when* and *why* to collaborate.
  */
 
 export const MARKER_ID = "AgentBridge";
+
+/**
+ * Shared budget-pacing governance block, injected verbatim into BOTH CLAUDE.md
+ * and AGENTS.md so Claude and Codex follow ONE identical policy. Code enforces
+ * only the hard floor (the near-limit pause/handoff gate) and edge cases; this
+ * block delegates the live "raise / hold / reduce intensity" decision to the
+ * model, driven by the probe data.
+ */
+export const BUDGET_PACING = `\
+### Budget pacing — drive the WEEKLY quota to ~100% over the week, evenly, without reaching a 5h cap (active when agent-quota-guard is installed)
+- **Core principle: token is the means, value is the end.** Raising intensity means producing more real parallel value (deeper reviews, more independent exploration / verification / genuine subtasks) — never manufacturing low-value work to consume quota. The budget to MAXIMIZE is the **weekly** quota (refreshed once a week): drive each side's weekly toward ~100% by its weekly reset, and consume it **evenly** across the week — front-loading then starving, or under-consuming throughout, both leave weekly quota unredeemed (forfeited). The **5h window is NOT a quota bucket to fill — it is a RATE CAP**: stay under it within any 5h period; reaching it = a forced pause until the 5h resets = wasted time, not progress.
+- **Re-query your budget before EVERY allocation decision** — Claude: \`get_budget\` → **rendered text** covering both sides; Codex: \`check_budget\` with \`agent:"claude"|"codex"\` → **normalized JSON**, per side. (Two different shapes — read the right one below.) Never reuse remembered numbers: a weekly window can refresh EARLY (resetting both 5h and weekly), fully restoring a side you believed was exhausted.
+- **Even-pacing test (per side — Claude runs it)** — compare two quantities: *budget-windows* = how many 5h windows the weekly quota still covers at the current burn rate; *clock-windows* = how many 5h windows physically fit before the weekly reset = (weekly reset − now) ÷ 5h. **Claude** (\`get_budget\` text) carries BOTH, pre-computed for BOTH sides: the lines "按当前节奏，周额度还够 … 个 5h 窗口" (budget-windows) and "距周刷新还能容纳 … 个 5h 窗口（时钟）" (clock-windows). **Codex** (\`check_budget\` JSON) today carries only per-bucket \`util\` / \`reset_epoch\` / \`reset_after_seconds\` — no burn rate, no \`five_hour_windows_left\` — so Codex CANNOT compute budget-windows itself; it reads its weekly \`util\` and clock-windows only. To locate Codex's weekly bucket: of the \`buckets[]\` entries whose \`id\` contains \`seven_day\` or \`secondary_window\` (there can be several — e.g. a model-specific \`additional_rate_limits[…]\` one at 0%), take the HIGHEST-util one (the binding account-level window, matching how the bridge parses it); its clock-windows = \`reset_after_seconds\` ÷ 5h (never the top-level \`reset_epoch\`, which tracks the current limiter, not necessarily the weekly window). For the budget-windows half and the raise/hold/reduce verdict, Codex relies on Claude's \`get_budget\` (the burn projection lives there, for both sides) and reports its own weekly \`util\` + reset timing so Claude can run the test. (If a future \`check_budget\` exposes \`five_hour_windows_left\` on the weekly bucket, Codex reads it directly.) **The verdict (Claude computes it, per side):** budget > clock → **under-consuming** (weekly will be left unused) → **raise intensity**; budget < clock → **over-consuming** (won't last to the weekly reset) → **reduce intensity**; within ~1 window, or no confident rate → **hold**. **Codex, absent a fresh Claude verdict, holds at its current intensity (it never escalates unilaterally) and stays clear of the 5h cap — surfacing its weekly \`util\` + reset timing so Claude can issue the verdict.**
+- **Raise intensity — use the levers your role has.** Orchestrator (Claude): pick larger, more-decomposable tasks; run more parallel subagents at once (3–5+ vs 1); raise delegation density; open more concurrent streams (review + explore + verify in parallel). Executor (Codex): go deeper in-turn, take larger chunks, run more verification/repro. Both: deepen quality (multi-angle review, broader test/repro) — never manufacture make-work. **Reduce intensity:** fewer/serial subagents (Claude), short bounded chunks, defer optional deep work. Stay below the **动态暂停线** (shown in \`get_budget\`; its \`余量\` = headroom from your current util to that soft line, measured on the resettable hard-winner window — the 5h OR the weekly window, whichever currently limits you) — that soft ceiling, not the raw 5h cap, is the "do not cross, avoid a forced pause" line. **If that line is absent, or you only have JSON (Codex),** fall back to the 5h bucket's raw util vs 100% (Codex: of the \`buckets[]\` entries whose \`id\` contains \`five_hour\` or \`primary_window\`, take the HIGHEST-util one) and keep clear of the 5h cap.
+- **Distinguish 5h from weekly:** a 5h window resetting does NOT consume or waste weekly budget — it only refreshes your rate headroom, so you can keep going when weekly is under-consumed. A near 5h reset is therefore not urgency but the release of a rate limit. The real "unused = forfeited" is the **weekly budget as its WEEKLY reset nears**: if weekly is still under-consumed then, raise intensity (within the 5h cap) to use it. If even pacing needs a rate beyond one 5h window's capacity, you are rate-limited → keep each 5h window as full as possible (under the cap).
+- **Two-subscription imbalance — the quotas are INDEPENDENT and differ in BOTH amount AND reset timing** (each side's weekly and 5h windows reset on different clocks). **The cross-side split is the orchestrator's (Claude) decision:** route more work to the side that is MORE under-consuming on the even-pacing test (the larger budget-windows − clock-windows gap); when EITHER side lacks a confident rate (so the gap can't be compared), fall back to the more budget-rich side (larger absolute weekly headroom). On any tie (equal gap, or equal headroom), prefer the side whose **weekly resets SOONER** (its leftover is forfeited earlier). **As the executor (Codex) you do NOT decide the global split** — execute what you're assigned, and when your own budget is rich report it (with evidence) so Claude routes more to you. The tighter / over-consuming side carries less.
+- **Side-aware pause (the hard floor the code enforces — obey, do not reinvent), with each side's own action:** **Codex exhausted** (\`system_budget_pause\`) → Codex's turns stop (gate closed); **Claude** must not retry replies and continues solo on independent work, checkpointing the split point — but the SAME \`system_budget_pause\` is ALSO emitted when both sides are exhausted, so do not infer "solo" from the directive name alone: read its content (it names the paused side[s]) or re-check \`get_budget\`, and continue solo ONLY while Claude's own side is healthy; if Claude is also at its line, handle it as **Both** below. **Claude exhausted** (\`system_budget_handoff\`) → **Claude** sends ONE handoff (remaining tasks / context / artifact locations / acceptance criteria) then stops; **Codex** receives the baton and carries the work forward as far as its remaining quota allows that turn. **Both** → joint pause; checkpoint and wait for \`resume\` (Claude's own quota-guard also hard-stops Claude independently). A transient probe **429 is NOT exhaustion** → fall back to cached util and keep working.`;
 
 export const CLAUDE_MD_SECTION = `\
 ## AgentBridge — Multi-Agent Collaboration
@@ -43,14 +62,7 @@ Another AI agent (Codex, by OpenAI) is available in a parallel session on this m
 3. Ask for Codex's agreement or counter-proposal before proceeding.
 4. After task completion, **cross-review** each other's work.
 
-### Budget awareness (active when agent-quota-guard is installed)
-- Goal: **keep the task moving while fully using the subscription quota**. The bridge polls both agents' account-level 5h/weekly windows and may send \`system_budget_*\` notices: **balance** (route more work to the side with more runway / remaining work-time), **underutilized** (the account won't use its weekly quota before reset — split more parallel subtasks / raise delegation density), **pause/handoff/resume**.
-- \`get_budget\` shows BOTH sides' quota — re-check it **before every task-allocation decision**. NEVER rely on quota numbers remembered from earlier in the conversation: the weekly window can refresh EARLY (resetting both 5h and weekly), so a side you remember as nearly exhausted may be fully restored.
-- Side-aware pause semantics:
-  - **Codex exhausted** (\`system_budget_pause\`): the reply gate closes. Do not retry replies; continue solo on independent work, note the split point in a checkpoint.
-  - **You (Claude) exhausted** (\`system_budget_handoff\`): the gate stays OPEN — immediately send ONE handoff reply to Codex packaging the remaining task list, context, artifact locations and acceptance criteria, then stop working (your own quota-guard will hard-stop you at 92%). Codex relays the baton.
-  - **Both exhausted**: joint pause; checkpoint and wait for the resume notice.
-- Save quota with model tiers: route mechanical subagent work to **haiku**, routine work to **sonnet**, reserve **opus** for architecture decisions; when your side is the heavier consumer, delegate more to Codex.`;
+${BUDGET_PACING}`;
 
 export const AGENTS_MD_SECTION = `\
 ## AgentBridge — Multi-Agent Collaboration
@@ -106,9 +118,4 @@ You MUST NOT run git **write** commands: \`commit\`, \`push\`, \`pull\`, \`fetch
 - Do not blindly follow Claude — challenge with evidence when you disagree.
 - Use explicit collaboration phrases: "My independent view is:", "I agree on:", "I disagree on:", "Current consensus:".
 
-### Budget awareness (active when agent-quota-guard is installed)
-- Goal: **keep the task moving while fully using the subscription quota**. You can check BOTH sides' quota yourself via your quota-guard MCP tool \`check_budget\` with \`agent: "claude"\` or \`"codex"\` — re-check **before negotiating task splits**, and NEVER rely on remembered numbers: the weekly window can refresh early (resetting both 5h and weekly windows).
-- During a **budget pause** (your side exhausted) you simply stop receiving new turns — that IS the pause. Your own quota-guard hooks still apply; work resumes when Claude's next message arrives.
-- **Handoff (Claude's side exhausted)**: you may receive a baton message packaging the remaining work. Push as far as possible within that single turn; write leftovers to a checkpoint file; do NOT expect Claude to respond until its quota refreshes.
-- Claude may route more or less work to you based on **remaining work-time (runway), not just raw usage %** — a side that looks heavily used but is close to a window reset still has plenty of runway. Expected load balancing, not preference. Claude may also ask for more parallel subtasks when the account will not use its weekly quota before reset (underutilization).
-- When the user enabled tier control, the bridge may adjust your model/reasoning-effort via turn parameters under budget pressure; if asked to economize, prefer lower effort and concise outputs.`;
+${BUDGET_PACING}`;
