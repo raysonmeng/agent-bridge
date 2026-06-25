@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.24", "0.0.0-source"),
-  commit: defineString("99d0f4a", "source"),
+  commit: defineString("39a46f1", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("aeb64ca4c8b6", "source")
+  codeHash: defineString("f2cb1899dc80", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -6519,34 +6519,6 @@ var PAIR_SLOT_STRIDE = 10;
 var RECLAIMABLE_MIN_AGE_MS = 24 * 60 * 60 * 1000;
 var MAX_PAIR_SLOT = Math.floor((65535 - 2 - PAIR_BASE_PORT) / PAIR_SLOT_STRIDE);
 
-// src/liveness-probe.ts
-var OPEN = 1;
-async function probeLiveness(target, options) {
-  const {
-    timeoutMs,
-    pollMs = 50,
-    now = Date.now,
-    sleep = (ms) => new Promise((r) => setTimeout(r, ms))
-  } = options;
-  if (target.readyState !== OPEN)
-    return false;
-  const baseline = target.pongCount;
-  try {
-    target.ping();
-  } catch {
-    return false;
-  }
-  const deadline = now() + timeoutMs;
-  while (now() < deadline) {
-    if (target.pongCount > baseline)
-      return true;
-    if (target.readyState !== OPEN)
-      return false;
-    await sleep(pollMs);
-  }
-  return target.pongCount > baseline;
-}
-
 // src/delivery-buffer.ts
 class BoundedMessageBuffer {
   messages = [];
@@ -6588,6 +6560,256 @@ class BoundedMessageBuffer {
   }
 }
 
+// src/liveness-probe.ts
+var OPEN = 1;
+async function probeLiveness(target, options) {
+  const {
+    timeoutMs,
+    pollMs = 50,
+    now = Date.now,
+    sleep = (ms) => new Promise((r) => setTimeout(r, ms))
+  } = options;
+  if (target.readyState !== OPEN)
+    return false;
+  const baseline = target.pongCount;
+  try {
+    target.ping();
+  } catch {
+    return false;
+  }
+  const deadline = now() + timeoutMs;
+  while (now() < deadline) {
+    if (target.pongCount > baseline)
+      return true;
+    if (target.readyState !== OPEN)
+      return false;
+    await sleep(pollMs);
+  }
+  return target.pongCount > baseline;
+}
+
+// src/connection-session.ts
+var OPEN2 = 1;
+
+class ConnectionSession {
+  ws;
+  deps;
+  constructor(ws, deps) {
+    this.ws = ws;
+    this.deps = deps;
+  }
+  get clientId() {
+    return this.ws.data.clientId;
+  }
+  get identity() {
+    return this.ws.data.identity;
+  }
+  set identity(v) {
+    this.ws.data.identity = v;
+  }
+  get readyState() {
+    return this.ws.readyState;
+  }
+  get isOpen() {
+    return this.ws.readyState === OPEN2;
+  }
+  get attached() {
+    return this.ws.data.attached;
+  }
+  get lastPongAt() {
+    return this.ws.data.lastPongAt;
+  }
+  get pongCount() {
+    return this.ws.data.pongCount;
+  }
+  get pendingBackpressureSize() {
+    return this.ws.data.pendingBackpressure.length;
+  }
+  markAttached(value) {
+    this.ws.data.attached = value;
+  }
+  recordPong() {
+    this.ws.data.lastPongAt = Date.now();
+    this.ws.data.pongCount++;
+  }
+  send(message) {
+    try {
+      const result = this.ws.send(JSON.stringify({ type: "codex_to_claude", message }));
+      if (typeof result === "number" && result === 0) {
+        this.deps.log("Bridge message send returned 0 (dropped)");
+        return false;
+      }
+      if (typeof result === "number" && result === -1) {
+        this.ws.data.pendingBackpressure.push(message);
+      }
+      return true;
+    } catch (err) {
+      this.deps.log(`Failed to send bridge message: ${err.message}`);
+      return false;
+    }
+  }
+  sendProtocol(message) {
+    try {
+      const result = this.ws.send(JSON.stringify(message));
+      if (typeof result === "number" && result === 0) {
+        this.deps.log(`Control message dropped (socket closed): type=${message.type}`);
+      }
+    } catch (err) {
+      this.deps.log(`Failed to send control message: ${err.message}`);
+    }
+  }
+  ping() {
+    this.ws.ping();
+  }
+  probeLiveness(timeoutMs) {
+    const ws = this.ws;
+    return probeLiveness({
+      get readyState() {
+        return ws.readyState;
+      },
+      get pongCount() {
+        return ws.data.pongCount;
+      },
+      ping: () => {
+        ws.ping();
+      }
+    }, { timeoutMs, pollMs: this.deps.livenessPollMs });
+  }
+  close(code, reason) {
+    this.ws.close(code, reason);
+  }
+  drainPendingBackpressureInto(backlog) {
+    const reBuffered = this.ws.data.pendingBackpressure.drainAll();
+    backlog.unshiftMany(reBuffered);
+    return reBuffered.length;
+  }
+  confirmDrainIfFlushed() {
+    if (this.ws.data.pendingBackpressure.length > 0 && this.ws.getBufferedAmount() === 0) {
+      this.ws.data.pendingBackpressure.clear();
+    }
+  }
+}
+
+// src/agent-registry.ts
+class AgentRegistry {
+  claude = null;
+  _codexBootstrapped = false;
+  _challengeInProgress = false;
+  getClaude() {
+    return this.claude;
+  }
+  setClaude(session) {
+    this.claude = session;
+  }
+  clearClaude() {
+    this.claude = null;
+  }
+  isClaude(ws) {
+    return this.claude?.ws === ws;
+  }
+  get codexBootstrapped() {
+    return this._codexBootstrapped;
+  }
+  set codexBootstrapped(value) {
+    this._codexBootstrapped = value;
+  }
+  beginChallenge() {
+    if (this._challengeInProgress)
+      return false;
+    this._challengeInProgress = true;
+    return true;
+  }
+  endChallenge() {
+    this._challengeInProgress = false;
+  }
+  get challengeInProgress() {
+    return this._challengeInProgress;
+  }
+}
+
+// src/room-manager.ts
+class RoomManager {
+  deps;
+  backlog;
+  idleShutdownTimer = null;
+  claudeDisconnectTimer = null;
+  constructor(deps) {
+    this.deps = deps;
+    this.backlog = new BoundedMessageBuffer({
+      cap: deps.bufferedCap,
+      overflowLabel: "Message buffer overflow",
+      log: deps.log
+    });
+  }
+  get backlogSize() {
+    return this.backlog.length;
+  }
+  deliverToClaude(message) {
+    const claude = this.deps.getClaude();
+    if (claude && claude.isOpen) {
+      if (claude.send(message))
+        return;
+      this.deps.log("Send to Claude failed, buffering message for retry on reconnect");
+    }
+    this.backlog.push(message);
+  }
+  flushBacklog(session) {
+    const messages = this.backlog.drainAll();
+    for (let i = 0;i < messages.length; i++) {
+      if (!session.send(messages[i])) {
+        const remaining = messages.slice(i);
+        this.backlog.unshiftMany(remaining);
+        this.deps.log(`Flush interrupted: re-buffered ${remaining.length} message(s) after send failure`);
+        return;
+      }
+    }
+  }
+  rebufferOnDetach(session) {
+    return session.drainPendingBackpressureInto(this.backlog);
+  }
+  scheduleIdleShutdown() {
+    this.cancelIdleShutdown();
+    if (this.deps.getClaude())
+      return;
+    if (this.deps.isTuiConnected())
+      return;
+    this.deps.log(`No clients connected. Daemon will shut down in ${this.deps.idleShutdownMs}ms if no one reconnects.`);
+    this.idleShutdownTimer = setTimeout(() => {
+      if (this.deps.getClaude() || this.deps.isTuiConnected()) {
+        this.deps.log("Idle shutdown cancelled: client reconnected during grace period");
+        return;
+      }
+      this.deps.onIdleShutdown("idle \u2014 no clients connected");
+    }, this.deps.idleShutdownMs);
+  }
+  cancelIdleShutdown() {
+    if (this.idleShutdownTimer) {
+      clearTimeout(this.idleShutdownTimer);
+      this.idleShutdownTimer = null;
+    }
+  }
+  clearPendingClaudeDisconnect(reason) {
+    if (!this.claudeDisconnectTimer)
+      return;
+    clearTimeout(this.claudeDisconnectTimer);
+    this.claudeDisconnectTimer = null;
+    if (reason) {
+      this.deps.log(`Cleared pending Claude disconnect notification (${reason})`);
+    }
+  }
+  scheduleClaudeDisconnectNotification(clientId) {
+    this.clearPendingClaudeDisconnect("rescheduled");
+    this.claudeDisconnectTimer = setTimeout(() => {
+      this.claudeDisconnectTimer = null;
+      if (this.deps.getClaude()) {
+        this.deps.log(`Skipping Claude disconnect notification for client #${clientId} because Claude already reconnected`);
+        return;
+      }
+      this.deps.log(`Claude disconnect persisted past grace window (client #${clientId})`);
+    }, this.deps.claudeDisconnectGraceMs);
+  }
+}
+
 // src/daemon.ts
 var stateDir = new StateDirResolver;
 stateDir.ensure();
@@ -6623,11 +6845,10 @@ var codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile)
 var attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
 var controlServer = null;
 var boundControlPort = false;
-var attachedClaude = null;
+var agentRegistry = new AgentRegistry;
 var nextControlClientId = 0;
 var nextSystemMessageId = 0;
 var SYSTEM_MSG_SALT = randomUUID4().slice(0, 8);
-var codexBootstrapped = false;
 var attentionWindowTimer = null;
 var inAttentionWindow = false;
 var replyTracker = new ReplyRequiredTracker;
@@ -6683,18 +6904,10 @@ var pendingSteerDispatches = new Map;
 var BUSY_RETRY_ADVISORY_MS = 15000;
 var shuttingDown = false;
 var bootDeadlineTimer = null;
-var idleShutdownTimer = null;
-var claudeDisconnectTimer = null;
 var lastAttachStatusSentTs = 0;
 var ATTACH_STATUS_COOLDOWN_MS = 30000;
 var LIVENESS_PROBE_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS", 3000, log);
 var LIVENESS_PROBE_POLL_MS = 50;
-var challengeInProgress = false;
-var bufferedMessages = new BoundedMessageBuffer({
-  cap: MAX_BUFFERED_MESSAGES,
-  overflowLabel: "Message buffer overflow",
-  log
-});
 function createPendingBackpressureBuffer() {
   return new BoundedMessageBuffer({
     cap: MAX_BUFFERED_MESSAGES,
@@ -6731,7 +6944,7 @@ function readResumeSignals() {
     log(`resume signal: codex tuiReady failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   try {
-    tuiReadyClaude = attachedClaude !== null;
+    tuiReadyClaude = agentRegistry.getClaude() !== null;
   } catch (error) {
     log(`resume signal: claude tuiReady failed: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -6928,6 +7141,15 @@ var tuiConnectionState = new TuiConnectionState({
   }
 });
 var statusBuffer = new StatusBuffer((summary) => emitToClaude(summary));
+var roomManager = new RoomManager({
+  bufferedCap: MAX_BUFFERED_MESSAGES,
+  idleShutdownMs: IDLE_SHUTDOWN_MS,
+  claudeDisconnectGraceMs: CLAUDE_DISCONNECT_GRACE_MS,
+  log,
+  getClaude: () => agentRegistry.getClaude(),
+  isTuiConnected: () => tuiConnectionState.snapshot().tuiConnected,
+  onIdleShutdown: (reason) => shutdown(reason)
+});
 function tryWriteStatusFile(reason) {
   try {
     writeStatusFile();
@@ -6982,8 +7204,9 @@ codex.on("bridgeTurnStarted", ({ requestId, turnId }) => {
   if (pending.idempotencyKey) {
     idempotencyTracker.markStarted(pending.threadId, pending.idempotencyKey, turnId);
   }
-  if (attachedClaude) {
-    sendProtocolMessage(attachedClaude, {
+  const claudeForTurnStarted = agentRegistry.getClaude();
+  if (claudeForTurnStarted) {
+    claudeForTurnStarted.sendProtocol({
       type: "turn_started",
       requestId: pending.requestId,
       ...pending.idempotencyKey ? { idempotencyKey: pending.idempotencyKey } : {},
@@ -7131,8 +7354,8 @@ codex.on("error", (err) => {
 });
 codex.on("exit", (code) => {
   log(`Codex process exited (code ${code})`);
-  const wasBootstrapped = codexBootstrapped;
-  codexBootstrapped = false;
+  const wasBootstrapped = agentRegistry.codexBootstrapped;
+  agentRegistry.codexBootstrapped = false;
   replyTracker.reset();
   idempotencyTracker.terminateAll("aborted");
   pendingTurnStarts.clear();
@@ -7162,7 +7385,7 @@ function startControlServer() {
           return Response.json(currentStatus());
         }
         if (url.pathname === "/readyz") {
-          return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
+          return Response.json(currentStatus(), { status: agentRegistry.codexBootstrapped ? 200 : 503 });
         }
         if (url.pathname === "/ws") {
           if (!isAllowedWsUpgrade(req)) {
@@ -7182,11 +7405,12 @@ function startControlServer() {
           ws.data.clientId = ++nextControlClientId;
           ws.data.lastPongAt = Date.now();
           ws.data.pendingBackpressure = createPendingBackpressureBuffer();
+          ws.data.session = new ConnectionSession(ws, { log, livenessPollMs: LIVENESS_PROBE_POLL_MS });
           log(`Frontend socket opened (#${ws.data.clientId})`);
         },
         close: (ws, code, reason) => {
-          log(`Frontend socket closed (#${ws.data.clientId}, code=${code}, reason=${reason || "none"}, wasAttached=${attachedClaude === ws})`);
-          if (attachedClaude === ws) {
+          log(`Frontend socket closed (#${ws.data.clientId}, code=${code}, reason=${reason || "none"}, wasAttached=${agentRegistry.isClaude(ws)})`);
+          if (agentRegistry.isClaude(ws)) {
             detachClaude(ws, "frontend socket closed");
           }
         },
@@ -7194,14 +7418,11 @@ function startControlServer() {
           handleControlMessage(ws, raw);
         },
         pong: (ws) => {
-          ws.data.lastPongAt = Date.now();
-          ws.data.pongCount++;
+          ws.data.session.recordPong();
         },
         drain: (ws) => {
-          if (ws.data.pendingBackpressure.length > 0 && ws.getBufferedAmount() === 0) {
-            ws.data.pendingBackpressure.clear();
-          }
-          if (ws === attachedClaude && bufferedMessages.length > 0) {
+          ws.data.session.confirmDrainIfFlushed();
+          if (agentRegistry.isClaude(ws) && roomManager.backlogSize > 0) {
             flushBufferedMessages(ws);
           }
         }
@@ -7319,9 +7540,10 @@ function waitForInterruptOutcome(turnIds) {
   });
 }
 async function handleClaudeToCodex(ws, message) {
-  const attachGuard = evaluateInjectionAttachGuard(attachedClaude, ws);
+  const claudeSlot = agentRegistry.getClaude();
+  const attachGuard = evaluateInjectionAttachGuard(claudeSlot?.ws ?? null, ws);
   if (!attachGuard.allowed) {
-    log(`Rejecting claude_to_codex from non-attached socket #${ws.data.clientId} ` + `(request ${message.requestId}, attached=${attachedClaude ? "#" + attachedClaude.data.clientId : "none"})`);
+    log(`Rejecting claude_to_codex from non-attached socket #${ws.data.clientId} ` + `(request ${message.requestId}, attached=${claudeSlot ? "#" + claudeSlot.clientId : "none"})`);
     sendClaudeToCodexResult(ws, message.requestId, {
       success: false,
       code: attachGuard.code,
@@ -7447,10 +7669,11 @@ async function handleClaudeToCodex(ws, message) {
       return;
     }
     log("Interrupt reached terminal boundary \u2014 injecting the message as a new turn");
-    const postWaitAttachGuard = evaluateInjectionAttachGuard(attachedClaude, ws);
+    const postWaitSlot = agentRegistry.getClaude();
+    const postWaitAttachGuard = evaluateInjectionAttachGuard(postWaitSlot?.ws ?? null, ws);
     if (!postWaitAttachGuard.allowed) {
       releaseInterruptKey();
-      log(`Rejecting interrupt-path injection from socket #${ws.data.clientId} that lost the attach ` + `slot during the terminal-boundary wait (request ${message.requestId}, ` + `attached=${attachedClaude ? "#" + attachedClaude.data.clientId : "none"})`);
+      log(`Rejecting interrupt-path injection from socket #${ws.data.clientId} that lost the attach ` + `slot during the terminal-boundary wait (request ${message.requestId}, ` + `attached=${postWaitSlot ? "#" + postWaitSlot.clientId : "none"})`);
       sendClaudeToCodexResult(ws, message.requestId, {
         success: false,
         code: "not_attached",
@@ -7528,21 +7751,20 @@ async function handleClaudeToCodex(ws, message) {
   sendClaudeToCodexResult(ws, message.requestId, { success: true });
 }
 async function attachClaude(ws, identity) {
-  const occupant = attachedClaude;
-  if (occupant && occupant !== ws && occupant.readyState !== WebSocket.CLOSED) {
-    const msSincePong = Date.now() - occupant.data.lastPongAt;
-    log(`Claude frontend contest: new=#${ws.data.clientId}, incumbent=#${occupant.data.clientId} ` + `(readyState=${occupant.readyState}, msSincePong=${msSincePong})`);
-    if (challengeInProgress) {
+  const occupant = agentRegistry.getClaude();
+  if (occupant && occupant.ws !== ws && occupant.readyState !== WebSocket.CLOSED) {
+    const msSincePong = Date.now() - occupant.lastPongAt;
+    log(`Claude frontend contest: new=#${ws.data.clientId}, incumbent=#${occupant.clientId} ` + `(readyState=${occupant.readyState}, msSincePong=${msSincePong})`);
+    if (!agentRegistry.beginChallenge()) {
       log(`Rejecting Claude frontend #${ws.data.clientId} \u2014 another liveness probe already in flight`);
       ws.close(CLOSE_CODE_PROBE_IN_PROGRESS, "liveness probe in progress, retry shortly");
       return;
     }
-    challengeInProgress = true;
     let incumbentAlive = false;
     try {
-      incumbentAlive = await probeLiveness2(occupant, LIVENESS_PROBE_TIMEOUT_MS);
+      incumbentAlive = await occupant.probeLiveness(LIVENESS_PROBE_TIMEOUT_MS);
     } finally {
-      challengeInProgress = false;
+      agentRegistry.endChallenge();
     }
     if (ws.readyState === WebSocket.CLOSED || ws.readyState === WebSocket.CLOSING) {
       log(`Contestant #${ws.data.clientId} disappeared during probe \u2014 aborting`);
@@ -7552,24 +7774,25 @@ async function attachClaude(ws, identity) {
       return;
     }
     if (incumbentAlive) {
-      log(`Rejecting Claude frontend #${ws.data.clientId} \u2014 incumbent #${occupant.data.clientId} responded to liveness probe`);
+      log(`Rejecting Claude frontend #${ws.data.clientId} \u2014 incumbent #${occupant.clientId} responded to liveness probe`);
       ws.close(CLOSE_CODE_REPLACED, "another Claude session is already connected");
       return;
     }
     evictStale(occupant, `liveness probe timed out after ${LIVENESS_PROBE_TIMEOUT_MS}ms`);
   }
-  if (attachedClaude && attachedClaude !== ws && attachedClaude.readyState !== WebSocket.CLOSED) {
-    log(`Rejecting Claude frontend #${ws.data.clientId} \u2014 slot re-acquired by #${attachedClaude.data.clientId} after probe`);
+  const currentSlot = agentRegistry.getClaude();
+  if (currentSlot && currentSlot.ws !== ws && currentSlot.readyState !== WebSocket.CLOSED) {
+    log(`Rejecting Claude frontend #${ws.data.clientId} \u2014 slot re-acquired by #${currentSlot.clientId} after probe`);
     ws.close(CLOSE_CODE_REPLACED, "another Claude session is already connected");
     return;
   }
   clearPendingClaudeDisconnect("Claude frontend attached");
   ws.data.identity = identity;
-  attachedClaude = ws;
+  agentRegistry.setClaude(ws.data.session);
   ws.data.attached = true;
   cancelIdleShutdown();
   log(`Claude frontend attached (#${ws.data.clientId}, pair=${identity?.pairId ?? "<none>"}, cwd=${identity?.cwd ?? "<unknown>"})`);
-  const hadBacklog = bufferedMessages.length > 0;
+  const hadBacklog = roomManager.backlogSize > 0;
   if (hadBacklog) {
     flushBufferedMessages(ws);
   }
@@ -7580,39 +7803,38 @@ async function attachClaude(ws, identity) {
   if (!hadBacklog && !isRapidReattach) {
     if (tuiConnectionState.canReply()) {
       sendBridgeMessage(ws, systemMessage("system_ready", currentReadyMessage()));
-    } else if (codexBootstrapped) {
+    } else if (agentRegistry.codexBootstrapped) {
       sendBridgeMessage(ws, systemMessage("system_waiting", currentWaitingMessage()));
     }
   }
   lastAttachStatusSentTs = now;
 }
 function detachClaude(ws, reason) {
-  if (attachedClaude !== ws)
+  if (!agentRegistry.isClaude(ws))
     return;
-  attachedClaude = null;
+  agentRegistry.clearClaude();
   ws.data.attached = false;
   log(`Claude frontend detached (#${ws.data.clientId}, ${reason})`);
-  if (ws.data.pendingBackpressure.length > 0) {
-    const reBuffered = ws.data.pendingBackpressure.drainAll();
-    log(`Re-buffered ${reBuffered.length} backpressured message(s) for redelivery on reconnect`);
-    bufferedMessages.unshiftMany(reBuffered);
+  if (ws.data.session.pendingBackpressureSize > 0) {
+    const reBufferedCount = roomManager.rebufferOnDetach(ws.data.session);
+    log(`Re-buffered ${reBufferedCount} backpressured message(s) for redelivery on reconnect`);
   }
   scheduleClaudeDisconnectNotification(ws.data.clientId);
   scheduleIdleShutdown();
 }
 async function handleProbeIncumbent(ws) {
-  const occupant = attachedClaude;
-  log(`probe_incumbent from #${ws.data.clientId}: occupant=${occupant ? "#" + occupant.data.clientId : "none"} readyState=${occupant?.readyState}`);
-  if (!occupant || occupant === ws || occupant.readyState !== WebSocket.OPEN) {
+  const occupant = agentRegistry.getClaude();
+  log(`probe_incumbent from #${ws.data.clientId}: occupant=${occupant ? "#" + occupant.clientId : "none"} readyState=${occupant?.readyState}`);
+  if (!occupant || occupant.ws === ws || occupant.readyState !== WebSocket.OPEN) {
     sendProtocolMessage(ws, { type: "incumbent_status", connected: false, alive: false });
     return;
   }
-  if (challengeInProgress) {
+  if (agentRegistry.challengeInProgress) {
     sendProtocolMessage(ws, { type: "incumbent_status", connected: true, alive: true });
     return;
   }
-  const alive = await probeLiveness2(occupant, LIVENESS_PROBE_TIMEOUT_MS);
-  const stillConnected = attachedClaude === occupant && occupant.readyState === WebSocket.OPEN;
+  const alive = await occupant.probeLiveness(LIVENESS_PROBE_TIMEOUT_MS);
+  const stillConnected = agentRegistry.getClaude() === occupant && occupant.readyState === WebSocket.OPEN;
   log(`probe_incumbent reply to #${ws.data.clientId}: connected=${stillConnected} alive=${stillConnected && alive}`);
   sendProtocolMessage(ws, {
     type: "incumbent_status",
@@ -7625,28 +7847,15 @@ async function handleRequestBudgetRefresh(ws, requestId) {
   log(`request_budget_refresh from #${ws.data.clientId}: ${snapshot ? "fresh" : "unavailable"}`);
   sendProtocolMessage(ws, { type: "budget_refresh", requestId, snapshot });
 }
-async function probeLiveness2(ws, timeoutMs) {
-  return probeLiveness({
-    get readyState() {
-      return ws.readyState;
-    },
-    get pongCount() {
-      return ws.data.pongCount;
-    },
-    ping: () => {
-      ws.ping();
-    }
-  }, { timeoutMs, pollMs: LIVENESS_PROBE_POLL_MS });
-}
-function evictStale(ws, reason) {
-  log(`Evicting stale Claude frontend #${ws.data.clientId}: ${reason}`);
-  if (attachedClaude === ws) {
-    detachClaude(ws, `evicted: ${reason}`);
+function evictStale(session, reason) {
+  log(`Evicting stale Claude frontend #${session.clientId}: ${reason}`);
+  if (agentRegistry.isClaude(session.ws)) {
+    detachClaude(session.ws, `evicted: ${reason}`);
   }
   try {
-    ws.close(CLOSE_CODE_EVICTED_STALE, "stale frontend evicted by newer session");
+    session.close(CLOSE_CODE_EVICTED_STALE, "stale frontend evicted by newer session");
   } catch (err) {
-    log(`Evict close threw on #${ws.data.clientId}: ${err.message}`);
+    log(`Evict close threw on #${session.clientId}: ${err.message}`);
   }
 }
 function startAttentionWindow() {
@@ -7675,81 +7884,25 @@ function clearAttentionWindow() {
   }
 }
 function scheduleIdleShutdown() {
-  cancelIdleShutdown();
-  if (attachedClaude)
-    return;
-  const snapshot = tuiConnectionState.snapshot();
-  if (snapshot.tuiConnected)
-    return;
-  log(`No clients connected. Daemon will shut down in ${IDLE_SHUTDOWN_MS}ms if no one reconnects.`);
-  idleShutdownTimer = setTimeout(() => {
-    if (attachedClaude || tuiConnectionState.snapshot().tuiConnected) {
-      log("Idle shutdown cancelled: client reconnected during grace period");
-      return;
-    }
-    shutdown("idle \u2014 no clients connected");
-  }, IDLE_SHUTDOWN_MS);
+  roomManager.scheduleIdleShutdown();
 }
 function cancelIdleShutdown() {
-  if (idleShutdownTimer) {
-    clearTimeout(idleShutdownTimer);
-    idleShutdownTimer = null;
-  }
+  roomManager.cancelIdleShutdown();
 }
 function clearPendingClaudeDisconnect(reason) {
-  if (!claudeDisconnectTimer)
-    return;
-  clearTimeout(claudeDisconnectTimer);
-  claudeDisconnectTimer = null;
-  if (reason) {
-    log(`Cleared pending Claude disconnect notification (${reason})`);
-  }
+  roomManager.clearPendingClaudeDisconnect(reason);
 }
 function scheduleClaudeDisconnectNotification(clientId) {
-  clearPendingClaudeDisconnect("rescheduled");
-  claudeDisconnectTimer = setTimeout(() => {
-    claudeDisconnectTimer = null;
-    if (attachedClaude) {
-      log(`Skipping Claude disconnect notification for client #${clientId} because Claude already reconnected`);
-      return;
-    }
-    log(`Claude disconnect persisted past grace window (client #${clientId})`);
-  }, CLAUDE_DISCONNECT_GRACE_MS);
+  roomManager.scheduleClaudeDisconnectNotification(clientId);
 }
 function emitToClaude(message) {
-  if (attachedClaude && attachedClaude.readyState === WebSocket.OPEN) {
-    if (trySendBridgeMessage(attachedClaude, message))
-      return;
-    log("Send to Claude failed, buffering message for retry on reconnect");
-  }
-  bufferedMessages.push(message);
+  roomManager.deliverToClaude(message);
 }
 function trySendBridgeMessage(ws, message) {
-  try {
-    const result = ws.send(JSON.stringify({ type: "codex_to_claude", message }));
-    if (typeof result === "number" && result === 0) {
-      log("Bridge message send returned 0 (dropped)");
-      return false;
-    }
-    if (typeof result === "number" && result === -1) {
-      ws.data.pendingBackpressure.push(message);
-    }
-    return true;
-  } catch (err) {
-    log(`Failed to send bridge message: ${err.message}`);
-    return false;
-  }
+  return ws.data.session.send(message);
 }
 function flushBufferedMessages(ws) {
-  const messages = bufferedMessages.drainAll();
-  for (let i = 0;i < messages.length; i++) {
-    if (!trySendBridgeMessage(ws, messages[i])) {
-      const remaining = messages.slice(i);
-      bufferedMessages.unshiftMany(remaining);
-      log(`Flush interrupted: re-buffered ${remaining.length} message(s) after send failure`);
-      return;
-    }
-  }
+  roomManager.flushBacklog(ws.data.session);
 }
 function sendBridgeMessage(ws, message) {
   trySendBridgeMessage(ws, message);
@@ -7758,19 +7911,13 @@ function sendStatus(ws) {
   sendProtocolMessage(ws, { type: "status", status: currentStatus() });
 }
 function broadcastStatus() {
-  if (!attachedClaude)
+  const claude = agentRegistry.getClaude();
+  if (!claude)
     return;
-  sendStatus(attachedClaude);
+  sendStatus(claude.ws);
 }
 function sendProtocolMessage(ws, message) {
-  try {
-    const result = ws.send(JSON.stringify(message));
-    if (typeof result === "number" && result === 0) {
-      log(`Control message dropped (socket closed): type=${message.type}`);
-    }
-  } catch (err) {
-    log(`Failed to send control message: ${err.message}`);
-  }
+  ws.data.session.sendProtocol(message);
 }
 function currentStatus() {
   const snapshot = tuiConnectionState.snapshot();
@@ -7778,7 +7925,7 @@ function currentStatus() {
     bridgeReady: tuiConnectionState.canReply(),
     tuiConnected: snapshot.tuiConnected,
     threadId: codex.activeThreadId,
-    queuedMessageCount: bufferedMessages.length + statusBuffer.size + (attachedClaude?.data.pendingBackpressure.length ?? 0),
+    queuedMessageCount: roomManager.backlogSize + statusBuffer.size + (agentRegistry.getClaude()?.pendingBackpressureSize ?? 0),
     proxyUrl: codex.proxyUrl,
     appServerUrl: codex.appServerUrl,
     pid: process.pid,
@@ -7889,12 +8036,12 @@ function armBootDeadline() {
     return;
   bootDeadlineTimer = setTimeout(() => {
     bootDeadlineTimer = null;
-    if (codexBootstrapped)
+    if (agentRegistry.codexBootstrapped)
       return;
     if (tuiConnectionState.snapshot().tuiConnected)
       return;
     log(`Codex not ready within bootstrap deadline (${BOOTSTRAP_TIMEOUT_MS}ms) \u2014 self-exiting to release control port`);
-    if (attachedClaude) {
+    if (agentRegistry.getClaude()) {
       emitToClaude(systemMessage("system_daemon_self_replace", "\u26A0\uFE0F Codex did not become ready within the bootstrap deadline \u2014 the AgentBridge daemon is restarting itself to release a clean slot. The bridge will reconnect automatically."));
     }
     shutdown("codex not ready within bootstrap deadline", 1);
@@ -7915,7 +8062,7 @@ async function bootCodex() {
   for (let attempt = 0;attempt <= CODEX_BOOT_RETRIES; attempt++) {
     try {
       await codex.start();
-      codexBootstrapped = true;
+      agentRegistry.codexBootstrapped = true;
       clearBootDeadline();
       writeStatusFile();
       emitToClaude(systemMessage("system_waiting", currentWaitingMessage()));

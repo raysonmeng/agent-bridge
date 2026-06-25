@@ -58,26 +58,10 @@ import type {
   DaemonStatus,
 } from "./control-protocol";
 import type { BridgeMessage } from "./types";
-import { probeLiveness as probeLivenessImpl } from "./liveness-probe";
 import { BoundedMessageBuffer } from "./delivery-buffer";
-
-interface ControlSocketData {
-  clientId: number;
-  attached: boolean;
-  /** Wall-clock of the last pong (used only for the contest diagnostic log). */
-  lastPongAt: number;
-  /** Monotonic pong counter — the liveness probe's source of truth (see liveness-probe.ts). */
-  pongCount: number;
-  identity?: ControlClientIdentity;
-  /**
-   * Bridge messages ws.send() returned -1 for: enqueued in Bun's socket buffer
-   * under backpressure, NOT yet on the wire. Bun discards that buffer if the
-   * socket closes before `drain` fires, so these are re-buffered at detach for
-   * redelivery on reconnect (at-least-once: a pre-close partial flush can
-   * produce a duplicate; silent loss cannot).
-   */
-  pendingBackpressure: BoundedMessageBuffer;
-}
+import { ConnectionSession, type ControlSocketData } from "./connection-session";
+import { AgentRegistry } from "./agent-registry";
+import { RoomManager } from "./room-manager";
 
 const stateDir = new StateDirResolver();
 stateDir.ensure();
@@ -155,7 +139,10 @@ let controlServer: ReturnType<typeof Bun.serve> | null = null;
 // bind-race daemon (EADDRINUSE) never flips this, so its cleanup is a no-op and
 // the live incumbent's identity files survive (HIGH-1a).
 let boundControlPort = false;
-let attachedClaude: ServerWebSocket<ControlSocketData> | null = null;
+// §2.1 logical-agent layer: owns the Claude slot + Codex liveness flags
+// (formerly the attachedClaude / codexBootstrapped / challengeInProgress
+// module singletons). Pure state holder — see agent-registry.ts.
+const agentRegistry = new AgentRegistry();
 let nextControlClientId = 0;
 let nextSystemMessageId = 0;
 // Per-PROCESS salt for systemMessage ids (HIGH-2). The counter resets to 0 on
@@ -165,7 +152,6 @@ let nextSystemMessageId = 0;
 // ids unique ACROSS restarts, the counter keeps them unique WITHIN a process.
 // Same fix class as STATUS_SUMMARY_SALT in message-filter.ts (PR #139).
 const SYSTEM_MSG_SALT = randomUUID().slice(0, 8);
-let codexBootstrapped = false;
 let attentionWindowTimer: ReturnType<typeof setTimeout> | null = null;
 let inAttentionWindow = false;
 const replyTracker = new ReplyRequiredTracker();
@@ -249,8 +235,6 @@ const pendingSteerDispatches = new Map<number, PendingSteerDispatch>();
 const BUSY_RETRY_ADVISORY_MS = 15_000;
 let shuttingDown = false;
 let bootDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
-let idleShutdownTimer: ReturnType<typeof setTimeout> | null = null;
-let claudeDisconnectTimer: ReturnType<typeof setTimeout> | null = null;
 let lastAttachStatusSentTs = 0;
 const ATTACH_STATUS_COOLDOWN_MS = 30_000; // Don't re-send status on rapid reattach
 
@@ -264,15 +248,6 @@ const LIVENESS_PROBE_TIMEOUT_MS = parsePositiveIntEnv(
   log,
 );
 const LIVENESS_PROBE_POLL_MS = 50;
-let challengeInProgress = false;
-
-// Module-level delivery backlog: messages that could not be sent while Claude
-// was detached / a send failed, awaiting the next attach or drain.
-const bufferedMessages = new BoundedMessageBuffer({
-  cap: MAX_BUFFERED_MESSAGES,
-  overflowLabel: "Message buffer overflow",
-  log,
-});
 
 // Per-socket backpressure tracker (ws.send returned -1): bounded the same way
 // so a never-draining socket can't accumulate unboundedly. Distinct overflow
@@ -328,7 +303,7 @@ function resumeClaimTtlSec(): number {
  * PR2 (detection only): gather the resume-readiness signals the coordinator's
  * pure reducer needs. ALL IO lives here so the reducer stays pure. Called once
  * per poll AFTER coordinator construction (first codex `ready`), so the
- * hoisted-but-later-`const` references (tuiConnectionState / attachedClaude) are
+ * hoisted-but-later-`const` references (tuiConnectionState / agentRegistry) are
  * fully initialized by the time this runs. Every probe is fault-isolated: a
  * transient fs/socket error degrades a SINGLE per-side signal to false rather
  * than throwing into the poll loop.
@@ -349,7 +324,7 @@ function readResumeSignals(): ResumeSignals {
     log(`resume signal: codex tuiReady failed: ${error instanceof Error ? error.message : String(error)}`);
   }
   try {
-    tuiReadyClaude = attachedClaude !== null;
+    tuiReadyClaude = agentRegistry.getClaude() !== null;
   } catch (error) {
     log(`resume signal: claude tuiReady failed: ${error instanceof Error ? error.message : String(error)}`);
   }
@@ -727,6 +702,20 @@ const tuiConnectionState = new TuiConnectionState({
 
 const statusBuffer = new StatusBuffer((summary) => emitToClaude(summary));
 
+// §2.3–2.4 room layer: owns the delivery backlog + the two "Claude slot empty"
+// lifecycle timers (formerly bufferedMessages / idleShutdownTimer /
+// claudeDisconnectTimer). Live state is injected via runtime getter closures so
+// timer callbacks read CURRENT state at fire time. See room-manager.ts.
+const roomManager = new RoomManager({
+  bufferedCap: MAX_BUFFERED_MESSAGES,
+  idleShutdownMs: IDLE_SHUTDOWN_MS,
+  claudeDisconnectGraceMs: CLAUDE_DISCONNECT_GRACE_MS,
+  log,
+  getClaude: () => agentRegistry.getClaude(),
+  isTuiConnected: () => tuiConnectionState.snapshot().tuiConnected,
+  onIdleShutdown: (reason) => shutdown(reason),
+});
+
 // Turn-transition status refreshes are OBSERVABILITY writes (issue #102) —
 // a disk/permission failure there must never break core turn handling, so
 // they go through this catcher (boot-path writes keep strict semantics).
@@ -834,8 +823,9 @@ codex.on("bridgeTurnStarted", ({ requestId, turnId }: { requestId: number; turnI
   if (pending.idempotencyKey) {
     idempotencyTracker.markStarted(pending.threadId, pending.idempotencyKey, turnId);
   }
-  if (attachedClaude) {
-    sendProtocolMessage(attachedClaude, {
+  const claudeForTurnStarted = agentRegistry.getClaude();
+  if (claudeForTurnStarted) {
+    claudeForTurnStarted.sendProtocol({
       type: "turn_started",
       requestId: pending.requestId,
       ...(pending.idempotencyKey ? { idempotencyKey: pending.idempotencyKey } : {}),
@@ -1076,8 +1066,8 @@ codex.on("exit", (code: number | null) => {
   // bootCodex() already govern recovery, and a retry may bring Codex up cleanly, so
   // telling the user to restart (and resetting the deadline each failed attempt) would
   // be misleading.
-  const wasBootstrapped = codexBootstrapped;
-  codexBootstrapped = false;
+  const wasBootstrapped = agentRegistry.codexBootstrapped;
+  agentRegistry.codexBootstrapped = false;
   replyTracker.reset(); // any in-flight require_reply turn is gone with the process
   // The process is gone — every pending/running idempotency key is terminal,
   // and per-injection correlation can never resolve (PR B).
@@ -1122,7 +1112,7 @@ function startControlServer() {
       }
 
       if (url.pathname === "/readyz") {
-        return Response.json(currentStatus(), { status: codexBootstrapped ? 200 : 503 });
+        return Response.json(currentStatus(), { status: agentRegistry.codexBootstrapped ? 200 : 503 });
       }
 
       if (url.pathname === "/ws") {
@@ -1148,11 +1138,12 @@ function startControlServer() {
         ws.data.clientId = ++nextControlClientId;
         ws.data.lastPongAt = Date.now();
         ws.data.pendingBackpressure = createPendingBackpressureBuffer();
+        ws.data.session = new ConnectionSession(ws, { log, livenessPollMs: LIVENESS_PROBE_POLL_MS });
         log(`Frontend socket opened (#${ws.data.clientId})`);
       },
       close: (ws: ServerWebSocket<ControlSocketData>, code: number, reason: string) => {
-        log(`Frontend socket closed (#${ws.data.clientId}, code=${code}, reason=${reason || "none"}, wasAttached=${attachedClaude === ws})`);
-        if (attachedClaude === ws) {
+        log(`Frontend socket closed (#${ws.data.clientId}, code=${code}, reason=${reason || "none"}, wasAttached=${agentRegistry.isClaude(ws)})`);
+        if (agentRegistry.isClaude(ws)) {
           detachClaude(ws, "frontend socket closed");
         }
       },
@@ -1160,8 +1151,7 @@ function startControlServer() {
         handleControlMessage(ws, raw);
       },
       pong: (ws: ServerWebSocket<ControlSocketData>) => {
-        ws.data.lastPongAt = Date.now();
-        ws.data.pongCount++;
+        ws.data.session!.recordPong();
       },
       drain: (ws: ServerWebSocket<ControlSocketData>) => {
         // Backpressure released. Confirm tracked messages as delivered only
@@ -1173,12 +1163,10 @@ function startControlServer() {
         // so a detached socket is always empty here. A drain with an empty
         // OS buffer means the bytes reached the transport — the same
         // delivery guarantee a plain successful send has.
-        if (ws.data.pendingBackpressure.length > 0 && ws.getBufferedAmount() === 0) {
-          ws.data.pendingBackpressure.clear();
-        }
+        ws.data.session!.confirmDrainIfFlushed();
         // Deliver anything that buffered while the socket was congested
         // instead of waiting for the next reattach.
-        if (ws === attachedClaude && bufferedMessages.length > 0) {
+        if (agentRegistry.isClaude(ws) && roomManager.backlogSize > 0) {
           flushBufferedMessages(ws);
         }
       },
@@ -1367,11 +1355,12 @@ async function handleClaudeToCodex(
   // lifecycle: attachClaude sets attachedClaude=ws, detachClaude/eviction clear
   // it, and a replaced socket is closed). Decision extracted to a pure helper so
   // it is unit-testable without a live WebSocket.
-  const attachGuard = evaluateInjectionAttachGuard(attachedClaude, ws);
+  const claudeSlot = agentRegistry.getClaude();
+  const attachGuard = evaluateInjectionAttachGuard(claudeSlot?.ws ?? null, ws);
   if (!attachGuard.allowed) {
     log(
       `Rejecting claude_to_codex from non-attached socket #${ws.data.clientId} ` +
-      `(request ${message.requestId}, attached=${attachedClaude ? "#" + attachedClaude.data.clientId : "none"})`,
+      `(request ${message.requestId}, attached=${claudeSlot ? "#" + claudeSlot.clientId : "none"})`,
     );
     sendClaudeToCodexResult(ws, message.requestId, {
       success: false,
@@ -1600,7 +1589,8 @@ async function handleClaudeToCodex(
     // turn_started) if `ws` lost the slot during the wait. steer has no such
     // await and the normal reply/inject paths satisfy attachedClaude===ws by
     // construction, so neither is affected.
-    const postWaitAttachGuard = evaluateInjectionAttachGuard(attachedClaude, ws);
+    const postWaitSlot = agentRegistry.getClaude();
+    const postWaitAttachGuard = evaluateInjectionAttachGuard(postWaitSlot?.ws ?? null, ws);
     if (!postWaitAttachGuard.allowed) {
       // The upfront accept() (under interruptThreadId) must not strand. Release
       // it — releaseInterruptKey is scoped to interruptThreadId and is a no-op
@@ -1610,7 +1600,7 @@ async function handleClaudeToCodex(
       log(
         `Rejecting interrupt-path injection from socket #${ws.data.clientId} that lost the attach ` +
         `slot during the terminal-boundary wait (request ${message.requestId}, ` +
-        `attached=${attachedClaude ? "#" + attachedClaude.data.clientId : "none"})`,
+        `attached=${postWaitSlot ? "#" + postWaitSlot.clientId : "none"})`,
       );
       sendClaudeToCodexResult(ws, message.requestId, {
         success: false,
@@ -1731,18 +1721,18 @@ async function handleClaudeToCodex(
 }
 
 async function attachClaude(ws: ServerWebSocket<ControlSocketData>, identity?: ControlClientIdentity) {
-  const occupant = attachedClaude;
-  if (occupant && occupant !== ws && occupant.readyState !== WebSocket.CLOSED) {
+  const occupant = agentRegistry.getClaude();
+  if (occupant && occupant.ws !== ws && occupant.readyState !== WebSocket.CLOSED) {
     // Slot is occupied by another socket that hasn't yet shown us FIN.
     // Issue #68: OS may never surface a FIN for a crashed peer, so readyState
     // stays OPEN forever. Probe the incumbent with a ping before rejecting.
-    const msSincePong = Date.now() - occupant.data.lastPongAt;
+    const msSincePong = Date.now() - occupant.lastPongAt;
     log(
-      `Claude frontend contest: new=#${ws.data.clientId}, incumbent=#${occupant.data.clientId} ` +
+      `Claude frontend contest: new=#${ws.data.clientId}, incumbent=#${occupant.clientId} ` +
       `(readyState=${occupant.readyState}, msSincePong=${msSincePong})`,
     );
 
-    if (challengeInProgress) {
+    if (!agentRegistry.beginChallenge()) {
       log(
         `Rejecting Claude frontend #${ws.data.clientId} — another liveness probe already in flight`,
       );
@@ -1753,12 +1743,11 @@ async function attachClaude(ws: ServerWebSocket<ControlSocketData>, identity?: C
       return;
     }
 
-    challengeInProgress = true;
     let incumbentAlive = false;
     try {
-      incumbentAlive = await probeLiveness(occupant, LIVENESS_PROBE_TIMEOUT_MS);
+      incumbentAlive = await occupant.probeLiveness(LIVENESS_PROBE_TIMEOUT_MS);
     } finally {
-      challengeInProgress = false;
+      agentRegistry.endChallenge();
     }
 
     // Slot may have cleared during the probe (real close fired, or the new ws
@@ -1773,7 +1762,7 @@ async function attachClaude(ws: ServerWebSocket<ControlSocketData>, identity?: C
 
     if (incumbentAlive) {
       log(
-        `Rejecting Claude frontend #${ws.data.clientId} — incumbent #${occupant.data.clientId} responded to liveness probe`,
+        `Rejecting Claude frontend #${ws.data.clientId} — incumbent #${occupant.clientId} responded to liveness probe`,
       );
       ws.close(CLOSE_CODE_REPLACED, "another Claude session is already connected");
       return;
@@ -1783,10 +1772,11 @@ async function attachClaude(ws: ServerWebSocket<ControlSocketData>, identity?: C
     // Fall through to accept path below.
   }
 
-  if (attachedClaude && attachedClaude !== ws && attachedClaude.readyState !== WebSocket.CLOSED) {
+  const currentSlot = agentRegistry.getClaude();
+  if (currentSlot && currentSlot.ws !== ws && currentSlot.readyState !== WebSocket.CLOSED) {
     // Another contestant may have raced in between the probe and here. Reject.
     log(
-      `Rejecting Claude frontend #${ws.data.clientId} — slot re-acquired by #${attachedClaude.data.clientId} after probe`,
+      `Rejecting Claude frontend #${ws.data.clientId} — slot re-acquired by #${currentSlot.clientId} after probe`,
     );
     ws.close(CLOSE_CODE_REPLACED, "another Claude session is already connected");
     return;
@@ -1794,7 +1784,7 @@ async function attachClaude(ws: ServerWebSocket<ControlSocketData>, identity?: C
 
   clearPendingClaudeDisconnect("Claude frontend attached");
   ws.data.identity = identity;
-  attachedClaude = ws;
+  agentRegistry.setClaude(ws.data.session!);
   ws.data.attached = true;
   cancelIdleShutdown();
   log(
@@ -1804,7 +1794,7 @@ async function attachClaude(ws: ServerWebSocket<ControlSocketData>, identity?: C
   // Drain the older backlog BEFORE the status buffer's fresher summary — the
   // reverse order delivered events out of timeline (summary first, then the
   // pre-disconnect messages it summarizes).
-  const hadBacklog = bufferedMessages.length > 0;
+  const hadBacklog = roomManager.backlogSize > 0;
   if (hadBacklog) {
     flushBufferedMessages(ws);
   }
@@ -1818,7 +1808,7 @@ async function attachClaude(ws: ServerWebSocket<ControlSocketData>, identity?: C
     // Only send status messages if this is not a rapid reattach (avoid flooding Claude)
     if (tuiConnectionState.canReply()) {
       sendBridgeMessage(ws, systemMessage("system_ready", currentReadyMessage()));
-    } else if (codexBootstrapped) {
+    } else if (agentRegistry.codexBootstrapped) {
       sendBridgeMessage(ws, systemMessage("system_waiting", currentWaitingMessage()));
     }
   }
@@ -1827,9 +1817,9 @@ async function attachClaude(ws: ServerWebSocket<ControlSocketData>, identity?: C
 }
 
 function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
-  if (attachedClaude !== ws) return;
+  if (!agentRegistry.isClaude(ws)) return;
 
-  attachedClaude = null;
+  agentRegistry.clearClaude();
   ws.data.attached = false;
   log(`Claude frontend detached (#${ws.data.clientId}, ${reason})`);
 
@@ -1837,12 +1827,11 @@ function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
   // drops its socket buffer on close, so without this they would be lost.
   // Prepend (they predate anything buffered after the send started failing)
   // and re-apply the cap.
-  if (ws.data.pendingBackpressure.length > 0) {
-    const reBuffered = ws.data.pendingBackpressure.drainAll();
+  if (ws.data.session!.pendingBackpressureSize > 0) {
+    const reBufferedCount = roomManager.rebufferOnDetach(ws.data.session!);
     log(
-      `Re-buffered ${reBuffered.length} backpressured message(s) for redelivery on reconnect`,
+      `Re-buffered ${reBufferedCount} backpressured message(s) for redelivery on reconnect`,
     );
-    bufferedMessages.unshiftMany(reBuffered);
   }
 
   scheduleClaudeDisconnectNotification(ws.data.clientId);
@@ -1864,15 +1853,15 @@ function detachClaude(ws: ServerWebSocket<ControlSocketData>, reason: string) {
  * it is safe to launch and let admission evict the stale frontend.
  */
 async function handleProbeIncumbent(ws: ServerWebSocket<ControlSocketData>) {
-  const occupant = attachedClaude;
-  log(`probe_incumbent from #${ws.data.clientId}: occupant=${occupant ? "#" + occupant.data.clientId : "none"} readyState=${occupant?.readyState}`);
-  if (!occupant || occupant === ws || occupant.readyState !== WebSocket.OPEN) {
+  const occupant = agentRegistry.getClaude();
+  log(`probe_incumbent from #${ws.data.clientId}: occupant=${occupant ? "#" + occupant.clientId : "none"} readyState=${occupant?.readyState}`);
+  if (!occupant || occupant.ws === ws || occupant.readyState !== WebSocket.OPEN) {
     sendProtocolMessage(ws, { type: "incumbent_status", connected: false, alive: false });
     return;
   }
   // A real challenge-on-contest decision is already running — defer to it (report
   // live so the CLI guard errs on the safe side and does not race the admission).
-  if (challengeInProgress) {
+  if (agentRegistry.challengeInProgress) {
     sendProtocolMessage(ws, { type: "incumbent_status", connected: true, alive: true });
     return;
   }
@@ -1881,9 +1870,9 @@ async function handleProbeIncumbent(ws: ServerWebSocket<ControlSocketData>) {
   // bounced with CLOSE_CODE_PROBE_IN_PROGRESS (a ~3s reconnect delay) even though
   // the probing socket never intends to attach. A real contest that races this
   // probe just runs its own ping concurrently — harmless (ping is idempotent).
-  const alive = await probeLiveness(occupant, LIVENESS_PROBE_TIMEOUT_MS);
+  const alive = await occupant.probeLiveness(LIVENESS_PROBE_TIMEOUT_MS);
   // The probe awaited; re-read state in case the incumbent closed meanwhile.
-  const stillConnected = attachedClaude === occupant && occupant.readyState === WebSocket.OPEN;
+  const stillConnected = agentRegistry.getClaude() === occupant && occupant.readyState === WebSocket.OPEN;
   log(`probe_incumbent reply to #${ws.data.clientId}: connected=${stillConnected} alive=${stillConnected && alive}`);
   sendProtocolMessage(ws, {
     type: "incumbent_status",
@@ -1908,20 +1897,6 @@ async function handleRequestBudgetRefresh(ws: ServerWebSocket<ControlSocketData>
   sendProtocolMessage(ws, { type: "budget_refresh", requestId, snapshot });
 }
 
-async function probeLiveness(
-  ws: ServerWebSocket<ControlSocketData>,
-  timeoutMs: number,
-): Promise<boolean> {
-  return probeLivenessImpl(
-    {
-      get readyState() { return ws.readyState; },
-      get pongCount() { return ws.data.pongCount; },
-      ping: () => { ws.ping(); },
-    },
-    { timeoutMs, pollMs: LIVENESS_PROBE_POLL_MS },
-  );
-}
-
 /**
  * Evict the incumbent Claude frontend so a newer session can take over.
  * Sends CLOSE_CODE_EVICTED_STALE (4002) and releases the slot so the next
@@ -1935,15 +1910,15 @@ async function probeLiveness(
  * contestant disappeared mid-probe), letting the timer fire is the correct
  * behavior: Codex genuinely has no Claude attached.
  */
-function evictStale(ws: ServerWebSocket<ControlSocketData>, reason: string) {
-  log(`Evicting stale Claude frontend #${ws.data.clientId}: ${reason}`);
-  if (attachedClaude === ws) {
-    detachClaude(ws, `evicted: ${reason}`);
+function evictStale(session: ConnectionSession, reason: string) {
+  log(`Evicting stale Claude frontend #${session.clientId}: ${reason}`);
+  if (agentRegistry.isClaude(session.ws)) {
+    detachClaude(session.ws, `evicted: ${reason}`);
   }
   try {
-    ws.close(CLOSE_CODE_EVICTED_STALE, "stale frontend evicted by newer session");
+    session.close(CLOSE_CODE_EVICTED_STALE, "stale frontend evicted by newer session");
   } catch (err: any) {
-    log(`Evict close threw on #${ws.data.clientId}: ${err.message}`);
+    log(`Evict close threw on #${session.clientId}: ${err.message}`);
   }
 }
 
@@ -1975,109 +1950,31 @@ function clearAttentionWindow() {
 }
 
 function scheduleIdleShutdown() {
-  cancelIdleShutdown();
-  if (attachedClaude) return; // still has a client
-
-  const snapshot = tuiConnectionState.snapshot();
-  if (snapshot.tuiConnected) return; // TUI still connected
-
-  log(`No clients connected. Daemon will shut down in ${IDLE_SHUTDOWN_MS}ms if no one reconnects.`);
-  idleShutdownTimer = setTimeout(() => {
-    // Re-check before shutting down
-    if (attachedClaude || tuiConnectionState.snapshot().tuiConnected) {
-      log("Idle shutdown cancelled: client reconnected during grace period");
-      return;
-    }
-    shutdown("idle — no clients connected");
-  }, IDLE_SHUTDOWN_MS);
+  roomManager.scheduleIdleShutdown();
 }
 
 function cancelIdleShutdown() {
-  if (idleShutdownTimer) {
-    clearTimeout(idleShutdownTimer);
-    idleShutdownTimer = null;
-  }
+  roomManager.cancelIdleShutdown();
 }
 
 function clearPendingClaudeDisconnect(reason?: string) {
-  if (!claudeDisconnectTimer) return;
-  clearTimeout(claudeDisconnectTimer);
-  claudeDisconnectTimer = null;
-  if (reason) {
-    log(`Cleared pending Claude disconnect notification (${reason})`);
-  }
+  roomManager.clearPendingClaudeDisconnect(reason);
 }
 
 function scheduleClaudeDisconnectNotification(clientId: number) {
-  clearPendingClaudeDisconnect("rescheduled");
-  claudeDisconnectTimer = setTimeout(() => {
-    claudeDisconnectTimer = null;
-
-    if (attachedClaude) {
-      log(
-        `Skipping Claude disconnect notification for client #${clientId} because Claude already reconnected`,
-      );
-      return;
-    }
-
-    // Runtime offline events are no longer injected into Codex: the only channel
-    // (turn/start) pollutes the Codex thread/title and can trigger spurious
-    // responses. Logged for ops; Codex simply receives no further messages until
-    // Claude reconnects (the static collaboration context lives in AGENTS.md).
-    log(`Claude disconnect persisted past grace window (client #${clientId})`);
-  }, CLAUDE_DISCONNECT_GRACE_MS);
+  roomManager.scheduleClaudeDisconnectNotification(clientId);
 }
 
 function emitToClaude(message: BridgeMessage) {
-  if (attachedClaude && attachedClaude.readyState === WebSocket.OPEN) {
-    if (trySendBridgeMessage(attachedClaude, message)) return;
-    // Send failed — fall through to buffer
-    log("Send to Claude failed, buffering message for retry on reconnect");
-  }
-
-  bufferedMessages.push(message);
+  roomManager.deliverToClaude(message);
 }
 
 function trySendBridgeMessage(ws: ServerWebSocket<ControlSocketData>, message: BridgeMessage): boolean {
-  try {
-    const result = ws.send(JSON.stringify({ type: "codex_to_claude", message } satisfies ControlServerMessage));
-    // Bun semantics: -1 = backpressure, the message IS enqueued and will be
-    // delivered once the socket drains — treating it as failure re-buffered an
-    // already-queued message and delivered it twice. Only 0 (dropped) fails.
-    if (typeof result === "number" && result === 0) {
-      log("Bridge message send returned 0 (dropped)");
-      return false;
-    }
-    if (typeof result === "number" && result === -1) {
-      // Enqueued but not on the wire: Bun owns the bytes until `drain`
-      // confirms delivery, and drops them if the socket closes first. Track
-      // the message so detachClaude can re-buffer it for the next attach.
-      // Same cap as bufferedMessages — a never-draining socket must not
-      // accumulate unboundedly (bounded, logged loss beats OOM).
-      ws.data.pendingBackpressure.push(message);
-    }
-    return true;
-  } catch (err: any) {
-    log(`Failed to send bridge message: ${err.message}`);
-    return false;
-  }
+  return ws.data.session!.send(message);
 }
 
 function flushBufferedMessages(ws: ServerWebSocket<ControlSocketData>) {
-  const messages = bufferedMessages.drainAll();
-  for (let i = 0; i < messages.length; i++) {
-    if (!trySendBridgeMessage(ws, messages[i]!)) {
-      // Re-buffer this and all remaining messages on failure. Positional index,
-      // not indexOf: identity lookup breaks the count if a message object is
-      // ever enqueued twice. The buffer is empty here (just drained, and
-      // trySend only touches pendingBackpressure), so re-applying the cap on
-      // prepend is a provable no-op — count is preserved bit-exactly.
-      const remaining = messages.slice(i);
-      bufferedMessages.unshiftMany(remaining);
-      log(`Flush interrupted: re-buffered ${remaining.length} message(s) after send failure`);
-      return;
-    }
-  }
+  roomManager.flushBacklog(ws.data.session!);
 }
 
 function sendBridgeMessage(ws: ServerWebSocket<ControlSocketData>, message: BridgeMessage) {
@@ -2089,24 +1986,13 @@ function sendStatus(ws: ServerWebSocket<ControlSocketData>) {
 }
 
 function broadcastStatus() {
-  if (!attachedClaude) return;
-  sendStatus(attachedClaude);
+  const claude = agentRegistry.getClaude();
+  if (!claude) return;
+  sendStatus(claude.ws);
 }
 
 function sendProtocolMessage(ws: ServerWebSocket<ControlSocketData>, message: ControlServerMessage) {
-  try {
-    const result = ws.send(JSON.stringify(message));
-    // Control responses are request-scoped: re-sending them to a future socket
-    // would be wrong (the client's pending request has already timed out), so
-    // a dropped send is not retried — but it must not be silent. A dropped
-    // `claude_to_codex_result` is the trail for "Claude saw a timeout but the
-    // turn WAS injected" reports.
-    if (typeof result === "number" && result === 0) {
-      log(`Control message dropped (socket closed): type=${message.type}`);
-    }
-  } catch (err: any) {
-    log(`Failed to send control message: ${err.message}`);
-  }
+  ws.data.session!.sendProtocol(message);
 }
 
 function currentStatus(): DaemonStatus {
@@ -2119,7 +2005,7 @@ function currentStatus(): DaemonStatus {
     // confirmation — without them a diagnosis can read "0 queued" while
     // unconfirmed messages still sit in the socket.
     queuedMessageCount:
-      bufferedMessages.length + statusBuffer.size + (attachedClaude?.data.pendingBackpressure.length ?? 0),
+      roomManager.backlogSize + statusBuffer.size + (agentRegistry.getClaude()?.pendingBackpressureSize ?? 0),
     proxyUrl: codex.proxyUrl,
     appServerUrl: codex.appServerUrl,
     pid: process.pid,
@@ -2307,13 +2193,13 @@ function armBootDeadline() {
   if (bootDeadlineTimer) return;
   bootDeadlineTimer = setTimeout(() => {
     bootDeadlineTimer = null;
-    if (codexBootstrapped) return; // became ready in time — nothing to do
+    if (agentRegistry.codexBootstrapped) return; // became ready in time — nothing to do
     if (tuiConnectionState.snapshot().tuiConnected) return; // a TUI is actively using it
     log(`Codex not ready within bootstrap deadline (${BOOTSTRAP_TIMEOUT_MS}ms) — self-exiting to release control port`);
     // An attached Claude frontend deserves a why before the socket drops: without
     // this notice the self-exit looks like a random daemon crash from its side
     // (it only sees "control connection lost" + a reconnect loop).
-    if (attachedClaude) {
+    if (agentRegistry.getClaude()) {
       emitToClaude(
         systemMessage(
           "system_daemon_self_replace",
@@ -2343,7 +2229,7 @@ async function bootCodex() {
   for (let attempt = 0; attempt <= CODEX_BOOT_RETRIES; attempt++) {
     try {
       await codex.start();
-      codexBootstrapped = true;
+      agentRegistry.codexBootstrapped = true;
       clearBootDeadline(); // codex up — cancel the self-exit watchdog
       writeStatusFile();
       emitToClaude(systemMessage("system_waiting", currentWaitingMessage()));
