@@ -1,5 +1,5 @@
 /**
- * v3.2 — time-aware dynamic pause line (04-额度策略-v3.md §3.1), the
+ * v3.2 — time-aware dynamic pause line (07-额度协调与策略v3.md §3.1), the
  * SOLE budget strategy (conserve|maximize selector removed). targetUtil = 98.
  *
  * Covers:

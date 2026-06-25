@@ -48,7 +48,7 @@ jobs:
         run: |
           if [ -z "$RELEASE_PAT" ]; then
             echo "::error::RELEASE_PAT secret is required for auto-publish-on-merge."
-            echo "::error::Pushes/releases made with GITHUB_TOKEN do not trigger the auto-release -> publish chain, so a bump would never reach npm. Add a fine-grained PAT with contents:write as the RELEASE_PAT secret. See docs/08-发布流程.md."
+            echo "::error::Pushes/releases made with GITHUB_TOKEN do not trigger the auto-release -> publish chain, so a bump would never reach npm. Add a fine-grained PAT with contents:write as the RELEASE_PAT secret. See docs/03-发布上线与Codex协议适配.md."
             exit 1
           fi
 

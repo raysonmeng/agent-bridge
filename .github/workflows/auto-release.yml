@@ -19,7 +19,7 @@ jobs:
           RELEASE_PAT: ${{ secrets.RELEASE_PAT }}
         run: |
           if [ -z "$RELEASE_PAT" ]; then
-            echo "::error::RELEASE_PAT secret is required: releases created with GITHUB_TOKEN do not trigger publish.yml, so npm publish would never run. Add a fine-grained PAT with contents:write as RELEASE_PAT. See docs/08-发布流程.md."
+            echo "::error::RELEASE_PAT secret is required: releases created with GITHUB_TOKEN do not trigger publish.yml, so npm publish would never run. Add a fine-grained PAT with contents:write as RELEASE_PAT. See docs/03-发布上线与Codex协议适配.md."
             exit 1
           fi
 
@@ -57,7 +57,7 @@ jobs:
           # PAT (required above) so the published release TRIGGERS publish.yml.
           # Releases created with GITHUB_TOKEN do not start new workflow runs
           # (GitHub recursion guard), which would strand the release without an
-          # npm publish. See docs/08-发布流程.md.
+          # npm publish. See docs/03-发布上线与Codex协议适配.md.
           GH_TOKEN: ${{ secrets.RELEASE_PAT }}
         run: |
           TAG="v${{ steps.version.outputs.version }}"
