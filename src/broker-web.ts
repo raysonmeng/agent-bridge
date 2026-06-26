@@ -91,8 +91,18 @@ async function collectState(store: Store): Promise<{ rooms: RoomState[]; generat
   return { rooms: out, generatedAt: Date.now() };
 }
 
+/**
+ * Strip control + format chars (ANSI/newline/CR/zero-width) so an attacker-supplied room NAME can't
+ * inject sequences into the broker operator's terminal log (CWE-117). The web face is loopback-only,
+ * but the docs invite SSH / `tailscale serve` forwarding, so a forwarded POST body is untrusted.
+ * roomId is already slug-safe (slugify strips these); createdBy is the operator's own authenticated id.
+ */
+function safeForLog(s: string): string {
+  return s.replace(/[\p{Cc}\p{Cf}]/gu, "");
+}
+
 /** Create a room owned by the logged-in identity, mirroring the CLI's closed-by-default rules (§11.2). */
-async function createRoom(store: Store, createdBy: string | null, body: unknown): Promise<Response> {
+async function createRoom(store: Store, createdBy: string | null, body: unknown, log: (m: string) => void): Promise<Response> {
   if (!createdBy) return json({ error: "未登录：请在 broker 机上先运行 abg auth login" }, 401);
   const name = typeof (body as { name?: unknown })?.name === "string" ? (body as { name: string }).name.trim() : "";
   if (!name) return json({ error: "缺少房间名称" }, 400);
@@ -107,6 +117,7 @@ async function createRoom(store: Store, createdBy: string | null, body: unknown)
   if (!existed) {
     await svc.createRoom(roomId, name, createdBy);
     await svc.join(roomId, createdBy); // creator of a NEW room is its first member
+    log(`已创建房间 ${roomId}（${safeForLog(name)}）by ${createdBy} — 加入：abg join ${roomId}`);
   } else if (!(await svc.isMember(roomId, createdBy))) {
     // Closed-by-default: creating an EXISTING room must not self-grant membership.
     return json({ error: `房间 ${roomId} 已存在且你（${createdBy}）不是成员；请让成员用 abg room add 加你` }, 409);
@@ -145,7 +156,7 @@ export function startBrokerWeb(opts: BrokerWebOptions): BrokerWebHandle {
           } catch {
             body = null;
           }
-          return await createRoom(opts.store, opts.createdBy, body);
+          return await createRoom(opts.store, opts.createdBy, body, log);
         }
         return new Response("not found", { status: 404 });
       } catch (e) {
@@ -183,6 +194,8 @@ const DASHBOARD_HTML = `<!doctype html>
   .muted { color:#8889; font-size:13px; font-weight:400; }
   .members span { display:inline-block; background:#8882; border-radius:6px; padding:1px 8px; margin:2px 4px 2px 0; font-size:13px; }
   .wb { font-size:13px; margin-top:8px; }
+  .join { font-size:13px; margin-top:6px; color:#8889; }
+  .join code { user-select:all; background:#8882; padding:1px 6px; border-radius:5px; color:inherit; }
   .empty { color:#8889; padding:24px; text-align:center; }
   .msg { padding:8px 12px; border-radius:8px; margin:8px 0; font-size:14px; }
   .msg.err { background:#ef44441a; color:#dc2626; }
@@ -219,6 +232,7 @@ function render(state){
     '<div class="room"><h2>'+esc(r.name)+' <span class="muted">'+esc(r.roomId)+'</span></h2>'
     +'<div class="muted">创建者 '+esc(r.createdBy)+' · 成员 '+r.members.length+'</div>'
     +'<div class="members">'+r.members.map(m=>'<span>'+esc(m)+'</span>').join('')+'</div>'
+    +'<div class="join">加入：<code>abg join '+esc(r.roomId)+'</code></div>'
     +wbLine(r.whiteboard)+'</div>'
   ).join('');
 }
