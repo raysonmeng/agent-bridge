@@ -49,6 +49,17 @@ function makeBridgeMessage(content: string, ts?: number, id?: string) {
   };
 }
 
+// A cross-machine room-event notice (source:"room") — same shape as a Codex
+// message but with the untrusted-external channel attribution.
+function makeRoomMessage(content: string, ts?: number, id?: string) {
+  return {
+    id: id ?? `room_${++nextTestMessageId}`,
+    source: "room" as const,
+    content,
+    timestamp: ts ?? Date.now(),
+  };
+}
+
 function withMockedChannel(adapter: any, mode: "success" | "fail" = "success") {
   const notifications: any[] = [];
   adapter.server = {
@@ -97,6 +108,67 @@ describe("Push-only delivery: AGENTBRIDGE_MODE is ignored", () => {
     await adapter.pushNotification(makeBridgeMessage("m1"));
     await adapter.pushNotification(makeBridgeMessage("m2"));
     expect(logs.filter((line) => line.includes("no longer supported"))).toHaveLength(0);
+  });
+});
+
+describe("Channel attribution: room events render as user=\"Room\"", () => {
+  test("push: a source:\"room\" event renders user/user_id/source_type = room", async () => {
+    const adapter = createAdapter();
+    const notifications = withMockedChannel(adapter);
+
+    await adapter.pushNotification(makeRoomMessage("📨 teammate finished a task", 1705312200000, "room-1"));
+
+    expect(notifications).toHaveLength(1);
+    const meta = notifications[0].params.meta;
+    expect(meta.user).toBe("Room");
+    expect(meta.user_id).toBe("room");
+    expect(meta.source_type).toBe("room");
+    // Must NOT borrow the trusted local Codex partner's identity.
+    expect(meta.user).not.toBe("Codex");
+    expect(meta.source_type).not.toBe("codex");
+  });
+
+  test("push regression: a normal Codex message still renders user=\"Codex\"", async () => {
+    const adapter = createAdapter();
+    const notifications = withMockedChannel(adapter);
+
+    await adapter.pushNotification(makeBridgeMessage("normal codex turn", 1705312200000, "codex-1"));
+
+    expect(notifications).toHaveLength(1);
+    const meta = notifications[0].params.meta;
+    expect(meta.user).toBe("Codex");
+    expect(meta.user_id).toBe("codex");
+    expect(meta.source_type).toBe("codex");
+  });
+
+  test("fallback drain: a queued room event renders \"Room:\" not \"Codex:\"", () => {
+    const adapter = createAdapter();
+
+    adapter.queueFallbackMessage(makeRoomMessage("📨 teammate pushed a commit", 1705312200000));
+
+    const text = adapter.drainMessages().content[0].text;
+    expect(text).toContain("Room: 📨 teammate pushed a commit");
+    expect(text).not.toContain("Codex: 📨 teammate pushed a commit");
+    expect(text).toContain("from Room]"); // batch header attributes to Room…
+    expect(text).not.toContain("from Codex]"); // …not Codex (the header lie is fixed)
+  });
+
+  test("fallback drain regression: a queued Codex message still renders \"Codex:\"", () => {
+    const adapter = createAdapter();
+
+    adapter.queueFallbackMessage(makeBridgeMessage("codex fallback body", 1705312200000));
+
+    const text = adapter.drainMessages().content[0].text;
+    expect(text).toContain("Codex: codex fallback body");
+    expect(text).toContain("from Codex]"); // codex-only header unchanged (v1 regression guard)
+  });
+
+  test("fallback drain: a mixed codex + room queue names both in the header", () => {
+    const adapter = createAdapter();
+    adapter.queueFallbackMessage(makeBridgeMessage("codex body", 1705312200000));
+    adapter.queueFallbackMessage(makeRoomMessage("📨 room body", 1705312200001));
+    const text = adapter.drainMessages().content[0].text;
+    expect(text).toContain("from Codex/Room]"); // both senders named — no single-source lie
   });
 });
 

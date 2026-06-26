@@ -2055,10 +2055,14 @@ function currentReadyMessage() {
   return `✅ Codex TUI connected (${codex.activeThreadId}). Bridge ready.`;
 }
 
-function systemMessage(idPrefix: string, content: string): BridgeMessage {
+function systemMessage(
+  idPrefix: string,
+  content: string,
+  source: BridgeMessage["source"] = "codex",
+): BridgeMessage {
   return {
     id: `${idPrefix}_${SYSTEM_MSG_SALT}_${++nextSystemMessageId}`,
-    source: "codex",
+    source,
     content,
     timestamp: Date.now(),
   };
@@ -2378,11 +2382,13 @@ void bootCodex();
 // inject room events (task_completed / presence) into Claude. Fail-inert — a
 // not-logged-in / non-collab user (no auth-token, or this cwd not mapped to a
 // room) starts nothing, so the v1 single-machine flow is untouched. Injected as
-// a `system_room_event` notice (source:"codex"), which renders in Claude and is
-// structurally ineligible for the Claude→Codex reply path (no loop).
+// a `system_room_event` notice stamped source:"room" (renders as user="Room",
+// distinct from the trusted local "codex" partner — the channel label itself
+// flags it as untrusted external input) and is structurally ineligible for the
+// Claude→Codex reply path (no loop).
 void startRoomBridge({
   cwd: process.cwd(),
-  emit: (text) => emitToClaude(systemMessage("system_room_event", text)),
+  emit: (text) => emitToClaude(systemMessage("system_room_event", text, "room")),
   log,
 })
   .then((handle) => {
