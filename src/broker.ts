@@ -4,19 +4,37 @@ import type { Identity, IdentityProvider } from "./backbone/identity";
 import type { MessageTransport } from "./backbone/transport";
 import type { Envelope } from "./backbone/envelope";
 import { InProcTransport } from "./backbone/transport/inproc-transport";
+import { buildPresenceEnvelope, type PresenceMeta } from "./presence";
 
 export const DEFAULT_BROKER_PORT = 4700; // outside the multi-pair 4500/4501/4502+stride range
 const CLOSE_AUTH_FAILED = 4401;
 
+/** Validate the optional reserved presence blob from hello — best-effort, drop anything malformed. Exported for boundary tests. */
+export function sanitizePresence(raw: unknown): PresenceMeta | undefined {
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) return undefined;
+  const r = raw as Record<string, unknown>;
+  const out: PresenceMeta = {};
+  if (typeof r.agentType === "string") out.agentType = r.agentType;
+  if (typeof r.host === "string") out.host = r.host;
+  if (Array.isArray(r.capabilities)) {
+    const caps = r.capabilities.filter((c): c is string => typeof c === "string");
+    if (caps.length > 0) out.capabilities = caps;
+  }
+  if (typeof r.budgetHint === "string") out.budgetHint = r.budgetHint;
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 interface BrokerSocketData {
   connId: number;
   identity?: Identity;
+  /** Reserved presence metadata declared at hello (§11.1 bullet 9); echoed in member_joined. */
+  presence?: PresenceMeta;
   /** topic → unsubscribe handle for this connection's subscriptions. */
   subs: Map<string, () => void>;
 }
 
 type ClientMessage =
-  | { type: "hello"; token: string }
+  | { type: "hello"; token: string; presence?: unknown }
   | { type: "subscribe"; topic: string }
   | { type: "unsubscribe"; topic: string }
   | { type: "publish"; topic: string; envelope: Envelope };
@@ -94,8 +112,16 @@ export class Broker {
           });
         },
         close(ws) {
-          const me = ws.data.identity?.id;
-          if (me) for (const topic of ws.data.subs.keys()) self.removeTopicMember(topic, me);
+          const identity = ws.data.identity;
+          if (identity) {
+            // A crash-disconnect still yields member_left here (presence tracks real
+            // connectivity). Fire-and-forget: close() is sync, emit can't be awaited.
+            for (const topic of ws.data.subs.keys()) {
+              if (self.removeTopicMember(topic, identity.id)) {
+                void self.emitPresence(topic, "member_left", identity, ws.data.presence);
+              }
+            }
+          }
           for (const unsub of ws.data.subs.values()) unsub();
           ws.data.subs.clear();
           self.log(`conn #${ws.data.connId} closed`);
@@ -156,6 +182,7 @@ export class Broker {
         return;
       }
       ws.data.identity = identity;
+      ws.data.presence = sanitizePresence(msg.presence); // reserved meta, best-effort
       this.send(ws, { type: "welcome", identity });
       this.log(`conn #${ws.data.connId} authenticated as ${identity.id}`);
       // Reconnect replay (§3.2) — OUTSIDE the auth try/catch: a transient store
@@ -187,8 +214,16 @@ export class Broker {
           if (this.shouldDeliver(me, envelope)) this.send(ws, { type: "event", topic, envelope });
         });
         ws.data.subs.set(topic, unsub);
-        this.addTopicMember(topic, me);
+        const becamePresent = this.addTopicMember(topic, me);
         this.send(ws, { type: "subscribed", topic });
+        // Presence (§11.1 bullet 9): announce only on the 0→1 transition, so a
+        // second connection for the same identity doesn't re-announce a join.
+        // Emit BEFORE draining this subscriber's own backlog: join notification
+        // doesn't depend on the joiner's pending queue, and keeping it ahead of the
+        // drain await means a disconnect mid-drain can't reorder it after the
+        // close()-emitted member_left (a "left-then-joined" ghost) under a future
+        // truly-async Store. Drain is broadcast-irrelevant; ordering vs join is moot.
+        if (becamePresent) await this.emitPresence(topic, "member_joined", ws.data.identity, ws.data.presence);
         // Drain anything queued during the connected-but-not-yet-subscribed gap
         // (between hello's drain and this subscribe). Safe: drainPending removes,
         // so an already-drained message is never re-delivered.
@@ -200,7 +235,10 @@ export class Broker {
         if (unsub) {
           unsub();
           ws.data.subs.delete(msg.topic);
-          this.removeTopicMember(msg.topic, me);
+          // member_left only on the →0 transition (last connection for this identity left the topic).
+          if (this.removeTopicMember(msg.topic, me)) {
+            await this.emitPresence(msg.topic, "member_left", ws.data.identity, ws.data.presence);
+          }
         }
         return;
       }
@@ -260,22 +298,55 @@ export class Broker {
     return true; // broadcast / @mention (highlight is client-side via mentions[])
   }
 
-  private addTopicMember(topic: string, id: string): void {
+  /** Add a live subscription for `id` on `topic`. Returns true iff this is a 0→1 transition (newly present). */
+  private addTopicMember(topic: string, id: string): boolean {
     let m = this.topicMembers.get(topic);
     if (!m) {
       m = new Map();
       this.topicMembers.set(topic, m);
     }
-    m.set(id, (m.get(id) ?? 0) + 1);
+    const prev = m.get(id) ?? 0;
+    m.set(id, prev + 1);
+    return prev === 0;
   }
 
-  private removeTopicMember(topic: string, id: string): void {
+  /** Drop a live subscription for `id` on `topic`. Returns true iff this is a →0 transition (now absent). */
+  private removeTopicMember(topic: string, id: string): boolean {
     const m = this.topicMembers.get(topic);
-    if (!m) return;
-    const n = (m.get(id) ?? 0) - 1;
+    if (!m) return false;
+    const had = m.get(id) ?? 0;
+    if (had === 0) return false;
+    const n = had - 1;
     if (n <= 0) m.delete(id);
     else m.set(id, n);
     if (m.size === 0) this.topicMembers.delete(topic);
+    return n <= 0;
+  }
+
+  /**
+   * Synthesize a presence event (§11.1 bullet 9) on a membership transition and
+   * fan it out to the topic. Broker-authored (not client-published) so it tracks
+   * ACTUAL connectivity — a crash-disconnect still yields member_left via close().
+   * `online_only` (never stored); shouldDeliver skips the subject themselves.
+   */
+  private async emitPresence(
+    topic: string,
+    kind: "member_joined" | "member_left",
+    identity: Identity,
+    presence?: PresenceMeta,
+  ): Promise<void> {
+    const env = buildPresenceEnvelope({
+      kind,
+      roomId: topic,
+      agentId: identity.id,
+      displayName: identity.displayName,
+      meta: presence,
+    });
+    try {
+      await this.transport.publish(topic, env);
+    } catch (e) {
+      this.log(`presence ${kind} publish failed for ${identity.id}@${topic}: ${String(e)}`);
+    }
   }
 
   private isReachable(topic: string, id: string): boolean {

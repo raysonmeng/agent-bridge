@@ -1,9 +1,12 @@
 import type { Envelope } from "./backbone/envelope";
 import type { Identity } from "./backbone/identity";
+import type { PresenceMeta } from "./presence";
 
 export interface BrokerClientOptions {
   url: string;
   token: string;
+  /** Reserved presence metadata (host/capabilities/...) declared at hello (§11.1 bullet 9). */
+  presence?: PresenceMeta;
   log?: (msg: string) => void;
   /** Initial reconnect backoff (default 250ms), doubled up to {@link reconnectMaxMs}. */
   reconnectBaseMs?: number;
@@ -136,7 +139,7 @@ export class BrokerClient {
     this.ws = ws;
 
     ws.onopen = () => {
-      this.sendRaw({ type: "hello", token: this.opts.token });
+      this.sendRaw({ type: "hello", token: this.opts.token, presence: this.opts.presence });
     };
     ws.onmessage = (ev) => {
       let msg: any;

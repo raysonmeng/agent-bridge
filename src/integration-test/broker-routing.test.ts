@@ -18,6 +18,9 @@ class WsClient {
     c.ws = new WebSocket(url);
     c.ws.onmessage = (ev) => {
       const m = JSON.parse(ev.data as string);
+      // Ignore presence churn (§11.1 bullet 9): these tests assert on the routing
+      // of PUBLISHED envelopes, not member_joined/left (covered by broker-presence).
+      if (m?.type === "event" && (m.envelope?.kind === "member_joined" || m.envelope?.kind === "member_left")) return;
       const w = c.waiters.shift();
       if (w) w(m);
       else c.q.push(m);
