@@ -16,15 +16,13 @@
  */
 
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { basename, dirname, join } from "node:path";
 import { BrokerClient } from "../broker-client";
 import { buildTaskCompletedEnvelope } from "../task-completed";
 import { PublishThrottle } from "../publish-throttle";
 import { RoomService } from "../room-service";
-import { SqliteStore } from "../backbone/store/sqlite-store";
 import type { Store } from "../backbone/store";
-import { StateDirResolver } from "../state-dir";
+import { openStore, readAuthToken, resolveBrokerUrl, resolveDbPath } from "../collab-store";
 
 const DEFAULT_THROTTLE_MS = 8 * 60 * 60 * 1000; // 8h: a given commit announces ~once per session
 const DEFAULT_CONNECT_TIMEOUT_MS = 3_000;
@@ -108,39 +106,6 @@ function gitContext(cwd: string): { repo?: string; branch?: string; commit?: str
     commit: git(["rev-parse", "--short", "HEAD"], cwd) ?? undefined,
     subject: git(["log", "-1", "--format=%s"], cwd) ?? undefined,
   };
-}
-
-function resolveDbPath(explicit?: string): string {
-  if (explicit) return explicit;
-  const env = process.env.AGENTBRIDGE_COLLAB_DB;
-  if (env && env.length > 0) return env;
-  return join(new StateDirResolver().dir, "collab.db");
-}
-
-function resolveBrokerUrl(explicit?: string): string {
-  if (explicit) return explicit;
-  const env = process.env.AGENTBRIDGE_BROKER_URL;
-  if (env && env.length > 0) return env;
-  return `ws://127.0.0.1:4700/ws`;
-}
-
-/** Open the collab Store with the same 0700 lockdown as `abg auth login` (raw PSK tokens + PII). */
-function openStore(dbPath: string): SqliteStore {
-  const dir = dirname(dbPath);
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  chmodSync(dir, 0o700);
-  return new SqliteStore(dbPath);
-}
-
-/** Read the logged-in token from `<collabDir>/auth-token` and resolve it to an identity id. */
-/** Read the logged-in PSK token from `<collabDir>/auth-token`. No Store needed — cheap login gate. */
-function readAuthToken(dbPath: string): string | null {
-  try {
-    const token = readFileSync(join(dirname(dbPath), "auth-token"), "utf-8").trim();
-    return token === "" ? null : token;
-  } catch {
-    return null;
-  }
 }
 
 /** connect() reconnects forever against a down broker — race it against a timeout so the hook never hangs. */

@@ -3,9 +3,9 @@
 var __require = import.meta.require;
 
 // src/daemon.ts
-import { existsSync as existsSync8, realpathSync as realpathSync2, rmSync as rmSync2 } from "fs";
+import { existsSync as existsSync8, realpathSync as realpathSync3, rmSync as rmSync2 } from "fs";
 import { homedir as homedir5 } from "os";
-import { join as join11 } from "path";
+import { join as join12 } from "path";
 import { randomUUID as randomUUID4 } from "crypto";
 
 // src/contract-version.ts
@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.24", "0.0.0-source"),
-  commit: defineString("a5a6005", "source"),
+  commit: defineString("8284e8a", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("5f8ef4c63fe4", "source")
+  codeHash: defineString("0a63b984bf2a", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -6810,6 +6810,532 @@ class RoomManager {
   }
 }
 
+// src/broker-client.ts
+class BrokerClient {
+  opts;
+  ws = null;
+  identity = null;
+  subscriptions = new Set;
+  outbox = [];
+  eventHandlers = [];
+  closed = false;
+  authFailed = false;
+  reconnectAttempt = 0;
+  reconnectTimer = null;
+  connectPromise = null;
+  resolveConnect = null;
+  rejectConnect = null;
+  log;
+  mkWs;
+  baseMs;
+  maxMs;
+  maxOutbox;
+  constructor(opts) {
+    this.opts = opts;
+    this.log = opts.log ?? (() => {});
+    this.mkWs = opts.wsFactory ?? ((url) => new WebSocket(url));
+    this.baseMs = opts.reconnectBaseMs ?? 250;
+    this.maxMs = opts.reconnectMaxMs ?? 1e4;
+    this.maxOutbox = opts.maxOutbox ?? 1000;
+  }
+  get connected() {
+    return this.ws !== null && this.ws.readyState === WebSocket.OPEN && this.identity !== null;
+  }
+  get whoami() {
+    return this.identity;
+  }
+  get queuedCount() {
+    return this.outbox.length;
+  }
+  connect() {
+    if (this.closed)
+      return Promise.reject(new Error("client closed"));
+    if (this.connectPromise)
+      return this.connectPromise;
+    this.connectPromise = new Promise((resolve, reject) => {
+      this.resolveConnect = resolve;
+      this.rejectConnect = reject;
+    });
+    this.openSocket();
+    return this.connectPromise;
+  }
+  subscribe(topic) {
+    this.subscriptions.add(topic);
+    if (this.connected)
+      this.sendRaw({ type: "subscribe", topic });
+  }
+  unsubscribe(topic) {
+    this.subscriptions.delete(topic);
+    if (this.connected)
+      this.sendRaw({ type: "unsubscribe", topic });
+  }
+  publish(topic, envelope) {
+    if (this.connected) {
+      this.sendRaw({ type: "publish", topic, envelope });
+      return;
+    }
+    if (this.outbox.length >= this.maxOutbox) {
+      this.outbox.shift();
+      this.log(`outbox full (${this.maxOutbox}) \u2014 dropped oldest queued message`);
+    }
+    this.outbox.push({ topic, envelope });
+  }
+  onEvent(handler) {
+    this.eventHandlers.push(handler);
+  }
+  close() {
+    this.closed = true;
+    this.clearReconnectTimer();
+    this.teardownSocket();
+    if (this.rejectConnect) {
+      const reject = this.rejectConnect;
+      this.resolveConnect = null;
+      this.rejectConnect = null;
+      reject(new Error("client closed"));
+    }
+  }
+  openSocket() {
+    this.clearReconnectTimer();
+    this.teardownSocket();
+    const ws = this.mkWs(this.opts.url);
+    this.ws = ws;
+    ws.onopen = () => {
+      this.sendRaw({ type: "hello", token: this.opts.token, presence: this.opts.presence });
+    };
+    ws.onmessage = (ev) => {
+      let msg;
+      try {
+        msg = JSON.parse(ev.data);
+      } catch {
+        return;
+      }
+      if (typeof msg !== "object" || msg === null || typeof msg.type !== "string")
+        return;
+      if (msg.type === "welcome") {
+        this.identity = msg.identity;
+        this.reconnectAttempt = 0;
+        for (const topic of this.subscriptions)
+          this.sendRaw({ type: "subscribe", topic });
+        this.flushOutbox();
+        this.log(`connected as ${msg.identity.id}`);
+        if (this.resolveConnect) {
+          const resolve = this.resolveConnect;
+          this.resolveConnect = null;
+          this.rejectConnect = null;
+          resolve(msg.identity);
+        }
+      } else if (msg.type === "auth_error") {
+        this.authFailed = true;
+        if (this.rejectConnect) {
+          const reject = this.rejectConnect;
+          this.resolveConnect = null;
+          this.rejectConnect = null;
+          reject(new Error("broker auth failed"));
+        }
+      } else if (msg.type === "event") {
+        for (const h of this.eventHandlers) {
+          try {
+            h(msg.topic, msg.envelope);
+          } catch (e) {
+            this.log(`event handler threw: ${String(e)}`);
+          }
+        }
+      }
+    };
+    ws.onclose = () => {
+      if (this.ws !== ws)
+        return;
+      this.ws = null;
+      this.identity = null;
+      if (!this.closed && !this.authFailed)
+        this.scheduleReconnect();
+    };
+    ws.onerror = () => {};
+  }
+  teardownSocket() {
+    const old = this.ws;
+    if (!old)
+      return;
+    this.ws = null;
+    this.identity = null;
+    old.onopen = null;
+    old.onmessage = null;
+    old.onclose = null;
+    old.onerror = null;
+    try {
+      old.close();
+    } catch {}
+  }
+  clearReconnectTimer() {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
+  }
+  flushOutbox() {
+    if (this.outbox.length === 0)
+      return;
+    const pending = this.outbox.splice(0, this.outbox.length);
+    for (const { topic, envelope } of pending)
+      this.sendRaw({ type: "publish", topic, envelope });
+    this.log(`flushed ${pending.length} queued message(s)`);
+  }
+  sendRaw(msg) {
+    try {
+      this.ws?.send(JSON.stringify(msg));
+    } catch (e) {
+      this.log(`send failed: ${String(e)}`);
+    }
+  }
+  scheduleReconnect() {
+    if (this.closed || this.reconnectTimer)
+      return;
+    const delay = Math.min(this.maxMs, this.baseMs * 2 ** this.reconnectAttempt);
+    this.reconnectAttempt++;
+    this.log(`reconnecting in ${delay}ms (attempt ${this.reconnectAttempt})`);
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (this.closed)
+        return;
+      this.openSocket();
+    }, delay);
+  }
+}
+
+// src/room-service.ts
+import { realpathSync as realpathSync2 } from "fs";
+
+class RoomService {
+  store;
+  constructor(store) {
+    this.store = store;
+  }
+  async createRoom(roomId, name, createdBy) {
+    await this.store.createRoom(roomId, name, createdBy);
+  }
+  async getRoom(roomId) {
+    return this.store.getRoom(roomId);
+  }
+  async listRooms() {
+    return this.store.listRooms();
+  }
+  async join(roomId, agentId) {
+    await this.store.addMember(roomId, agentId);
+  }
+  async leave(roomId, agentId) {
+    await this.store.removeMember(roomId, agentId);
+  }
+  async getMembers(roomId) {
+    return this.store.getMembers(roomId);
+  }
+  async getRoomsForAgent(agentId) {
+    return this.store.getRoomsForAgent(agentId);
+  }
+  async isMember(roomId, agentId) {
+    return (await this.store.getMembers(roomId)).includes(agentId);
+  }
+  async mapCwd(workspacePath, roomId) {
+    await this.store.mapCwd(this.normalizeCwd(workspacePath), roomId);
+  }
+  async resolveRoomForCwd(workspacePath) {
+    return this.store.getRoomForCwd(this.normalizeCwd(workspacePath));
+  }
+  async autoJoinByCwd(workspacePath, agentId) {
+    const roomId = await this.resolveRoomForCwd(workspacePath);
+    if (!roomId)
+      return null;
+    const already = await this.isMember(roomId, agentId);
+    if (!already)
+      await this.join(roomId, agentId);
+    return { roomId, joined: !already };
+  }
+  normalizeCwd(workspacePath) {
+    try {
+      return realpathSync2(workspacePath);
+    } catch {
+      return workspacePath;
+    }
+  }
+}
+
+// src/collab-store.ts
+import { chmodSync as chmodSync3, mkdirSync as mkdirSync6, readFileSync as readFileSync9 } from "fs";
+import { dirname as dirname3, join as join11 } from "path";
+
+// src/backbone/store/sqlite-store.ts
+import { Database } from "bun:sqlite";
+
+class SqliteStore {
+  db;
+  closed = false;
+  constructor(path) {
+    this.db = new Database(path);
+    this.db.exec("PRAGMA journal_mode=WAL");
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS identities (
+        id TEXT PRIMARY KEY,
+        display_name TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS agents (
+        agent_id TEXT PRIMARY KEY,
+        person_id TEXT NOT NULL,
+        type TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS sessions (
+        session_id TEXT PRIMARY KEY,
+        agent_id TEXT NOT NULL,
+        started_at INTEGER NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS workspace_sessions (
+        workspace_path TEXT,
+        agent_type TEXT,
+        last_session_id TEXT NOT NULL,
+        PRIMARY KEY (workspace_path, agent_type)
+      );
+      CREATE TABLE IF NOT EXISTS rooms (
+        room_id TEXT PRIMARY KEY,
+        name TEXT NOT NULL,
+        created_by TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS room_members (
+        room_id TEXT,
+        agent_id TEXT,
+        PRIMARY KEY (room_id, agent_id)
+      );
+      CREATE TABLE IF NOT EXISTS cwd_room_map (
+        workspace_path TEXT PRIMARY KEY,
+        room_id TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS room_events (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        room_id TEXT NOT NULL,
+        envelope TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS room_whiteboard (
+        room_id TEXT PRIMARY KEY,
+        data TEXT NOT NULL
+      );
+      CREATE TABLE IF NOT EXISTS pending_deliveries (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        target_agent_id TEXT NOT NULL,
+        idempotency_key TEXT NOT NULL,
+        envelope TEXT NOT NULL,
+        UNIQUE (target_agent_id, idempotency_key)
+      );
+      CREATE TABLE IF NOT EXISTS auth_tokens (
+        token TEXT PRIMARY KEY,
+        identity_id TEXT NOT NULL
+      );
+    `);
+  }
+  async upsertIdentity(id, displayName) {
+    this.db.query("INSERT INTO identities(id, display_name) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name").run(id, displayName);
+    return { id, displayName };
+  }
+  async getIdentity(id) {
+    const row = this.db.query("SELECT id, display_name FROM identities WHERE id=?").get(id);
+    return row ? { id: row.id, displayName: row.display_name } : null;
+  }
+  async upsertAgent(agentId, personId, type) {
+    this.db.query("INSERT INTO agents(agent_id, person_id, type) VALUES(?, ?, ?) ON CONFLICT(agent_id) DO UPDATE SET person_id=excluded.person_id, type=excluded.type").run(agentId, personId, type);
+  }
+  async getAgent(agentId) {
+    const row = this.db.query("SELECT agent_id, person_id, type FROM agents WHERE agent_id=?").get(agentId);
+    return row ? { agentId: row.agent_id, personId: row.person_id, type: row.type } : null;
+  }
+  async recordSession(sessionId, agentId, startedAt) {
+    this.db.query("INSERT OR REPLACE INTO sessions(session_id, agent_id, started_at) VALUES(?, ?, ?)").run(sessionId, agentId, startedAt);
+  }
+  async getLastSession(workspacePath, agentType) {
+    const row = this.db.query("SELECT last_session_id FROM workspace_sessions WHERE workspace_path=? AND agent_type=?").get(workspacePath, agentType);
+    return row ? row.last_session_id : null;
+  }
+  async setLastSession(workspacePath, agentType, sessionId) {
+    this.db.query("INSERT INTO workspace_sessions(workspace_path, agent_type, last_session_id) VALUES(?, ?, ?) ON CONFLICT(workspace_path, agent_type) DO UPDATE SET last_session_id=excluded.last_session_id").run(workspacePath, agentType, sessionId);
+  }
+  async createRoom(roomId, name, createdBy) {
+    this.db.query("INSERT OR IGNORE INTO rooms(room_id, name, created_by) VALUES(?, ?, ?)").run(roomId, name, createdBy);
+  }
+  async getRoom(roomId) {
+    const row = this.db.query("SELECT room_id, name, created_by FROM rooms WHERE room_id=?").get(roomId);
+    return row ? { roomId: row.room_id, name: row.name, createdBy: row.created_by } : null;
+  }
+  async listRooms() {
+    const rows = this.db.query("SELECT room_id, name, created_by FROM rooms").all();
+    return rows.map((r) => ({ roomId: r.room_id, name: r.name, createdBy: r.created_by }));
+  }
+  async addMember(roomId, agentId) {
+    this.db.query("INSERT OR IGNORE INTO room_members(room_id, agent_id) VALUES(?, ?)").run(roomId, agentId);
+  }
+  async removeMember(roomId, agentId) {
+    this.db.query("DELETE FROM room_members WHERE room_id=? AND agent_id=?").run(roomId, agentId);
+  }
+  async getMembers(roomId) {
+    const rows = this.db.query("SELECT agent_id FROM room_members WHERE room_id=?").all(roomId);
+    return rows.map((r) => r.agent_id);
+  }
+  async getRoomsForAgent(agentId) {
+    const rows = this.db.query("SELECT room_id FROM room_members WHERE agent_id=?").all(agentId);
+    return rows.map((r) => r.room_id);
+  }
+  async mapCwd(workspacePath, roomId) {
+    this.db.query("INSERT INTO cwd_room_map(workspace_path, room_id) VALUES(?, ?) ON CONFLICT(workspace_path) DO UPDATE SET room_id=excluded.room_id").run(workspacePath, roomId);
+  }
+  async getRoomForCwd(workspacePath) {
+    const row = this.db.query("SELECT room_id FROM cwd_room_map WHERE workspace_path=?").get(workspacePath);
+    return row ? row.room_id : null;
+  }
+  async appendEvent(roomId, envelope) {
+    this.db.query("INSERT INTO room_events(room_id, envelope) VALUES(?, ?)").run(roomId, JSON.stringify(envelope));
+  }
+  async getRecentEvents(roomId, limit) {
+    if (limit <= 0)
+      return [];
+    const rows = this.db.query("SELECT envelope FROM room_events WHERE room_id=? ORDER BY seq DESC LIMIT ?").all(roomId, limit);
+    return rows.map((r) => JSON.parse(r.envelope));
+  }
+  async getWhiteboard(roomId) {
+    const row = this.db.query("SELECT data FROM room_whiteboard WHERE room_id=?").get(roomId);
+    return row ? JSON.parse(row.data) : null;
+  }
+  async saveWhiteboard(roomId, whiteboard) {
+    this.db.query("INSERT INTO room_whiteboard(room_id, data) VALUES(?, ?) ON CONFLICT(room_id) DO UPDATE SET data=excluded.data").run(roomId, JSON.stringify(whiteboard));
+  }
+  async enqueuePending(targetAgentId, envelope) {
+    this.db.query("INSERT OR IGNORE INTO pending_deliveries(target_agent_id, idempotency_key, envelope) VALUES(?, ?, ?)").run(targetAgentId, envelope.idempotencyKey, JSON.stringify(envelope));
+  }
+  async drainPending(targetAgentId) {
+    const rows = this.db.query("SELECT envelope FROM pending_deliveries WHERE target_agent_id=? ORDER BY seq").all(targetAgentId);
+    this.db.query("DELETE FROM pending_deliveries WHERE target_agent_id=?").run(targetAgentId);
+    return rows.map((r) => JSON.parse(r.envelope));
+  }
+  async issueToken(token, identityId) {
+    this.db.query("INSERT INTO auth_tokens(token, identity_id) VALUES(?, ?) ON CONFLICT(token) DO UPDATE SET identity_id=excluded.identity_id").run(token, identityId);
+  }
+  async resolveToken(token) {
+    const row = this.db.query("SELECT identity_id FROM auth_tokens WHERE token=?").get(token);
+    return row ? row.identity_id : null;
+  }
+  async listTokens() {
+    const rows = this.db.query("SELECT token, identity_id FROM auth_tokens").all();
+    return rows.map((r) => ({ token: r.token, identityId: r.identity_id }));
+  }
+  async close() {
+    if (this.closed)
+      return;
+    this.closed = true;
+    this.db.close();
+  }
+}
+
+// src/collab-store.ts
+var DEFAULT_BROKER_URL = "ws://127.0.0.1:4700/ws";
+function resolveDbPath(explicit) {
+  if (explicit)
+    return explicit;
+  const env = process.env.AGENTBRIDGE_COLLAB_DB;
+  if (env && env.length > 0)
+    return env;
+  return join11(new StateDirResolver().dir, "collab.db");
+}
+function resolveBrokerUrl(explicit) {
+  if (explicit)
+    return explicit;
+  const env = process.env.AGENTBRIDGE_BROKER_URL;
+  if (env && env.length > 0)
+    return env;
+  return DEFAULT_BROKER_URL;
+}
+function readAuthToken(dbPath) {
+  try {
+    const token = readFileSync9(join11(dirname3(dbPath), "auth-token"), "utf-8").trim();
+    return token === "" ? null : token;
+  } catch {
+    return null;
+  }
+}
+function openStore(dbPath) {
+  const dir = dirname3(dbPath);
+  mkdirSync6(dir, { recursive: true, mode: 448 });
+  chmodSync3(dir, 448);
+  return new SqliteStore(dbPath);
+}
+
+// src/room-bridge.ts
+var INERT = { stop: () => {}, roomId: null };
+var SEEN_CAP = 500;
+function label(env) {
+  const dn = env.payload?.displayName;
+  return env.from?.name || (typeof dn === "string" ? dn : "") || env.from?.agentId || "\u67D0\u6210\u5458";
+}
+function renderRoomEvent(env) {
+  const who = label(env);
+  switch (env.kind) {
+    case "task_completed": {
+      const p = env.payload ?? {};
+      const where = [p.repo, p.branch].filter(Boolean).join("@");
+      const loc = [where, p.commit].filter(Boolean).join(" ");
+      const unblocks = p.unblocks && p.unblocks.length > 0 ? ` \xB7 \u89E3\u9501: ${p.unblocks.join(", ")}` : "";
+      return `\uD83C\uDFC1 ${who} \u5B8C\u6210\u4EFB\u52A1\uFF1A${p.summary ?? "(\u65E0\u6458\u8981)"}${loc ? ` (${loc})` : ""}${unblocks}`;
+    }
+    case "member_joined": {
+      const host = env.payload?.host;
+      return `\uD83D\uDC4B ${who} \u52A0\u5165\u623F\u95F4${typeof host === "string" && host ? `\uFF08${host}\uFF09` : ""}`;
+    }
+    case "member_left":
+      return `\uD83D\uDC4B ${who} \u79BB\u5F00\u623F\u95F4`;
+    default:
+      return null;
+  }
+}
+async function startRoomBridge(deps) {
+  const log = deps.log ?? (() => {});
+  const dbPath = resolveDbPath(deps.dbPath);
+  const token = readAuthToken(dbPath);
+  if (!token) {
+    log("room bridge: not logged in (no auth-token) \u2014 inactive");
+    return INERT;
+  }
+  const ownStore = !deps.store;
+  const store = deps.store ?? openStore(dbPath);
+  let roomId;
+  try {
+    roomId = await new RoomService(store).resolveRoomForCwd(deps.cwd);
+  } finally {
+    if (ownStore)
+      await store.close();
+  }
+  if (!roomId) {
+    log(`room bridge: ${deps.cwd} not mapped to a room \u2014 inactive`);
+    return INERT;
+  }
+  const room = roomId;
+  const seen = new Set;
+  const client = new BrokerClient({
+    url: resolveBrokerUrl(deps.brokerUrl),
+    token,
+    presence: { agentType: "claude" },
+    log
+  });
+  client.onEvent((_topic, env) => {
+    const key = env.idempotencyKey;
+    if (typeof key === "string" && key.length > 0) {
+      if (seen.has(key))
+        return;
+      seen.add(key);
+      if (seen.size > SEEN_CAP)
+        seen.delete(seen.values().next().value);
+    }
+    const text = renderRoomEvent(env);
+    if (text)
+      deps.emit(text);
+  });
+  client.subscribe(room);
+  client.connect().catch((e) => log(`room bridge: connect failed \u2014 ${String(e)}`));
+  log(`room bridge: subscribed to room ${room}`);
+  return { stop: () => client.close(), roomId: room };
+}
+
 // src/daemon.ts
 var stateDir = new StateDirResolver;
 stateDir.ensure();
@@ -6904,6 +7430,7 @@ var pendingSteerDispatches = new Map;
 var BUSY_RETRY_ADVISORY_MS = 15000;
 var shuttingDown = false;
 var bootDeadlineTimer = null;
+var roomBridge = null;
 var lastAttachStatusSentTs = 0;
 var ATTACH_STATUS_COOLDOWN_MS = 30000;
 var LIVENESS_PROBE_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS", 3000, log);
@@ -6920,7 +7447,7 @@ var budgetCoordinator = null;
 function pairCwd() {
   const raw = process.cwd();
   try {
-    return realpathSync2(raw);
+    return realpathSync3(raw);
   } catch {
     return raw;
   }
@@ -6929,7 +7456,7 @@ function budgetGuardStateDir() {
   const override = process.env.BUDGET_STATE_DIR;
   if (override && override.trim() !== "")
     return override.trim();
-  return join11(homedir5(), ".budget-guard");
+  return join12(homedir5(), ".budget-guard");
 }
 function resumeClaimTtlSec() {
   const totalMs = RESUME_CONFIRM_TIMEOUT_MS * RESUME_INJECT_MAX_ATTEMPTS + RESUME_INJECT_RETRY_MS * Math.max(0, RESUME_INJECT_MAX_ATTEMPTS - 1);
@@ -6965,7 +7492,7 @@ function readResumeSignals() {
   let checkpointExists = false;
   let checkpointPath;
   try {
-    checkpointPath = join11(pairCwd(), ".agent", "checkpoint.md");
+    checkpointPath = join12(pairCwd(), ".agent", "checkpoint.md");
     checkpointExists = existsSync8(checkpointPath);
   } catch (error) {
     log(`resume signal: checkpoint stat failed: ${error instanceof Error ? error.message : String(error)}`);
@@ -8102,6 +8629,8 @@ function shutdown(reason, exitCode = 0) {
   controlServer?.stop();
   controlServer = null;
   codex.stop();
+  roomBridge?.stop();
+  roomBridge = null;
   removePidFile();
   removeStatusFile();
   removeControlToken();
@@ -8152,3 +8681,13 @@ writePidFile();
 writeControlTokenPostBind();
 armBootDeadline();
 bootCodex();
+startRoomBridge({
+  cwd: process.cwd(),
+  emit: (text) => emitToClaude(systemMessage("system_room_event", text)),
+  log
+}).then((handle) => {
+  if (shuttingDown)
+    handle.stop();
+  else
+    roomBridge = handle;
+}).catch((e) => log(`room bridge start failed: ${String(e)}`));

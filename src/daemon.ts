@@ -62,6 +62,7 @@ import { BoundedMessageBuffer } from "./delivery-buffer";
 import { ConnectionSession, type ControlSocketData } from "./connection-session";
 import { AgentRegistry } from "./agent-registry";
 import { RoomManager } from "./room-manager";
+import { startRoomBridge, type RoomBridgeHandle } from "./room-bridge";
 
 const stateDir = new StateDirResolver();
 stateDir.ensure();
@@ -235,6 +236,8 @@ const pendingSteerDispatches = new Map<number, PendingSteerDispatch>();
 const BUSY_RETRY_ADVISORY_MS = 15_000;
 let shuttingDown = false;
 let bootDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
+/** v3 last-mile: forwards broker room events into this Claude session (§11.1). Null until bootstrapped / when inert. */
+let roomBridge: RoomBridgeHandle | null = null;
 let lastAttachStatusSentTs = 0;
 const ATTACH_STATUS_COOLDOWN_MS = 30_000; // Don't re-send status on rapid reattach
 
@@ -2284,6 +2287,8 @@ function shutdown(reason: string, exitCode = 0) {
   controlServer?.stop();
   controlServer = null;
   codex.stop();
+  roomBridge?.stop();
+  roomBridge = null;
   removePidFile();
   removeStatusFile();
   removeControlToken();
@@ -2368,3 +2373,20 @@ writeControlTokenPostBind();
 // the only thing that releases the control port. bootCodex clears it on success.
 armBootDeadline();
 void bootCodex();
+
+// v3 last-mile (§11.1): connect this session to the control-plane broker and
+// inject room events (task_completed / presence) into Claude. Fail-inert — a
+// not-logged-in / non-collab user (no auth-token, or this cwd not mapped to a
+// room) starts nothing, so the v1 single-machine flow is untouched. Injected as
+// a `system_room_event` notice (source:"codex"), which renders in Claude and is
+// structurally ineligible for the Claude→Codex reply path (no loop).
+void startRoomBridge({
+  cwd: process.cwd(),
+  emit: (text) => emitToClaude(systemMessage("system_room_event", text)),
+  log,
+})
+  .then((handle) => {
+    if (shuttingDown) handle.stop(); // a shutdown that raced our async start
+    else roomBridge = handle;
+  })
+  .catch((e) => log(`room bridge start failed: ${String(e)}`));
