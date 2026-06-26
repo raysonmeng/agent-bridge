@@ -203,6 +203,9 @@ Commands:
                      --broker-url from "abg broker start"'s card so the invitee can actually reach you
   room set-password <roomId> (--password <pw> | --password-stdin | --clear)
                      On the broker: set/clear a room's self-service-join password (members only)
+  room add <roomId> <identityId> | room remove <roomId> <identityId>
+                     On the broker: directly grant/revoke a member (members only). "remove"
+                     pairs with "auth revoke" to evict a live session
   join <roomId> [--password <pw> | --password-stdin]
                      Join a room and auto-join this directory next time (§2.4). For a remote
                      room (no local record) it maps the cwd; the broker enforces membership.

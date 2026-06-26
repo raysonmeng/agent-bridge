@@ -65,7 +65,7 @@
   <!-- 1 install -->
   <h2><span class="zh">1 · 安装</span><span class="en">1 · Install</span></h2>
   <p><span class="zh">运行时是 <b>Bun</b>。正式发布后：</span><span class="en">Runtime is <b>Bun</b>. After release:</span></p>
-  <pre>abg install:global   <span class="c"># <span class="zh">安装/更新全局命令 + 插件</span><span class="en">install/update global commands + plugin</span></span></pre>
+  <pre>bun run install:global   <span class="c"># <span class="zh">安装/更新全局命令 + 插件</span><span class="en">install/update global commands + plugin</span></span></pre>
   <p><span class="zh">测试期（从仓库）：</span><span class="en">During testing (from the repo):</span></p>
   <pre>bun install
 bun run build:cli
@@ -104,6 +104,7 @@ abg auth login --id bob@team.dev --name Bob
 abg join checkout    <span class="c"># <span class="zh">关联当前目录→房间</span><span class="en">map cwd → room</span></span>
 abg claude           <span class="c"># <span class="zh">或 abg codex</span><span class="en">or abg codex</span></span>
 abg init</pre>
+    <p class="sub"><span class="zh">⚠️ 注意：上面的 <code>abg auth login --id</code> 跨机当前<b>不通</b>——边机自签的 token 不在 broker 机的库里，会被拒（4401）。正在补 <code>abg auth issue</code>（broker 侧签发）+ <code>abg auth login --token</code>（边机安装）+ <code>abg room invite</code> 一条龙；在那之前跨机请按 <a href="../10-跨网部署与运维.md">docs/10</a> 的手动流程。</span><span class="en">⚠️ The <code>abg auth login --id</code> step above does NOT work cross-machine yet (an edge-signed token isn't in the broker's store → 4401); a real onboarding flow is being added.</span></p>
   </div>
 
   <div class="step">

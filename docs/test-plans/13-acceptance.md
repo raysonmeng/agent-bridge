@@ -55,4 +55,4 @@ docker compose -f docker/docker-compose.scenario.yml logs -f
 
 ## 真·三机（后续）
 
-家里机 + 公司 MacBook + Mac mini 的真实跨机测试：先在各机装 v3 build（建议合并后 `abg install:global`）、各机 `abg auth login` + 同房间、一台 `abg broker start --host 100.x`、起真实 Claude 会话。步骤见 [docs/10](../10-跨网部署与运维.md)。
+家里机 + 公司 MacBook + Mac mini 的真实跨机测试：先在各机装 v3 build（建议合并后 `bun run install:global`）、一台 `abg broker start --host 100.x`、**在 broker 机**为各参与者签发 token（⚠️ 边机自己 `abg auth login` 自签的 token broker 不认 4401；跨机签发/安装的 `abg auth issue` / `auth login --token` / `room invite` 一条龙正在实现）、参与者带外拿 token + join 同房间、起真实 Claude 会话。步骤见 [docs/10](../10-跨网部署与运维.md)。

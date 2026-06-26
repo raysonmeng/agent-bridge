@@ -28,7 +28,7 @@
 
 **Release install:**
 ```bash
-abg install:global        # install/update the global abg + agentbridge commands + plugin
+bun run install:global    # install/update the global abg + agentbridge commands + plugin
 ```
 
 **Testing (from the repo):**
@@ -112,8 +112,14 @@ Distribute each person's token **out of band** (IM / password manager; never com
 # (a) point at the remote broker (Tailscale 100.x or MagicDNS)
 export AGENTBRIDGE_BROKER_URL=ws://100.x.y.z:4700/ws
 
-# (b) place the admin-issued token (abg auth login writes it locally)
-abg auth login --id bob@team.dev --name Bob          # local login state
+# (b) ⚠️ Cross-machine auth is NOT yet functional — do NOT follow this step
+# Problem: abg auth login creates a brand-new self-signed token locally, but the
+# broker only accepts tokens already in its own collab.db store; a locally-created
+# token is unknown to the broker → connection rejected with 4401.
+# Current workaround: the admin issues the token on the broker machine (§3.2(b)),
+# delivers it out-of-band, and the participant writes it into <state>/auth-token
+# on their machine (path shown by `abg doctor`).
+# ⚠️ A proper `abg auth issue` / `abg auth login --token` command is in progress (feat/v3-xnet-onboarding).
 
 # (c) map the current working directory to the room (auto-joins this dir next time)
 abg join checkout
