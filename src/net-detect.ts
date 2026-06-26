@@ -143,17 +143,25 @@ export function buildConnectionCard(opts: {
   }
   lines.push(`  本机:      ${bindHost || "127.0.0.1"}  （仅本机）`);
 
-  // ── 协作者命令块 ──
+  // ── 邀请协作者（在本机 broker 上运行）──
+  // 注意：edge 自签的令牌进不了 broker 的 store，必须由 broker 侧签发。`abg room invite`
+  // 一条龙完成「签发令牌 + 授权入房 + 打印对方要跑的完整命令（含 broker 地址）」。
   lines.push("");
-  lines.push("── 把下面的命令发给协作者 ──────────────────────────");
+  lines.push("── 邀请协作者加入（在本机 broker 上运行）──────────────");
   if (primary) {
-    lines.push(`  export AGENTBRIDGE_BROKER_URL=ws://${primary}:${brokerPort}/ws`);
+    lines.push(`  broker 地址：ws://${primary}:${brokerPort}/ws`);
   } else {
     lines.push(`  # ⚠️ broker 只本机可达，跨机请先绑定可路由地址（见下方指引）`);
-    lines.push(`  export AGENTBRIDGE_BROKER_URL=ws://127.0.0.1:${brokerPort}/ws`);
+    lines.push(`  broker 地址：ws://127.0.0.1:${brokerPort}/ws`);
   }
-  lines.push("  abg auth login --token <带外分发的 PSK>");
-  lines.push("  abg join <roomId>");
+  lines.push("  邀请某人加入房间（签发令牌 + 授权 + 打印对方要跑的完整命令）：");
+  if (primary) {
+    // Embed the routable address so `room invite` hands the invitee a reachable URL
+    // (it otherwise falls back to a loopback default — useless cross-machine).
+    lines.push(`  abg room invite <roomId> <对方id> --broker-url ws://${primary}:${brokerPort}/ws`);
+  } else {
+    lines.push("  abg room invite <roomId> <对方id>");
+  }
 
   // ── Tailscale 未运行指引 ──
   if (!tailscale.running) {

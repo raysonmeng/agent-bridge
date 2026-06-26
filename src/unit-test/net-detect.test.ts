@@ -44,9 +44,12 @@ describe("buildConnectionCard", () => {
     expect(card.primary).toBe("100.90.1.42");
     // 命令块含 Tailscale IP
     expect(card.lines.some((l) => l.includes("ws://100.90.1.42:4700/ws"))).toBe(true);
-    // 协作者命令块
-    expect(card.lines.some((l) => l.includes("abg auth login --token"))).toBe(true);
-    expect(card.lines.some((l) => l.includes("abg join <roomId>"))).toBe(true);
+    // 协作者命令块：invite 命令把可路由地址内嵌进 --broker-url（一条龙可复制）
+    expect(
+      card.lines.some((l) => l.includes("abg room invite <roomId> <对方id> --broker-url ws://100.90.1.42:4700/ws")),
+    ).toBe(true);
+    expect(card.lines.some((l) => l.includes("abg room invite"))).toBe(true);
+    expect(card.lines.some((l) => l.includes("abg room invite <roomId>"))).toBe(true);
     // tailscale running → 不显示「没装 Tailscale」指引
     expect(card.lines.some((l) => l.includes("没装 Tailscale"))).toBe(false);
   });
@@ -68,7 +71,7 @@ describe("buildConnectionCard", () => {
 
     expect(card.primary).toBe("192.168.0.100");
     expect(card.lines.some((l) => l.includes("ws://192.168.0.100:4700/ws"))).toBe(true);
-    expect(card.lines.some((l) => l.includes("abg auth login --token"))).toBe(true);
+    expect(card.lines.some((l) => l.includes("abg room invite"))).toBe(true);
     // tailscale 未运行 → 含「没装 Tailscale」指引
     expect(card.lines.some((l) => l.includes("没装 Tailscale"))).toBe(true);
     expect(card.lines.some((l) => l.includes("tailscale.com/install.sh"))).toBe(true);
@@ -93,8 +96,8 @@ describe("buildConnectionCard", () => {
     // 含仅本机可达警告
     expect(card.lines.some((l) => l.includes("只本机可达"))).toBe(true);
     // 仍然包含协作者命令块（fallback 地址）
-    expect(card.lines.some((l) => l.includes("abg auth login --token"))).toBe(true);
-    expect(card.lines.some((l) => l.includes("abg join <roomId>"))).toBe(true);
+    expect(card.lines.some((l) => l.includes("abg room invite"))).toBe(true);
+    expect(card.lines.some((l) => l.includes("abg room invite <roomId>"))).toBe(true);
     // tailscale 未运行 → 含「没装 Tailscale」指引
     expect(card.lines.some((l) => l.includes("没装 Tailscale"))).toBe(true);
   });
@@ -116,7 +119,7 @@ describe("buildConnectionCard", () => {
 
     expect(card.primary).toBe("100.90.0.5");
     expect(card.lines.some((l) => l.includes("ws://100.90.0.5:4700/ws"))).toBe(true);
-    expect(card.lines.some((l) => l.includes("abg auth login --token"))).toBe(true);
+    expect(card.lines.some((l) => l.includes("abg room invite"))).toBe(true);
   });
 });
 

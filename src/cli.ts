@@ -184,11 +184,21 @@ Commands:
   doctor [--json]    Diagnose env, daemon, build drift, logs, and current thread
   doctor resume-pollution [--apply]  Find/fix old AgentBridge kickoff metadata
   budget [--json]    Show both agents' subscription quota snapshot (5h/weekly, drift, pause state)
+  auth issue --id <email|github> --name <displayName>
+                     On the broker: issue a PSK token for someone else and PRINT it (carry it
+                     out-of-band; does not touch <state>/auth-token)
+  auth login --token <PSK>
+                     On the edge: install a broker-issued token to <state>/auth-token (0600)
   auth login --id <email|github> --name <displayName>
-                     Issue a collaboration PSK token and write it to <state>/auth-token (0600)
+                     Self-sign a token locally (single-machine case) and write it (0600)
   room create <name> | room list
                      Create a collaboration room (id = slugified name) or list rooms
-  join <roomId>      Join a room and auto-join this directory next time (§2.4)
+  room invite <roomId> <identityId> [--name <displayName>] [--broker-url <ws://…>]
+                     On the broker: issue a token + grant membership + print the invitee's
+                     full join commands (one-shot cross-network onboarding). Pass the routable
+                     --broker-url from "abg broker start"'s card so the invitee can actually reach you
+  join <roomId>      Join a room and auto-join this directory next time (§2.4). For a remote
+                     room (no local record) it maps the cwd; the broker enforces membership
   broker start [--host <ip>] [--port <n>] [--db <path>] [--web-port <n>] [--no-web] [--no-open]
                      Run the always-on control-plane broker (§11.1) + a loopback-only
                      admin dashboard (view rooms/members/whiteboards + create a room)

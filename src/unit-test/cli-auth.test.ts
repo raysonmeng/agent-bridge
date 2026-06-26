@@ -2,7 +2,7 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { authLogin } from "../cli/auth";
+import { authIssue, authLogin, installToken } from "../cli/auth";
 import { StorePskIdentityProvider } from "../backbone/identity/store-psk-identity-provider";
 import { SqliteStore } from "../backbone/store/sqlite-store";
 
@@ -55,5 +55,67 @@ describe("authLogin", () => {
     chmodSync(collabDir, 0o755); // simulate a world-traversable dir
     await authLogin({ id: "c@x.com", name: "C", dbPath: join(collabDir, "collab.db") });
     expect(statSync(collabDir).mode & 0o777).toBe(0o700);
+  });
+});
+
+describe("authIssue (broker-side sign)", () => {
+  let dir: string | undefined;
+
+  afterEach(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  it("issues a broker-verifiable token but does NOT write a local auth-token", async () => {
+    dir = mkdtempSync(join(tmpdir(), "agentbridge-issue-"));
+    const dbPath = join(dir, "collab.db");
+
+    const result = await authIssue({ id: "edge@x.com", name: "Edge", dbPath });
+
+    expect(result.token).toBeTruthy();
+    expect(result.identity).toEqual({ id: "edge@x.com", displayName: "Edge" });
+    // The token is for SOMEONE ELSE — the broker operator must not adopt it locally.
+    expect(existsSync(join(dir, "auth-token"))).toBe(false);
+    // dir still locked down (raw token + PII at rest).
+    expect(statSync(dir).mode & 0o777).toBe(0o700);
+
+    // The issued token authenticates against the broker's provider.
+    const store = new SqliteStore(dbPath);
+    try {
+      const identity = await new StorePskIdentityProvider(store).authenticate(result.token);
+      expect(identity).toEqual({ id: "edge@x.com", displayName: "Edge" });
+    } finally {
+      await store.close();
+    }
+  });
+});
+
+describe("installToken (edge: abg auth login --token)", () => {
+  let dir: string | undefined;
+
+  afterEach(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  it("writes the broker-issued token 0600 without registering/issuing anything", async () => {
+    dir = mkdtempSync(join(tmpdir(), "agentbridge-install-"));
+    const dbPath = join(dir, "collab.db");
+
+    const { tokenFile } = await installToken({ token: "  opaque-broker-token  ", dbPath });
+
+    expect(readFileSync(tokenFile, "utf-8")).toBe("opaque-broker-token"); // trimmed
+    expect(statSync(tokenFile).mode & 0o777).toBe(0o600);
+    // No Store was opened/seeded — the binding lives on the broker, not here.
+    expect(existsSync(dbPath)).toBe(false);
+    // dir still locked to 0700.
+    expect(statSync(dir).mode & 0o777).toBe(0o700);
+  });
+
+  it("rejects an empty token (would silently disable auth)", async () => {
+    dir = mkdtempSync(join(tmpdir(), "agentbridge-install-"));
+    const dbPath = join(dir, "collab.db");
+    await expect(installToken({ token: "   ", dbPath })).rejects.toThrow(/令牌为空/);
+    expect(existsSync(join(dir, "auth-token"))).toBe(false);
   });
 });
