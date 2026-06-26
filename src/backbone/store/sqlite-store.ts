@@ -1,6 +1,7 @@
 import { Database } from "bun:sqlite";
 import type { Envelope } from "../envelope";
 import { MAX_PENDING_PER_TARGET } from "../store";
+import { hashToken, looksHashedToken } from "../token-hash";
 import type {
   AgentRecord,
   IdentityRecord,
@@ -83,6 +84,18 @@ export class SqliteStore implements Store {
       this.db.exec("ALTER TABLE rooms ADD COLUMN password_hash TEXT");
     } catch {
       /* column already present (fresh DB or already-migrated) — no-op */
+    }
+    // Migration (§11.3): re-hash any pre-existing RAW auth tokens. issueToken now stores SHA-256(token);
+    // a row whose token isn't already a 64-hex digest is a legacy raw token → hash it in place.
+    // Idempotent — once every row is hashed this loop makes no changes.
+    const legacyTokens = this.db.query("SELECT token, identity_id FROM auth_tokens").all() as {
+      token: string;
+      identity_id: string;
+    }[];
+    for (const r of legacyTokens) {
+      if (!looksHashedToken(r.token)) {
+        this.db.query("UPDATE auth_tokens SET token=? WHERE token=?").run(hashToken(r.token), r.token);
+      }
     }
   }
 
@@ -283,19 +296,19 @@ export class SqliteStore implements Store {
     return rows.map((r) => JSON.parse(r.envelope) as Envelope);
   }
 
-  // --- auth tokens ---
+  // --- auth tokens (stored hashed at rest, §11.3: the raw token lives only in the edge's 0600 file) ---
   async issueToken(token: string, identityId: string): Promise<void> {
     this.db
       .query(
         "INSERT INTO auth_tokens(token, identity_id) VALUES(?, ?) ON CONFLICT(token) DO UPDATE SET identity_id=excluded.identity_id",
       )
-      .run(token, identityId);
+      .run(hashToken(token), identityId);
   }
 
   async resolveToken(token: string): Promise<string | null> {
     const row = this.db
       .query("SELECT identity_id FROM auth_tokens WHERE token=?")
-      .get(token) as { identity_id: string } | null;
+      .get(hashToken(token)) as { identity_id: string } | null;
     return row ? row.identity_id : null;
   }
 
@@ -304,6 +317,10 @@ export class SqliteStore implements Store {
       .query("SELECT token, identity_id FROM auth_tokens")
       .all() as { token: string; identity_id: string }[];
     return rows.map((r) => ({ token: r.token, identityId: r.identity_id }));
+  }
+
+  async revokeTokens(identityId: string): Promise<number> {
+    return this.db.query("DELETE FROM auth_tokens WHERE identity_id=?").run(identityId).changes;
   }
 
   async close(): Promise<void> {

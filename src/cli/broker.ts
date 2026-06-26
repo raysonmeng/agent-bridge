@@ -97,7 +97,7 @@ export async function runBrokerStart(argv: string[]): Promise<void> {
 
   const dbPath = resolveDbPath(db);
   const dir = dirname(dbPath);
-  // Same 0700 lockdown as `abg auth login`: the collab DB holds raw PSK tokens + PII.
+  // Same 0700 lockdown as `abg auth login`: the collab DB holds PSK tokens (hashed at rest §11.3) + identity PII.
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   chmodSync(dir, 0o700);
 

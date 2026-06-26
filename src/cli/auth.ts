@@ -47,8 +47,8 @@ function resolveDbPath(dbPath?: string): string {
 }
 
 /**
- * Lock the collab dir to 0700. The collab DB holds RAW PSK tokens (auth_tokens) + identity
- * emails/PII (identities). bun:sqlite creates the DB file 0644, and its WAL/SHM sidecars are
+ * Lock the collab dir to 0700. The collab DB holds PSK tokens (auth_tokens — hashed at rest §11.3) +
+ * identity emails/PII (identities, still plaintext). bun:sqlite creates the DB file 0644, and its WAL/SHM sidecars are
  * recreated 0644 on every reopen, so file-level chmod is not durable — lock the CONTAINING
  * directory instead (matches codex-transport.ts), blocking any other local user from
  * traversing in to read the secrets (CWE-732). chmodSync covers a pre-existing looser dir.
@@ -179,10 +179,42 @@ export async function runAuthIssueCli(argv: string[]): Promise<void> {
   console.log(`已在本机（broker）store 为 ${result.identity.id}（${result.identity.displayName}）签发令牌。`);
   console.log("把下面这行通过安全渠道带外发给对方，让它在自己机器上运行：");
   console.log(`  abg auth login --token ${result.token}`);
-  console.log("（注：对同一 --id 重复 issue 会另签新 token、旧 token 不会自动失效——令牌吊销 CLI 仍在 backlog。）");
+  console.log("（注：对同一 --id 重复 issue 会另签新 token、旧 token 不会自动失效；要作废旧 token 用 abg auth revoke --id <id>。）");
 }
 
-/** Dispatch `abg auth <subcommand>`: `login` (install/self-sign) or `issue` (broker-side sign). */
+const REVOKE_USAGE = "用法：abg auth revoke --id <email|github>（在 broker 机上吊销该身份的所有 token）";
+
+/**
+ * Revoke ALL tokens bound to an identity (`abg auth revoke`, §11.3) — run on the broker machine where
+ * the collab DB lives. The identity must `auth login`/be re-invited to get a fresh token; old tokens
+ * are rejected at the broker's next authenticate. Directly unit-testable via an explicit `dbPath`.
+ */
+export async function authRevoke(opts: { id: string; dbPath?: string }): Promise<{ revoked: number }> {
+  const dbPath = resolveDbPath(opts.dbPath);
+  lockCollabDir(dbPath);
+  const store = new SqliteStore(dbPath);
+  try {
+    return { revoked: await new IdentityService(store).revokeTokens(opts.id) };
+  } finally {
+    await store.close();
+  }
+}
+
+/** Run `abg auth revoke --id <id>`: delete the identity's tokens so old ones can't reconnect. */
+export async function runAuthRevokeCli(argv: string[]): Promise<void> {
+  const { id } = parseAuthArgs(argv);
+  if (!id) {
+    console.error("缺少必填参数 --id。");
+    console.error(REVOKE_USAGE);
+    process.exit(1);
+    return;
+  }
+  const { revoked } = await authRevoke({ id });
+  console.log(`已吊销 ${id} 的 ${revoked} 个令牌。该身份用旧 token 重连即被 broker 拒（4401）。`);
+  console.log(`注意：已在线的连接会保持到自然断开——要立刻踢出，请同时 abg room remove <roomId> ${id}（投递时强制成员制）。`);
+}
+
+/** Dispatch `abg auth <subcommand>`: `login` (install/self-sign) / `issue` (broker-side sign) / `revoke`. */
 export async function runAuth(args: string[]): Promise<void> {
   const sub = args[0];
   switch (sub) {
@@ -192,10 +224,14 @@ export async function runAuth(args: string[]): Promise<void> {
     case "issue":
       await runAuthIssueCli(args.slice(1));
       break;
+    case "revoke":
+      await runAuthRevokeCli(args.slice(1));
+      break;
     default:
       console.error(`未知的 auth 子命令：${sub ?? "(空)"}`);
       console.error(LOGIN_USAGE);
       console.error(ISSUE_USAGE);
+      console.error(REVOKE_USAGE);
       process.exit(1);
   }
 }

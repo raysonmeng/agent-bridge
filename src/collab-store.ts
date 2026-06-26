@@ -3,7 +3,7 @@
  * lookups every collab entrypoint needs. Extracted so `abg publish`, the daemon
  * room bridge, and future consumers resolve the collab DB, auth token, and broker
  * URL identically (and lock the dir down identically), instead of each re-deriving
- * them. The collab DB holds raw PSK tokens + PII, so its dir is forced to 0700.
+ * them. The collab DB holds PSK tokens (hashed at rest §11.3) + identity PII, so its dir is forced to 0700.
  */
 
 import { chmodSync, mkdirSync, readFileSync } from "node:fs";
@@ -39,7 +39,7 @@ export function readAuthToken(dbPath: string): string | null {
   }
 }
 
-/** Open the collab Store, locking the containing dir to 0700 (raw PSK tokens + PII live there). */
+/** Open the collab Store, locking the containing dir to 0700 (hashed PSK tokens §11.3 + identity PII live there). */
 export function openStore(dbPath: string): SqliteStore {
   const dir = dirname(dbPath);
   mkdirSync(dir, { recursive: true, mode: 0o700 });

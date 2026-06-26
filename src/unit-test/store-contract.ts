@@ -2,6 +2,7 @@ import { describe, test, expect, beforeEach, afterEach } from "bun:test";
 import { MAX_PENDING_PER_TARGET } from "../backbone/store";
 import type { Store } from "../backbone/store";
 import { makeEnvelope } from "./backbone-fixtures";
+import { hashToken } from "../backbone/token-hash";
 
 /**
  * Shared Store contract (NOT a *.test.ts — imported by per-impl driver tests).
@@ -139,7 +140,7 @@ export function runStoreContract(label: string, makeStore: () => Store) {
       expect(keys.has(`k${total - 1}`)).toBe(true);
     });
 
-    test("auth tokens issue / resolve / list, re-issue re-points", async () => {
+    test("auth tokens issue / resolve / list (hashed at rest §11.3), re-issue re-points, revoke deletes", async () => {
       expect(await store.resolveToken("tok-1")).toBeNull();
       await store.issueToken("tok-1", "alice@x.com");
       await store.issueToken("tok-2", "bob@x.com");
@@ -148,8 +149,16 @@ export function runStoreContract(label: string, makeStore: () => Store) {
       // re-issuing the same token re-points it to a new identity
       await store.issueToken("tok-1", "carol@x.com");
       expect(await store.resolveToken("tok-1")).toBe("carol@x.com");
+      // §11.3: tokens are stored HASHED at rest — listTokens exposes digests, never the raw tokens
       const all = (await store.listTokens()).map((t) => `${t.token}:${t.identityId}`).sort();
-      expect(all).toEqual(["tok-1:carol@x.com", "tok-2:bob@x.com"]);
+      expect(all).toEqual([`${hashToken("tok-1")}:carol@x.com`, `${hashToken("tok-2")}:bob@x.com`].sort());
+      // revokeTokens removes ALL of an identity's tokens, returns the count, and is idempotent
+      await store.issueToken("tok-3", "carol@x.com");
+      expect(await store.revokeTokens("carol@x.com")).toBe(2); // tok-1 + tok-3
+      expect(await store.resolveToken("tok-1")).toBeNull();
+      expect(await store.resolveToken("tok-3")).toBeNull();
+      expect(await store.resolveToken("tok-2")).toBe("bob@x.com"); // bob untouched
+      expect(await store.revokeTokens("carol@x.com")).toBe(0);
     });
   });
 }

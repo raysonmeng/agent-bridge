@@ -1,5 +1,6 @@
 import type { Envelope } from "../envelope";
 import { MAX_PENDING_PER_TARGET } from "../store";
+import { hashToken } from "../token-hash";
 import type {
   AgentRecord,
   IdentityRecord,
@@ -166,15 +167,26 @@ export class InMemoryStore implements Store {
   }
 
   async issueToken(token: string, identityId: string): Promise<void> {
-    this.tokens.set(token, identityId); // re-issue re-points
+    this.tokens.set(hashToken(token), identityId); // store the hash at rest (§11.3); re-issue re-points
   }
 
   async resolveToken(token: string): Promise<string | null> {
-    return this.tokens.get(token) ?? null;
+    return this.tokens.get(hashToken(token)) ?? null;
   }
 
   async listTokens(): Promise<Array<{ token: string; identityId: string }>> {
     return [...this.tokens.entries()].map(([token, identityId]) => ({ token, identityId }));
+  }
+
+  async revokeTokens(identityId: string): Promise<number> {
+    let n = 0;
+    for (const [t, id] of this.tokens) {
+      if (id === identityId) {
+        this.tokens.delete(t);
+        n++;
+      }
+    }
+    return n;
   }
 
   async close(): Promise<void> {
