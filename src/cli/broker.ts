@@ -36,10 +36,10 @@ function isTailscaleCgnat(host: string): boolean {
 
 /**
  * Normalise the bind host and decide whether to warn (§7.3). Empty → loopback (a
- * malformed/unset `--host` must NOT silently bind all interfaces). Warn on any
- * non-loopback, non-Tailscale address — a WHITELIST, so `0.0.0.0` / `""` / `::` /
- * a LAN IP / a public 100.x all surface the exposure warning (the prior
- * `=== "0.0.0.0"` blacklist missed empty string and `::`).
+ * malformed/unset `--host` must NOT silently bind all interfaces) and is therefore
+ * SILENT (no warning). Warn on any other non-loopback, non-Tailscale address — a
+ * WHITELIST, so `0.0.0.0` / `::` / a LAN IP / a public 100.x all surface the
+ * exposure warning (the prior `=== "0.0.0.0"` blacklist missed `::` and a bare LAN IP).
  */
 export function resolveBindHost(raw: string): { host: string; warning: string | null } {
   const host = raw === "" ? "127.0.0.1" : raw;

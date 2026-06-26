@@ -1,0 +1,71 @@
+# §13 端到端验收 — 多机/多人/多(异构)agent 完整场景模拟。
+#
+# 拓扑：provision(一次性) → broker(常开服务器机) → 6 个 agent 机(各一容器):
+#   alice(claude)  发完成事件 + DM + 触发离线补投
+#   bob(codex)     收完成事件(契约) + DM 往返
+#   bob2(codex)    显示名也叫 "Bob"、id 不同 → 验证身份消歧(DM 按 id 路由)
+#   carol(gemini)  晚加入 → 验证新成员白板注入
+#   dave(claude)   断开→重连 → 验证离线补投
+#   intruder       伪造 token → 验证 PSK 拒绝
+#
+# 跑：bash docker/run-acceptance.sh   （它跑这个 compose 并收集结果/报告）
+
+x-agent: &agent
+  build: { context: .., dockerfile: docker/Dockerfile }
+  volumes: [collab:/data]
+  command: ["bun", "docker/scenario-agent.ts"]
+  depends_on: [broker]
+  environment: &agent-env
+    BROKER_URL: ws://broker:4700/ws
+    ROOM: team-room
+
+services:
+  provision:
+    build: { context: .., dockerfile: docker/Dockerfile }
+    volumes: [collab:/data]
+    command: ["bun", "docker/provision-scenario.ts"]
+    environment:
+      COLLAB_DB: /data/collab.db
+      TOKEN_DIR: /data
+      ROOM: team-room
+
+  broker:
+    build: { context: .., dockerfile: docker/Dockerfile }
+    volumes: [collab:/data]
+    depends_on:
+      provision: { condition: service_completed_successfully }
+    command: ["bun", "docker/broker-entry.ts"]
+    environment:
+      BROKER_HOST: 0.0.0.0 # 0.0.0.0 仅在隔离的容器网络内；真机请绑 Tailscale 100.x
+      BROKER_PORT: "4700"
+      COLLAB_DB: /data/collab.db
+    ports: ["4700:4700"]
+
+  alice:
+    <<: *agent
+    environment: { <<: *agent-env, AGENT_NAME: alice, AGENT_TYPE: claude, IDENTITY: alice@team.dev, ROLE: alice, TOKEN_FILE: /data/token-alice }
+
+  bob:
+    <<: *agent
+    environment: { <<: *agent-env, AGENT_NAME: bob, AGENT_TYPE: codex, IDENTITY: bob@team.dev, ROLE: bob, TOKEN_FILE: /data/token-bob }
+
+  bob2:
+    <<: *agent
+    environment: { <<: *agent-env, AGENT_NAME: bob2, AGENT_TYPE: codex, IDENTITY: bob2@team.dev, ROLE: bob2, TOKEN_FILE: /data/token-bob2 }
+
+  carol:
+    <<: *agent
+    # 晚 8s 加入，验证新成员从白板拿到房间已有状态
+    command: ["sh", "-c", "sleep 8 && bun docker/scenario-agent.ts"]
+    environment: { <<: *agent-env, AGENT_NAME: carol, AGENT_TYPE: gemini, IDENTITY: carol@team.dev, ROLE: carol, TOKEN_FILE: /data/token-carol }
+
+  dave:
+    <<: *agent
+    environment: { <<: *agent-env, AGENT_NAME: dave, AGENT_TYPE: claude, IDENTITY: dave@team.dev, ROLE: dave, TOKEN_FILE: /data/token-dave }
+
+  intruder:
+    <<: *agent
+    environment: { <<: *agent-env, AGENT_NAME: intruder, AGENT_TYPE: claude, ROLE: intruder, TOKEN_FILE: /data/token-alice }
+
+volumes:
+  collab:
