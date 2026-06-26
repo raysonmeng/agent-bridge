@@ -127,6 +127,14 @@ async function main(command: string | undefined, restArgs: string[]) {
       const { runBroker } = await import("./cli/broker");
       await runBroker(restArgs);
       break;
+    case "room":
+      const { runRoom } = await import("./cli/room");
+      await runRoom(restArgs);
+      break;
+    case "join":
+      const { runJoin } = await import("./cli/room");
+      await runJoin(restArgs);
+      break;
     case "--help":
     case "-h":
     case undefined:
@@ -173,6 +181,9 @@ Commands:
   budget [--json]    Show both agents' subscription quota snapshot (5h/weekly, drift, pause state)
   auth login --id <email|github> --name <displayName>
                      Issue a collaboration PSK token and write it to <state>/auth-token (0600)
+  room create <name> | room list
+                     Create a collaboration room (id = slugified name) or list rooms
+  join <roomId>      Join a room and auto-join this directory next time (§2.4)
   logs [--codex] [-f] [-n N]
                      Tail this pair's daemon log (or the codex wrapper log with
                      --codex). -n N: last N lines (default 100). -f: follow/stream.
