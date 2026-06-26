@@ -126,9 +126,26 @@ export async function runBrokerStart(argv: string[]): Promise<void> {
     if (stopping) return;
     stopping = true;
     console.error(`[broker] ${sig} 收到，正在优雅关闭…`);
-    webHandle?.stop();
-    broker.stop();
-    store.close().finally(() => process.exit(0));
+    // Ordered teardown: web first (stop accepting requests), then broker (drain in-flight WS),
+    // then store (WAL checkpoint). Failures must not prevent process.exit(0).
+    // ponytail: 10s force-exit is a safety valve against Bun.serve.stop() hanging;
+    // upgrade to configurable --shutdown-timeout if operational needs arise.
+    void (async () => {
+      const forceExit = setTimeout(() => {
+        console.error("[broker] 关闭超时（10s），强制退出");
+        process.exit(1);
+      }, 10_000);
+      try {
+        webHandle?.stop();
+        await broker.stop();
+        await store.close();
+      } catch (e) {
+        console.error(`[broker] 关闭出错：${e instanceof Error ? e.message : String(e)}`);
+      } finally {
+        clearTimeout(forceExit);
+        process.exit(0);
+      }
+    })();
   };
   process.once("SIGTERM", () => shutdown("SIGTERM"));
   process.once("SIGINT", () => shutdown("SIGINT"));

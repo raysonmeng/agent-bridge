@@ -13,6 +13,11 @@ const CLOSE_AUTH_FAILED = 4401;
 // distinct topic/identity pairs over a long-lived process. FIFO-ish eviction of
 // the oldest key once full (same pattern as the room-bridge SEEN_CAP).
 const MEMBER_CACHE_CAP = 2000;
+// Per-connection bounded outbox for backpressure: when Bun's ws.send() drops a frame
+// (returns 0, over the backpressure limit) we re-queue it and resend on the drain event
+// instead of losing it silently. Drop oldest when full — bounded loss beats unbounded growth.
+// ponytail: 256 frames covers any realistic burst; upgrade to per-type priority if needed.
+const OUTBOX_CAP = 256;
 // Bound attacker-controlled presence fields at the SOURCE: a member's hello blob is
 // broadcast to the whole room in member_joined, so cap each string field's length and
 // the capabilities count — one member must not be able to fan out a multi-MB field or
@@ -55,6 +60,12 @@ interface BrokerSocketData {
   presence?: PresenceMeta;
   /** topic → unsubscribe handle for this connection's subscriptions. */
   subs: Map<string, () => void>;
+  /**
+   * Bounded outbox for backpressure: a frame is RETAINED for retry when ws.send()
+   * returns 0 (DROPPED), and flushed on drain(ws). (r===-1 means Bun buffered the
+   * frame itself and will deliver it, so it is removed — see flushOutbox.)
+   */
+  outbox: string[];
 }
 
 type ClientMessage =
@@ -137,7 +148,7 @@ export class Broker {
           return Response.json(self.healthBody());
         }
         if (pathname === "/ws") {
-          if (server.upgrade(req, { data: { connId: ++self.nextConnId, subs: new Map() } })) {
+          if (server.upgrade(req, { data: { connId: ++self.nextConnId, subs: new Map(), outbox: [] } })) {
             self.liveConnections++;
             return undefined;
           }
@@ -168,6 +179,9 @@ export class Broker {
           if (self.liveConnections > 0) self.liveConnections--;
           self.log(`conn #${ws.data.connId} closed`);
         },
+        drain(ws) {
+          self.flushOutbox(ws);
+        },
       },
     });
     this.server = server;
@@ -185,16 +199,61 @@ export class Broker {
     };
   }
 
-  stop(): void {
-    this.server?.stop(true);
+  // Best-effort + never-reject: callers (cli/broker.ts shutdown, test cleanup) may not
+  // await the returned promise, so a rejecting server.stop() must NOT become an unhandled
+  // rejection. Swallow + log; shutdown proceeds to store.close() regardless, and the cli
+  // forceExit fuse covers a hung stop.
+  async stop(): Promise<void> {
+    try {
+      await this.server?.stop(true);
+    } catch (e) {
+      this.log(`server stop failed: ${String(e)}`);
+    }
     this.server = null;
   }
 
+  // Bun ServerWebSocket.send() return contract (empirically verified, Bun 1.3.11):
+  //   r  > 0  → sent (bytes written)
+  //   r === -1 → backpressured, but Bun BUFFERED the frame and WILL deliver it on drain
+  //   r === 0  → DROPPED (over backpressureLimit / socket not open) — frame NOT delivered
+  // So the ONLY frame that needs our own retry is the r===0 drop; a -1 frame is already
+  // owned by Bun and re-sending it would DOUBLE-deliver. The outbox is the FIFO source of
+  // truth: enqueue then flush, so ordering holds even when a send is queued behind a drop.
   private send(ws: ServerWebSocket<BrokerSocketData>, msg: unknown): void {
-    try {
-      ws.send(JSON.stringify(msg));
-    } catch (e) {
-      this.log(`send failed (#${ws.data.connId}): ${String(e)}`);
+    this.enqueue(ws, JSON.stringify(msg));
+    this.flushOutbox(ws);
+  }
+
+  /** Enqueue a serialised frame; drop oldest when outbox is full (bounded loss > unbounded growth). */
+  private enqueue(ws: ServerWebSocket<BrokerSocketData>, frame: string): void {
+    if (ws.data.outbox.length >= OUTBOX_CAP) {
+      ws.data.outbox.shift(); // drop oldest
+      this.log(`outbox full (#${ws.data.connId}): dropped oldest frame (cap=${OUTBOX_CAP})`);
+    }
+    ws.data.outbox.push(frame);
+  }
+
+  /**
+   * Drain the FIFO outbox into the socket. Called on every send and on Bun's drain
+   * event. Per the send() return contract above:
+   *   r === 0  → DROPPED: keep the frame at the head and stop; retry on the next drain.
+   *   r  <  0  → buffered by Bun (delivered): remove the frame, then stop (we're backpressured).
+   *   r  >  0  → sent: remove the frame and keep flushing.
+   */
+  private flushOutbox(ws: ServerWebSocket<BrokerSocketData>): void {
+    while (ws.data.outbox.length > 0) {
+      const frame = ws.data.outbox[0]!;
+      let r: number;
+      try {
+        r = ws.send(frame);
+      } catch (e) {
+        ws.data.outbox.shift(); // socket closed/errored — can't deliver; discard head and stop
+        this.log(`flush send failed (#${ws.data.connId}): ${String(e)}`);
+        return;
+      }
+      if (r === 0) return; // dropped (over backpressure limit) — keep frame, wait for drain
+      ws.data.outbox.shift(); // r>0 sent, or r<0 buffered-by-Bun (will deliver) — remove either way
+      if (r < 0) return; // backpressured: Bun took this frame, stop sending more until drain
     }
   }
 
