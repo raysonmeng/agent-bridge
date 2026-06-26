@@ -7,18 +7,13 @@
  */
 
 import { chmodSync, mkdirSync } from "node:fs";
-import { dirname, join } from "node:path";
+import { dirname } from "node:path";
 import { Broker, DEFAULT_BROKER_PORT } from "../broker";
 import { SqliteStore } from "../backbone/store/sqlite-store";
 import { StorePskIdentityProvider } from "../backbone/identity/store-psk-identity-provider";
-import { StateDirResolver } from "../state-dir";
-
-function resolveDbPath(explicit?: string): string {
-  if (explicit) return explicit;
-  const env = process.env.AGENTBRIDGE_COLLAB_DB;
-  if (env && env.length > 0) return env;
-  return join(new StateDirResolver().dir, "collab.db");
-}
+import { startBrokerWeb, DEFAULT_DASHBOARD_PORT } from "../broker-web";
+import { readAuthToken, resolveDbPath } from "../collab-store";
+import { detectTailscale, localIPv4s, buildConnectionCard } from "../net-detect";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "::1", "localhost"]);
 
@@ -51,10 +46,28 @@ export function resolveBindHost(raw: string): { host: string; warning: string | 
   };
 }
 
+/** Best-effort: open `url` in the default browser. Never throws (a headless host just won't open). */
+function openBrowser(url: string, log: (m: string) => void): void {
+  const cmd =
+    process.platform === "darwin"
+      ? ["open", url]
+      : process.platform === "win32"
+        ? ["cmd", "/c", "start", "", url]
+        : ["xdg-open", url];
+  try {
+    Bun.spawn(cmd, { stdout: "ignore", stderr: "ignore", stdin: "ignore" });
+  } catch (e) {
+    log(`无法自动打开浏览器：${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 export async function runBrokerStart(argv: string[]): Promise<void> {
   let host = "127.0.0.1";
   let port = DEFAULT_BROKER_PORT;
   let db: string | undefined;
+  let webPort = DEFAULT_DASHBOARD_PORT;
+  let web = true;
+  let autoOpen = true;
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i]!;
     if (a === "--host") host = argv[++i] ?? host;
@@ -63,10 +76,19 @@ export async function runBrokerStart(argv: string[]): Promise<void> {
     else if (a.startsWith("--port=")) port = parseInt(a.slice("--port=".length), 10);
     else if (a === "--db") db = argv[++i];
     else if (a.startsWith("--db=")) db = a.slice("--db=".length);
+    else if (a === "--web-port") webPort = parseInt(argv[++i] ?? "", 10);
+    else if (a.startsWith("--web-port=")) webPort = parseInt(a.slice("--web-port=".length), 10);
+    else if (a === "--no-web") web = false;
+    else if (a === "--no-open") autoOpen = false;
   }
 
   if (!Number.isInteger(port) || port < 0 || port > 65535) {
     console.error(`无效的 --port：${port}`);
+    process.exit(1);
+    return;
+  }
+  if (web && (!Number.isInteger(webPort) || webPort < 0 || webPort > 65535)) {
+    console.error(`无效的 --web-port：${webPort}`);
     process.exit(1);
     return;
   }
@@ -92,20 +114,62 @@ export async function runBrokerStart(argv: string[]): Promise<void> {
   console.log(`协作数据库：${dbPath}`);
   console.log("用 abg auth login 签发的 token 连接；Ctrl-C 停止。");
 
-  // Graceful shutdown (§8.2): on SIGTERM/SIGINT, stop the server then close the
-  // Store — db.close() checkpoints the WAL so pending_deliveries survive the
-  // restart and a reconnecting member can still drain them. `once` so a second
-  // signal during teardown doesn't re-enter; exit 0 even if close() rejects.
+  // Graceful shutdown (§8.2): register IMMEDIATELY after bind — BEFORE the slow
+  // connectivity probe / web startup below — so a SIGTERM/Ctrl-C arriving right after
+  // the "已启动" line is handled (exit 0) rather than left to the default signal (kill).
+  // The handler reads `webHandle` lazily; if a signal beats web startup it's a no-op.
+  // db.close() checkpoints the WAL so pending_deliveries survive the restart. `once`
+  // so a second signal during teardown doesn't re-enter; exit 0 even if close() rejects.
+  let webHandle: { url: string; stop(): void } | undefined;
   let stopping = false;
   const shutdown = (sig: string) => {
     if (stopping) return;
     stopping = true;
     console.error(`[broker] ${sig} 收到，正在优雅关闭…`);
+    webHandle?.stop();
     broker.stop();
     store.close().finally(() => process.exit(0));
   };
   process.once("SIGTERM", () => shutdown("SIGTERM"));
   process.once("SIGINT", () => shutdown("SIGINT"));
+
+  // Connectivity card (§ cross-network onboarding): detect Tailscale/LAN reach and
+  // print the exact connect command to hand a collaborator. Detection only — never
+  // auto-install or auto-invite (user decision: detect + guide).
+  try {
+    const card = buildConnectionCard({
+      bindHost: bind.host,
+      brokerPort: bound.port,
+      tailscale: await detectTailscale(),
+      lanIps: localIPv4s(),
+    });
+    console.log("");
+    console.log("📡 网络可达性 / 邀请协作者：");
+    for (const line of card.lines) console.log(line);
+  } catch {
+    // detection is best-effort; never block broker startup
+  }
+
+  // Local admin dashboard (§ web console): a LOOPBACK-ONLY Bun.serve on its own
+  // port to view rooms/members/whiteboards + create a room from a browser. Never
+  // bound to the broker's public interface (that would be an unauthenticated admin
+  // console). For remote viewing: SSH-forward this port or `tailscale serve` it.
+  if (web) {
+    // Fail-inert: the dashboard is a convenience. If its port is taken or it fails
+    // to bind, log and keep the broker running — never let it take down the broker.
+    try {
+      const token = readAuthToken(dbPath);
+      const createdBy = token ? await store.resolveToken(token) : null;
+      webHandle = startBrokerWeb({ store, port: webPort, createdBy, log: (m) => console.error(`[web] ${m}`) });
+      console.log(`管理面板（仅本机）：${webHandle.url}`);
+      if (!createdBy) console.log("（未登录：面板可查看，建房需先 abg auth login）");
+      const isSsh = !!(process.env.SSH_CONNECTION || process.env.SSH_TTY);
+      if (autoOpen && !isSsh) openBrowser(webHandle.url, (m) => console.error(`[web] ${m}`));
+      else if (isSsh) console.log("检测到 SSH 会话，未自动打开浏览器；远程访问请 SSH 端口转发或 tailscale serve 该端口。");
+    } catch (e) {
+      console.error(`[web] 管理面板启动失败（不影响 broker）：${e instanceof Error ? e.message : String(e)}`);
+    }
+  }
   // Bun.serve keeps the event loop alive — the process stays up until a signal.
 }
 
@@ -117,7 +181,9 @@ export async function runBroker(args: string[]): Promise<void> {
       break;
     default:
       console.error(`未知的 broker 子命令：${sub ?? "(空)"}`);
-      console.error("用法：abg broker start [--host <ip>] [--port <n>] [--db <path>]");
+      console.error(
+        "用法：abg broker start [--host <ip>] [--port <n>] [--db <path>] [--web-port <n>] [--no-web] [--no-open]",
+      );
       process.exit(1);
   }
 }

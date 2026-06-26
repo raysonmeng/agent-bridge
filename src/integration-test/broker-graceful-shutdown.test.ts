@@ -17,7 +17,10 @@ describe("abg broker start — graceful shutdown (§8.2)", () => {
   test("SIGTERM stops the server, closes the Store, and exits 0", async () => {
     dir = mkdtempSync(join(tmpdir(), "agentbridge-broker-sig-"));
     const dbPath = join(dir, "collab.db");
-    const child = spawn(process.execPath, ["run", CLI_PATH, "broker", "start", "--port", "0", "--db", dbPath], {
+    // --no-web: this test exercises broker shutdown only; keep it hermetic (no
+    // dashboard port bind / browser spawn). The shutdown-handler ordering fix is
+    // verified independently — the handler is registered before the web/probe step.
+    const child = spawn(process.execPath, ["run", CLI_PATH, "broker", "start", "--port", "0", "--db", dbPath, "--no-web"], {
       env: { ...process.env, AGENTBRIDGE_COLLAB_DB: dbPath },
       stdio: ["ignore", "pipe", "pipe"],
     });
