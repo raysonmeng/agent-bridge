@@ -1,0 +1,25 @@
+// AgentBridge v3 — Tailscale ACL 模板（网络层准入，§7 / docs/10）
+//
+// 用法：把本文件内容粘进 Tailscale 管理台的 Access Controls（HuJSON：带注释 + 尾逗号的 JSON）。
+//
+// 🔴 第一步先删掉默认的 allow-all —— 新 tailnet 默认全通；grants 是 deny-by-default，
+//    但只要旧的 allow-all acls/grants 还在，限制就形同虚设。
+// 🔴 端口必须等于 broker 实际监听端口（默认 4700 = src/broker.ts 的 DEFAULT_BROKER_PORT）。
+//    曾经这里写成 4500 会让 4700 仍被默认 deny 挡死、ACL 整个失效。
+//
+// 这是第一层鉴权（网络层：哪些设备能碰到 broker 端口）。第二层是 broker 的 PSK
+// （abg auth login 签发的 token）。两层叠加，缺一不可。详见 docs/10。
+{
+  "tagOwners": {
+    "tag:broker": [], // 仅 owner/admin 可授；broker 机打这个 tag
+    "tag:agent": [],  // 参与者机（跑 Claude/Codex 的机器）打这个 tag
+  },
+  "grants": [
+    // 仅 tag:agent 设备可访问 tag:broker 设备的 broker 端口。
+    { "src": ["tag:agent"], "dst": ["tag:broker"], "ip": ["tcp:4700"] },
+  ],
+}
+// 装机入网（系统级 tailscaled）：
+//   broker 机：     tailscale up --advertise-tags=tag:broker
+//   参与者机：       tailscale up --advertise-tags=tag:agent
+//   无人值守机器：   用 ephemeral + tagged auth key（泄漏即在控制台 Revoke）
