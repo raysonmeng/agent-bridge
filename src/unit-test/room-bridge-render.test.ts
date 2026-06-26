@@ -107,6 +107,78 @@ describe("renderRoomEvent — broker Envelope → one-line Claude notice", () =>
     expect(count(jout, CORE)).toBe(1);
   });
 
+  test("zero-width / bidi format chars (\\p{Cf}) are stripped from attacker fields", () => {
+    // ZWSP, ZWNJ, ZWJ, BOM/ZWNBSP, RLO, RLM — all category Cf. Without stripping
+    // these, an attacker could smuggle invisible code points INTO the marker core
+    // (breaking the neutraliser) or flip text direction (bidi spoofing).
+    const FORMAT = ["\u200B", "\u200C", "\u200D", "\uFEFF", "\u202E", "\u200F"]; // ZWSP ZWNJ ZWJ BOM RLO RLM
+    const summary = `a${FORMAT.join("")}b`;
+    const out = renderRoomEvent(
+      buildTaskCompletedEnvelope({ roomId: "r1", from: { agentId: "x@y", agentType: "codex" }, summary }),
+    )!;
+    for (const cf of FORMAT) expect(out.includes(cf)).toBe(false); // each \p{Cf} code point neutralised → space
+    expect(out).toContain("a b"); // the run collapsed to a single space (not deleted into "ab")
+  });
+
+  test("over-long fields are truncated and over-many unblocks are collapsed (DoS caps)", () => {
+    const longSummary = "x".repeat(5000);
+    const manyUnblocks = Array.from({ length: 50 }, (_, i) => `u${i}`);
+    const out = renderRoomEvent(
+      buildTaskCompletedEnvelope({
+        roomId: "r1",
+        from: { agentId: "x@y", agentType: "codex" },
+        summary: longSummary,
+        unblocks: manyUnblocks,
+      }),
+    )!;
+    expect(out).toContain("…"); // summary truncated with an ellipsis
+    expect(out.includes("x".repeat(5000))).toBe(false); // the full 5000-char field never appears verbatim
+    expect(out.length).toBeLessThan(1500); // bounded in THIS input; the real cap is proven by the worst-case test below
+    expect(out).toContain("等50个"); // unblocks collapsed to a count
+    expect(out).toContain("u0"); // first entries shown…
+    expect(out).toContain("u9");
+    expect(out).not.toContain("u10"); // …but the 11th onward are collapsed, not listed
+  });
+
+  test("DoS caps hold in the ALL-FIELDS-MAXED worst case incl. emoji (real code-point bound)", () => {
+    const big = "🎉".repeat(5000); // emoji = 1 code point / 2 UTF-16 units — the true worst case
+    const out = renderRoomEvent(
+      buildTaskCompletedEnvelope({
+        roomId: "r1",
+        from: { agentId: "x@y", agentType: "codex" },
+        summary: big,
+        repo: big,
+        branch: big,
+        commit: big,
+        unblocks: Array.from({ length: 100 }, () => "🎉".repeat(5000)),
+      }),
+    )!;
+    // Caps are in CODE POINTS (FIELD_CAP 500 ×4 fields + UNBLOCKS_CAP 10 ×500 ≈ 7.5K),
+    // never the 600K of raw input. Count code points (Array.from) — a plain .length
+    // (UTF-16) would double-count emoji and misstate the bound. This is the real cap.
+    expect(Array.from(out).length).toBeLessThan(9000);
+    expect(out.includes("🎉".repeat(600))).toBe(false); // no field exceeds its 500-cp cap
+  });
+
+  test("a non-array unblocks payload is handled (no throw) and simply omitted", () => {
+    // payload is attacker-controlled and only TYPED as string[]; a raw publish can
+    // set it to anything. renderRoomEvent must not throw on a non-array.
+    const env: Envelope = {
+      roomId: "r1",
+      messageId: "m",
+      traceId: "t",
+      idempotencyKey: "k",
+      from: { agentId: "x@y", agentType: "claude" },
+      kind: "task_completed",
+      payload: { summary: "done", unblocks: "not-an-array" as unknown as string[] },
+      timestamp: 1,
+      deliveryMode: "online_only",
+    };
+    const out = renderRoomEvent(env)!;
+    expect(out).toContain("done");
+    expect(out).not.toContain("解锁"); // a malformed unblocks is dropped, not rendered
+  });
+
   test("attribution is ALWAYS the broker-stamped from.agentId — never a spoofable name/displayName", () => {
     const base = {
       roomId: "r1",

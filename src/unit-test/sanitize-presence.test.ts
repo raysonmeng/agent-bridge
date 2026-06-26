@@ -37,4 +37,22 @@ describe("sanitizePresence — hello presence trust boundary", () => {
     expect(out).toEqual({ host: "h" }); // only the known string field survives
     expect(({} as Record<string, unknown>).polluted).toBeUndefined(); // no prototype pollution
   });
+
+  test("over-long fields are length-capped and over-many capabilities are count-capped (fan-out DoS)", () => {
+    // A member's presence blob is broadcast to the whole room; an unbounded field or
+    // list would let one member amplify a multi-MB payload across all subscribers.
+    const out = sanitizePresence({
+      host: "h".repeat(5000),
+      agentType: "a".repeat(5000),
+      budgetHint: "b".repeat(5000),
+      capabilities: Array.from({ length: 100 }, (_, i) => `cap-${i}`),
+    })!;
+    // Count CODE POINTS (Array.from), matching the impl's code-point slice — a
+    // plain .length (UTF-16 units) would over-count emoji and diverge from the cap.
+    expect(Array.from(out.host!).length).toBeLessThanOrEqual(200); // PRESENCE_FIELD_CAP
+    expect(Array.from(out.agentType!).length).toBeLessThanOrEqual(200);
+    expect(Array.from(out.budgetHint!).length).toBeLessThanOrEqual(200);
+    expect(out.capabilities!.length).toBe(20); // PRESENCE_CAPS_CAP (array count)
+    expect(out.capabilities!.every((c) => Array.from(c).length <= 200)).toBe(true);
+  });
 });

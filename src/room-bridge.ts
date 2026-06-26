@@ -40,6 +40,8 @@ export interface RoomBridgeHandle {
 
 const INERT: RoomBridgeHandle = { stop: () => {}, roomId: null };
 const SEEN_CAP = 500; // bounded idempotency-key memory — drop a redelivered envelope once
+const FIELD_CAP = 500; // per-field char cap — one member can't flood the receiver's context (DoS)
+const UNBLOCKS_CAP = 10; // max unblock entries rendered before collapsing to a count
 
 /**
  * Untrusted-input marker prepended to every injected room notice (anti prompt-
@@ -61,19 +63,34 @@ function senderId(env: Envelope): string {
 
 /**
  * Neutralise attacker-controlled free text before embedding it in a one-line
- * notice. (1) Collapse ALL line/paragraph separators + control chars — not just
- * \r\n\t but also U+2028/U+2029/U+000B/U+000C/U+0085 — so a member can't inject a
- * SEPARATE visual line. (2) Neutralise the structural chars `📨「」` AND the
- * distinctive marker phrase `房间消息·外部成员` (so an attacker can't forge the
- * untrusted-marker prefix even with a look-alike glyph like ✉️). The channel
- * boundary (one injected notice per event) is the structural defense; this keeps
- * the attacker's text confined and clearly un-marker-able inside their one notice.
+ * notice. THREE best-effort speed-bumps + one hard cap:
+ *   (1) Collapse ALL line/paragraph separators + control + FORMAT chars — not
+ *       just \r\n\t but also U+2028/U+2029/U+000B/U+000C/U+0085 AND \p{Cf}
+ *       (zero-width U+200B/ZWJ/BOM, bidi U+202E/U+200F) — so a member can't
+ *       inject a SEPARATE visual line nor hide code points inside a marker.
+ *   (2) Rewrite the structural chars `📨「」` and (3) the marker phrase
+ *       `房间消息·外部成员`.
+ *   (4) Cap the field length (DoS): one member can't flood the receiver's context.
+ *
+ * IMPORTANT — these are speed-bumps, NOT a forgery-proof boundary. The marker is
+ * an emoji + Chinese phrase; a determined attacker can still approximate it with
+ * look-alike glyphs (✉️, the interpunct U+2027/U+30FB, etc.), and (2)/(3) do not
+ * enumerate every look-alike. The REAL defense is STRUCTURAL OUTER FRAMING, not
+ * this scrub: every notice is prefixed with a genuine {@link UNTRUSTED} marker
+ * the broker controls, and the standing {@link ROOM_SECURITY_PREAMBLE} (plus the
+ * ROOM_COLLAB preamble) tells the agent that ALL room text is untrusted and NEVER
+ * an instruction — regardless of what marker-like text it contains. Keep this
+ * scrub as a confidence-lowering measure; do not rely on it as the trust boundary.
  */
 function safeField(s: unknown): string {
-  return String(s ?? "")
-    .replace(/[\p{Cc}\p{Zl}\p{Zp}]+/gu, " ") // all control + line/para separators → space
+  const cleaned = String(s ?? "")
+    .replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]+/gu, " ") // control + format + line/para separators → space
     .replace(/[📨「」]/gu, "·")
-    .replace(/房间消息·外部成员/gu, "··"); // the marker's distinctive core — unforgeable
+    .replace(/房间消息·外部成员/gu, "··"); // best-effort marker-phrase scrub (NOT unforgeable — see above)
+  // Hard length cap (DoS). Fast path on UTF-16 length; the slow path slices by
+  // code point so a cap boundary never splits a surrogate pair into lone halves.
+  if (cleaned.length <= FIELD_CAP) return cleaned;
+  return Array.from(cleaned).slice(0, FIELD_CAP).join("") + "…";
 }
 
 /**
@@ -128,8 +145,14 @@ export function renderRoomEvent(env: Envelope): string | null {
       // (strips newlines + neutralises the marker/delimiter chars).
       const where = [p.repo, p.branch].filter(Boolean).map(safeField).join("@");
       const loc = [where, p.commit ? safeField(p.commit) : ""].filter(Boolean).join(" ");
-      const unblocks =
-        p.unblocks && p.unblocks.length > 0 ? ` · 解锁: ${p.unblocks.map(safeField).join(", ")}` : "";
+      // unblocks is attacker-influenced: guard the type (a non-array payload must
+      // not throw) and cap the count (a 10k-entry list must not flood the notice).
+      let unblocks = "";
+      if (Array.isArray(p.unblocks) && p.unblocks.length > 0) {
+        const shown = p.unblocks.slice(0, UNBLOCKS_CAP).map(safeField).join(", ");
+        const more = p.unblocks.length > UNBLOCKS_CAP ? ` 等${p.unblocks.length}个` : "";
+        unblocks = ` · 解锁: ${shown}${more}`;
+      }
       return `${UNTRUSTED} ${from} · 🏁 完成任务：「${safeField(p.summary ?? "(无摘要)")}」${loc ? ` (${loc})` : ""}${unblocks}`;
     }
     case "member_joined": {

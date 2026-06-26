@@ -1,6 +1,7 @@
 import { describe, test, expect, afterEach } from "bun:test";
 import { Broker } from "../broker";
 import { InMemoryStore } from "../backbone/store/memory-store";
+import { InProcTransport } from "../backbone/transport/inproc-transport";
 import { IdentityService } from "../backbone/identity-service";
 import { StorePskIdentityProvider } from "../backbone/identity/store-psk-identity-provider";
 
@@ -185,6 +186,90 @@ describe("Broker room authorization (§11.2) — closed by default", () => {
     expect(aliceWs.drainNow().some((m) => m.envelope?.messageId === "ev2")).toBe(false);
     aliceWs.close();
     bobWs.close();
+  });
+
+  test("a removed member's QUEUED offline events are NOT drained on reconnect (revocation symmetry)", async () => {
+    const { broker, store, alice, bob, url } = await start();
+    stop = () => broker.stop();
+    const off = { ...envelope(ROOM), deliveryMode: "store_if_offline" as const };
+    // Seed an offline room event for a member who will be removed (alice) AND one
+    // who stays (bob) — so the assertion distinguishes "skipped because removed"
+    // from "the queue was empty anyway".
+    await store.enqueuePending("alice@x.com", { ...off, messageId: "off-a", idempotencyKey: "off-a" });
+    await store.enqueuePending("bob@x.com", { ...off, messageId: "off-b", idempotencyKey: "off-b" });
+    // alice is removed AFTER her event was queued (the enqueue→reconnect race).
+    await store.removeMember(ROOM, "alice@x.com");
+
+    // bob (still a member) reconnects → his queued event drains normally (control).
+    const b = await WsClient.connect(url);
+    b.send({ type: "hello", token: bob });
+    await b.next(); // welcome
+    await sleep(40);
+    expect(b.drainNow().some((m) => m.type === "event" && m.envelope?.messageId === "off-b")).toBe(true);
+
+    // alice (removed) reconnects → her queued event must NOT be delivered.
+    const a = await WsClient.connect(url);
+    a.send({ type: "hello", token: alice });
+    expect(await a.next()).toMatchObject({ type: "welcome" });
+    await sleep(40);
+    expect(a.drainNow().some((m) => m.type === "event")).toBe(false); // nothing leaked to a non-member
+    // The queue WAS consumed (drainPending is destructive regardless of membership)
+    // — this only proves the broker processed the item, NOT that it dropped it. The
+    // real proof of "dropped, not delivered" is the WS-side drainNow assertion above.
+    expect(await store.drainPending("alice@x.com")).toEqual([]);
+    a.close();
+    b.close();
+  });
+
+  test("a Store error DURING delivery skips the event but does NOT evict a legit member", async () => {
+    const store = new InMemoryStore();
+    const svc = new IdentityService(store);
+    await svc.registerIdentity("alice@x.com", "Alice");
+    const aliceTok = await svc.issueToken("alice@x.com");
+    await store.addMember(ROOM, "alice@x.com");
+    // Make the membership store throw on demand (a transient read failure).
+    const realGetMembers = store.getMembers.bind(store);
+    let failMembers = false;
+    (store as { getMembers: (roomId: string) => Promise<string[]> }).getMembers = async (roomId: string) => {
+      if (failMembers) throw new Error("membership store unavailable");
+      return realGetMembers(roomId);
+    };
+    // Own the transport so the test can publish straight onto alice's delivery
+    // callback — isolating the delivery-time re-check from the publish authz path
+    // (which would otherwise be denied while the store is "down").
+    const transport = new InProcTransport({});
+    // memberCacheTtlMs:0 ⇒ every delivery re-reads membership (no cache hides the throw).
+    const broker = new Broker({ store, identityProvider: new StorePskIdentityProvider(store), transport, host: "127.0.0.1", port: 0, memberCacheTtlMs: 0, log: () => {} });
+    const { port } = broker.start();
+    stop = () => broker.stop();
+    const url = `ws://127.0.0.1:${port}/ws`;
+    const fromBob = (messageId: string, idempotencyKey: string) => ({
+      ...envelope(ROOM),
+      messageId,
+      idempotencyKey,
+      deliveryMode: "online_only" as const,
+      from: { agentId: "bob@x.com", agentType: "codex" },
+    });
+
+    const a = await WsClient.connect(url);
+    a.send({ type: "hello", token: aliceTok });
+    await a.next(); // welcome
+    a.send({ type: "subscribe", topic: ROOM }); // admission reads membership (store healthy here)
+    await a.next(); // subscribed
+    await sleep(40);
+
+    // Membership store goes DOWN, then an event is published: alice's re-check throws.
+    failMembers = true;
+    await transport.publish(ROOM, fromBob("ev1", "i1") as never);
+    await sleep(100);
+    expect(a.drainNow().some((m) => m.envelope?.messageId === "ev1")).toBe(false); // skipped — couldn't verify membership
+
+    // Store recovers: alice must STILL be subscribed (not evicted) → gets the next event.
+    failMembers = false;
+    await transport.publish(ROOM, fromBob("ev2", "i2") as never);
+    await sleep(100);
+    expect(a.drainNow().some((m) => m.envelope?.messageId === "ev2")).toBe(true); // subscription survived the transient error
+    a.close();
   });
 
   test("a member subscribes + publishes normally", async () => {
