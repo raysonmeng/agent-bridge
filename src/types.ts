@@ -1,6 +1,11 @@
 // ===== Bridge Core Types =====
 
-export type MessageSource = "claude" | "codex";
+// "room" tags cross-machine room-event notices injected by the daemon's room
+// bridge. It is a CHANNEL-attribution source only (renders as user="Room",
+// distinct from the trusted local "codex" partner) — it never participates in
+// the Claude→Codex reply/forward paths, so the source-never-forwarded invariant
+// is unchanged.
+export type MessageSource = "claude" | "codex" | "room";
 
 export interface BridgeMessage {
   id: string;
