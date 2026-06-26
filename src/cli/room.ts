@@ -61,8 +61,8 @@ export async function currentIdentityId(store: Store, dbPath: string): Promise<s
 /** Open the collab Store with the same 0700 lockdown as `abg auth login`. */
 function openStore(dbPath: string): SqliteStore {
   const dir = dirname(dbPath);
-  // The collab DB holds raw PSK tokens + PII; lock the containing dir to 0700
-  // (matches auth.ts/broker.ts — bun:sqlite files are 0644 so dir is the gate).
+  // The collab DB holds PSK tokens (hashed at rest §11.3) + identity PII; lock the containing dir to
+  // 0700 (matches auth.ts/broker.ts — bun:sqlite files are 0644 so dir is the gate).
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   chmodSync(dir, 0o700);
   return new SqliteStore(dbPath);
@@ -424,7 +424,7 @@ export async function runRoom(args: string[]): Promise<void> {
       console.log("提示：AGENTBRIDGE_BROKER_URL 要在 daemon 启动那一刻就已设好、且持久——建议写进 ~/.zshrc / ~/.bashrc。");
       console.log("daemon 在启动时读一次该变量；若 daemon 已在跑、或新开终端没设它，会回退本机 ws://127.0.0.1:4700/ws、");
       console.log("静默收不到房间事件。设好变量后，先 agentbridge kill 再 agentbridge claude，让 daemon 带上这个地址。");
-      console.log("（注：重复 invite 会另签一个新 token、旧 token 不会自动失效——令牌吊销 CLI 仍在 backlog。）");
+      console.log("（注：重复 invite 会另签一个新 token、旧 token 不会自动失效；要作废旧 token 用 abg auth revoke --id <id>。）");
       if (isLoopbackBrokerUrl(url)) {
         console.log("");
         console.log(`⚠️ 上面的 broker 地址 ${url} 仅本机可达，对方跨机连不上。请改用 broker 机的可路由地址重发：`);

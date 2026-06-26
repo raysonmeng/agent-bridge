@@ -2,9 +2,10 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { authIssue, authLogin, installToken } from "../cli/auth";
+import { authIssue, authLogin, authRevoke, installToken } from "../cli/auth";
 import { StorePskIdentityProvider } from "../backbone/identity/store-psk-identity-provider";
 import { SqliteStore } from "../backbone/store/sqlite-store";
+import { IdentityService } from "../backbone/identity-service";
 
 describe("authLogin", () => {
   let dir: string | undefined;
@@ -117,5 +118,35 @@ describe("installToken (edge: abg auth login --token)", () => {
     const dbPath = join(dir, "collab.db");
     await expect(installToken({ token: "   ", dbPath })).rejects.toThrow(/令牌为空/);
     expect(existsSync(join(dir, "auth-token"))).toBe(false);
+  });
+});
+
+describe("authRevoke", () => {
+  let dir: string | undefined;
+  afterEach(() => {
+    if (dir) rmSync(dir, { recursive: true, force: true });
+    dir = undefined;
+  });
+
+  it("revokes ALL of an identity's tokens so they no longer resolve, reports the count, is idempotent", async () => {
+    dir = mkdtempSync(join(tmpdir(), "agentbridge-revoke-"));
+    const dbPath = join(dir, "collab.db");
+    const store = new SqliteStore(dbPath);
+    const svc = new IdentityService(store);
+    await svc.registerIdentity("alice@x.com", "Alice");
+    const t1 = await svc.issueToken("alice@x.com");
+    const t2 = await svc.issueToken("alice@x.com");
+    await store.close();
+
+    expect((await authRevoke({ id: "alice@x.com", dbPath })).revoked).toBe(2);
+
+    const check = new SqliteStore(dbPath);
+    try {
+      expect(await check.resolveToken(t1)).toBeNull(); // revoked → no longer authenticates
+      expect(await check.resolveToken(t2)).toBeNull();
+    } finally {
+      await check.close();
+    }
+    expect((await authRevoke({ id: "alice@x.com", dbPath })).revoked).toBe(0); // nothing left → idempotent
   });
 });

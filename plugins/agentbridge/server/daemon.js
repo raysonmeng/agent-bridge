@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.24", "0.0.0-source"),
-  commit: defineString("2869fdd", "source"),
+  commit: defineString("9680ce9", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("66df1aadf54e", "source")
+  codeHash: defineString("57a2f6a3851c", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -7124,6 +7124,15 @@ import { Database } from "bun:sqlite";
 // src/backbone/store.ts
 var MAX_PENDING_PER_TARGET = 1000;
 
+// src/backbone/token-hash.ts
+import { createHash as createHash3 } from "crypto";
+function hashToken(raw) {
+  return createHash3("sha256").update(raw).digest("hex");
+}
+function looksHashedToken(s) {
+  return /^[0-9a-f]{64}$/.test(s);
+}
+
 // src/backbone/store/sqlite-store.ts
 class SqliteStore {
   db;
@@ -7191,6 +7200,12 @@ class SqliteStore {
     try {
       this.db.exec("ALTER TABLE rooms ADD COLUMN password_hash TEXT");
     } catch {}
+    const legacyTokens = this.db.query("SELECT token, identity_id FROM auth_tokens").all();
+    for (const r of legacyTokens) {
+      if (!looksHashedToken(r.token)) {
+        this.db.query("UPDATE auth_tokens SET token=? WHERE token=?").run(hashToken(r.token), r.token);
+      }
+    }
   }
   async upsertIdentity(id, displayName) {
     this.db.query("INSERT INTO identities(id, display_name) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name").run(id, displayName);
@@ -7284,15 +7299,18 @@ class SqliteStore {
     return rows.map((r) => JSON.parse(r.envelope));
   }
   async issueToken(token, identityId) {
-    this.db.query("INSERT INTO auth_tokens(token, identity_id) VALUES(?, ?) ON CONFLICT(token) DO UPDATE SET identity_id=excluded.identity_id").run(token, identityId);
+    this.db.query("INSERT INTO auth_tokens(token, identity_id) VALUES(?, ?) ON CONFLICT(token) DO UPDATE SET identity_id=excluded.identity_id").run(hashToken(token), identityId);
   }
   async resolveToken(token) {
-    const row = this.db.query("SELECT identity_id FROM auth_tokens WHERE token=?").get(token);
+    const row = this.db.query("SELECT identity_id FROM auth_tokens WHERE token=?").get(hashToken(token));
     return row ? row.identity_id : null;
   }
   async listTokens() {
     const rows = this.db.query("SELECT token, identity_id FROM auth_tokens").all();
     return rows.map((r) => ({ token: r.token, identityId: r.identity_id }));
+  }
+  async revokeTokens(identityId) {
+    return this.db.query("DELETE FROM auth_tokens WHERE identity_id=?").run(identityId).changes;
   }
   async close() {
     if (this.closed)

@@ -128,6 +128,10 @@ export class PostgresStore implements Store {
     throw new Error(NOT_IMPLEMENTED);
   }
 
+  async revokeTokens(_identityId: string): Promise<number> {
+    throw new Error(NOT_IMPLEMENTED);
+  }
+
   async close(): Promise<void> {
     throw new Error(NOT_IMPLEMENTED);
   }

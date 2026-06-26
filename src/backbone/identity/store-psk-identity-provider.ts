@@ -9,12 +9,12 @@ import type { Identity, IdentityProvider } from "../identity";
  * (seeded at construction), this reads the live Store, so a freshly-issued token
  * authenticates without restarting the broker.
  *
- * Note (security, MVP): tokens are stored raw in the local Store. The collab DB
- * file itself is 0644 (bun:sqlite default), so its CONTAINING directory is locked
- * to 0700 by the writer (`abg auth login`, src/cli/auth.ts) to block other local
- * users — the durable equivalent of control-token.ts's 0600 file. The token is an
- * unguessable randomUUID and the link is WireGuard-encrypted over Tailscale (§7).
- * Hashing tokens at rest is a §11.3 hardening item.
+ * Note (security): tokens are stored HASHED at rest (SHA-256, §11.3 — see token-hash.ts); the raw
+ * token lives only in the edge's auth-token file (0600). The collab DB file itself is 0644 (bun:sqlite
+ * default), so its CONTAINING directory is still locked to 0700 by the writer (`abg auth login`,
+ * src/cli/auth.ts) — the identities table holds emails/PII even though the token rows are now digests —
+ * the durable equivalent of control-token.ts's 0600 file. The token is an unguessable randomUUID and
+ * the link is WireGuard-encrypted over Tailscale (§7).
  */
 export class StorePskIdentityProvider implements IdentityProvider {
   constructor(private readonly store: Store) {}

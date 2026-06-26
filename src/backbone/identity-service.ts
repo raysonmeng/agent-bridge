@@ -60,4 +60,14 @@ export class IdentityService {
     await this.store.issueToken(token, identityId);
     return token;
   }
+
+  /**
+   * Revoke ALL PSK tokens bound to an identity (§11.3). Returns how many bindings were deleted. The
+   * identity must `abg auth login`/`issue` again to get a fresh token; old tokens are rejected at the
+   * broker's next authenticate. Does NOT close already-open connections (auth is checked at hello) —
+   * pair with `abg room remove` to evict a live session (membership is re-checked on delivery).
+   */
+  async revokeTokens(identityId: string): Promise<number> {
+    return this.store.revokeTokens(identityId);
+  }
 }

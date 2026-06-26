@@ -191,6 +191,9 @@ Commands:
                      On the edge: install a broker-issued token to <state>/auth-token (0600)
   auth login --id <email|github> --name <displayName>
                      Self-sign a token locally (single-machine case) and write it (0600)
+  auth revoke --id <email|github>
+                     On the broker: revoke all of an identity's tokens (old tokens can't reconnect).
+                     Pair with "room remove" to evict a live session
   room create <name> [--password <pw> | --password-stdin] | room list
                      Create a collaboration room (id = slugified name) or list rooms. With a
                      password, members can self-join via "abg join <id> --password <pw>"

@@ -108,8 +108,14 @@ export interface Store {
   issueToken(token: string, identityId: string): Promise<void>;
   /** Resolve a presented token to its identity id, or null if unknown. */
   resolveToken(token: string): Promise<string | null>;
-  /** All issued (token, identityId) bindings — e.g. to seed an in-memory PSK provider. */
+  /**
+   * All issued (token, identityId) bindings. NOTE: the token is the HASHED at-rest value (§11.3), NOT
+   * the raw token — so this is for inspection/migration, NOT for seeding a PskIdentityProvider (which
+   * compares raw tokens; seeding it from these hashes would fail every authentication).
+   */
   listTokens(): Promise<Array<{ token: string; identityId: string }>>;
+  /** Revoke ALL tokens bound to an identity (§11.3). Returns how many bindings were deleted. */
+  revokeTokens(identityId: string): Promise<number>;
 
   /** Release resources (close the DB handle). Idempotent. */
   close(): Promise<void>;
