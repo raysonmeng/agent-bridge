@@ -9,20 +9,9 @@
  * `abg broker start`; the logged-in identity is resolved from `<state>/auth-token`.
  */
 
-import { chmodSync, mkdirSync, readFileSync } from "node:fs";
-import { dirname, join } from "node:path";
 import { RoomService, slugify } from "../room-service";
-import { SqliteStore } from "../backbone/store/sqlite-store";
 import type { RoomRecord, Store } from "../backbone/store";
-import { StateDirResolver } from "../state-dir";
-
-/** Resolve the collab DB path: explicit > env override > `<state>/collab.db`. */
-function resolveDbPath(explicit?: string): string {
-  if (explicit) return explicit;
-  const env = process.env.AGENTBRIDGE_COLLAB_DB;
-  if (env && env.length > 0) return env;
-  return join(new StateDirResolver().dir, "collab.db");
-}
+import { resolveDbPath, openStore, readAuthToken } from "../collab-store";
 
 /**
  * Resolve the currently logged-in collab identity id from `<collabDir>/auth-token`
@@ -30,27 +19,11 @@ function resolveDbPath(explicit?: string): string {
  * unresolvable token means the user has not logged in yet.
  */
 export async function currentIdentityId(store: Store, dbPath: string): Promise<string> {
-  const tokenFile = join(dirname(dbPath), "auth-token");
-  let token: string;
-  try {
-    token = readFileSync(tokenFile, "utf-8").trim();
-  } catch {
-    throw new Error("未找到登录令牌，请先运行 abg auth login");
-  }
-  if (token === "") throw new Error("登录令牌为空，请先运行 abg auth login");
+  const token = readAuthToken(dbPath);
+  if (token === null) throw new Error("未找到登录令牌，请先运行 abg auth login");
   const identityId = await store.resolveToken(token);
   if (!identityId) throw new Error("登录令牌无效，请先运行 abg auth login");
   return identityId;
-}
-
-/** Open the collab Store with the same 0700 lockdown as `abg auth login`. */
-function openStore(dbPath: string): SqliteStore {
-  const dir = dirname(dbPath);
-  // The collab DB holds raw PSK tokens + PII; lock the containing dir to 0700
-  // (matches auth.ts/broker.ts — bun:sqlite files are 0644 so dir is the gate).
-  mkdirSync(dir, { recursive: true, mode: 0o700 });
-  chmodSync(dir, 0o700);
-  return new SqliteStore(dbPath);
 }
 
 /**
