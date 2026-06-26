@@ -52,6 +52,13 @@ export class RoomService {
   async listRooms(): Promise<RoomRecord[]> {
     return this.store.listRooms();
   }
+  /** Set (hashed) or clear (null) a room's self-service-join password (§11.2). */
+  async setRoomPassword(roomId: string, passwordHash: string | null): Promise<void> {
+    await this.store.setRoomPassword(roomId, passwordHash);
+  }
+  async getRoomPasswordHash(roomId: string): Promise<string | null> {
+    return this.store.getRoomPasswordHash(roomId);
+  }
 
   // --- membership (persistent, bound to logical agent id) ---
   async join(roomId: string, agentId: string): Promise<void> {

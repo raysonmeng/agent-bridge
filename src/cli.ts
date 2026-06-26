@@ -191,14 +191,21 @@ Commands:
                      On the edge: install a broker-issued token to <state>/auth-token (0600)
   auth login --id <email|github> --name <displayName>
                      Self-sign a token locally (single-machine case) and write it (0600)
-  room create <name> | room list
-                     Create a collaboration room (id = slugified name) or list rooms
+  room create <name> [--password <pw> | --password-stdin] | room list
+                     Create a collaboration room (id = slugified name) or list rooms. With a
+                     password, members can self-join via "abg join <id> --password <pw>"
   room invite <roomId> <identityId> [--name <displayName>] [--broker-url <ws://…>]
                      On the broker: issue a token + grant membership + print the invitee's
                      full join commands (one-shot cross-network onboarding). Pass the routable
                      --broker-url from "abg broker start"'s card so the invitee can actually reach you
-  join <roomId>      Join a room and auto-join this directory next time (§2.4). For a remote
-                     room (no local record) it maps the cwd; the broker enforces membership
+  room set-password <roomId> (--password <pw> | --password-stdin | --clear)
+                     On the broker: set/clear a room's self-service-join password (members only)
+  join <roomId> [--password <pw> | --password-stdin]
+                     Join a room and auto-join this directory next time (§2.4). For a remote
+                     room (no local record) it maps the cwd; the broker enforces membership.
+                     With a password, self-join a password-protected room (broker grants membership).
+                     Prefer --password-stdin (e.g. "echo pw | abg join r --password-stdin"): a
+                     password on argv leaks via ps / shell history
   broker start [--host <ip>] [--port <n>] [--db <path>] [--web-port <n>] [--no-web] [--no-open]
                      Run the always-on control-plane broker (§11.1) + a loopback-only
                      admin dashboard (view rooms/members/whiteboards + create a room)

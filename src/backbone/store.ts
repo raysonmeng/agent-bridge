@@ -69,6 +69,10 @@ export interface Store {
   createRoom(roomId: string, name: string, createdBy: string): Promise<void>;
   getRoom(roomId: string): Promise<RoomRecord | null>;
   listRooms(): Promise<RoomRecord[]>;
+  /** Set (or clear, with null) a room's hashed self-service-join password (§11.2). */
+  setRoomPassword(roomId: string, passwordHash: string | null): Promise<void>;
+  /** The room's hashed self-service-join password, or null when invite-only (no self-join). */
+  getRoomPasswordHash(roomId: string): Promise<string | null>;
 
   // --- room members (§2.3): bound to logical agent id, persistent (survives restart) ---
   addMember(roomId: string, agentId: string): Promise<void>;

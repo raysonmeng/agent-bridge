@@ -44,7 +44,8 @@ export class SqliteStore implements Store {
       CREATE TABLE IF NOT EXISTS rooms (
         room_id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
-        created_by TEXT NOT NULL
+        created_by TEXT NOT NULL,
+        password_hash TEXT
       );
       CREATE TABLE IF NOT EXISTS room_members (
         room_id TEXT,
@@ -76,6 +77,13 @@ export class SqliteStore implements Store {
         identity_id TEXT NOT NULL
       );
     `);
+    // Migration: rooms.password_hash (§11.2 self-service join, added post-v3). The CREATE above
+    // carries it for fresh DBs; this idempotent ALTER backfills DBs created before the column existed.
+    try {
+      this.db.exec("ALTER TABLE rooms ADD COLUMN password_hash TEXT");
+    } catch {
+      /* column already present (fresh DB or already-migrated) — no-op */
+    }
   }
 
   // --- identities ---
@@ -158,6 +166,17 @@ export class SqliteStore implements Store {
       .query("SELECT room_id, name, created_by FROM rooms")
       .all() as { room_id: string; name: string; created_by: string }[];
     return rows.map((r) => ({ roomId: r.room_id, name: r.name, createdBy: r.created_by }));
+  }
+
+  async setRoomPassword(roomId: string, passwordHash: string | null): Promise<void> {
+    this.db.query("UPDATE rooms SET password_hash=? WHERE room_id=?").run(passwordHash, roomId);
+  }
+
+  async getRoomPasswordHash(roomId: string): Promise<string | null> {
+    const row = this.db
+      .query("SELECT password_hash FROM rooms WHERE room_id=?")
+      .get(roomId) as { password_hash: string | null } | null;
+    return row?.password_hash ?? null;
   }
 
   // --- room members ---

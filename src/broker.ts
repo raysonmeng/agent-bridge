@@ -6,6 +6,7 @@ import type { Envelope } from "./backbone/envelope";
 import { InProcTransport } from "./backbone/transport/inproc-transport";
 import { buildPresenceEnvelope, type PresenceMeta } from "./presence";
 import { mergeWhiteboard } from "./whiteboard";
+import { hashPassword, verifyPassword } from "./backbone/password";
 
 export const DEFAULT_BROKER_PORT = 4700; // outside the multi-pair 4500/4501/4502+stride range
 const CLOSE_AUTH_FAILED = 4401;
@@ -20,6 +21,19 @@ const MEMBER_CACHE_CAP = 2000;
 // the broker's fan-out bandwidth, so the cap is needed here too.)
 const PRESENCE_FIELD_CAP = 200;
 const PRESENCE_CAPS_CAP = 20;
+// Brute-force throttle for room-password self-join (§11.2): a room password is a guessable shared
+// secret. After MAX_JOIN_FAILS wrong attempts the IDENTITY (not the socket) is locked out of join for
+// JOIN_LOCKOUT_MS — keyed to the PSK-authenticated id, so reconnecting can't reset it. This bounds the
+// online attempt RATE; combined with the memory-hard scrypt verify it makes online guessing slow.
+// Offline guessing is impossible — the hash never leaves the broker.
+const MAX_JOIN_FAILS = 5;
+const JOIN_LOCKOUT_MS = 60_000;
+// Bound the per-identity throttle map (backstop — identities are already bounded by registration).
+const JOIN_THROTTLE_CAP = 10_000;
+// A constant dummy hash to verify against when a room has NO password set: the join handler then runs
+// the same memory-hard scrypt work whether the room is missing / invite-only or the password is simply
+// wrong, so response LATENCY can't be used to enumerate which slugs are password-protected rooms.
+const DUMMY_PW_HASH = hashPassword("agentbridge::no-such-password::sentinel");
 
 /** Validate the optional reserved presence blob from hello — best-effort, drop anything malformed. Exported for boundary tests. */
 export function sanitizePresence(raw: unknown): PresenceMeta | undefined {
@@ -61,6 +75,7 @@ type ClientMessage =
   | { type: "hello"; token: string; presence?: unknown }
   | { type: "subscribe"; topic: string }
   | { type: "unsubscribe"; topic: string }
+  | { type: "join"; topic: string; password: string }
   | { type: "publish"; topic: string; envelope: Envelope };
 
 export interface BrokerOptions {
@@ -73,6 +88,8 @@ export interface BrokerOptions {
   transport?: MessageTransport;
   /** TTL for the hot-path membership cache (§11.2 revocation latency). Default 3000ms; tests set it small. */
   memberCacheTtlMs?: number;
+  /** Lockout window after MAX_JOIN_FAILS wrong room-password attempts (§11.2). Default 60000ms; tests set it small. */
+  joinLockoutMs?: number;
   log?: (msg: string) => void;
 }
 
@@ -106,6 +123,8 @@ export class Broker {
   private readonly topicMembers = new Map<string, Map<string, number>>();
   /** Short-TTL membership cache (§11.2 revocation): bounds re-validation cost on the hot delivery path. */
   private readonly memberCache = new Map<string, { ok: boolean; exp: number }>();
+  /** Per-identity room-password brute-force throttle (§11.2): id → { consecutive fails, lockout-until epoch ms }. */
+  private readonly joinThrottle = new Map<string, { fails: number; until: number }>();
   private readonly transport: MessageTransport;
   private readonly log: (msg: string) => void;
 
@@ -338,6 +357,61 @@ export class Broker {
         }
         return;
       }
+      case "join": {
+        // Self-service join (§11.2): a room with a password lets an already-AUTHENTICATED identity
+        // add ITSELF to the room, sparing a member from running `abg room add` per person. The PSK
+        // hello already proved identity; the room password is a SECOND gate. PERSISTENT membership is
+        // granted (not just this socket), so a later subscribe / reconnect is authorized. Wrong
+        // attempts lock the IDENTITY out (not just the socket), so reconnecting can't reset the cap.
+        const topic = msg.topic;
+        if (typeof msg.password !== "string" || msg.password.length === 0) {
+          this.send(ws, { type: "join_error", topic, reason: "missing password" });
+          return;
+        }
+        const now = Date.now();
+        const throttle = this.joinThrottle.get(me);
+        if (throttle && throttle.until > now) {
+          // Locked out by too many recent wrong attempts — keyed to the identity, so a fresh socket
+          // (reconnect) is still locked. The real barrier is scrypt × password entropy; this just
+          // bounds the online attempt RATE per identity (offline guessing isn't possible — no hash leaves).
+          this.send(ws, { type: "join_error", topic, reason: "too many attempts" });
+          this.log(`DENY join ${me} → ${topic} (locked out ${Math.ceil((throttle.until - now) / 1000)}s)`);
+          return;
+        }
+        let hash: string | null;
+        try {
+          hash = await this.opts.store.getRoomPasswordHash(topic);
+        } catch (e) {
+          // Store unreadable → fail CLOSED (never grant), and don't burn the attempt counter.
+          this.send(ws, { type: "join_error", topic, reason: "join unavailable" });
+          this.log(`join store error ${me} → ${topic}: ${String(e)}`);
+          return;
+        }
+        // ALWAYS run a constant-time verify (against a dummy when no password is set), so latency
+        // can't distinguish "no such / invite-only room" from "wrong password". A null hash (room
+        // missing OR invite-only) and a wrong password collapse to the SAME generic rejection.
+        const ok = verifyPassword(msg.password, hash ?? DUMMY_PW_HASH);
+        if (!hash || !ok) {
+          this.recordJoinFail(me, now);
+          this.send(ws, { type: "join_error", topic, reason: "invalid room or password" });
+          this.log(`DENY join ${me} → ${topic} (bad room/password)`);
+          return;
+        }
+        try {
+          await this.opts.store.addMember(topic, me);
+        } catch (e) {
+          this.send(ws, { type: "join_error", topic, reason: "join unavailable" });
+          this.log(`join addMember error ${me} → ${topic}: ${String(e)}`);
+          return;
+        }
+        // Success clears the per-identity fail counter; drop stale cached membership so a subscribe
+        // immediately after this sees the grant.
+        this.joinThrottle.delete(me);
+        this.memberCache.delete(`${topic}|${me}`);
+        this.send(ws, { type: "joined", topic });
+        this.log(`JOIN ${me} → ${topic} (self-service via password)`);
+        return;
+      }
       case "publish": {
         // CONTROL PLANE ONLY: forward the structured Envelope. No filesystem,
         // no repo access — code sync is git's job (§2.6). The broker is a trust
@@ -526,6 +600,26 @@ export class Broker {
     }
     this.memberCache.set(key, { ok, exp: now + ttlMs });
     return ok;
+  }
+
+  /**
+   * Record a wrong room-password attempt for `id`, locking the identity out for JOIN_LOCKOUT_MS once it
+   * reaches MAX_JOIN_FAILS. Keyed by the PSK-authenticated identity (NOT the socket), so a reconnect
+   * can't reset the counter (§11.2 R1). The map is bounded as a backstop — identities are already
+   * bounded by registration, and a success / lockout expiry clears the entry.
+   */
+  private recordJoinFail(id: string, now: number): void {
+    const t = this.joinThrottle.get(id) ?? { fails: 0, until: 0 };
+    t.fails++;
+    if (t.fails >= MAX_JOIN_FAILS) {
+      t.until = now + (this.opts.joinLockoutMs ?? JOIN_LOCKOUT_MS); // lock out; the window now governs
+      t.fails = 0; // reset so a fresh window starts clean after the lockout expires
+    }
+    if (!this.joinThrottle.has(id) && this.joinThrottle.size >= JOIN_THROTTLE_CAP) {
+      const oldest = this.joinThrottle.keys().next().value;
+      if (oldest !== undefined) this.joinThrottle.delete(oldest);
+    }
+    this.joinThrottle.set(id, t);
   }
 
   /**

@@ -2,11 +2,12 @@ import { afterEach, describe, expect, it } from "bun:test";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { addRoomMember, createRoom, inviteRoomMember, isLoopbackBrokerUrl, joinRoom, listRooms, removeRoomMember, runRoom } from "../cli/room";
+import { addRoomMember, createRoom, inviteRoomMember, isLoopbackBrokerUrl, joinRoom, listRooms, removeRoomMember, runRoom, setRoomPasswordCli } from "../cli/room";
 import { IdentityService } from "../backbone/identity-service";
 import { RoomService } from "../room-service";
 import { StorePskIdentityProvider } from "../backbone/identity/store-psk-identity-provider";
 import { SqliteStore } from "../backbone/store/sqlite-store";
+import { verifyPassword } from "../backbone/password";
 import { atomicWriteText } from "../atomic-json";
 
 /** Mimic `abg auth login`: register an identity, issue a token, persist it. */
@@ -277,6 +278,77 @@ describe("cli/room", () => {
     await expect(
       removeRoomMember({ roomId: "ghost", identityId: "bob@x.com", dbPath }),
     ).rejects.toThrow(/房间不存在/);
+  });
+
+  it("create --password: stores a verifiable hash, never the plaintext", async () => {
+    dir = mkdtempSync(join(tmpdir(), "agentbridge-room-"));
+    const dbPath = join(dir, "collab.db");
+    await seedLogin(dir, dbPath);
+    await createRoom({ name: "vault", cwd: dir, dbPath, password: "s3cret!" });
+
+    const store = new SqliteStore(dbPath);
+    try {
+      const hash = await new RoomService(store).getRoomPasswordHash("vault");
+      expect(hash).toBeTruthy();
+      expect(hash).not.toContain("s3cret!"); // hashed at rest, not plaintext
+      expect(verifyPassword("s3cret!", hash!)).toBe(true);
+      expect(verifyPassword("wrong", hash!)).toBe(false);
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("set-password: a member sets then clears the room password", async () => {
+    dir = mkdtempSync(join(tmpdir(), "agentbridge-room-"));
+    const dbPath = join(dir, "collab.db");
+    await seedLogin(dir, dbPath); // alice = creator → member
+    await createRoom({ name: "room", dbPath });
+
+    await setRoomPasswordCli({ roomId: "room", password: "pw1", dbPath });
+    let store = new SqliteStore(dbPath);
+    try {
+      expect(verifyPassword("pw1", (await new RoomService(store).getRoomPasswordHash("room"))!)).toBe(true);
+    } finally {
+      await store.close();
+    }
+
+    await setRoomPasswordCli({ roomId: "room", password: null, dbPath }); // clear → invite-only
+    store = new SqliteStore(dbPath);
+    try {
+      expect(await new RoomService(store).getRoomPasswordHash("room")).toBeNull();
+    } finally {
+      await store.close();
+    }
+  });
+
+  it("set-password: rejects a non-member caller and a non-existent room", async () => {
+    dir = mkdtempSync(join(tmpdir(), "agentbridge-room-"));
+    const dbPath = join(dir, "collab.db");
+    await seedLogin(dir, dbPath); // alice logged in but NOT a member of the target room
+
+    const store = new SqliteStore(dbPath);
+    try {
+      await new RoomService(store).createRoom("secret", "Secret", "owner@x.com");
+    } finally {
+      await store.close();
+    }
+    await expect(setRoomPasswordCli({ roomId: "secret", password: "pw", dbPath })).rejects.toThrow(/只有房间成员能设置口令/);
+    await expect(setRoomPasswordCli({ roomId: "ghost", password: "pw", dbPath })).rejects.toThrow(/房间不存在/);
+  });
+
+  it("remove: reports roomHasPassword so the CLI can warn that removal alone isn't revocation (R3)", async () => {
+    dir = mkdtempSync(join(tmpdir(), "agentbridge-room-"));
+    const dbPath = join(dir, "collab.db");
+    await seedLogin(dir, dbPath); // alice = creator/member
+
+    await createRoom({ name: "guarded", dbPath, password: "pw" });
+    await addRoomMember({ roomId: "guarded", identityId: "bob@x.com", dbPath });
+    // removing bob from a PASSWORD-protected room flags that the password must also be rotated/cleared
+    expect((await removeRoomMember({ roomId: "guarded", identityId: "bob@x.com", dbPath })).roomHasPassword).toBe(true);
+
+    await createRoom({ name: "open", dbPath }); // no password → no warning
+    await addRoomMember({ roomId: "open", identityId: "bob@x.com", dbPath });
+    expect((await removeRoomMember({ roomId: "open", identityId: "bob@x.com", dbPath })).roomHasPassword).toBe(false);
   });
 });
 

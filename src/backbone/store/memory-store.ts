@@ -18,6 +18,7 @@ export class InMemoryStore implements Store {
   private sessions = new Map<string, { agentId: string; startedAt: number }>();
   private workspaceSessions = new Map<string, string>(); // `${path}\0${type}` → sessionId
   private rooms = new Map<string, RoomRecord>();
+  private roomPasswords = new Map<string, string>(); // roomId → hashed self-service-join password
   private members = new Map<string, Set<string>>(); // roomId → agentIds
   private cwdRoom = new Map<string, string>();
   private events = new Map<string, Envelope[]>(); // roomId → append-ordered ledger
@@ -71,6 +72,15 @@ export class InMemoryStore implements Store {
 
   async listRooms(): Promise<RoomRecord[]> {
     return [...this.rooms.values()];
+  }
+
+  async setRoomPassword(roomId: string, passwordHash: string | null): Promise<void> {
+    if (passwordHash === null) this.roomPasswords.delete(roomId);
+    else this.roomPasswords.set(roomId, passwordHash);
+  }
+
+  async getRoomPasswordHash(roomId: string): Promise<string | null> {
+    return this.roomPasswords.get(roomId) ?? null;
   }
 
   async addMember(roomId: string, agentId: string): Promise<void> {

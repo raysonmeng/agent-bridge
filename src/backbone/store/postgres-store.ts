@@ -60,6 +60,14 @@ export class PostgresStore implements Store {
     throw new Error(NOT_IMPLEMENTED);
   }
 
+  async setRoomPassword(_roomId: string, _passwordHash: string | null): Promise<void> {
+    throw new Error(NOT_IMPLEMENTED);
+  }
+
+  async getRoomPasswordHash(_roomId: string): Promise<string | null> {
+    throw new Error(NOT_IMPLEMENTED);
+  }
+
   async addMember(_roomId: string, _agentId: string): Promise<void> {
     throw new Error(NOT_IMPLEMENTED);
   }

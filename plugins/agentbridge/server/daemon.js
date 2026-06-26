@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.24", "0.0.0-source"),
-  commit: defineString("2d64afa", "source"),
+  commit: defineString("2869fdd", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("e9f689afd6b6", "source")
+  codeHash: defineString("66df1aadf54e", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -6824,6 +6824,7 @@ class BrokerClient {
   outbox = [];
   eventHandlers = [];
   whiteboardHandlers = [];
+  pendingJoins = new Map;
   closed = false;
   authFailed = false;
   reconnectAttempt = 0;
@@ -6877,6 +6878,15 @@ class BrokerClient {
     if (this.connected)
       this.sendRaw({ type: "unsubscribe", topic });
   }
+  joinWithPassword(topic, password) {
+    if (!this.connected)
+      return Promise.reject(new Error("not connected"));
+    return new Promise((resolve, reject) => {
+      this.pendingJoins.get(topic)?.reject(new Error("superseded by a newer join"));
+      this.pendingJoins.set(topic, { resolve, reject });
+      this.sendRaw({ type: "join", topic, password });
+    });
+  }
   publish(topic, envelope) {
     if (this.connected) {
       this.sendRaw({ type: "publish", topic, envelope });
@@ -6898,6 +6908,7 @@ class BrokerClient {
     this.closed = true;
     this.clearReconnectTimer();
     this.teardownSocket();
+    this.failPendingJoins("client closed");
     if (this.rejectConnect) {
       const reject = this.rejectConnect;
       this.resolveConnect = null;
@@ -6959,6 +6970,18 @@ class BrokerClient {
             this.log(`whiteboard handler threw: ${String(e)}`);
           }
         }
+      } else if (msg.type === "joined") {
+        const p = this.pendingJoins.get(msg.topic);
+        if (p) {
+          this.pendingJoins.delete(msg.topic);
+          p.resolve();
+        }
+      } else if (msg.type === "join_error") {
+        const p = this.pendingJoins.get(msg.topic);
+        if (p) {
+          this.pendingJoins.delete(msg.topic);
+          p.reject(new Error(typeof msg.reason === "string" ? msg.reason : "join failed"));
+        }
       }
     };
     ws.onclose = () => {
@@ -6966,6 +6989,7 @@ class BrokerClient {
         return;
       this.ws = null;
       this.identity = null;
+      this.failPendingJoins("connection lost before the join completed");
       if (!this.closed && !this.authFailed)
         this.scheduleReconnect();
     };
@@ -6990,6 +7014,14 @@ class BrokerClient {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+  }
+  failPendingJoins(reason) {
+    if (this.pendingJoins.size === 0)
+      return;
+    const pend = [...this.pendingJoins.values()];
+    this.pendingJoins.clear();
+    for (const p of pend)
+      p.reject(new Error(reason));
   }
   flushOutbox() {
     if (this.outbox.length === 0)
@@ -7036,6 +7068,12 @@ class RoomService {
   }
   async listRooms() {
     return this.store.listRooms();
+  }
+  async setRoomPassword(roomId, passwordHash) {
+    await this.store.setRoomPassword(roomId, passwordHash);
+  }
+  async getRoomPasswordHash(roomId) {
+    return this.store.getRoomPasswordHash(roomId);
   }
   async join(roomId, agentId) {
     await this.store.addMember(roomId, agentId);
@@ -7117,7 +7155,8 @@ class SqliteStore {
       CREATE TABLE IF NOT EXISTS rooms (
         room_id TEXT PRIMARY KEY,
         name TEXT NOT NULL,
-        created_by TEXT NOT NULL
+        created_by TEXT NOT NULL,
+        password_hash TEXT
       );
       CREATE TABLE IF NOT EXISTS room_members (
         room_id TEXT,
@@ -7149,6 +7188,9 @@ class SqliteStore {
         identity_id TEXT NOT NULL
       );
     `);
+    try {
+      this.db.exec("ALTER TABLE rooms ADD COLUMN password_hash TEXT");
+    } catch {}
   }
   async upsertIdentity(id, displayName) {
     this.db.query("INSERT INTO identities(id, display_name) VALUES(?, ?) ON CONFLICT(id) DO UPDATE SET display_name=excluded.display_name").run(id, displayName);
@@ -7185,6 +7227,13 @@ class SqliteStore {
   async listRooms() {
     const rows = this.db.query("SELECT room_id, name, created_by FROM rooms").all();
     return rows.map((r) => ({ roomId: r.room_id, name: r.name, createdBy: r.created_by }));
+  }
+  async setRoomPassword(roomId, passwordHash) {
+    this.db.query("UPDATE rooms SET password_hash=? WHERE room_id=?").run(passwordHash, roomId);
+  }
+  async getRoomPasswordHash(roomId) {
+    const row = this.db.query("SELECT password_hash FROM rooms WHERE room_id=?").get(roomId);
+    return row?.password_hash ?? null;
   }
   async addMember(roomId, agentId) {
     this.db.query("INSERT OR IGNORE INTO room_members(room_id, agent_id) VALUES(?, ?)").run(roomId, agentId);

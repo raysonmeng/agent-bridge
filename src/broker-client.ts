@@ -58,6 +58,8 @@ export class BrokerClient {
   private readonly outbox: Array<{ topic: string; envelope: Envelope }> = [];
   private readonly eventHandlers: EventHandler[] = [];
   private readonly whiteboardHandlers: WhiteboardHandler[] = [];
+  /** topic → resolver for an in-flight joinWithPassword, settled by the broker's joined/join_error. */
+  private readonly pendingJoins = new Map<string, { resolve: () => void; reject: (e: Error) => void }>();
   private closed = false;
   /** Set on auth_error: a bad token must NOT trigger an infinite reconnect loop. */
   private authFailed = false;
@@ -120,6 +122,21 @@ export class BrokerClient {
     if (this.connected) this.sendRaw({ type: "unsubscribe", topic });
   }
 
+  /**
+   * Self-service join a password-protected room (§11.2): present the room password to the broker,
+   * which verifies it against the room's stored hash and grants PERSISTENT membership. Resolves on
+   * the broker's `joined`; rejects with the broker's reason (wrong password / throttled / no
+   * self-service join). Requires a live connection — call connect() first; subscribe() after it resolves.
+   */
+  joinWithPassword(topic: string, password: string): Promise<void> {
+    if (!this.connected) return Promise.reject(new Error("not connected"));
+    return new Promise<void>((resolve, reject) => {
+      this.pendingJoins.get(topic)?.reject(new Error("superseded by a newer join")); // one in-flight per topic
+      this.pendingJoins.set(topic, { resolve, reject });
+      this.sendRaw({ type: "join", topic, password });
+    });
+  }
+
   /** Publish an envelope; if offline, queue it (bounded) and flush on reconnect. */
   publish(topic: string, envelope: Envelope): void {
     if (this.connected) {
@@ -146,6 +163,7 @@ export class BrokerClient {
     this.closed = true;
     this.clearReconnectTimer();
     this.teardownSocket();
+    this.failPendingJoins("client closed");
     if (this.rejectConnect) {
       const reject = this.rejectConnect;
       this.resolveConnect = null;
@@ -211,12 +229,28 @@ export class BrokerClient {
             this.log(`whiteboard handler threw: ${String(e)}`);
           }
         }
+      } else if (msg.type === "joined") {
+        const p = this.pendingJoins.get(msg.topic);
+        if (p) {
+          this.pendingJoins.delete(msg.topic);
+          p.resolve();
+        }
+      } else if (msg.type === "join_error") {
+        const p = this.pendingJoins.get(msg.topic);
+        if (p) {
+          this.pendingJoins.delete(msg.topic);
+          p.reject(new Error(typeof msg.reason === "string" ? msg.reason : "join failed"));
+        }
       }
     };
     ws.onclose = () => {
       if (this.ws !== ws) return; // a stale/torn-down socket closing — ignore
       this.ws = null;
       this.identity = null;
+      // An in-flight password join can't be answered by a dead socket — reject it now so the
+      // caller errors out instead of hanging (the broker grants membership transactionally; a
+      // drop before `joined` means it did NOT complete).
+      this.failPendingJoins("connection lost before the join completed");
       // A transient drop does NOT reject connect() — reconnect retries and the
       // next welcome resolves the still-pending promise. Only auth failure / close()
       // settle it. Avoids the "reject-but-secretly-reconnect" contract that induced
@@ -250,6 +284,14 @@ export class BrokerClient {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
+  }
+
+  /** Reject every in-flight joinWithPassword (the socket went away before the broker replied). */
+  private failPendingJoins(reason: string): void {
+    if (this.pendingJoins.size === 0) return;
+    const pend = [...this.pendingJoins.values()];
+    this.pendingJoins.clear();
+    for (const p of pend) p.reject(new Error(reason));
   }
 
   private flushOutbox(): void {
