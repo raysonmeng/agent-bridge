@@ -11,7 +11,7 @@
 
 import { chmodSync, mkdirSync, readFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { RoomService } from "../room-service";
+import { RoomService, slugify } from "../room-service";
 import { SqliteStore } from "../backbone/store/sqlite-store";
 import type { RoomRecord, Store } from "../backbone/store";
 import { StateDirResolver } from "../state-dir";
@@ -41,26 +41,6 @@ export async function currentIdentityId(store: Store, dbPath: string): Promise<s
   const identityId = await store.resolveToken(token);
   if (!identityId) throw new Error("登录令牌无效，请先运行 abg auth login");
   return identityId;
-}
-
-/**
- * Turn a human room name into a room id: lowercase, whitespace→`-`, keep unicode
- * letters/numbers (Chinese-first, so "结账" is valid) + dash, drop everything
- * else, collapse runs of `-`, trim leading/trailing `-`. Throws when nothing
- * usable remains (e.g. a name of only punctuation).
- */
-export function slugify(name: string): string {
-  // Keep unicode letters/numbers (the project is Chinese-first, so "结账" is a
-  // valid room id) + dash; whitespace → dash; drop everything else. The room id
-  // is an internal topic key / Store key, not a URL, so CJK is fine.
-  const slug = name
-    .toLowerCase()
-    .replace(/\s+/g, "-")
-    .replace(/[^\p{L}\p{N}-]/gu, "")
-    .replace(/-+/g, "-")
-    .replace(/^-+|-+$/g, "");
-  if (slug === "") throw new Error(`无法从「${name}」生成有效的房间 ID（需含字母或数字）`);
-  return slug;
 }
 
 /** Open the collab Store with the same 0700 lockdown as `abg auth login`. */

@@ -1,6 +1,25 @@
 import { realpathSync } from "node:fs";
 import type { Store, RoomRecord } from "./backbone/store";
 
+/**
+ * Turn a human room name into a room id: lowercase, whitespace→`-`, keep unicode
+ * letters/numbers (Chinese-first, so "结账" is valid) + dash, drop everything else,
+ * collapse runs of `-`, trim leading/trailing `-`. Throws when nothing usable
+ * remains (e.g. a name of only punctuation). The room id is an internal topic /
+ * Store key (not a URL), so CJK is fine. Lives here (domain layer) so both the CLI
+ * and the broker web dashboard derive room ids identically.
+ */
+export function slugify(name: string): string {
+  const slug = name
+    .toLowerCase()
+    .replace(/\s+/g, "-")
+    .replace(/[^\p{L}\p{N}-]/gu, "")
+    .replace(/-+/g, "-")
+    .replace(/^-+|-+$/g, "");
+  if (slug === "") throw new Error(`无法从「${name}」生成有效的房间 ID（需含字母或数字）`);
+  return slug;
+}
+
 export interface AutoJoinResult {
   roomId: string;
   /** true if this call newly joined the agent; false if it was already a member. */

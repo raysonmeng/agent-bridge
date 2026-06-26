@@ -189,6 +189,9 @@ Commands:
   room create <name> | room list
                      Create a collaboration room (id = slugified name) or list rooms
   join <roomId>      Join a room and auto-join this directory next time (§2.4)
+  broker start [--host <ip>] [--port <n>] [--db <path>] [--web-port <n>] [--no-web] [--no-open]
+                     Run the always-on control-plane broker (§11.1) + a loopback-only
+                     admin dashboard (view rooms/members/whiteboards + create a room)
   logs [--codex] [-f] [-n N]
                      Tail this pair's daemon log (or the codex wrapper log with
                      --codex). -n N: last N lines (default 100). -f: follow/stream.

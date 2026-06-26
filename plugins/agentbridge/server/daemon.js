@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.24", "0.0.0-source"),
-  commit: defineString("78a46a7", "source"),
+  commit: defineString("fdc78c6", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("0634265c8c47", "source")
+  codeHash: defineString("ace71209327c", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -7023,7 +7023,6 @@ class BrokerClient {
 
 // src/room-service.ts
 import { realpathSync as realpathSync2 } from "fs";
-
 class RoomService {
   store;
   constructor(store) {
