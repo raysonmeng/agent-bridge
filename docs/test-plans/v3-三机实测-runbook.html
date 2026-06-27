@@ -1,0 +1,271 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AgentBridge v3 · 真三机跨网协作实测 Runbook</title>
+<style>
+  :root{
+    --bg:#0f1117; --card:#171a21; --card2:#1d212b; --ink:#e7e9ee; --muted:#9aa3b2;
+    --line:#2a2f3a; --accent:#6ea8fe; --green:#4ade80; --amber:#fbbf24; --red:#f87171; --code:#0b0d12;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:15px/1.65 -apple-system,"SF Pro Text","PingFang SC",Segoe UI,Roboto,sans-serif;padding:0 0 80px}
+  .wrap{max-width:920px;margin:0 auto;padding:0 20px}
+  header{padding:42px 0 8px}
+  h1{font-size:26px;margin:0 0 6px;letter-spacing:.3px}
+  h1 .v{color:var(--accent)}
+  .sub{color:var(--muted);font-size:15px;margin:0 0 4px}
+  h2{font-size:20px;margin:38px 0 12px;padding-top:14px;border-top:1px solid var(--line)}
+  h2 .n{display:inline-block;min-width:30px;color:var(--accent);font-variant-numeric:tabular-nums}
+  h3{font-size:16px;margin:22px 0 8px;color:#cdd3df}
+  p{margin:8px 0}
+  code{background:#222734;color:#e9edf6;padding:1.5px 6px;border-radius:5px;font:13px/1.5 "SF Mono",ui-monospace,Menlo,Consolas,monospace}
+  pre{background:var(--code);border:1px solid var(--line);border-radius:10px;padding:14px 16px;overflow:auto;margin:10px 0}
+  pre code{background:none;padding:0;color:#d7deea;font-size:13px;white-space:pre}
+  .muted{color:var(--muted)}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:18px 20px;margin:14px 0}
+  .role{display:inline-block;font-size:12px;font-weight:600;padding:2px 9px;border-radius:999px;margin-right:8px;vertical-align:2px}
+  .role.broker{background:#3b2f10;color:#fbbf24;border:1px solid #5a4716}
+  .role.edge{background:#0f2c1c;color:#4ade80;border:1px solid #1c4d33}
+  .role.all{background:#16263f;color:#6ea8fe;border:1px solid #244069}
+  .note{border-left:3px solid var(--accent);background:#141a26;border-radius:0 8px 8px 0;padding:10px 14px;margin:12px 0}
+  .note.warn{border-color:var(--amber);background:#1f1a10}
+  .note.ok{border-color:var(--green);background:#101d15}
+  .note.danger{border-color:var(--red);background:#1f1212}
+  .note b{color:#fff}
+  ul,ol{margin:8px 0 8px 2px;padding-left:22px}
+  li{margin:5px 0}
+  .topo{background:var(--card2);border:1px solid var(--line);border-radius:12px;padding:18px;margin:14px 0;font:12.5px/1.5 "SF Mono",ui-monospace,Menlo,monospace;color:#cdd3df;white-space:pre;overflow:auto}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px}
+  th,td{border:1px solid var(--line);padding:8px 11px;text-align:left;vertical-align:top}
+  th{background:#1b2030;color:#cdd3df}
+  .chk{list-style:none;padding-left:0}
+  .chk li{padding-left:28px;position:relative;margin:8px 0}
+  .chk li:before{content:"☐";position:absolute;left:0;color:var(--accent);font-size:16px}
+  .expect{color:var(--green)}
+  .pin{font-size:12.5px;color:var(--muted)}
+  kbd{background:#222734;border:1px solid var(--line);border-bottom-width:2px;border-radius:5px;padding:1px 6px;font-size:12px}
+  a{color:var(--accent)}
+  .foot{margin-top:36px;padding-top:16px;border-top:1px solid var(--line);color:var(--muted);font-size:13px}
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>AgentBridge <span class="v">v3</span> · 真三机跨网协作实测 Runbook</h1>
+  <p class="sub">office MacBook + Mac mini + 家里机 · Tailscale 直连 · 控制面只传事件、代码同步靠 git</p>
+  <p class="pin">生成于 2026-06-27 · 对应栈顶分支 <code>feat/v3-docs-agent-scope</code>（含 #201/#206/#207/#208/#209 全部 v3 改动）</p>
+</header>
+
+<div class="note">
+  <b>这份手册要证什么。</b> 单团队跨机协作的真实用户旅程：一台机器当 broker（控制面），另两台当边机（参与者）；
+  边机 A 完成一件事 → 边机 B 的 Claude 会话<b>自动收到</b>。代码从不经 broker（只传一句话摘要 + 仓/分支指针），靠 git 同步。
+</div>
+
+<div class="note warn">
+  <b>诚实前提。</b> 跨机链路此前已由「多个物理隔离 SqliteStore + 真 CLI + 真边机入口」的 E2E <b>证明过</b>（绝不共享 store），
+  并经 2 个对抗 reviewer 跑变异测试钉死。<b>但这是它第一次在你真三台机器、真 Tailscale 上跑</b>——本手册就是为此。
+  整个栈（7 个 PR）<b>还没合 master</b>，所以每台机器要从分支 <code>feat/v3-docs-agent-scope</code> 装。
+</div>
+
+<div class="topo">                         Tailscale tailnet（100.x，WireGuard 自带加密）
+  ┌──────────────────┐        ┌──────────────────┐        ┌──────────────────┐
+  │   边机 A          │  WSS   │   Broker 机       │  WSS   │   边机 B          │
+  │  office MacBook  │◀──────▶│   Mac mini       │◀──────▶│   家里机          │
+  │                  │        │                  │        │                  │
+  │ agentbridge      │  事件   │ abg broker start │  事件   │ agentbridge      │
+  │  claude          │        │ + collab.db      │        │  claude          │
+  │ (daemon+         │        │ (身份/房间/成员/  │        │ (daemon+         │
+  │  room-bridge)    │        │  鉴权 权威)       │        │  room-bridge)    │
+  └──────────────────┘        └──────────────────┘        └──────────────────┘
+        参与者                     控制面（权威）                参与者
+
+      代码同步：各机 git push/pull —— broker 全程不碰任何代码文件</div>
+
+<p class="muted">下面用<b>角色</b>而非固定机器：<span class="role broker">Broker 机</span> 选一台<b>常开、其它机能 Tailscale 连到</b>的（推荐 Mac mini）；
+另两台是 <span class="role edge">边机 A</span> / <span class="role edge">边机 B</span>。哪台当 broker 随你。</p>
+
+
+<h2><span class="n">0.</span> 前置 — <span class="role all">每台机器都做一次</span></h2>
+
+<h3>0.1 Bun（运行时）</h3>
+<pre><code>curl -fsSL https://bun.sh/install | bash
+# 装完<b>重开终端</b>（或 source ~/.zshrc），然后验证：
+bun --version          # 应打印 1.3.x</code></pre>
+<p class="muted">你之前在 office 机遇到「没有 bun 命令」就是这步没生效——一定重开终端再验证。</p>
+
+<h3>0.2 Tailscale（跨网直连）</h3>
+<pre><code>brew install tailscale         # 或 https://tailscale.com/download
+sudo tailscale up              # 浏览器登录，三台用<b>同一个 tailnet 账号</b>
+tailscale ip -4                # 记下本机 100.x.y.z 地址（后面要用）</code></pre>
+<div class="note ok"><b>验通：</b>在任一台 <code>ping &lt;另一台的 100.x&gt;</code> 通，说明 tailnet 就绪。三台都要在线。</div>
+
+<h3>0.3 装 v3 build（global <code>abg</code> / <code>agentbridge</code>）</h3>
+<pre><code># 拉代码（已 clone 过就 git fetch）
+git clone https://github.com/quilin-ai/agent-bridge.git agent_bridge
+cd agent_bridge
+git fetch origin
+git checkout feat/v3-docs-agent-scope     # 栈顶，含全部 v3 改动
+
+bun install
+bun run install:global                    # 编译 + 装全局 CLI + 同步 plugin
+abg --help                                # 验证：能打印帮助就 OK</code></pre>
+<div class="note warn"><b>「command not found: abg」？</b> bun 的全局 bin 目录没在 PATH。把 <code>export PATH="$HOME/.bun/bin:$PATH"</code> 写进 <code>~/.zshrc</code>，
+重开终端再试。仍不行就用 <code>bun link</code> 兜底（在 repo 目录里跑），再验证 <code>agentbridge --help</code>。</div>
+
+
+<h2><span class="n">1.</span> Broker 机 — <span class="role broker">控制面（选 Mac mini）</span></h2>
+<p>broker 是房间/身份/成员/鉴权的<b>唯一权威</b>。这台机上你要开<b>两个终端</b>：终端①跑 broker（一直开着），终端②做管理操作。</p>
+
+<h3>1.1 终端① — 操作者登录 + 启动 broker</h3>
+<pre><code># a) 拿本机 Tailscale 地址
+tailscale ip -4                                  # 例：100.92.1.10
+
+# b) 操作者自签身份（建立 broker store 里你这个操作者）
+abg auth login --id you@macmini --name "You (Mac mini)"
+
+# c) 启动 broker，绑 Tailscale 地址（<b>这个终端就一直开着别关</b>）
+abg broker start --host 100.92.1.10</code></pre>
+<p class="muted">启动后会打印一张<b>连接卡</b>（含 <code>broker 地址：ws://100.92.1.10:4700/ws</code> + 邀请命令模板），并自动开本机 web 仪表盘（loopback，看房间/成员/白板 + 建房）。</p>
+
+<h3>1.2 终端② — 建房间 + 邀请两台边机</h3>
+<pre><code># 在 broker 机<b>另开一个终端</b>（broker 还在终端①跑着）
+abg room create demo                             # 建房间 demo，你自动成为成员
+
+# 给两台边机各签发 token + 加成员 + 打印对方要跑的「一条龙」
+abg room invite demo officembp@you --broker-url ws://100.92.1.10:4700/ws
+abg room invite demo home@you     --broker-url ws://100.92.1.10:4700/ws</code></pre>
+<div class="note"><b>每条 invite 会打印 3 行</b>（每台 token 不同），形如：
+<pre><code>export AGENTBRIDGE_BROKER_URL=ws://100.92.1.10:4700/ws
+abg auth login --token &lt;一长串 token&gt;
+abg join demo</code></pre>
+把<b>对应那台</b>的 3 行通过安全渠道（私信/密码管理器，别贴进仓库）发给边机操作者。token 是秘密。</div>
+<div class="note warn"><b>看到「⚠️ broker 地址仅本机可达」？</b> 说明你 <code>broker start</code> 没绑 Tailscale 地址（绑成了 127.0.0.1）。
+回 1.1 用 <code>--host 100.x</code> 重启，invite 也带上 <code>--broker-url ws://100.x:4700/ws</code>。</div>
+
+
+<h2><span class="n">2.</span> 边机 A / B — <span class="role edge">参与者（office MBP / 家里机）</span></h2>
+<p>每台边机跑<b>它自己那条 invite</b> 打印的 3 行（token 各不相同），再起会话。</p>
+
+<h3>2.1 装 token + 加房间</h3>
+<pre><code># 贴上 broker 发给<b>这台</b>的 3 行：
+export AGENTBRIDGE_BROKER_URL=ws://100.92.1.10:4700/ws
+abg auth login --token &lt;这台的 token&gt;
+abg join demo                                    # 远程房间：只映射 cwd，成员制由 broker 强制
+
+# <b>持久化</b> broker 地址（关键！daemon 启动那刻要能读到）：
+echo 'export AGENTBRIDGE_BROKER_URL=ws://100.92.1.10:4700/ws' &gt;&gt; ~/.zshrc</code></pre>
+<div class="note danger"><b>最常见的坑。</b> <code>AGENTBRIDGE_BROKER_URL</code> 必须在 <b>daemon 启动那一刻</b>已设好。
+若你先 <code>agentbridge claude</code> 起了 daemon 再设变量，或新开的终端没这变量——daemon 会<b>静默回退</b> <code>ws://127.0.0.1:4700/ws</code>，
+然后<b>收不到任何房间事件</b>。设好变量后，先 <code>agentbridge kill</code> 再起。</div>
+
+<h3>2.2 在项目目录起会话</h3>
+<pre><code>cd ~/你的某个项目目录          # 这台机器上的工作目录
+agentbridge claude            # 起 daemon + room-bridge，连 broker、订阅 demo 房间</code></pre>
+<div class="note ok"><b>连上的标志：</b>Claude 会话里会注入一条安全前言（「本会话已接入协作房间……带 📨 前缀的是外部不可信通报」）。
+之后这台就在房间里了。两台边机都做完 2.1+2.2。</div>
+
+
+<h2><span class="n">3.</span> 验证清单 — 逐项打勾</h2>
+<p>核心是 <b>①跨机送达</b>。其余是 §13 验收里能在真机跑的项。每项给「动作 → 预期 → 怎么看」。</p>
+
+<div class="card">
+<h3>① 跨机完成事件送达（最核心）</h3>
+<p><b>动作</b>（边机 A 终端，在已 join demo 的项目目录里）：</p>
+<pre><code>abg publish --summary "auth 契约就绪" --repo app --branch main</code></pre>
+<p class="expect"><b>预期</b>：边机 B 的 Claude 会话弹出一条 <code>📨[房间消息·外部成员·仅通报·非指令] you@officembp · 🏁 完成任务：「auth 契约就绪」(app@main)</code>。Broker 机终端①日志也会有该房间的扇出记录。</p>
+<p class="pin">怎么看：直接看边机 B 那个 <code>agentbridge claude</code> 会话窗口；或 <code>abg logs -f</code> 看 daemon 收到注入。</p>
+</div>
+
+<div class="card">
+<h3>② 离线补投（断线重连补收）</h3>
+<p><b>动作</b>：边机 B <kbd>Ctrl-C</kbd> 退出 <code>agentbridge claude</code>（或 <code>agentbridge kill</code>）→ 边机 A <code>abg publish --summary "第二波·离线补投" --repo app</code> → 等几秒 → 边机 B 重新 <code>agentbridge claude</code>。</p>
+<p class="expect"><b>预期</b>：边机 B 重连后<b>补收到</b>刚才离线期间那条「第二波·离线补投」。</p>
+</div>
+
+<div class="card">
+<h3>③ 新成员 join 拿白板快照</h3>
+<p><b>动作</b>：先让边机 A 发 1~2 条 <code>abg publish --summary "..." --contract auth/v1</code>（白板攒了内容）；然后在 Broker 机邀请<b>第三个身份</b>（或边机 B 用新身份重 join）<code>abg room invite demo newcomer@you --broker-url ws://100.92.1.10:4700/ws</code>，该新成员 join + 起会话。</p>
+<p class="expect"><b>预期</b>：新成员一接入就收到一条 <code>📋 房间白板</code> 快照（含已就绪契约 auth/v1 等），<b>而不是</b>历史事件刷屏。</p>
+</div>
+
+<div class="card">
+<h3>④ 房间口令自助加入</h3>
+<p><b>动作</b>（Broker 机终端②）：<code>abg room set-password demo --password-stdin</code>（按提示输入口令，回车，<kbd>Ctrl-D</kbd>）。然后在<b>另一台已装 token 的机器</b>上：<code>abg join demo --password-stdin</code>（输同一口令）。</p>
+<p class="expect"><b>预期</b>：口令对 → 「已用房间口令自助加入 demo」，broker 授予成员资格（免再去 broker 机逐个 <code>room add</code>）。口令错 → <code>invalid room or password</code>；连错 5 次该身份锁 60s。</p>
+<p class="pin">用 <code>--password-stdin</code> 而非 <code>--password &lt;pw&gt;</code>：后者会进 <code>ps</code> / shell history 泄漏。</p>
+</div>
+
+<div class="card">
+<h3>⑤ 非授权设备连不上 + token 吊销</h3>
+<p><b>动作 a</b>（非授权）：随便一台机器用<b>伪造 token</b> 连 → 应被拒。<br>
+<b>动作 b</b>（吊销）：Broker 机 <code>abg auth revoke --id officembp@you</code> → 边机 A 重连（<code>agentbridge kill</code> 再 <code>agentbridge claude</code>）。</p>
+<p class="expect"><b>预期</b>：a) 伪造 token 被 broker 4401 拒（应用层 PSK）。b) 被吊销的身份<b>重连即被拒</b>；已在线的连接会保持到自然断开——要<b>立刻</b>踢，再 <code>abg room remove demo officembp@you</code>（投递时强制成员制即时生效）。</p>
+<p class="pin">网络层 ACL（非 <code>tag:agent</code> 设备连不上）由 Tailscale ACL 验，不在本 CLI 范围。</p>
+</div>
+
+<div class="card">
+<h3>⑥ broker 全程不传代码文件</h3>
+<p><b>动作</b>：看 ① 里边机 B 收到的通报内容。</p>
+<p class="expect"><b>预期</b>：payload 只有 <code>repo/branch/commit/summary</code> 这些<b>字符串指针</b>，<b>没有任何文件内容</b>。代码同步是各机 <code>git push/pull</code> 的事，broker 不碰文件。</p>
+</div>
+
+<ul class="chk" style="margin-top:18px">
+  <li>① 跨机完成事件：边机 A publish → 边机 B 会话收到 🏁</li>
+  <li>② 离线补投：B 离线期间 A publish → B 重连补收</li>
+  <li>③ 新成员 join → 收到 📋 白板快照（非历史刷屏）</li>
+  <li>④ 房间口令 <code>--password-stdin</code> 自助加入成功 / 错口令拒 + 锁定</li>
+  <li>⑤ 伪造 token 4401 拒；<code>auth revoke</code> 后重连拒（配 <code>room remove</code> 立刻踢）</li>
+  <li>⑥ 通报 payload 只有指针、无文件内容</li>
+</ul>
+
+
+<h2><span class="n">4.</span> 常见排错</h2>
+<table>
+<tr><th>症状</th><th>原因 / 排查</th></tr>
+<tr><td>边机收不到任何房间事件</td><td>九成是 <code>AGENTBRIDGE_BROKER_URL</code> 没在 daemon 启动时设好 → daemon 回退 127.0.0.1。<code>echo $AGENTBRIDGE_BROKER_URL</code> 确认，写进 ~/.zshrc，<code>agentbridge kill</code> 再起。</td></tr>
+<tr><td><code>command not found: abg</code></td><td>bun 全局 bin 不在 PATH：<code>export PATH="$HOME/.bun/bin:$PATH"</code> 进 ~/.zshrc，重开终端。</td></tr>
+<tr><td>边机 <code>auth login --token</code> / <code>join</code> 后连不上（4401）</td><td>token 是不是<b>这台</b>的（每台 invite 的 token 不同，别贴错）？broker 是否还在终端①跑着？broker 是否绑了 Tailscale 地址（非 127.0.0.1）？</td></tr>
+<tr><td><code>ping 100.x</code> 不通</td><td>Tailscale 没都在线 / 不在同一 tailnet。三台 <code>tailscale status</code> 互相看得到才行。</td></tr>
+<tr><td>broker 连接卡显示「仅本机可达」</td><td><code>broker start</code> 没带 <code>--host 100.x</code>。用 Tailscale 地址重启。</td></tr>
+<tr><td>看 broker 在干嘛</td><td>broker 机终端①直接有日志；边机 <code>abg logs -f</code> 看本机 daemon。</td></tr>
+</table>
+
+
+<h2><span class="n">5.</span> 跑完了 · 清理</h2>
+<pre><code># 边机（每台）
+agentbridge kill                  # 停 daemon
+
+# Broker 机
+# 终端① <kbd>Ctrl-C</kbd> 停 broker；要清状态：abg kill</code></pre>
+<p class="muted">collab.db 留着没事（下次直接复用身份/房间/成员）。要彻底重来再删平台 state 目录里的 collab.db。</p>
+
+
+<h2><span class="n">附.</span> 命令速查</h2>
+<table>
+<tr><th>角色</th><th>命令</th><th>作用</th></tr>
+<tr><td><span class="role broker">broker</span></td><td><code>abg auth login --id &lt;id&gt; --name &lt;名&gt;</code></td><td>操作者自签身份</td></tr>
+<tr><td><span class="role broker">broker</span></td><td><code>abg broker start --host 100.x</code></td><td>启动控制面（绑 Tailscale）</td></tr>
+<tr><td><span class="role broker">broker</span></td><td><code>abg room create &lt;名&gt;</code></td><td>建房间</td></tr>
+<tr><td><span class="role broker">broker</span></td><td><code>abg room invite &lt;房&gt; &lt;id&gt; --broker-url ws://100.x:4700/ws</code></td><td>签 token + 加成员 + 打印一条龙</td></tr>
+<tr><td><span class="role broker">broker</span></td><td><code>abg room set-password &lt;房&gt; --password-stdin</code></td><td>设房间自助口令</td></tr>
+<tr><td><span class="role broker">broker</span></td><td><code>abg auth revoke --id &lt;id&gt;</code></td><td>吊销该身份所有 token</td></tr>
+<tr><td><span class="role edge">边机</span></td><td><code>abg auth login --token &lt;T&gt;</code></td><td>装 broker 签发的 token</td></tr>
+<tr><td><span class="role edge">边机</span></td><td><code>abg join &lt;房&gt;</code> / <code>--password-stdin</code></td><td>加房间 / 凭口令自助加入</td></tr>
+<tr><td><span class="role edge">边机</span></td><td><code>agentbridge claude</code></td><td>起会话（daemon + room-bridge）</td></tr>
+<tr><td><span class="role edge">边机</span></td><td><code>abg publish --summary "&lt;文&gt;" --repo &lt;仓&gt; [--branch] [--contract] [--unblocks a,b]</code></td><td>手动发布完成事件</td></tr>
+<tr><td><span class="role all">通用</span></td><td><code>abg logs -f</code> · <code>agentbridge kill</code></td><td>看日志 / 停</td></tr>
+</table>
+
+<div class="note">
+  <b>跑通后告诉我结果</b>（哪几项 ☑、哪项卡住 + 报错原文），我就能定位是配置问题还是真 bug，并据此决定这 7 个 PR 怎么合 master。
+  这是 P1 跨机协作的<b>终极验证</b>——多 store E2E 已经证过协议，这一步证的是真机真网。
+</div>
+
+<p class="foot">AgentBridge v3 · 控制面只传事件、数据面靠 git · 真实会话集成目前仅 Claude Code（Codex/其它 agent 协议层可接、会话集成是明确 backlog，见 docs/09 §5.5）。</p>
+
+</div>
+</body>
+</html>
