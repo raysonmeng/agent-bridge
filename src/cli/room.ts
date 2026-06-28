@@ -12,7 +12,7 @@
 import { RoomService, slugify } from "../room-service";
 import { IdentityService } from "../backbone/identity-service";
 import type { RoomRecord, Store } from "../backbone/store";
-import { readAuthToken, resolveBrokerUrl, resolveDbPath, openStore } from "../collab-store";
+import { readAuthToken, resolveBrokerUrl, resolveDbPath, openStore, writeBrokerUrl } from "../collab-store";
 import { BrokerClient } from "../broker-client";
 import { hashPassword } from "../backbone/password";
 
@@ -388,14 +388,11 @@ export async function runRoom(args: string[]): Promise<void> {
         return;
       }
       const { token, brokerUrl: url } = await inviteRoomMember({ roomId, identityId, name, brokerUrl });
-      console.log(`已邀请 ${identityId} 加入房间 ${roomId}。把下面三行通过安全渠道带外发给 ${identityId}，让它在自己机器上运行：`);
-      console.log(`  export AGENTBRIDGE_BROKER_URL=${url}`);
+      console.log(`已邀请 ${identityId} 加入房间 ${roomId}。把下面两行通过安全渠道带外发给 ${identityId}，让它在自己机器上运行：`);
       console.log(`  abg auth login --token ${token}`);
-      console.log(`  abg join ${roomId}`);
+      console.log(`  abg join ${roomId} --broker-url ${url}`);
       console.log("");
-      console.log("提示：AGENTBRIDGE_BROKER_URL 要在 daemon 启动那一刻就已设好、且持久——建议写进 ~/.zshrc / ~/.bashrc。");
-      console.log("daemon 在启动时读一次该变量；若 daemon 已在跑、或新开终端没设它，会回退本机 ws://127.0.0.1:4700/ws、");
-      console.log("静默收不到房间事件。设好变量后，先 agentbridge kill 再 agentbridge claude，让 daemon 带上这个地址。");
+      console.log("（join 会记住 broker 地址，下次 agentbridge claude 启动时自动连接——无需设 AGENTBRIDGE_BROKER_URL、无需重启 daemon。）");
       console.log("（注：重复 invite 会另签一个新 token、旧 token 不会自动失效；要作废旧 token 用 abg auth revoke --id <id>。）");
       if (isLoopbackBrokerUrl(url)) {
         console.log("");
@@ -438,17 +435,21 @@ export async function runRoom(args: string[]): Promise<void> {
 export async function runJoin(args: string[]): Promise<void> {
   const roomId = args[0];
   // Optional `--password <pw>` / `--password-stdin` → self-service join via the broker.
+  // Optional `--broker-url <ws://…>` → persisted so the daemon auto-connects (no AGENTBRIDGE_BROKER_URL).
   let password: string | undefined;
   let stdin = false;
+  let brokerUrl: string | undefined;
   for (let i = 1; i < args.length; i++) {
     const a = args[i]!;
     if (a === "--password") password = args[++i] ?? "";
     else if (a.startsWith("--password=")) password = a.slice("--password=".length);
     else if (a === "--password-stdin") stdin = true;
+    else if (a === "--broker-url") brokerUrl = args[++i];
+    else if (a.startsWith("--broker-url=")) brokerUrl = a.slice("--broker-url=".length);
   }
   if (stdin) password = await readPasswordFromStdin();
   if (!roomId) {
-    console.error("用法：abg join <roomId> [--password <口令> | --password-stdin]");
+    console.error("用法：abg join <roomId> [--password <口令> | --password-stdin] [--broker-url <ws://…>]");
     process.exit(1);
     return;
   }
@@ -458,11 +459,13 @@ export async function runJoin(args: string[]): Promise<void> {
       process.exit(1);
       return;
     }
-    await joinRoomWithPassword({ roomId, password });
+    await joinRoomWithPassword({ roomId, password, brokerUrl });
+    if (brokerUrl) writeBrokerUrl(resolveDbPath(), brokerUrl);
     console.log(`已用房间口令自助加入 ${roomId}（broker 已校验口令并授予成员资格）；该目录今后会自动加入`);
     return;
   }
   const result = await joinRoom({ roomId });
+  if (brokerUrl) writeBrokerUrl(resolveDbPath(), brokerUrl);
   if (result.local) {
     console.log(`已把当前目录关联到房间 ${result.roomId}（agent ${result.agentId}，你已是成员）；该目录今后会自动加入`);
   } else {

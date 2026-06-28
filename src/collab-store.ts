@@ -6,7 +6,7 @@
  * them. The collab DB holds PSK tokens (hashed at rest §11.3) + identity PII, so its dir is forced to 0700.
  */
 
-import { chmodSync, mkdirSync, readFileSync } from "node:fs";
+import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { SqliteStore } from "./backbone/store/sqlite-store";
 import { StateDirResolver } from "./state-dir";
@@ -33,12 +33,42 @@ export function resolveDbPath(explicit?: string): string {
   return join(dir, "collab.db");
 }
 
-/** Resolve the broker URL: explicit > AGENTBRIDGE_BROKER_URL > local default. */
-export function resolveBrokerUrl(explicit?: string): string {
+/**
+ * Resolve the broker URL: explicit > AGENTBRIDGE_BROKER_URL > persisted `<collabDir>/broker-url` > local default.
+ *
+ * Why the persisted file: the edge daemon (room-bridge) used to learn the broker address ONLY from the
+ * AGENTBRIDGE_BROKER_URL env var, which had to be exported in the shell rc BEFORE `agentbridge claude`
+ * started — forget it and the daemon silently fell back to localhost and received zero room events. `abg
+ * join --broker-url <ws://…>` now writes the address here, so the daemon picks it up automatically with no
+ * env var and no kill/restart dance. Env still wins as a deliberate one-off override; pass `dbPath` to opt
+ * into the persisted lookup (the plain non-collab CLI paths omit it and keep the old env-or-default shape).
+ */
+export function resolveBrokerUrl(explicit?: string, dbPath?: string): string {
   if (explicit) return explicit;
   const env = process.env.AGENTBRIDGE_BROKER_URL;
   if (env && env.length > 0) return env;
+  if (dbPath) {
+    const persisted = readPersistedBrokerUrl(dbPath);
+    if (persisted) return persisted;
+  }
   return DEFAULT_BROKER_URL;
+}
+
+/** Read the persisted broker URL from `<collabDir>/broker-url` (written by `abg join --broker-url`). */
+export function readPersistedBrokerUrl(dbPath: string): string | null {
+  try {
+    const url = readFileSync(join(dirname(dbPath), "broker-url"), "utf-8").trim();
+    return url === "" ? null : url;
+  } catch {
+    return null;
+  }
+}
+
+/** Persist the broker URL next to the collab DB so the daemon auto-connects without AGENTBRIDGE_BROKER_URL. */
+export function writeBrokerUrl(dbPath: string, url: string): void {
+  const dir = dirname(dbPath);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  writeFileSync(join(dir, "broker-url"), url, { mode: 0o600 });
 }
 
 /** Read the logged-in PSK token from `<collabDir>/auth-token`. No Store needed — cheap login gate. */

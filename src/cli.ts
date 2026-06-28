@@ -206,10 +206,12 @@ Commands:
   room add <roomId> <identityId> | room remove <roomId> <identityId>
                      On the broker: directly grant/revoke a member (members only). "remove"
                      pairs with "auth revoke" to evict a live session
-  join <roomId> [--password <pw> | --password-stdin]
+  join <roomId> [--password <pw> | --password-stdin] [--broker-url <ws://…>]
                      Join a room and auto-join this directory next time (§2.4). For a remote
                      room (no local record) it maps the cwd; the broker enforces membership.
                      With a password, self-join a password-protected room (broker grants membership).
+                     --broker-url is persisted so "agentbridge claude" auto-connects (no
+                     AGENTBRIDGE_BROKER_URL env var needed).
                      Prefer --password-stdin (e.g. "echo pw | abg join r --password-stdin"): a
                      password on argv leaks via ps / shell history
   broker start [--host <ip>] [--port <n>] [--db <path>] [--web-port <n>] [--no-web] [--no-open]

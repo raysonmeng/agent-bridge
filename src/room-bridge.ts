@@ -17,7 +17,7 @@
 import { randomUUID } from "node:crypto";
 import { BrokerClient } from "./broker-client";
 import { RoomService } from "./room-service";
-import { openStore, readAuthToken, resolveBrokerUrl, resolveDbPath } from "./collab-store";
+import { DEFAULT_BROKER_URL, openStore, readAuthToken, resolveBrokerUrl, resolveDbPath } from "./collab-store";
 import type { Store } from "./backbone/store";
 import type { Envelope } from "./backbone/envelope";
 
@@ -240,8 +240,14 @@ export async function startRoomBridge(deps: RoomBridgeDeps): Promise<RoomBridgeH
 
   const room = roomId;
   const seen = new Set<string>();
+  const brokerUrl = resolveBrokerUrl(deps.brokerUrl, dbPath);
+  if (brokerUrl === DEFAULT_BROKER_URL) {
+    // Not silent (§ no-silent-fallback): a cwd mapped to a room but resolving to localhost almost always
+    // means a remote join forgot `--broker-url` — surface it so "no room events" is diagnosable.
+    log(`room bridge: WARN no broker URL configured, using ${DEFAULT_BROKER_URL} — cross-machine room events won't arrive; run \`abg join ${room} --broker-url ws://<broker>:4700/ws\``);
+  }
   const client = new BrokerClient({
-    url: resolveBrokerUrl(deps.brokerUrl),
+    url: brokerUrl,
     token,
     presence: { agentType: "claude" },
     log,

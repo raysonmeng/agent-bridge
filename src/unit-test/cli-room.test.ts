@@ -131,7 +131,7 @@ describe("cli/room", () => {
     }
   });
 
-  it("invite (CLI): prints the 3 onboarding commands + the env-persist note", async () => {
+  it("invite (CLI): prints the 2 onboarding commands with --broker-url (no env-var dance)", async () => {
     dir = mkdtempSync(join(tmpdir(), "agentbridge-room-"));
     const dbPath = join(dir, "collab.db");
     await seedLogin(dir, dbPath, "alice@x.com", "Alice"); // alice logged in (writes auth-token)
@@ -149,10 +149,12 @@ describe("cli/room", () => {
       else process.env.AGENTBRIDGE_COLLAB_DB = prevDb;
     }
     const out = logs.join("\n");
-    expect(out).toContain("export AGENTBRIDGE_BROKER_URL=ws://100.90.1.42:4700/ws");
     expect(out).toContain("abg auth login --token "); // invitee installs the issued token
-    expect(out).toContain("abg join ship-it");
-    expect(out).toContain("~/.zshrc"); // the env-persist note (MEDIUM fix) must be present
+    // broker-url now rides on `abg join` (persisted), so the env-var dance is gone
+    expect(out).toContain("abg join ship-it --broker-url ws://100.90.1.42:4700/ws");
+    expect(out).toContain("记住 broker 地址"); // the persistence note (no env var / no restart)
+    expect(out).not.toContain("export AGENTBRIDGE_BROKER_URL=");
+    expect(out).not.toContain("~/.zshrc");
   });
 
   it("invite: member issues a broker-verifiable token + grants membership", async () => {
