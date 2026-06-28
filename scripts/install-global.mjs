@@ -4,20 +4,25 @@
  *
  * Modes:
  *   local  preflight active sessions, build + verify this checkout, pack it,
- *          install the tarball (`--force`), THEN stop running daemons and sync
- *          the Claude Code plugin
+ *          install the tarball (`--force`), sync the Claude Code plugin. With
+ *          --restart-now: also stop running daemons.
  *   npm    preflight active sessions, verify npm latest exists, install latest
- *          (`--force`), THEN stop daemons
+ *          (`--force`). With --restart-now: also stop daemons.
+ *
+ * Non-destructive default (backlog ⑥):
+ *   - The upgrade does NOT stop running daemons by default. Active Claude
+ *     frontends / Codex TUIs keep serving with the OLD bytes until they restart
+ *     on their own — so an upgrade never interrupts an in-flight session, and
+ *     no confirmation is needed. `--restart-now` opts back into the old "stop
+ *     daemons now" behaviour (and then active sessions require confirm/--force).
  *
  * Ordering invariant (downtime + failure safety):
- *   - active Claude frontends / Codex TUIs are detected before build/npm work
- *     and require explicit confirmation (or `--force`) because stop-running will
- *     disconnect them once the install succeeds.
  *   - `npm install -g --force` is a full replace, so no separate `npm uninstall`
  *     is needed — dropping it removes the window where no binary is on PATH.
- *   - stop-running fires AFTER the install succeeds, so the old daemon keeps
- *     serving until the new bytes are on disk and a FAILED install (red build,
- *     unreachable registry, missing version) never kills the running daemon.
+ *   - stop-running (only under --restart-now) fires AFTER the install succeeds,
+ *     so the old daemon keeps serving until the new bytes are on disk and a
+ *     FAILED install (red build, unreachable registry, missing version) never
+ *     kills the running daemon.
  *
  * PREFIX RESOLUTION: a plain `npm install -g` targets npm's configured global
  * prefix, which is NOT always where the user's `agentbridge` command resolves —
@@ -45,12 +50,13 @@ const args = process.argv.slice(2);
 const dryRun = args.includes("--dry-run");
 const skipPlugin = args.includes("--skip-plugin");
 const force = args.includes("--force");
+const restartNow = args.includes("--restart-now");
 const mode = args.find((arg) => !arg.startsWith("-"));
 const PAIR_BASE_PORT = 4500;
 const PAIR_SLOT_STRIDE = 10;
 
 function usage() {
-  process.stderr.write(`Usage: node scripts/install-global.mjs <local|npm> [--dry-run] [--skip-plugin] [--force]
+  process.stderr.write(`Usage: node scripts/install-global.mjs <local|npm> [--dry-run] [--skip-plugin] [--restart-now] [--force]
 
 Examples:
   bun run install:global:local   # build this checkout, replace the global install, sync the Claude Code plugin
@@ -58,7 +64,9 @@ Examples:
 
 Options:
   --skip-plugin   local mode only: skip the Claude Code plugin sync (\`dev\`) step
-  --force         install even when active AgentBridge frontends/Codex TUIs are running
+  --restart-now   stop running daemons after install (disconnects active sessions). Default is
+                  non-destructive: daemons keep serving the old version until they restart on their own.
+  --force         with --restart-now: skip the confirm prompt for active sessions
 `);
 }
 
@@ -158,9 +166,18 @@ export function detectActiveInstallSessionsFromPsOutput(psOutput, pairInfos = []
   return sessions;
 }
 
-export function decideInstallPreflight({ activeSessionCount, force, dryRun, isTTY }) {
+/**
+ * @param {{ activeSessionCount: number, force: boolean, dryRun: boolean, isTTY: boolean, restartNow?: boolean }} opts
+ * @returns {{ action: "allow" | "prompt" | "block", reason: string }}
+ */
+export function decideInstallPreflight({ activeSessionCount, force, dryRun, isTTY, restartNow = false }) {
   if (dryRun) return { action: "allow", reason: "dry-run" };
   if (activeSessionCount === 0) return { action: "allow", reason: "no-active-sessions" };
+  // Non-destructive default (backlog ⑥): the upgrade no longer stops running daemons, so active
+  // sessions keep serving with the OLD bytes until they restart on their own — there is nothing to
+  // disconnect, hence nothing to confirm. Only `--restart-now` (the opt-in destructive path that
+  // stops daemons) keeps the old confirm/force gate below.
+  if (!restartNow) return { action: "allow", reason: "non-destructive" };
   if (force) return { action: "allow", reason: "force" };
   if (isTTY) return { action: "prompt", reason: "tty" };
   return { action: "block", reason: "non-tty" };
@@ -277,15 +294,23 @@ async function runInstallPreflight() {
     force,
     dryRun,
     isTTY: Boolean(process.stdin.isTTY && process.stderr.isTTY),
+    restartNow,
   });
   if (decision.action === "allow") {
+    if (decision.reason === "non-destructive" && sessions.length > 0) {
+      process.stderr.write(
+        "install-global: active sessions detected; they will KEEP RUNNING the old version until they restart " +
+          "(pass --restart-now to stop them now):\n" +
+          `${renderActiveInstallSessions(sessions)}\n`,
+      );
+    }
     if (decision.reason === "force" && sessions.length > 0) {
       process.stderr.write(
         "install-global: --force set; continuing even though active sessions may be disconnected:\n" +
           `${renderActiveInstallSessions(sessions)}\n`,
       );
     }
-    return;
+    return sessions.length;
   }
   if (sessions.length > 0) {
     process.stderr.write(
@@ -294,7 +319,7 @@ async function runInstallPreflight() {
     );
   }
   if (decision.action === "block") {
-    process.stderr.write("install-global: refusing to continue in non-TTY mode; re-run with --force to proceed.\n");
+    process.stderr.write("install-global: --restart-now in non-TTY mode needs --force to confirm disconnecting sessions; or drop --restart-now for a non-destructive install.\n");
     process.exit(1);
   }
   const ok = await askContinueWithActiveSessions();
@@ -302,6 +327,7 @@ async function runInstallPreflight() {
     process.stderr.write("install-global: cancelled; no changes made.\n");
     process.exit(1);
   }
+  return sessions.length;
 }
 
 /**
@@ -353,7 +379,9 @@ function printDry(cmd, commandArgs, suffix = "") {
 
 function printDryPreflight() {
   process.stdout.write(
-    "# preflight: check active AgentBridge frontends/Codex TUIs; prompt on TTY, refuse in non-TTY (use --force to skip)\n",
+    restartNow
+      ? "# preflight: --restart-now stops active AgentBridge frontends/Codex TUIs; prompt on TTY, refuse in non-TTY (use --force to skip)\n"
+      : "# preflight: active AgentBridge frontends/Codex TUIs are left running (non-destructive); pass --restart-now to stop them\n",
   );
 }
 
@@ -414,14 +442,14 @@ async function installLocal() {
     printDry("npm", ["pack", "--pack-destination", "<temp>"]);
     printDry("node", ["scripts/install-safety.cjs", "verify-tarball", "<packed-tarball>"]);
     printDry("npm", ["install", "-g", "--force", "<packed-tarball>"]);
-    printDry("node", ["scripts/install-safety.cjs", "stop-running", "--dry-run"], "  # after install succeeds — the old daemon keeps serving until the new bytes are on disk");
+    if (restartNow) printDry("node", ["scripts/install-safety.cjs", "stop-running", "--dry-run"], "  # --restart-now: stop running daemons now (default leaves them serving the old version until they restart)");
     if (!skipPlugin) {
       printDry("bun", ["src/cli.ts", "dev", "--skip-build"], "  # sync Claude Code plugin (skip with --skip-plugin)");
     }
     return;
   }
 
-  await runInstallPreflight();
+  const runningSessions = await runInstallPreflight();
   const target = resolveInstallPrefix();
   reportPrefix(target);
   const env = prefixEnv(target);
@@ -444,7 +472,10 @@ async function installLocal() {
     const tarball = packedTarballFrom(packed.stdout ?? "", packDir);
     run("node", ["scripts/install-safety.cjs", "verify-tarball", tarball]);
     run("npm", ["install", "-g", "--force", tarball], { envExtra: env });
-    run("node", ["scripts/install-safety.cjs", "stop-running"]);
+    // Non-destructive default (⑥): leave running daemons alone — they keep serving active sessions
+    // with the old bytes and pick up the new version on their next restart. Only --restart-now stops
+    // them now (the old behaviour).
+    if (restartNow) run("node", ["scripts/install-safety.cjs", "stop-running"]);
     process.stdout.write(`install-global: installed ${packageName} globally from local source\n`);
   } finally {
     if (packDir) rmSync(packDir, { recursive: true, force: true });
@@ -464,11 +495,17 @@ async function installLocal() {
     }
   }
 
-  // Running daemons/sessions were stopped after the new bytes landed — make
-  // the required restart explicit instead of leaving it implied.
-  process.stdout.write(
-    "# note: running AgentBridge sessions were stopped — start fresh with `agentbridge claude` / `agentbridge codex`\n",
-  );
+  // Tell the user the truth about running sessions — but ONLY when there actually were any at
+  // preflight time (gated on runningSessions, like the preflight stderr): a clean install with
+  // nothing running must not claim phantom sessions. The wording depends on whether this was the
+  // destructive (--restart-now) path or the non-destructive default (backlog ⑥).
+  if (runningSessions > 0) {
+    process.stdout.write(
+      restartNow
+        ? "# note: running AgentBridge sessions were stopped — start fresh with `agentbridge claude` / `agentbridge codex`\n"
+        : "# note: running AgentBridge sessions keep serving the OLD version until they restart — restart when convenient to pick up the new build (or re-run with --restart-now to stop them now)\n",
+    );
+  }
 
   warnAboutSurvivingFrontends();
 }
@@ -511,7 +548,7 @@ async function installNpm() {
     reportPrefix(prefix);
     printDry("npm", ["view", spec, "version"]);
     printDry("npm", ["install", "-g", "--force", spec]);
-    printDry("node", ["scripts/install-safety.cjs", "stop-running", "--dry-run"], "  # after install succeeds — a failed `npm view` / install leaves the running daemon untouched");
+    if (restartNow) printDry("node", ["scripts/install-safety.cjs", "stop-running", "--dry-run"], "  # --restart-now: stop running daemons now (default leaves them serving the old version until they restart)");
     return;
   }
 
@@ -527,7 +564,8 @@ async function installNpm() {
   // the running daemon untouched — zero downtime on the failure path.
   run("npm", ["view", spec, "version"]);
   run("npm", ["install", "-g", "--force", spec], { envExtra: env });
-  run("node", ["scripts/install-safety.cjs", "stop-running"]);
+  // Non-destructive default (⑥): see local path above — only --restart-now stops running daemons now.
+  if (restartNow) run("node", ["scripts/install-safety.cjs", "stop-running"]);
   process.stdout.write(`install-global: installed ${packageName} globally from npm latest\n`);
 }
 

@@ -243,29 +243,36 @@ to conflict with.
 Both install modes (via `scripts/install-global.mjs`) use the same four-step
 sequence:
 
-1. Preflight active Claude frontends and managed Codex TUIs. If any are running,
-   the installer asks on a TTY, refuses in non-TTY mode, or continues with
+1. Preflight active Claude frontends and managed Codex TUIs. **Non-destructive by
+   default (backlog ⑥):** the install no longer stops running daemons, so active
+   sessions keep serving the OLD version until they restart on their own — nothing
+   is disconnected and nothing is asked. Only `--restart-now` (the opt-in
+   destructive path) prompts on a TTY, refuses in non-TTY, or continues with
    `--force`.
 2. Build/verify/install succeeds. Local mode rebuilds `dist/` and plugin
    bundles, verifies required artifacts on disk, packs a tarball, and verifies
    the tarball before installing it; npm mode verifies `latest` exists and
    installs it.
-3. Only after the install succeeds, call `install-safety.cjs stop-running` using
-   a scrubbed install environment.
-4. Print the post-install reminder to restart affected AgentBridge/Claude
-   windows.
+3. **Only under `--restart-now`**, after the install succeeds, call
+   `install-safety.cjs stop-running` using a scrubbed install environment. The
+   default path skips this entirely.
+4. Print the post-install reminder (only when sessions were running) — restart
+   affected AgentBridge/Claude windows to pick up the new version.
 
 Use `node scripts/install-global.mjs local --dry-run` to inspect the sequence
-without stopping anything.
+without stopping anything; add `--restart-now` to see the stop step.
 
 #### What stops running daemons (and what doesn't) / 谁会停掉运行中的 daemon
 
 Stopping all running AgentBridge daemons/TUIs is destructive, so it is **not**
 triggered by arbitrary installs. There are exactly two paths that stop them:
 
-1. **The intentional installer** — `scripts/install-global.mjs` (`bun run
-   install:global:*`) calls `install-safety.cjs stop-running` directly in both
-   `local` and `npm` modes. It now preflights active sessions before doing so.
+1. **The intentional installer WITH `--restart-now`** — `scripts/install-global.mjs`
+   (`bun run install:global:* -- --restart-now`) calls `install-safety.cjs
+   stop-running` after install, in both `local` and `npm` modes. **Without
+   `--restart-now` the installer is non-destructive (backlog ⑥): it never stops
+   running daemons** — active sessions keep serving the old version until they
+   restart on their own.
 2. **An explicit global self-install via npm `postinstall`** — `scripts/postinstall.cjs`
    stops running daemons **only** when it detects an explicit global signal:
    - `npm_config_global=true` (i.e. `npm install -g …`), or
@@ -282,8 +289,9 @@ a note pointing at `abg kill --all` / install-global). Stop-the-world is reserve
 for the two intentional paths above.
 
 停掉所有运行中的 daemon/TUI 是破坏性操作,因此**不会**被任意安装触发。只有两条路径会停:
-(1) **有意安装器** `scripts/install-global.mjs`(`bun run install:global:*`)在 `local` 与
-`npm` 两种模式下直接调用 `install-safety.cjs stop-running`,且现在会先前置检测活跃会话;
+(1) **带 `--restart-now` 的有意安装器** `scripts/install-global.mjs`(`bun run install:global:* -- --restart-now`)
+在 `local` 与 `npm` 两种模式下于安装后调用 `install-safety.cjs stop-running`。**不带 `--restart-now` 时安装器是非破坏的(backlog ⑥):
+绝不停掉运行中的 daemon**——活跃会话继续用旧版服务,直到它们自行重启;
 (2) **经 npm `postinstall` 的显式全局自安装**——`scripts/postinstall.cjs` 仅在检测到显式全局信号时才停
 (`npm_config_global=true` / `npm_config_location=global` / `AGENTBRIDGE_POSTINSTALL_STOP=1`;
 `AGENTBRIDGE_POSTINSTALL_STOP=0` 强制不停,优先级最高)。**任意 `.tgz` / 传递依赖安装

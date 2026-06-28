@@ -26,6 +26,8 @@ export function decideInstallPreflight(opts: {
   force: boolean;
   dryRun: boolean;
   isTTY: boolean;
+  /** Opt-in destructive path (stop daemons now). Default false = non-destructive (backlog ⑥). */
+  restartNow?: boolean;
 }): { action: "allow" | "prompt" | "block"; reason: string };
 
 /** Derive the install prefix from a resolved bin path like `<prefix>/bin/<name>`. */

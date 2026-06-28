@@ -159,22 +159,39 @@ describe("scripts/install-global.mjs", () => {
     ]);
   });
 
-  test("preflight decision blocks active sessions before install unless forced or dry-run", () => {
-    expect(decideInstallPreflight({ activeSessionCount: 1, force: false, dryRun: false, isTTY: false })).toEqual({
+  test("preflight: --restart-now (destructive) blocks active sessions unless forced or dry-run", () => {
+    expect(decideInstallPreflight({ activeSessionCount: 1, force: false, dryRun: false, isTTY: false, restartNow: true })).toEqual({
       action: "block",
       reason: "non-tty",
     });
-    expect(decideInstallPreflight({ activeSessionCount: 1, force: true, dryRun: false, isTTY: false })).toEqual({
+    expect(decideInstallPreflight({ activeSessionCount: 1, force: true, dryRun: false, isTTY: false, restartNow: true })).toEqual({
       action: "allow",
       reason: "force",
     });
-    expect(decideInstallPreflight({ activeSessionCount: 1, force: false, dryRun: true, isTTY: false })).toEqual({
+    expect(decideInstallPreflight({ activeSessionCount: 1, force: false, dryRun: false, isTTY: true, restartNow: true })).toEqual({
+      action: "prompt",
+      reason: "tty",
+    });
+    expect(decideInstallPreflight({ activeSessionCount: 1, force: false, dryRun: true, isTTY: false, restartNow: true })).toEqual({
       action: "allow",
       reason: "dry-run",
     });
-    expect(decideInstallPreflight({ activeSessionCount: 0, force: false, dryRun: false, isTTY: false })).toEqual({
+    expect(decideInstallPreflight({ activeSessionCount: 0, force: false, dryRun: false, isTTY: false, restartNow: true })).toEqual({
       action: "allow",
       reason: "no-active-sessions",
+    });
+  });
+
+  test("preflight: non-destructive default (backlog ⑥) never blocks/prompts on active sessions", () => {
+    // No --restart-now → the upgrade leaves daemons running, so active sessions are allowed through
+    // regardless of TTY (nothing is disconnected, nothing to confirm).
+    expect(decideInstallPreflight({ activeSessionCount: 3, force: false, dryRun: false, isTTY: false, restartNow: false })).toEqual({
+      action: "allow",
+      reason: "non-destructive",
+    });
+    expect(decideInstallPreflight({ activeSessionCount: 3, force: false, dryRun: false, isTTY: true, restartNow: false })).toEqual({
+      action: "allow",
+      reason: "non-destructive",
     });
   });
 
@@ -186,14 +203,14 @@ describe("scripts/install-global.mjs", () => {
     //     stop-running, so a failed install never kills the running daemon.
     //   - the redundant `npm uninstall -g` is gone: `--force` is a full replace,
     //     and uninstalling only widened the window with no binary on PATH.
-    const commands = dryRunCommands("local");
+    const commands = dryRunCommands("local", ["--restart-now"]);
     expect(commands).toEqual([
       "$ bun run prepublishOnly",
       "$ node scripts/install-safety.cjs verify-built",
       "$ npm pack --pack-destination <temp>",
       "$ node scripts/install-safety.cjs verify-tarball <packed-tarball>",
       "$ npm install -g --force <packed-tarball>",
-      "$ node scripts/install-safety.cjs stop-running --dry-run  # after install succeeds — the old daemon keeps serving until the new bytes are on disk",
+      "$ node scripts/install-safety.cjs stop-running --dry-run  # --restart-now: stop running daemons now (default leaves them serving the old version until they restart)",
       "$ bun src/cli.ts dev --skip-build  # sync Claude Code plugin (skip with --skip-plugin)",
     ]);
     // The redundant uninstall must be gone entirely.
@@ -205,7 +222,8 @@ describe("scripts/install-global.mjs", () => {
     expect(stopIdx).toBeGreaterThan(installIdx);
   });
 
-  test("dry-run output includes the active-session preflight as the first plan step", () => {
+  test("non-destructive default (⑥): dry-run preflight + NO stop-running; --restart-now opts back in", () => {
+    // Default (no --restart-now): preflight says sessions are left running, plan starts at npm view.
     const res = runDry("npm");
     expect(res.status).toBe(0);
     const lines = res.stdout
@@ -213,17 +231,29 @@ describe("scripts/install-global.mjs", () => {
       .map((line) => line.trim())
       .filter(Boolean);
     expect(lines[0]).toContain("preflight");
-    expect(lines[0]).toContain("--force");
+    expect(lines[0]).toContain("--restart-now"); // default points the user at the opt-in, not --force
     expect(lines.findIndex((line) => line.startsWith("$ npm view"))).toBeGreaterThan(0);
+
+    // Headline contract regression guard: the DEFAULT path must never emit stop-running, in BOTH
+    // modes. Without this, dropping the `if (restartNow)` guard would slip through (every other
+    // stop-running test opts into --restart-now).
+    expect(dryRunCommands("npm").some((l) => l.includes("stop-running"))).toBe(false);
+    expect(dryRunCommands("local").some((l) => l.includes("stop-running"))).toBe(false);
+
+    // --restart-now is the destructive path: preflight mentions --force, plan includes stop-running.
+    const restart = runDry("npm", ["--restart-now"]);
+    const restartLines = restart.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+    expect(restartLines[0]).toContain("--force");
+    expect(dryRunCommands("npm", ["--restart-now"]).some((l) => l.includes("stop-running"))).toBe(true);
   });
 
   test("local mode --skip-plugin omits the plugin sync step (stop-running still last)", () => {
-    const commands = dryRunCommands("local", ["--skip-plugin"]);
+    const commands = dryRunCommands("local", ["--skip-plugin", "--restart-now"]);
     expect(commands.some((line) => line.includes("dev --skip-build"))).toBe(false);
     // With the plugin sync skipped, stop-running is the final step — and it is
     // still AFTER the install (downtime + failure-safety invariant preserved).
     expect(commands[commands.length - 1]).toBe(
-      "$ node scripts/install-safety.cjs stop-running --dry-run  # after install succeeds — the old daemon keeps serving until the new bytes are on disk",
+      "$ node scripts/install-safety.cjs stop-running --dry-run  # --restart-now: stop running daemons now (default leaves them serving the old version until they restart)",
     );
     const installIdx = commands.findIndex((l) => l.startsWith("$ npm install -g --force"));
     const stopIdx = commands.findIndex((l) => l.includes("stop-running"));
@@ -234,11 +264,11 @@ describe("scripts/install-global.mjs", () => {
     // Ordering contract (P1): a failed `npm view` (registry unreachable / version
     // missing) or a failed install must leave the running daemon untouched, so
     // stop-running runs LAST — after both validation and install succeed.
-    const commands = dryRunCommands("npm");
+    const commands = dryRunCommands("npm", ["--restart-now"]);
     expect(commands).toEqual([
       `$ npm view ${PACKAGE_NAME}@latest version`,
       `$ npm install -g --force ${PACKAGE_NAME}@latest`,
-      "$ node scripts/install-safety.cjs stop-running --dry-run  # after install succeeds — a failed `npm view` / install leaves the running daemon untouched",
+      "$ node scripts/install-safety.cjs stop-running --dry-run  # --restart-now: stop running daemons now (default leaves them serving the old version until they restart)",
     ]);
     // stop-running must be the LAST step (after view + install).
     expect(commands[commands.length - 1]).toContain("stop-running");
@@ -254,7 +284,7 @@ describe("scripts/install-global.mjs", () => {
   //     installer with stubbed npm/node/bun and assert stop-running never fired.
 
   test("npm mode: a failed `npm view` aborts BEFORE stop-running (daemon untouched)", () => {
-    const { status, record } = runRealWithStubs("npm", [], "view");
+    const { status, record } = runRealWithStubs("npm", ["--restart-now"], "view");
     expect(status).not.toBe(0); // the installer propagates the failure
     // npm view was attempted...
     expect(record.some((l) => l.startsWith("npm view"))).toBe(true);
@@ -265,7 +295,8 @@ describe("scripts/install-global.mjs", () => {
 
   test("npm mode: active sessions in non-TTY abort BEFORE npm view unless --force is passed", () => {
     const activePs = "501 /usr/local/bin/codex --enable tui_app_server --remote ws://127.0.0.1:4501\n";
-    const { status, record, stderr } = runRealWithStubs("npm", [], "", activePs);
+    // --restart-now is the destructive path that disconnects sessions, so it keeps the abort gate.
+    const { status, record, stderr } = runRealWithStubs("npm", ["--restart-now"], "", activePs);
 
     expect(status).toBe(1);
     expect(record).toEqual(["ps -axo pid=,command="]);
@@ -273,14 +304,14 @@ describe("scripts/install-global.mjs", () => {
     expect(recordHasStop(record)).toBe(false);
     expect(stderr).toContain("--force");
 
-    const forced = runRealWithStubs("npm", ["--force"], "", activePs);
+    const forced = runRealWithStubs("npm", ["--restart-now", "--force"], "", activePs);
     expect(forced.status).toBe(0);
     expect(forced.record.some((l) => l.startsWith("npm view"))).toBe(true);
     expect(recordHasStop(forced.record)).toBe(true);
   });
 
   test("npm mode: a failed `npm install` aborts BEFORE stop-running (daemon untouched)", () => {
-    const { status, record } = runRealWithStubs("npm", [], "install -g --force");
+    const { status, record } = runRealWithStubs("npm", ["--restart-now"], "install -g --force");
     expect(status).not.toBe(0);
     expect(record.some((l) => l.startsWith("npm view"))).toBe(true);
     expect(record.some((l) => l.startsWith("npm install"))).toBe(true);
@@ -288,7 +319,7 @@ describe("scripts/install-global.mjs", () => {
   });
 
   test("npm mode: full success runs stop-running LAST, after view + install", () => {
-    const { status, record } = runRealWithStubs("npm", [], "");
+    const { status, record } = runRealWithStubs("npm", ["--restart-now"], "");
     expect(status).toBe(0);
     const viewIdx = record.findIndex((l) => l.startsWith("npm view"));
     const installIdx = record.findIndex((l) => l.startsWith("npm install"));
@@ -301,7 +332,7 @@ describe("scripts/install-global.mjs", () => {
   });
 
   test("local mode: a failed build (prepublishOnly) aborts BEFORE stop-running", () => {
-    const { status, record } = runRealWithStubs("local", ["--skip-plugin"], "run prepublishOnly");
+    const { status, record } = runRealWithStubs("local", ["--skip-plugin", "--restart-now"], "run prepublishOnly");
     expect(status).not.toBe(0);
     expect(record.some((l) => l.startsWith("bun run prepublishOnly"))).toBe(true);
     // Nothing destructive ran: no install, no stop-running.
@@ -311,7 +342,8 @@ describe("scripts/install-global.mjs", () => {
 
   test("local mode: active sessions in non-TTY abort BEFORE build unless --force is passed", () => {
     const activePs = "601 /Users/x/.claude/plugins/agentbridge/server/bridge-server.js\n";
-    const { status, record, stderr } = runRealWithStubs("local", ["--skip-plugin"], "", activePs);
+    // --restart-now is the destructive path that disconnects sessions, so it keeps the abort gate.
+    const { status, record, stderr } = runRealWithStubs("local", ["--skip-plugin", "--restart-now"], "", activePs);
 
     expect(status).toBe(1);
     expect(record).toEqual(["ps -axo pid=,command="]);
@@ -319,14 +351,14 @@ describe("scripts/install-global.mjs", () => {
     expect(recordHasStop(record)).toBe(false);
     expect(stderr).toContain("--force");
 
-    const forced = runRealWithStubs("local", ["--skip-plugin", "--force"], "", activePs);
+    const forced = runRealWithStubs("local", ["--skip-plugin", "--restart-now", "--force"], "", activePs);
     expect(forced.status).toBe(0);
     expect(forced.record.some((l) => l.startsWith("bun run prepublishOnly"))).toBe(true);
     expect(recordHasStop(forced.record)).toBe(true);
   });
 
   test("local mode: a failed `npm install` aborts BEFORE stop-running (daemon untouched)", () => {
-    const { status, record } = runRealWithStubs("local", ["--skip-plugin"], "install -g --force");
+    const { status, record } = runRealWithStubs("local", ["--skip-plugin", "--restart-now"], "install -g --force");
     expect(status).not.toBe(0);
     // Build + verify + pack + install were attempted...
     expect(record.some((l) => l.startsWith("bun run prepublishOnly"))).toBe(true);
@@ -337,7 +369,7 @@ describe("scripts/install-global.mjs", () => {
   });
 
   test("local mode: full success runs stop-running AFTER install, with no uninstall", () => {
-    const { status, record } = runRealWithStubs("local", ["--skip-plugin"], "");
+    const { status, record } = runRealWithStubs("local", ["--skip-plugin", "--restart-now"], "");
     expect(status).toBe(0);
     const installIdx = record.findIndex((l) => l.startsWith("npm install -g --force"));
     const stopIdx = record.findIndex(
@@ -346,6 +378,36 @@ describe("scripts/install-global.mjs", () => {
     expect(installIdx).toBeGreaterThanOrEqual(0);
     expect(stopIdx).toBeGreaterThan(installIdx);
     expect(record.some((l) => l.startsWith("npm uninstall"))).toBe(false);
+  });
+
+  test("local mode DEFAULT (no --restart-now): installs, never stops daemons, tells the truth", () => {
+    // Backlog ⑥ headline contract at the REAL (non-dry) level.
+    // (a) With a running session: install proceeds, nothing is stopped, note truthfully says the
+    //     session keeps serving the OLD version (never "were stopped").
+    const active = "601 /Users/x/.claude/plugins/agentbridge/server/bridge-server.js\n";
+    const withSession = runRealWithStubs("local", ["--skip-plugin"], "", active);
+    expect(withSession.status).toBe(0);
+    expect(withSession.record.some((l) => l.startsWith("npm install -g --force"))).toBe(true);
+    expect(recordHasStop(withSession.record)).toBe(false);
+    expect(withSession.stdout).toContain("keep serving the OLD version");
+    expect(withSession.stdout).not.toContain("sessions were stopped");
+
+    // (b) With NO running sessions: still installs + stops nothing, and must NOT print a
+    //     phantom-session note (the note is gated on runningSessions, like the preflight stderr).
+    const clean = runRealWithStubs("local", ["--skip-plugin"], "");
+    expect(clean.status).toBe(0);
+    expect(recordHasStop(clean.record)).toBe(false);
+    expect(clean.stdout).not.toContain("keep serving the OLD version");
+    expect(clean.stdout).not.toContain("sessions were stopped");
+  });
+
+  test("npm mode DEFAULT (no --restart-now): installs, never stops daemons", () => {
+    // Symmetric REAL-path guard for the npm flow — without it, dropping the `if (restartNow)` gate on
+    // the npm stop-running call regresses (npm default would stop daemons) with every test still green.
+    const { status, record } = runRealWithStubs("npm", [], "");
+    expect(status).toBe(0);
+    expect(record.some((l) => l.startsWith("npm install"))).toBe(true); // install still happened
+    expect(recordHasStop(record)).toBe(false); // ...but nothing was stopped
   });
 
   test("package.json exposes one-line local and npm install commands", () => {
