@@ -98,13 +98,12 @@ abg room add checkout bob@team.dev</pre>
   </div>
 
   <div class="step">
-    <h3><span class="zh">② 每台参与者机：连 broker + 落 token + 起 agent</span><span class="en">② Each participant machine: connect + place token + start agent</span></h3>
-    <pre>export AGENTBRIDGE_BROKER_URL=ws://100.x.y.z:4700/ws
-abg auth login --id bob@team.dev --name Bob
-abg join checkout    <span class="c"># <span class="zh">关联当前目录→房间</span><span class="en">map cwd → room</span></span>
+    <h3><span class="zh">② 每台参与者机：装 token + 加房间 + 起 agent</span><span class="en">② Each participant machine: install token + join room + start agent</span></h3>
+    <pre>abg auth login --token &lt;broker 签发的 token&gt;   <span class="c"># <span class="zh">装 broker 带外发来的 token</span><span class="en">install the broker-issued token</span></span>
+abg join checkout --broker-url ws://100.x.y.z:4700/ws    <span class="c"># <span class="zh">加房间 + 持久化 broker 地址</span><span class="en">join + persist broker URL</span></span>
 abg claude           <span class="c"># <span class="zh">或 abg codex</span><span class="en">or abg codex</span></span>
 abg init</pre>
-    <p class="sub"><span class="zh">⚠️ 注意：上面的 <code>abg auth login --id</code> 跨机当前<b>不通</b>——边机自签的 token 不在 broker 机的库里，会被拒（4401）。正在补 <code>abg auth issue</code>（broker 侧签发）+ <code>abg auth login --token</code>（边机安装）+ <code>abg room invite</code> 一条龙；在那之前跨机请按 <a href="../10-跨网部署与运维.md">docs/10</a> 的手动流程。</span><span class="en">⚠️ The <code>abg auth login --id</code> step above does NOT work cross-machine yet (an edge-signed token isn't in the broker's store → 4401); a real onboarding flow is being added.</span></p>
+    <p class="sub"><span class="zh">broker 机 <code>abg room invite &lt;room&gt; &lt;id&gt; --broker-url ws://…</code> 会一次性打印好上面两行，带外发给参与者粘贴即可。<code>--broker-url</code> 持久化后<b>无需设 <code>AGENTBRIDGE_BROKER_URL</code>、无需重启 daemon</b>。</span><span class="en">On the broker, <code>abg room invite &lt;room&gt; &lt;id&gt; --broker-url ws://…</code> prints both lines ready to paste (deliver out-of-band). Once <code>--broker-url</code> is persisted, <b>no <code>AGENTBRIDGE_BROKER_URL</code> env var and no daemon restart</b> are needed.</span></p>
   </div>
 
   <div class="step">
@@ -143,13 +142,13 @@ abg init</pre>
     <tr><td><code>abg announce --summary</code></td><td><span class="zh">广播完成事件</span><span class="en">broadcast a completion</span></td></tr>
     <tr><td><code>abg claude / codex / init / doctor / budget / kill</code></td><td><span class="zh">起会话 / 注入 / 自检 / 额度 / 全停</span><span class="en">session / inject / doctor / quota / stop</span></td></tr>
   </table>
-  <p class="sub"><span class="zh">环境变量：<code>AGENTBRIDGE_BROKER_URL</code>（连远程 broker）、<code>AGENTBRIDGE_COLLAB_DB</code>。</span>
-     <span class="en">Env: <code>AGENTBRIDGE_BROKER_URL</code> (remote broker), <code>AGENTBRIDGE_COLLAB_DB</code>.</span></p>
+  <p class="sub"><span class="zh">环境变量：<code>AGENTBRIDGE_BROKER_URL</code>（连远程 broker 的一次性 override；常态用 <code>abg join --broker-url</code> 持久化即可）、<code>AGENTBRIDGE_COLLAB_DB</code>。</span>
+     <span class="en">Env: <code>AGENTBRIDGE_BROKER_URL</code> (one-off override for the remote broker; normally unneeded — <code>abg join --broker-url</code> persists it), <code>AGENTBRIDGE_COLLAB_DB</code>.</span></p>
 
   <!-- 6 troubleshoot -->
   <h2><span class="zh">6 · 排障</span><span class="en">6 · Troubleshooting</span></h2>
   <ul>
-    <li><span class="zh"><b>看不到房间事件</b> → 确认你是该房间成员（broker 机 <code>abg room add</code> 过你）+ BROKER_URL 对 + token 一致。</span><span class="en"><b>No room events</b> → confirm you're a member (<code>abg room add</code>'d on the broker machine) + correct BROKER_URL + matching token.</span></li>
+    <li><span class="zh"><b>看不到房间事件</b> → 确认你是该房间成员（broker 机 <code>abg room add</code>/<code>invite</code> 过你）+ <code>abg join</code> 带了 <code>--broker-url</code>（漏了会回退本地默认并打 WARN）+ token 一致。</span><span class="en"><b>No room events</b> → confirm you're a member (<code>abg room add</code>/<code>invite</code>'d on the broker) + you passed <code>--broker-url</code> to <code>abg join</code> (omitting it falls back to localhost and logs a WARN) + matching token.</span></li>
     <li><span class="zh"><b>连不上 broker</b> → <code>curl http://100.x:4700/healthz</code> 应 200；别绑 0.0.0.0。</span><span class="en"><b>Can't reach broker</b> → <code>curl http://100.x:4700/healthz</code> should be 200; don't bind 0.0.0.0.</span></li>
     <li><span class="zh"><b>完成事件没广播</b> → 装了插件 + 当前目录 <code>abg join</code> 过 + 已登录。</span><span class="en"><b>Completions not broadcast</b> → plugin installed + current dir <code>abg join</code>'d + logged in.</span></li>
   </ul>

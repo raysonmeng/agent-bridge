@@ -106,28 +106,24 @@ abg room list                                        # list all rooms
 
 Distribute each person's token **out of band** (IM / password manager; never commit to git).
 
-### 3.3 ② On each participant machine: connect + place token + start the agent
+### 3.3 ② On each participant machine: install token + join room + start the agent
 
 ```bash
-# (a) point at the remote broker (Tailscale 100.x or MagicDNS)
-export AGENTBRIDGE_BROKER_URL=ws://100.x.y.z:4700/ws
+# (a) install the token the broker issued for you (sent out-of-band by
+#     `abg room invite` / `abg auth issue` on the broker machine)
+abg auth login --token <token-issued-by-broker>
 
-# (b) ⚠️ Cross-machine auth is NOT yet functional — do NOT follow this step
-# Problem: abg auth login creates a brand-new self-signed token locally, but the
-# broker only accepts tokens already in its own collab.db store; a locally-created
-# token is unknown to the broker → connection rejected with 4401.
-# Current workaround: the admin issues the token on the broker machine (§3.2(b)),
-# delivers it out-of-band, and the participant writes it into <state>/auth-token
-# on their machine (path shown by `abg doctor`).
-# ⚠️ A proper `abg auth issue` / `abg auth login --token` command is in progress (feat/v3-xnet-onboarding).
+# (b) join the room and persist the broker URL (so agentbridge claude auto-connects)
+abg join <roomId> --broker-url ws://100.x.y.z:4700/ws    # Tailscale 100.x or MagicDNS
 
-# (c) map the current working directory to the room (auto-joins this dir next time)
-abg join checkout
-
-# (d) start the agent as usual (bridged)
+# (c) start the agent as usual (bridged)
 abg claude            # or abg codex
 abg init              # first time: inject the collaboration + security rules into CLAUDE.md/AGENTS.md
 ```
+
+> On the broker machine, `abg room invite <roomId> <id> --broker-url ws://…` prints lines (a)+(b)
+> ready to paste; deliver them out-of-band (IM / password manager). Once `--broker-url` is persisted,
+> there is **no `AGENTBRIDGE_BROKER_URL` env var and no daemon restart** needed.
 
 ### 3.4 ③ Daily use — how it helps
 
@@ -168,13 +164,13 @@ Multi-agent collaboration is a new trust boundary: **other members' room message
 | `abg init` | inject collaboration + security rules into CLAUDE.md/AGENTS.md |
 | `abg doctor` / `abg budget` / `abg pairs` / `abg kill` | self-check / quota / pairs / stop all |
 
-Env vars: `AGENTBRIDGE_BROKER_URL` (remote broker), `AGENTBRIDGE_COLLAB_DB` (collab.db path).
+Env vars: `AGENTBRIDGE_BROKER_URL` (one-off override for the remote broker; normally unneeded — `abg join --broker-url` persists it), `AGENTBRIDGE_COLLAB_DB` (collab.db path).
 
 ---
 
 ## 6. Troubleshooting
 
-- **No room events:** confirm you are a **member** of that room (added via `abg room add` on the broker machine); confirm `AGENTBRIDGE_BROKER_URL` is correct; confirm the token matches the broker.
+- **No room events:** confirm you are a **member** of that room (added via `abg room add` / `abg room invite` on the broker machine); confirm you passed `--broker-url` to `abg join` (it persists the address; omitting it falls back to the local default and logs a WARN, visible via `abg logs -f`); confirm the token matches the broker.
 - **Can't reach the broker:** `curl http://100.x:4700/healthz` should return `{ok:true,...}`; don't bind 0.0.0.0 (bind the Tailscale 100.x).
 - **ACL not taking effect:** usually the default allow-all wasn't deleted (docs/10).
 - **Completions not broadcast:** confirm the plugin (Stop hook) is installed + the current directory has `abg join`ed a room + you're logged in.
