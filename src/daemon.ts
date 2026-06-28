@@ -238,6 +238,14 @@ let shuttingDown = false;
 let bootDeadlineTimer: ReturnType<typeof setTimeout> | null = null;
 /** v3 last-mile: forwards broker room events into this Claude session (§11.1). Null until bootstrapped / when inert. */
 let roomBridge: RoomBridgeHandle | null = null;
+/**
+ * v3 §5.2 multi agent-type: a SECOND room bridge that forwards the same broker room events into the
+ * live Codex session (distinct broker identity via `auth-token-codex`, presence agentType:"codex").
+ * Independent of {@link roomBridge}: each is fail-inert on its own token, so Codex absent / not
+ * provisioned leaves the Claude bridge (and the v1 flow) untouched. A future 3rd agent-type adds its
+ * own binding + bespoke emit wiring (the inject target differs per agent — no generic Map helps).
+ */
+let codexRoomBridge: RoomBridgeHandle | null = null;
 let lastAttachStatusSentTs = 0;
 const ATTACH_STATUS_COOLDOWN_MS = 30_000; // Don't re-send status on rapid reattach
 
@@ -2401,6 +2409,8 @@ function shutdown(reason: string, exitCode = 0) {
   codex.stop();
   roomBridge?.stop();
   roomBridge = null;
+  codexRoomBridge?.stop();
+  codexRoomBridge = null;
   removePidFile();
   removeStatusFile();
   removeControlToken();
@@ -2504,3 +2514,19 @@ void startRoomBridge({
     else roomBridge = handle;
   })
   .catch((e) => log(`room bridge start failed: ${String(e)}`));
+
+// v3 §5.2: the Codex-side room bridge. Same broker room, but injects into the live Codex session
+// (codex.injectRoomNotice queues mid-turn — Codex can't be injected during a running turn). Distinct
+// identity via auth-token-codex; fail-inert when Codex has no collab token (the common single-agent case).
+void startRoomBridge({
+  cwd: process.cwd(),
+  agentType: "codex",
+  capabilities: ["implement", "execute"],
+  emit: (text) => codex.injectRoomNotice(text),
+  log,
+})
+  .then((handle) => {
+    if (shuttingDown) handle.stop();
+    else codexRoomBridge = handle;
+  })
+  .catch((e) => log(`codex room bridge start failed: ${String(e)}`));

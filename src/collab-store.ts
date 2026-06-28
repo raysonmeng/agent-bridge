@@ -71,10 +71,23 @@ export function writeBrokerUrl(dbPath: string, url: string): void {
   writeFileSync(join(dir, "broker-url"), url, { mode: 0o600 });
 }
 
-/** Read the logged-in PSK token from `<collabDir>/auth-token`. No Store needed — cheap login gate. */
-export function readAuthToken(dbPath: string): string | null {
+/**
+ * Resolve the auth-token filename for an agent kind (§5.2 multi agent-type). Claude (or no
+ * agentType) uses the bare `auth-token` (back-compat); a non-claude agent uses `auth-token-<type>`
+ * so Claude and Codex authenticate to the broker as DISTINCT identities from the same collab dir.
+ * agentType is sanitised to `[a-z0-9-]` before it becomes a filename (defence-in-depth: it must
+ * never escape the collab dir even though it is daemon-set, not user input).
+ */
+export function authTokenFile(agentType?: string): string {
+  if (!agentType) return "auth-token";
+  const safe = agentType.toLowerCase().replace(/[^a-z0-9-]/g, "");
+  return safe === "" || safe === "claude" ? "auth-token" : `auth-token-${safe}`;
+}
+
+/** Read the logged-in PSK token from `<collabDir>/auth-token[-<agentType>]`. No Store needed — cheap login gate. */
+export function readAuthToken(dbPath: string, agentType?: string): string | null {
   try {
-    const token = readFileSync(join(dirname(dbPath), "auth-token"), "utf-8").trim();
+    const token = readFileSync(join(dirname(dbPath), authTokenFile(agentType)), "utf-8").trim();
     return token === "" ? null : token;
   } catch {
     return null;

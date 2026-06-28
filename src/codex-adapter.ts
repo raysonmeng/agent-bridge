@@ -159,6 +159,14 @@ export class CodexAdapter extends EventEmitter {
   }>();
 
   private agentMessageBuffers = new Map<string, string[]>();
+  /**
+   * Room-event notices (§5.2) that arrived while a turn was in progress. Unlike Claude (pushed to a
+   * socket), Codex injection is rejected mid-turn ({@link injectMessage} returns null when
+   * turnInProgress), so room events must queue and flush when the turn ends. Bounded (drop-oldest):
+   * a flood of room chatter must not grow unbounded while a long turn runs.
+   */
+  private roomInjectQueue: string[] = [];
+  private static readonly ROOM_INJECT_QUEUE_CAP = 50;
   private pendingRequests = new Map<string, PendingRequest>();
   private activeTurnIds = new Set<string>();
   turnInProgress = false;
@@ -551,6 +559,38 @@ export class CodexAdapter extends EventEmitter {
       this.untrackBridgeRequestId(requestId);
       this.log(`Injection send failed: ${err.message}`);
       return null;
+    }
+  }
+
+  /**
+   * Inject a room-event notice (§5.2 multi agent-type room join) into the Codex session. The Claude
+   * bridge pushes notices straight to a socket, but Codex {@link injectMessage} is rejected mid-turn,
+   * so when a turn is in progress (or the app-server isn't ready) the notice is QUEUED and flushed
+   * one-per-turn on the next {@link flushRoomInjectQueue}. Best-effort by design: room events are
+   * untrusted notifications, never instructions, so a late or (on overflow) dropped notice is fine.
+   */
+  injectRoomNotice(text: string): void {
+    if (this.canInject()) {
+      this.injectMessage(text);
+      return;
+    }
+    this.roomInjectQueue.push(text);
+    if (this.roomInjectQueue.length > CodexAdapter.ROOM_INJECT_QUEUE_CAP) {
+      this.roomInjectQueue.shift(); // drop-oldest: bound the backlog while a long turn runs
+      this.log("Room inject queue full — dropped oldest notice");
+    }
+  }
+
+  /**
+   * Flush at most ONE queued room notice once the inject gate is open (called on turnCompleted).
+   * One-per-turn pacing: each injected notice starts its own turn, whose completion flushes the
+   * next — so a burst never fires a stack of concurrent turn/starts. FIFO order preserved.
+   */
+  private flushRoomInjectQueue(): void {
+    if (this.roomInjectQueue.length === 0 || !this.canInject()) return;
+    const text = this.roomInjectQueue.shift()!;
+    if (this.injectMessage(text) === null) {
+      this.roomInjectQueue.unshift(text); // race: gate closed between check and send — requeue at head
     }
   }
 
@@ -2061,6 +2101,7 @@ export class CodexAdapter extends EventEmitter {
         // Only emit when all turns are done (symmetric with turnStarted)
         if (wasInProgress && !this.turnInProgress) {
           this.emit("turnCompleted");
+          this.flushRoomInjectQueue(); // gate just opened — drain one queued room notice (§5.2)
         }
         break;
       }

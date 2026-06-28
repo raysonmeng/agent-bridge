@@ -24,9 +24,18 @@ import type { Envelope } from "./backbone/envelope";
 export interface RoomBridgeDeps {
   /** The pair's project dir, resolved to a room via the cwd→room map (§2.4). */
   cwd: string;
-  /** Inject a rendered one-line room-event notice into the live Claude session. */
+  /** Inject a rendered one-line room-event notice into the live agent session. */
   emit: (text: string) => void;
   log?: (msg: string) => void;
+  /**
+   * The agent kind this bridge fronts (§5.2 multi agent-type). Drives the broker presence label
+   * and which `<collabDir>/auth-token[-<agentType>]` token authenticates it, so Claude and Codex
+   * join the same room as DISTINCT identities. Defaults to "claude" (back-compat: the original
+   * single-bridge caller, which used the bare `auth-token`).
+   */
+  agentType?: string;
+  /** Capabilities advertised to other members (presence meta, render-only — routing never reads it). */
+  capabilities?: string[];
   // --- test seams ---
   dbPath?: string;
   brokerUrl?: string;
@@ -216,10 +225,11 @@ export function renderRoomEvent(env: Envelope, selfId?: string): string | null {
  */
 export async function startRoomBridge(deps: RoomBridgeDeps): Promise<RoomBridgeHandle> {
   const log = deps.log ?? (() => {});
+  const agentType = deps.agentType ?? "claude";
   const dbPath = resolveDbPath(deps.dbPath);
-  const token = readAuthToken(dbPath);
+  const token = readAuthToken(dbPath, agentType);
   if (!token) {
-    log("room bridge: not logged in (no auth-token) — inactive");
+    log(`room bridge: ${agentType} not logged in (no auth-token) — inactive`);
     return INERT;
   }
 
@@ -249,7 +259,10 @@ export async function startRoomBridge(deps: RoomBridgeDeps): Promise<RoomBridgeH
   const client = new BrokerClient({
     url: brokerUrl,
     token,
-    presence: { agentType: "claude" },
+    presence: {
+      agentType,
+      ...(deps.capabilities && deps.capabilities.length > 0 ? { capabilities: deps.capabilities } : {}),
+    },
     log,
   });
 
@@ -297,7 +310,7 @@ export async function startRoomBridge(deps: RoomBridgeDeps): Promise<RoomBridgeH
       idempotencyKey: randomUUID(),
       // The broker re-stamps from.agentId from the authenticated socket, so this is only a
       // placeholder for the offline-queued case; agentType is a UI label (routing never reads it).
-      from: { agentId: self?.id ?? "(me)", agentType: "claude" },
+      from: { agentId: self?.id ?? "(me)", agentType },
       kind: "chat",
       payload: { text: body },
       timestamp: Date.now(),

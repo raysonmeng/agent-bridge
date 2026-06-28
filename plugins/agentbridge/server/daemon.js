@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.24", "0.0.0-source"),
-  commit: defineString("c19e0e1", "source"),
+  commit: defineString("58fa8ab", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("45aee8e59953", "source")
+  codeHash: defineString("874605b5a367", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -965,6 +965,8 @@ class CodexAdapter extends EventEmitter {
   connIdCounter = 0;
   secondaryConnections = new Map;
   agentMessageBuffers = new Map;
+  roomInjectQueue = [];
+  static ROOM_INJECT_QUEUE_CAP = 50;
   pendingRequests = new Map;
   activeTurnIds = new Set;
   turnInProgress = false;
@@ -1171,6 +1173,25 @@ class CodexAdapter extends EventEmitter {
       this.untrackBridgeRequestId(requestId);
       this.log(`Injection send failed: ${err.message}`);
       return null;
+    }
+  }
+  injectRoomNotice(text) {
+    if (this.canInject()) {
+      this.injectMessage(text);
+      return;
+    }
+    this.roomInjectQueue.push(text);
+    if (this.roomInjectQueue.length > CodexAdapter.ROOM_INJECT_QUEUE_CAP) {
+      this.roomInjectQueue.shift();
+      this.log("Room inject queue full \u2014 dropped oldest notice");
+    }
+  }
+  flushRoomInjectQueue() {
+    if (this.roomInjectQueue.length === 0 || !this.canInject())
+      return;
+    const text = this.roomInjectQueue.shift();
+    if (this.injectMessage(text) === null) {
+      this.roomInjectQueue.unshift(text);
     }
   }
   steerMessage(text) {
@@ -2177,6 +2198,7 @@ class CodexAdapter extends EventEmitter {
         this.markTurnCompleted(params?.turn?.id);
         if (wasInProgress && !this.turnInProgress) {
           this.emit("turnCompleted");
+          this.flushRoomInjectQueue();
         }
         break;
       }
@@ -7419,9 +7441,15 @@ function readPersistedBrokerUrl(dbPath) {
     return null;
   }
 }
-function readAuthToken(dbPath) {
+function authTokenFile(agentType) {
+  if (!agentType)
+    return "auth-token";
+  const safe = agentType.toLowerCase().replace(/[^a-z0-9-]/g, "");
+  return safe === "" || safe === "claude" ? "auth-token" : `auth-token-${safe}`;
+}
+function readAuthToken(dbPath, agentType) {
   try {
-    const token = readFileSync9(join11(dirname3(dbPath), "auth-token"), "utf-8").trim();
+    const token = readFileSync9(join11(dirname3(dbPath), authTokenFile(agentType)), "utf-8").trim();
     return token === "" ? null : token;
   } catch {
     return null;
@@ -7513,10 +7541,11 @@ function renderRoomEvent(env, selfId) {
 }
 async function startRoomBridge(deps) {
   const log = deps.log ?? (() => {});
+  const agentType = deps.agentType ?? "claude";
   const dbPath = resolveDbPath(deps.dbPath);
-  const token = readAuthToken(dbPath);
+  const token = readAuthToken(dbPath, agentType);
   if (!token) {
-    log("room bridge: not logged in (no auth-token) \u2014 inactive");
+    log(`room bridge: ${agentType} not logged in (no auth-token) \u2014 inactive`);
     return INERT;
   }
   const ownStore = !deps.store;
@@ -7541,7 +7570,10 @@ async function startRoomBridge(deps) {
   const client = new BrokerClient({
     url: brokerUrl,
     token,
-    presence: { agentType: "claude" },
+    presence: {
+      agentType,
+      ...deps.capabilities && deps.capabilities.length > 0 ? { capabilities: deps.capabilities } : {}
+    },
     log
   });
   client.onEvent((_topic, env) => {
@@ -7579,7 +7611,7 @@ async function startRoomBridge(deps) {
       messageId: randomUUID4(),
       traceId: randomUUID4(),
       idempotencyKey: randomUUID4(),
-      from: { agentId: self?.id ?? "(me)", agentType: "claude" },
+      from: { agentId: self?.id ?? "(me)", agentType },
       kind: "chat",
       payload: { text: body },
       timestamp: Date.now(),
@@ -7692,6 +7724,7 @@ var BUSY_RETRY_ADVISORY_MS = 15000;
 var shuttingDown = false;
 var bootDeadlineTimer = null;
 var roomBridge = null;
+var codexRoomBridge = null;
 var lastAttachStatusSentTs = 0;
 var ATTACH_STATUS_COOLDOWN_MS = 30000;
 var LIVENESS_PROBE_TIMEOUT_MS = parsePositiveIntEnv("AGENTBRIDGE_LIVENESS_PROBE_TIMEOUT_MS", 3000, log);
@@ -8983,6 +9016,8 @@ function shutdown(reason, exitCode = 0) {
   codex.stop();
   roomBridge?.stop();
   roomBridge = null;
+  codexRoomBridge?.stop();
+  codexRoomBridge = null;
   removePidFile();
   removeStatusFile();
   removeControlToken();
@@ -9043,3 +9078,15 @@ startRoomBridge({
   else
     roomBridge = handle;
 }).catch((e) => log(`room bridge start failed: ${String(e)}`));
+startRoomBridge({
+  cwd: process.cwd(),
+  agentType: "codex",
+  capabilities: ["implement", "execute"],
+  emit: (text) => codex.injectRoomNotice(text),
+  log
+}).then((handle) => {
+  if (shuttingDown)
+    handle.stop();
+  else
+    codexRoomBridge = handle;
+}).catch((e) => log(`codex room bridge start failed: ${String(e)}`));

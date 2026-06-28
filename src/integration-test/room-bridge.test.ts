@@ -123,4 +123,53 @@ describe("startRoomBridge — last-mile broker→session injection (§11.1)", ()
     await delay(150);
     expect(emitted.filter((t) => t.includes("🏁")).length).toBe(1);
   });
+
+  // §5.2 multi agent-type: a Codex-side bridge authenticates with its OWN `auth-token-codex`.
+  test("agentType:codex stays inert when only the claude auth-token exists (no identity piggybacking)", async () => {
+    const { dir, store, broker, url, dbPath } = await setup(); // writes auth-token (claude) only
+    cleanup.push(() => broker.stop(), () => rmSync(dir, { recursive: true, force: true }));
+    const emitted: string[] = [];
+    const handle = await startRoomBridge({ cwd: dir, agentType: "codex", emit: (t) => emitted.push(t), store, dbPath, brokerUrl: url });
+    expect(handle.roomId).toBeNull(); // no auth-token-codex ⇒ INERT, never borrows claude's token
+    await delay(80);
+    expect(emitted).toEqual([]);
+  });
+
+  test("agentType:codex connects with its own auth-token-codex and injects room events", async () => {
+    const { dir, store, tokenB, broker, url, dbPath } = await setup();
+    const svc = new IdentityService(store);
+    await svc.registerIdentity("codex@x.com", "Codex");
+    const tokenCodex = await svc.issueToken("codex@x.com");
+    await new RoomService(store).join(ROOM, "codex@x.com");
+    writeFileSync(join(dir, "auth-token-codex"), tokenCodex, { mode: 0o600 });
+    cleanup.push(() => broker.stop(), () => rmSync(dir, { recursive: true, force: true }));
+
+    const emitted: string[] = [];
+    const handle = await startRoomBridge({
+      cwd: dir,
+      agentType: "codex",
+      capabilities: ["implement"],
+      emit: (t) => emitted.push(t),
+      store,
+      dbPath,
+      brokerUrl: url,
+    });
+    expect(handle.roomId).toBe(ROOM);
+    cleanup.push(() => handle.stop());
+    await delay(80);
+
+    const bob = new BrokerClient({ url, token: tokenB });
+    await bob.connect();
+    cleanup.push(() => bob.close());
+    bob.publish(
+      ROOM,
+      buildTaskCompletedEnvelope({
+        roomId: ROOM,
+        from: { agentId: "bob@x.com", agentType: "claude" },
+        summary: "auth contract ready",
+      }),
+    );
+    await waitFor(() => emitted.some((t) => t.includes("🏁")));
+    expect(emitted.find((t) => t.includes("🏁"))!).toContain("auth contract ready");
+  });
 });
