@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.24", "0.0.0-source"),
-  commit: defineString("8443f08", "source"),
+  commit: defineString("95d74f2", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("18d9033e3f3f", "source")
+  codeHash: defineString("71812f90a540", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -7181,7 +7181,7 @@ class RoomService {
 }
 
 // src/collab-store.ts
-import { chmodSync as chmodSync3, mkdirSync as mkdirSync6, readFileSync as readFileSync9 } from "fs";
+import { chmodSync as chmodSync3, mkdirSync as mkdirSync6, readFileSync as readFileSync9, writeFileSync as writeFileSync5 } from "fs";
 import { dirname as dirname3, join as join11 } from "path";
 
 // src/backbone/store/sqlite-store.ts
@@ -7398,13 +7398,26 @@ function resolveDbPath(explicit) {
   const dir = base && base.length > 0 ? base : new StateDirResolver().dir;
   return join11(dir, "collab.db");
 }
-function resolveBrokerUrl(explicit) {
+function resolveBrokerUrl(explicit, dbPath) {
   if (explicit)
     return explicit;
   const env = process.env.AGENTBRIDGE_BROKER_URL;
   if (env && env.length > 0)
     return env;
+  if (dbPath) {
+    const persisted = readPersistedBrokerUrl(dbPath);
+    if (persisted)
+      return persisted;
+  }
   return DEFAULT_BROKER_URL;
+}
+function readPersistedBrokerUrl(dbPath) {
+  try {
+    const url = readFileSync9(join11(dirname3(dbPath), "broker-url"), "utf-8").trim();
+    return url === "" ? null : url;
+  } catch {
+    return null;
+  }
 }
 function readAuthToken(dbPath) {
   try {
@@ -7521,8 +7534,12 @@ async function startRoomBridge(deps) {
   }
   const room = roomId;
   const seen = new Set;
+  const brokerUrl = resolveBrokerUrl(deps.brokerUrl, dbPath);
+  if (brokerUrl === DEFAULT_BROKER_URL) {
+    log(`room bridge: WARN no broker URL configured, using ${DEFAULT_BROKER_URL} \u2014 cross-machine room events won't arrive; run \`abg join ${room} --broker-url ws://<broker>:4700/ws\``);
+  }
   const client = new BrokerClient({
-    url: resolveBrokerUrl(deps.brokerUrl),
+    url: brokerUrl,
     token,
     presence: { agentType: "claude" },
     log
