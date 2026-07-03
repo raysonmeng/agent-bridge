@@ -26,6 +26,11 @@ agentbridge claude  # Start Claude Code with plugin auto-loaded
 
 After changing plugin or runtime code, run `agentbridge dev` again and restart Claude Code (or `/reload-plugins` in an active session).
 
+> **Committed build artifacts.** The bundles under `plugins/agentbridge/server/*.js` are generated
+> but committed on purpose (the marketplace and `.mcp.json` run them straight from git). After any
+> `src/` change run `bun run build:plugin` and commit the result; on a bundle conflict, rebuild — do
+> not hand-merge. See [docs/adr-bundle-in-git.md](docs/adr-bundle-in-git.md).
+
 ## Development Workflow
 
 1. Create a focused branch for one change (`feat/xxx`, `fix/xxx`, `docs/xxx`).
