@@ -1,0 +1,35 @@
+name: Deploy website to GitHub Pages
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - 'site/**'
+      - '.github/workflows/pages.yml'
+  workflow_dispatch:
+
+# Allow the workflow to publish to GitHub Pages
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# One live deployment at a time; don't cancel an in-progress publish
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/configure-pages@v5
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+      - id: deployment
+        uses: actions/deploy-pages@v4

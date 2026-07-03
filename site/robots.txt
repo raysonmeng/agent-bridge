@@ -1,0 +1,4 @@
+User-agent: *
+Allow: /
+
+Sitemap: https://quilin-ai.github.io/agent-bridge/sitemap.xml

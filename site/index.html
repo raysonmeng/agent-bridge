@@ -1,0 +1,616 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>AgentBridge — Claude Code &amp; Codex, collaborating in one session</title>
+<meta name="description" content="AgentBridge is a local, MIT-licensed bridge that lets Claude Code and Codex collaborate in real time inside one session: cross-review, task splits, and quota relay for overnight runs. Zero runtime deps, 1,700+ tests." />
+<meta name="keywords" content="AgentBridge, Claude Code, Codex, multi-agent collaboration, cross-review, task split, quota relay, MCP, local AI tooling" />
+<meta name="author" content="raysonmeng" />
+<link rel="canonical" href="https://quilin-ai.github.io/agent-bridge/" />
+<link rel="alternate" hreflang="en" href="https://quilin-ai.github.io/agent-bridge/" />
+<link rel="alternate" hreflang="zh-Hans" href="https://quilin-ai.github.io/agent-bridge/zh/" />
+<link rel="alternate" hreflang="x-default" href="https://quilin-ai.github.io/agent-bridge/" />
+
+<!-- Open Graph -->
+<meta property="og:type" content="website" />
+<meta property="og:site_name" content="AgentBridge" />
+<meta property="og:title" content="AgentBridge — Claude Code &amp; Codex, collaborating in one session" />
+<meta property="og:description" content="A local bridge for real-time collaboration between Claude Code and Codex: cross-review, task splits, and quota relay. Local, MIT, zero runtime deps." />
+<meta property="og:url" content="https://quilin-ai.github.io/agent-bridge/" />
+<!-- og.svg is a text placeholder; swap for a real demo screenshot once recorded -->
+<meta property="og:image" content="https://quilin-ai.github.io/agent-bridge/assets/og.svg" />
+<meta property="og:image:alt" content="AgentBridge — Claude Code and Codex collaborating in one session" />
+<meta property="og:locale" content="en_US" />
+<meta property="og:locale:alternate" content="zh_CN" />
+
+<!-- Twitter Card -->
+<meta name="twitter:card" content="summary_large_image" />
+<meta name="twitter:title" content="AgentBridge — Claude Code &amp; Codex, collaborating in one session" />
+<meta name="twitter:description" content="A local bridge for real-time collaboration between Claude Code and Codex: cross-review, task splits, and quota relay." />
+<meta name="twitter:image" content="https://quilin-ai.github.io/agent-bridge/assets/og.svg" />
+<meta name="twitter:creator" content="@raysonmeng" />
+
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Ctext y='26' font-size='26'%3E%F0%9F%8C%89%3C/text%3E%3C/svg%3E" />
+
+<script type="application/ld+json">
+{
+  "@context": "https://schema.org",
+  "@graph": [
+    {
+      "@type": "SoftwareApplication",
+      "name": "AgentBridge",
+      "applicationCategory": "DeveloperApplication",
+      "operatingSystem": "macOS, Linux",
+      "description": "A local bridge for bidirectional, real-time collaboration between Claude Code and Codex inside one working session: cross-review, task splits, and quota relay for long-running tasks.",
+      "url": "https://quilin-ai.github.io/agent-bridge/",
+      "downloadUrl": "https://www.npmjs.com/package/@raysonmeng/agentbridge",
+      "softwareVersion": "0.1.24",
+      "license": "https://opensource.org/licenses/MIT",
+      "isAccessibleForFree": true,
+      "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
+      "author": { "@type": "Person", "name": "raysonmeng", "url": "https://x.com/raysonmeng" },
+      "codeRepository": "https://github.com/quilin-ai/agent-bridge"
+    },
+    {
+      "@type": "FAQPage",
+      "mainEntity": [
+        {
+          "@type": "Question",
+          "name": "abg installed but won't run — what's wrong?",
+          "acceptedAnswer": { "@type": "Answer", "text": "You are almost certainly missing Bun. AgentBridge's daemon and plugin server run on the Bun runtime; Node.js alone is not enough. Install Bun with 'curl -fsSL https://bun.sh/install | bash', then re-run abg claude." }
+        },
+        {
+          "@type": "Question",
+          "name": "Does AgentBridge support Windows?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Windows is not an officially supported platform yet. AgentBridge runs on macOS and Linux today. WSL2 may work but is untested." }
+        },
+        {
+          "@type": "Question",
+          "name": "Is it safe? What does --safe do?",
+          "acceptedAnswer": { "@type": "Answer", "text": "By default abg claude launches with --dangerously-skip-permissions and abg codex with --yolo, so an unattended agent pair does not stop for each prompt. Only do this in a workspace you trust. Add --safe (or set AGENTBRIDGE_SAFE=1) to launch with normal permission prompts. AgentBridge runs entirely on your machine and is not a hardened boundary between untrusted tools." }
+        },
+        {
+          "@type": "Question",
+          "name": "How does quota relay work?",
+          "acceptedAnswer": { "@type": "Answer", "text": "With the companion agent-quota-guard installed, the daemon polls both agents' 5h and weekly subscription windows. Near a limit the guard lets the current turn finish, stops cleanly at the turn boundary, writes a .agent/checkpoint.md, and drops a pending record. When the window refreshes, the bridge auto-resumes the task in the original interactive TUI." }
+        },
+        {
+          "@type": "Question",
+          "name": "Which agents does AgentBridge support?",
+          "acceptedAnswer": { "@type": "Answer", "text": "Today the shipping in-session integration connects Claude Code and Codex. A public adapter vote (issue #212) decides which agent — OpenCode, Gemini CLI, and others are candidates — is wired in next." }
+        },
+        {
+          "@type": "Question",
+          "name": "How is this different from codex-plugin-cc?",
+          "acceptedAnswer": { "@type": "Answer", "text": "One-way delegation plugins like openai/codex-plugin-cc let a host call Codex and get one answer back — request in, response out, no standing peer. AgentBridge keeps both agents live as persistent peers, and either side can push a message mid-turn (a review comment lands while the other is still working), not only at call boundaries." }
+        },
+        {
+          "@type": "Question",
+          "name": "Do I need an account or API keys for AgentBridge itself?",
+          "acceptedAnswer": { "@type": "Answer", "text": "No. AgentBridge is a local tool with zero runtime dependencies and no hosted service. You use your existing Claude Code and Codex logins; AgentBridge only relays messages between them on your machine." }
+        }
+      ]
+    }
+  ]
+}
+</script>
+
+<style>
+:root {
+  --bg: #ffffff;
+  --bg-soft: #f5f6f8;
+  --panel: #ffffff;
+  --text: #14181d;
+  --muted: #5b636e;
+  --border: #e3e7ec;
+  --accent: #0a7d55;
+  --accent-soft: #e5f5ee;
+  --term-bg: #12151b;
+  --term-text: #d6dbe4;
+  --term-green: #5fd39a;
+  --term-cyan: #6cc5e0;
+  --term-muted: #8b95a3;
+  --shadow: 0 1px 2px rgba(20,24,29,.05), 0 8px 28px rgba(20,24,29,.06);
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #0b0d11;
+    --bg-soft: #10131a;
+    --panel: #13161d;
+    --text: #e7eaf0;
+    --muted: #99a2b0;
+    --border: #232833;
+    --accent: #3ddc97;
+    --accent-soft: #12241c;
+    --term-bg: #0e1016;
+    --term-text: #d6dbe4;
+    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
+  }
+}
+* { box-sizing: border-box; }
+html { scroll-behavior: smooth; }
+body {
+  margin: 0;
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
+  background: var(--bg);
+  color: var(--text);
+  line-height: 1.65;
+  -webkit-font-smoothing: antialiased;
+}
+.mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+.wrap { max-width: 960px; margin: 0 auto; padding: 0 20px; }
+h1, h2, h3 { line-height: 1.25; letter-spacing: -.01em; }
+h2 { font-size: 1.75rem; margin: 0 0 .5rem; }
+section { padding: 64px 0; border-top: 1px solid var(--border); }
+.lead { color: var(--muted); font-size: 1.05rem; max-width: 46rem; }
+
+/* header */
+header {
+  position: sticky; top: 0; z-index: 20;
+  backdrop-filter: saturate(1.4) blur(10px);
+  background: var(--bg);
+  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  border-bottom: 1px solid var(--border);
+}
+.nav { display: flex; align-items: center; gap: 18px; height: 58px; }
+.brand { font-weight: 700; font-size: 1.05rem; display: flex; align-items: center; gap: 8px; color: var(--text); }
+.brand:hover { text-decoration: none; }
+.nav-links { display: flex; gap: 18px; margin-left: auto; align-items: center; }
+.nav-links a { color: var(--muted); font-size: .92rem; }
+.nav-links a:hover { color: var(--text); text-decoration: none; }
+.nav-cta { color: var(--text) !important; font-weight: 600; }
+@media (max-width: 720px) { .nav-hide { display: none; } }
+
+/* hero */
+.hero { padding: 72px 0 56px; border-top: none; text-align: center; }
+.hero h1 { font-size: 2.7rem; margin: 0 0 16px; }
+.hero .lead { margin: 0 auto 28px; font-size: 1.18rem; }
+.tag { color: var(--accent); font-weight: 600; }
+.badges { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin: 22px 0 4px; }
+.badge {
+  font-size: .78rem; font-weight: 600; color: var(--muted);
+  border: 1px solid var(--border); border-radius: 999px; padding: 4px 11px; background: var(--bg-soft);
+}
+.btns { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; margin-top: 26px; }
+.btn {
+  display: inline-flex; align-items: center; gap: 8px;
+  padding: 11px 20px; border-radius: 10px; font-weight: 600; font-size: .95rem;
+  border: 1px solid var(--border); background: var(--panel); color: var(--text);
+}
+.btn:hover { text-decoration: none; border-color: var(--accent); }
+.btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
+@media (prefers-color-scheme: dark) { .btn-primary { color: #06120d; } }
+.btn-primary:hover { filter: brightness(1.06); }
+
+/* install line */
+.install {
+  display: inline-flex; align-items: center; gap: 12px;
+  background: var(--term-bg); color: var(--term-text);
+  border-radius: 12px; padding: 13px 16px; margin: 6px auto 0;
+  box-shadow: var(--shadow); max-width: 100%;
+}
+.install code { font-size: .98rem; white-space: nowrap; overflow-x: auto; }
+.install code::before { content: "$ "; color: var(--term-green); }
+.copy {
+  border: 1px solid #333a46; background: #1b2028; color: var(--term-muted);
+  border-radius: 7px; padding: 5px 10px; font-size: .78rem; cursor: pointer; flex: none;
+}
+.copy:hover { color: var(--term-text); border-color: #4a5261; }
+
+/* terminal window */
+.term {
+  background: var(--term-bg); border-radius: 12px; overflow: hidden;
+  box-shadow: var(--shadow); border: 1px solid rgba(255,255,255,.05); margin-top: 10px;
+}
+.term-bar { display: flex; align-items: center; gap: 7px; padding: 10px 14px; background: rgba(255,255,255,.03); border-bottom: 1px solid rgba(255,255,255,.05); }
+.dot { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
+.dot.r { background: #ff5f57; } .dot.y { background: #febc2e; } .dot.g { background: #28c840; }
+.term-title { color: var(--term-muted); font-size: .78rem; margin-left: 8px; }
+.term pre {
+  margin: 0; padding: 16px; overflow-x: auto; color: var(--term-text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .86rem; line-height: 1.7;
+}
+.c-claude { color: #b892ff; } .c-codex { color: var(--term-cyan); } .c-green { color: var(--term-green); }
+.c-muted { color: var(--term-muted); }
+
+/* demo placeholder */
+.demo {
+  margin: 34px auto 0; max-width: 760px; border: 1px dashed var(--border); border-radius: 14px;
+  background: var(--bg-soft); overflow: hidden;
+}
+.demo .ph { display: grid; place-items: center; padding: 46px 20px; color: var(--muted); text-align: center; }
+.demo .ph .k { font-weight: 700; color: var(--text); }
+
+/* benefit cards */
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 20px; margin-top: 30px; }
+.card { border: 1px solid var(--border); border-radius: 14px; padding: 22px; background: var(--panel); }
+.card h3 { margin: 0 0 8px; font-size: 1.12rem; }
+.card p { margin: 0 0 14px; color: var(--muted); font-size: .96rem; }
+.card .term { margin-top: auto; }
+
+/* comparison table */
+.table-scroll { overflow-x: auto; margin-top: 26px; border: 1px solid var(--border); border-radius: 14px; }
+table { border-collapse: collapse; width: 100%; min-width: 620px; font-size: .93rem; }
+th, td { text-align: left; padding: 13px 16px; border-bottom: 1px solid var(--border); vertical-align: top; }
+thead th { background: var(--bg-soft); font-size: .82rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+tbody tr:last-child td { border-bottom: none; }
+td.yes { color: var(--accent); font-weight: 600; }
+.rowhead { font-weight: 600; white-space: nowrap; }
+
+/* steps */
+.steps { counter-reset: step; margin-top: 26px; display: grid; gap: 18px; }
+.step { display: grid; grid-template-columns: 40px 1fr; gap: 16px; align-items: start; }
+.step .n {
+  counter-increment: step; width: 34px; height: 34px; border-radius: 50%;
+  display: grid; place-items: center; font-weight: 700; background: var(--accent-soft); color: var(--accent); border: 1px solid var(--border);
+}
+.step .n::before { content: counter(step); }
+.step .body h3 { margin: 4px 0 8px; font-size: 1.05rem; }
+.step pre {
+  margin: 0; background: var(--term-bg); color: var(--term-text); border-radius: 10px; padding: 13px 15px;
+  overflow-x: auto; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .85rem; line-height: 1.7;
+}
+.step .cmd::before { content: "$ "; color: var(--term-green); }
+
+/* story */
+.story { background: var(--bg-soft); }
+.story blockquote {
+  margin: 22px 0 0; padding: 20px 24px; border-left: 3px solid var(--accent);
+  background: var(--panel); border-radius: 0 12px 12px 0; font-size: 1.08rem;
+}
+.story blockquote strong { color: var(--text); }
+
+/* roadmap */
+.road { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px,1fr)); gap: 18px; margin-top: 26px; }
+.road .item { border: 1px solid var(--border); border-radius: 14px; padding: 20px; background: var(--panel); }
+.road .item .when { font-size: .78rem; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--accent); }
+.road .item h3 { margin: 6px 0 8px; font-size: 1.08rem; }
+.road .item p { margin: 0; color: var(--muted); font-size: .94rem; }
+
+/* faq */
+.faq { margin-top: 22px; }
+details { border: 1px solid var(--border); border-radius: 12px; padding: 4px 18px; margin-bottom: 12px; background: var(--panel); }
+details[open] { border-color: var(--accent); }
+summary { cursor: pointer; font-weight: 600; padding: 14px 0; list-style: none; display: flex; justify-content: space-between; gap: 12px; }
+summary::-webkit-details-marker { display: none; }
+summary::after { content: "+"; color: var(--accent); font-weight: 700; }
+details[open] summary::after { content: "\2013"; }
+details p { margin: 0 0 16px; color: var(--muted); }
+
+/* footer */
+footer { border-top: 1px solid var(--border); padding: 40px 0; color: var(--muted); font-size: .9rem; }
+.foot-grid { display: flex; flex-wrap: wrap; gap: 26px; align-items: center; justify-content: space-between; }
+.foot-links { display: flex; flex-wrap: wrap; gap: 18px; }
+.foot-links a { color: var(--muted); }
+.foot-links a:hover { color: var(--text); }
+
+.center { text-align: center; }
+.sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); border: 0; }
+</style>
+</head>
+<body>
+
+<header>
+  <nav class="nav wrap">
+    <a class="brand" href="/agent-bridge/">🌉 AgentBridge</a>
+    <div class="nav-links">
+      <a class="nav-hide" href="#benefits">Features</a>
+      <a class="nav-hide" href="#why">Why</a>
+      <a class="nav-hide" href="#quickstart">Quick Start</a>
+      <a class="nav-hide" href="#faq">FAQ</a>
+      <a href="/agent-bridge/zh/">中文</a>
+      <a class="nav-cta" href="https://github.com/quilin-ai/agent-bridge">GitHub</a>
+    </div>
+  </nav>
+</header>
+
+<main>
+<section class="hero">
+  <div class="wrap">
+    <h1>Two AI agents. <span class="tag">One session.</span><br />No copy-paste.</h1>
+    <p class="lead">AgentBridge is a local bridge that lets <strong>Claude Code</strong> and <strong>Codex</strong> collaborate in real time inside one working session — cross-reviewing each other's diffs, splitting tasks between them, and relaying work across quota limits.</p>
+
+    <div class="install">
+      <code class="mono" id="installcmd">npm install -g @raysonmeng/agentbridge</code>
+      <button class="copy" data-copy="npm install -g @raysonmeng/agentbridge" aria-label="Copy install command">Copy</button>
+    </div>
+
+    <div class="btns">
+      <a class="btn btn-primary" href="#quickstart">Get started</a>
+      <a class="btn" href="https://github.com/quilin-ai/agent-bridge">★ GitHub</a>
+      <a class="btn" href="https://www.npmjs.com/package/@raysonmeng/agentbridge">npm</a>
+    </div>
+
+    <div class="badges">
+      <span class="badge">MIT licensed</span>
+      <span class="badge">Runs 100% locally</span>
+      <span class="badge">Zero runtime deps</span>
+      <span class="badge">1,700+ tests</span>
+      <span class="badge">v0.1.24</span>
+    </div>
+
+    <!-- assets/demo.gif — replace this placeholder once the demo is recorded (see docs/demo/RECORDING.md) -->
+    <div class="demo" aria-label="Product demo placeholder">
+      <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">agentbridge — live session</span></div>
+      <div class="ph">
+        <div>
+          <div class="k">▶ Demo coming soon</div>
+          <div style="margin-top:6px">A recorded session — Claude and Codex reviewing each other live — lands here (<code class="mono">assets/demo.gif</code>).</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="benefits">
+  <div class="wrap">
+    <h2>What that buys you, concretely</h2>
+    <p class="lead">Not two chatbots talking. Two full agents from different providers holding each other accountable while you steer.</p>
+    <div class="cards">
+
+      <div class="card">
+        <h3>Cross-review, not just cross-talk</h3>
+        <p>Codex implements; Claude reviews the diff in real time <em>inside the same session</em> and pushes change requests straight back into Codex's thread. Two providers checking each other — no copy-paste.</p>
+        <div class="term">
+          <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">cross-review</span></div>
+<pre><span class="c-codex">codex</span>  <span class="c-muted">→</span> implemented rate-limit guard, 3 files
+<span class="c-claude">claude</span> <span class="c-muted">→</span> reviewing diff…
+<span class="c-claude">claude</span> <span class="c-muted">→</span> <span class="c-green">reply</span>: edge case — retry after 429 unbounded
+<span class="c-codex">codex</span>  <span class="c-muted">→</span> fixed, capped at 5 retries</pre>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Task splits from one prompt</h3>
+        <p>Ask either agent to propose a division of labor with the other, and they negotiate who does what before writing code. You steer; they coordinate.</p>
+        <div class="term">
+          <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">task-split</span></div>
+<pre><span class="c-muted">you →</span> propose a split with Codex for the auth refactor
+<span class="c-claude">claude</span> <span class="c-muted">→</span> I'll take the token model + tests;
+        Codex takes the middleware. Agreed?
+<span class="c-codex">codex</span>  <span class="c-muted">→</span> <span class="c-green">agreed</span> — starting middleware now</pre>
+        </div>
+      </div>
+
+      <div class="card">
+        <h3>Quota relay for overnight runs</h3>
+        <p>When one side's subscription window runs dry, it stops cleanly at a turn boundary and hands the task off — so a long job keeps moving instead of dying at a limit.</p>
+        <div class="term">
+          <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">quota-relay</span></div>
+<pre><span class="c-codex">codex</span>  <span class="c-muted">→</span> 5h window low — checkpoint written
+<span class="c-green">bridge</span> <span class="c-muted">→</span> handing off to Claude…
+<span class="c-claude">claude</span> <span class="c-muted">→</span> resumed from .agent/checkpoint.md
+<span class="c-green">bridge</span> <span class="c-muted">→</span> auto-resume Codex when window refreshes</pre>
+        </div>
+      </div>
+
+    </div>
+  </div>
+</section>
+
+<section id="quota">
+  <div class="wrap">
+    <h2>Quota relay — the part nothing else does</h2>
+    <p class="lead">A long task shouldn't die because one agent hit its 5-hour or weekly subscription limit at 2am. AgentBridge keeps it moving.</p>
+    <div class="cards" style="margin-top:24px">
+      <div class="card">
+        <h3>No mid-task cut</h3>
+        <p>Near the quota hard-line, the companion <a href="https://www.npmjs.com/package/agent-quota-guard">agent-quota-guard</a> does <em>not</em> deny mid-tool-call. It lets the current turn finish, stops cleanly at the boundary, writes a <code class="mono">.agent/checkpoint.md</code>, and drops a <code class="mono">pending</code> record the bridge detects.</p>
+      </div>
+      <div class="card">
+        <h3>Automatic resume</h3>
+        <p>When the paused side's window refreshes, the bridge resumes the task <strong>in the original interactive TUI</strong> — Codex via a queued <code class="mono">turn/start</code>, Claude via a channel push it acks with <code class="mono">ack_resume</code>. Idempotency tombstones inject each resume at most once.</p>
+      </div>
+      <div class="card">
+        <h3>Both windows in one glance</h3>
+        <p>The daemon polls both agents' account-level 5h and weekly quota. <code class="mono">abg budget --json</code> prints the live snapshot: both windows, drift between the two sides, and pause state.</p>
+      </div>
+    </div>
+    <p style="margin-top:20px; color:var(--muted); font-size:.92rem"><strong>Opt-in.</strong> Quota relay is a companion-guard feature — install <a href="https://github.com/quilin-ai/agent-quota-guard">agent-quota-guard</a> to enable it. Without it, everything else still works.</p>
+  </div>
+</section>
+
+<section id="why">
+  <div class="wrap">
+    <h2>Why AgentBridge, and not…</h2>
+    <p class="lead">Three things people reach for instead — and where each one leaves you doing the work by hand.</p>
+    <div class="table-scroll">
+      <table>
+        <thead>
+          <tr>
+            <th>&nbsp;</th>
+            <th>Two terminals + copy-paste</th>
+            <th>One-way delegation plugin<br /><span class="mono" style="font-weight:400">(e.g. codex-plugin-cc)</span></th>
+            <th>External orchestrator</th>
+            <th>AgentBridge</th>
+          </tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td class="rowhead">Message relay</td>
+            <td>You are the message bus</td>
+            <td>Request in, response out</td>
+            <td>Scripted per hop</td>
+            <td class="yes">Automatic, both ways</td>
+          </tr>
+          <tr>
+            <td class="rowhead">Both agents live as peers</td>
+            <td>Yes, but disconnected</td>
+            <td>No — one standing host, one callee</td>
+            <td>No — one brain, N dumb workers</td>
+            <td class="yes">Yes — persistent peers</td>
+          </tr>
+          <tr>
+            <td class="rowhead">Push mid-turn</td>
+            <td>Manual, guess when it's safe</td>
+            <td>Only at call boundaries</td>
+            <td>Only at scheduled steps</td>
+            <td class="yes">Yes — review lands mid-turn</td>
+          </tr>
+          <tr>
+            <td class="rowhead">Agents propose their own splits</td>
+            <td>No</td>
+            <td>No</td>
+            <td>No — top-down</td>
+            <td class="yes">Yes — they negotiate</td>
+          </tr>
+          <tr>
+            <td class="rowhead">Survives a quota limit</td>
+            <td>No — you restart by hand</td>
+            <td>No</td>
+            <td>Depends on your script</td>
+            <td class="yes">Yes — checkpoint + auto-resume</td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+</section>
+
+<section id="quickstart">
+  <div class="wrap">
+    <h2>Quick Start</h2>
+    <p class="lead">Four steps from nothing to a running pair. The daemon starts automatically when needed and reconnects if restarted.</p>
+    <div class="steps">
+      <div class="step">
+        <div class="n"></div>
+        <div class="body">
+          <h3>Install Bun (the runtime — Node alone won't work)</h3>
+          <pre><span class="cmd">curl -fsSL https://bun.sh/install | bash</span></pre>
+        </div>
+      </div>
+      <div class="step">
+        <div class="n"></div>
+        <div class="body">
+          <h3>Install the CLI</h3>
+          <p style="margin:0 0 8px;color:var(--muted);font-size:.92rem">postinstall auto-registers the Claude Code plugin marketplace and installs the plugin (best-effort; needs bun + claude present).</p>
+          <pre><span class="cmd">npm install -g @raysonmeng/agentbridge</span></pre>
+        </div>
+      </div>
+      <div class="step">
+        <div class="n"></div>
+        <div class="body">
+          <h3>Start Claude Code with the AgentBridge channel</h3>
+          <pre><span class="cmd">abg claude</span></pre>
+        </div>
+      </div>
+      <div class="step">
+        <div class="n"></div>
+        <div class="body">
+          <h3>In another terminal, start Codex connected to the same bridge</h3>
+          <pre><span class="cmd">abg codex</span></pre>
+        </div>
+      </div>
+    </div>
+    <p style="margin-top:22px;color:var(--muted)"><strong>Your first collaboration:</strong> with both sides running, ask Claude — <em>"Propose a task split with Codex for &lt;your task&gt;, then have Codex implement its part while you review."</em> You'll see the split flow into Codex's session, Codex start working, and its completion push back to Claude for review — all without you relaying anything by hand.</p>
+    <p style="color:var(--muted);font-size:.92rem"><code class="mono">abg</code> is a short alias for <code class="mono">agentbridge</code>. Both agents launch with max-permission defaults so an unattended pair doesn't stop for each prompt — add <code class="mono">--safe</code> to launch with normal prompts. See the <a href="https://github.com/quilin-ai/agent-bridge/blob/master/docs/TROUBLESHOOTING.md">Troubleshooting guide</a> if <code class="mono">abg</code> installs but won't run.</p>
+  </div>
+</section>
+
+<section id="story" class="story">
+  <div class="wrap">
+    <h2>AgentBridge is its own proof of concept</h2>
+    <p class="lead">The strongest thing we can say about it is that we didn't build it the normal way.</p>
+    <blockquote>
+      This tool was largely built by <strong>Claude Code</strong> (Anthropic) and <strong>Codex</strong> (OpenAI) collaborating <em>through it</em> — the very bridge they were building together. <strong>Every PR written by one agent was reviewed by the other.</strong> A human steered: assigning tasks, reviewing progress, and directing the two to work in parallel and check each other's output.
+    </blockquote>
+    <p style="margin-top:18px;color:var(--muted)">Two AI agents from different providers, connected in real time, shipping code side by side — and reviewing each other's PRs across the wire. That's not a marketing metaphor; it's the commit history.</p>
+  </div>
+</section>
+
+<section id="roadmap">
+  <div class="wrap">
+    <h2>Roadmap</h2>
+    <p class="lead">Claude Code ↔ Codex ships today. Here's where it goes next.</p>
+    <div class="road">
+      <div class="item">
+        <div class="when">Next up · vote</div>
+        <h3>More adapters</h3>
+        <p>Which agent gets wired in next is a public vote — OpenCode, Gemini CLI, and others are candidates. Cast yours on <a href="https://github.com/quilin-ai/agent-bridge/issues/212">issue #212</a>.</p>
+      </div>
+      <div class="item">
+        <div class="when">Longer term</div>
+        <h3>Capability mesh</h3>
+        <p>Beyond a single pair: rooms of agents across machines, each advertising what it's good at, routing work to the right capability instead of a fixed pairing. A v3 cross-network preview already ships behind experimental commands.</p>
+      </div>
+      <div class="item">
+        <div class="when">Ongoing</div>
+        <h3>Sharper collaboration</h3>
+        <p>Less noise, better turn discipline, richer coordination policies, and stronger recovery semantics across runtimes.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section id="faq">
+  <div class="wrap">
+    <h2>FAQ</h2>
+    <div class="faq">
+      <details>
+        <summary><span><code class="mono">abg</code> installed but won't run — what's wrong?</span></summary>
+        <p>You're almost certainly missing <strong>Bun</strong>. AgentBridge's daemon and plugin server run on the Bun runtime; Node.js alone is not enough. Install it with <code class="mono">curl -fsSL https://bun.sh/install | bash</code>, then re-run <code class="mono">abg claude</code>. This is the single most common install failure.</p>
+      </details>
+      <details>
+        <summary><span>Does AgentBridge support Windows?</span></summary>
+        <p>Not officially yet. AgentBridge runs on <strong>macOS and Linux</strong> today. WSL2 may work but is untested and unsupported.</p>
+      </details>
+      <details>
+        <summary><span>Is it safe? What does <code class="mono">--safe</code> do?</span></summary>
+        <p>By default <code class="mono">abg claude</code> launches with <code class="mono">--dangerously-skip-permissions</code> and <code class="mono">abg codex</code> with <code class="mono">--yolo</code> — deliberate, because an unattended agent pair can't stop to ask you for each permission. Both can then run commands and edit files without prompting, so <strong>only do this in a workspace you trust</strong>. Add <code class="mono">--safe</code> (or set <code class="mono">AGENTBRIDGE_SAFE=1</code>) to launch with normal prompts. AgentBridge is a local dev tool, not a hardened boundary between untrusted tools.</p>
+      </details>
+      <details>
+        <summary><span>How does quota relay actually work?</span></summary>
+        <p>With the companion <a href="https://github.com/quilin-ai/agent-quota-guard">agent-quota-guard</a> installed, the daemon polls both agents' 5h and weekly subscription windows. Near a limit the guard lets the current turn finish, stops cleanly at the turn boundary, writes a <code class="mono">.agent/checkpoint.md</code>, and drops a <code class="mono">pending</code> record. When the window refreshes, the bridge auto-resumes the task in the original interactive TUI — Codex via a queued <code class="mono">turn/start</code>, Claude via an acked channel push.</p>
+      </details>
+      <details>
+        <summary><span>Which agents does it support?</span></summary>
+        <p>Today the shipping in-session integration connects <strong>Claude Code and Codex</strong>. Which agent comes next is a public vote — see the adapter roadmap on <a href="https://github.com/quilin-ai/agent-bridge/issues/212">issue #212</a> (OpenCode, Gemini CLI, and more are candidates).</p>
+      </details>
+      <details>
+        <summary><span>How is this different from <code class="mono">codex-plugin-cc</code>?</span></summary>
+        <p>One-way delegation plugins like <code class="mono">openai/codex-plugin-cc</code> let a host <em>call</em> Codex and get one answer back — request in, response out, no standing peer on the other side. AgentBridge keeps <strong>both</strong> agents live as persistent peers, and either side can push a message <strong>mid-turn</strong> (a review comment lands while the other is still working), not only at call boundaries.</p>
+      </details>
+      <details>
+        <summary><span>Do I need an account or API keys for AgentBridge itself?</span></summary>
+        <p>No. AgentBridge is a local tool with zero runtime dependencies and no hosted service. You use your existing Claude Code and Codex logins; AgentBridge only relays messages between them on your machine — raw work never leaves the box.</p>
+      </details>
+      <details>
+        <summary><span>Can I run more than one pair at once?</span></summary>
+        <p>Yes. One Claude+Codex pair per project directory, with ports allocated per pair in +10 strides from 4500. Target a specific pair with <code class="mono">--pair &lt;name&gt;</code> on the pair-aware commands.</p>
+      </details>
+    </div>
+  </div>
+</section>
+</main>
+
+<footer>
+  <div class="wrap foot-grid">
+    <div>
+      <div class="brand" style="margin-bottom:6px">🌉 AgentBridge</div>
+      <div>Local bridge for Claude Code ↔ Codex collaboration. MIT licensed.</div>
+    </div>
+    <div class="foot-links">
+      <a href="https://github.com/quilin-ai/agent-bridge">GitHub</a>
+      <a href="https://www.npmjs.com/package/@raysonmeng/agentbridge">npm</a>
+      <a href="https://github.com/quilin-ai/agent-bridge/blob/master/docs/TROUBLESHOOTING.md">Troubleshooting</a>
+      <a href="/agent-bridge/zh/">中文</a>
+      <a href="https://x.com/raysonmeng">@raysonmeng</a>
+    </div>
+  </div>
+</footer>
+
+<script>
+// ponytail: tiny inline copy handler, no lib — command is plain text if JS is off
+document.querySelectorAll('.copy').forEach(function (b) {
+  b.addEventListener('click', function () {
+    navigator.clipboard && navigator.clipboard.writeText(b.dataset.copy).then(function () {
+      var t = b.textContent; b.textContent = 'Copied'; setTimeout(function () { b.textContent = t; }, 1400);
+    });
+  });
+});
+</script>
+</body>
+</html>
