@@ -250,7 +250,7 @@ header {
 .caret { display: inline-block; width: .55em; height: 1em; background: var(--term-text); vertical-align: -.12em; animation: blink 1.05s steps(1) infinite; }
 @keyframes blink { 50% { opacity: 0; } }
 .pulse {
-  position: absolute; top: 50%; left: 25%; width: 16px; height: 16px; margin-top: -8px;
+  position: absolute; top: 0; left: 0; width: 16px; height: 16px; margin: -8px 0 0 -8px;
   border-radius: 50%; background: var(--term-green); opacity: 0; pointer-events: none; z-index: 2;
   box-shadow: 0 0 12px 4px rgba(61,220,151,.85), 0 0 34px 14px rgba(61,220,151,.35);
 }
@@ -862,7 +862,11 @@ var Demo = (function () {
     events.push(ev);
   });
   var TOTAL = cursor;
+  // each pulse flies from the line spoken just before it to the spot where
+  // the next message will land in the other pane
+  events.forEach(function (ev, i) { if (ev.kind === 'pulse') ev.srcIdx = i - 1; });
   var INP = document.getElementById('cl-input');
+  var DUO = document.getElementById('duo');
 
   function pane(p) { return p === 'L' ? CL : CX; }
   var applied = -1;
@@ -900,11 +904,23 @@ var Demo = (function () {
         var q = (T - ev.start) / ev.dur;
         if (q >= 0 && q <= 1) {
           pulseOn = true;
-          var a = ev.dir === 'go-r' ? 22 : 78, b = ev.dir === 'go-r' ? 78 : 22;
+          var srcPane = pane(ev.dir === 'go-r' ? 'L' : 'R'), dstPane = pane(ev.dir === 'go-r' ? 'R' : 'L');
+          var dRect = DUO.getBoundingClientRect(), sRect = srcPane.getBoundingClientRect(), tRect = dstPane.getBoundingClientRect();
+          var src = events[ev.srcIdx] && events[ev.srcIdx].node;
+          var y0 = sRect.top + sRect.height / 2;
+          if (src) { var r0 = src.getBoundingClientRect(); y0 = Math.max(sRect.top + 12, Math.min(r0.top + r0.height / 2, sRect.bottom - 12)); }
+          var lastD = dstPane.lastElementChild;
+          var y1 = lastD ? Math.min(lastD.getBoundingClientRect().bottom + 16, tRect.bottom - 14) : tRect.top + 18;
+          y1 = Math.max(tRect.top + 12, y1);
+          var x0 = ev.dir === 'go-r' ? sRect.right - 20 : sRect.left + 20;
+          var x1 = ev.dir === 'go-r' ? tRect.left + 20 : tRect.right - 20;
           var s = Math.sin(Math.PI * q);
-          PU.style.left = (a + (b - a) * q) + '%';
+          var x = x0 + (x1 - x0) * q - dRect.left, y = y0 + (y1 - y0) * q - dRect.top;
+          var ang = Math.atan2(y1 - y0, x1 - x0) * 180 / Math.PI;
+          PU.style.left = x + 'px';
+          PU.style.top = y + 'px';
           PU.style.opacity = s.toFixed(3);
-          PU.style.transform = 'scale(' + (0.7 + s * 0.9).toFixed(3) + ')';
+          PU.style.transform = 'rotate(' + ang.toFixed(1) + 'deg) scale(' + (0.7 + s * 0.9).toFixed(3) + ')';
         }
       }
     }
