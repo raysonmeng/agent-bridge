@@ -1,0 +1,74 @@
+# AgentBridge
+
+> A local, MIT-licensed developer tool that lets two AI coding agents — Claude Code (Anthropic) and Codex (OpenAI) — collaborate in real time inside one working session. It relays messages between an MCP channel and the Codex app-server protocol so the two agents can cross-review each other's diffs, split tasks, and hand work off across quota limits. It runs entirely on the developer's machine, has zero runtime dependencies, and is not a hosted service.
+
+## Facts
+
+- Name: AgentBridge
+- License: MIT
+- Latest version: v0.1.24
+- Install (CLI): `npm install -g @raysonmeng/agentbridge`
+- npm package: @raysonmeng/agentbridge
+- Repository: https://github.com/quilin-ai/agent-bridge
+- Website: https://quilin-ai.github.io/agent-bridge/
+- Author: raysonmeng (https://x.com/raysonmeng)
+- Platforms: macOS and Linux (Windows not officially supported yet)
+- Runtime: Bun (required — Node.js alone is not sufficient)
+- Tests: 1,700+
+- Runs 100% locally; no accounts, API keys, or servers needed for AgentBridge itself (uses your existing Claude Code and Codex logins). Raw work never leaves the machine.
+
+## What it is
+
+- A local bridge that connects Claude Code and Codex in one workflow, in the same working session.
+- Two-process architecture: a foreground MCP client (`bridge.ts`, started by Claude Code via the AgentBridge plugin) and a persistent background daemon (`daemon.ts`) that owns the Codex app-server proxy and bridge state. The daemon survives Claude Code restarts; the foreground reconnects with exponential backoff.
+- An experimental setup for human-in-the-loop collaboration between multiple agents. The human steers; the agents coordinate.
+
+## What it is NOT
+
+- Not a hosted service or multi-tenant system.
+- Not a generic orchestration framework for arbitrary agent backends.
+- Not a hardened security boundary between tools you do not trust.
+
+## Three core benefits
+
+- Cross-review, not just cross-talk: Codex implements; Claude reviews the diff in real time inside the same session and pushes change requests straight back into Codex's thread. Two providers holding each other accountable, no copy-paste.
+- Task splits from one prompt: ask either agent to propose a division of labor with the other; they negotiate who does what before writing code.
+- Quota relay for overnight runs: when one side's subscription window runs dry it stops cleanly at a turn boundary, writes a checkpoint, and hands off, so a long job keeps moving instead of dying at a limit. Requires the companion tool agent-quota-guard.
+
+## How it compares
+
+- vs two terminals + copy-paste: with two terminals the human is the message bus, ferrying text by hand. AgentBridge automates the relay — messages flow on their own, a busy-guard blocks replies during an active turn, and noisy intermediate events are filtered.
+- vs a one-way delegation plugin (e.g. openai/codex-plugin-cc): those let a host call Codex and get one answer back (request in, response out, no standing peer). AgentBridge keeps both agents live as persistent peers, and either side can push a message mid-turn, not only at call boundaries.
+- vs an external orchestrator: a god-process scheduling dumb terminals is top-down (one brain, N workers that never talk). AgentBridge is peer-to-peer — two full agents converse in-session, propose their own splits, and review each other.
+
+## Quick start (4 steps)
+
+1. Install Bun: `curl -fsSL https://bun.sh/install | bash`
+2. Install the CLI: `npm install -g @raysonmeng/agentbridge` (postinstall best-effort registers the Claude Code plugin)
+3. Start Claude Code with the bridge channel: `abg claude`
+4. In another terminal, start Codex on the same bridge: `abg codex`
+
+`abg` is a short alias for `agentbridge`. Both agents launch with max-permission defaults so an unattended pair does not stop for each prompt; add `--safe` (or set AGENTBRIDGE_SAFE=1) for normal permission prompts. Only run the default mode in a workspace you trust.
+
+## Key CLI commands
+
+- `abg init` — install plugin, check dependencies, generate `.agentbridge/config.json`
+- `abg claude [args]` — start Claude Code with the push channel enabled
+- `abg codex [args]` — start Codex TUI connected to the AgentBridge daemon (auto-resumes the pair's last thread; `--new` for a fresh one)
+- `abg budget [--json]` — both agents' subscription quota snapshot (5h/weekly windows, drift, pause state)
+- `abg doctor [--json]` — read-only diagnosis of env, daemon health, build drift
+- `abg pairs` — list/remove/prune registered pairs (one pair per project directory)
+- `abg kill [--all]` — stop the pair's daemon and managed Codex TUI
+
+## How it was built
+
+AgentBridge was largely built by Claude Code and Codex collaborating through it — the very tool they were building together. Every PR written by one agent was reviewed by the other, with a human steering. It is its own proof of concept.
+
+## Roadmap
+
+- More adapters: which agent is wired in next is a public vote at https://github.com/quilin-ai/agent-bridge/issues/212 (candidates include OpenCode and Gemini CLI).
+- Capability mesh: rooms of agents across machines that advertise capabilities and route work accordingly (v3 cross-network preview ships behind experimental commands today).
+
+## Companion tool
+
+- agent-quota-guard (https://github.com/quilin-ai/agent-quota-guard) — enables the quota-relay / slowdown-line / auto-resume feature. Optional; everything else works without it.

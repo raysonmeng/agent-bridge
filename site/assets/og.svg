@@ -1,0 +1,38 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="630" viewBox="0 0 1200 630" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif">
+  <!-- Placeholder OG image (text-only). Swap for a real demo screenshot before launch. -->
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#0b0d11"/>
+      <stop offset="1" stop-color="#12151b"/>
+    </linearGradient>
+  </defs>
+  <rect width="1200" height="630" fill="url(#bg)"/>
+  <rect x="0" y="0" width="1200" height="6" fill="#3ddc97"/>
+
+  <!-- terminal window mock -->
+  <g transform="translate(72,150)">
+    <rect x="0" y="0" width="480" height="330" rx="16" fill="#0e1016" stroke="#232833" stroke-width="1.5"/>
+    <circle cx="28" cy="30" r="7" fill="#ff5f57"/>
+    <circle cx="52" cy="30" r="7" fill="#febc2e"/>
+    <circle cx="76" cy="30" r="7" fill="#28c840"/>
+    <text x="104" y="35" fill="#8b95a3" font-size="18" font-family="ui-monospace, Menlo, monospace">agentbridge — live session</text>
+    <g font-family="ui-monospace, Menlo, monospace" font-size="19">
+      <text x="30" y="92"  fill="#b892ff">claude</text><text x="120" y="92" fill="#8b95a3">→ reviewing diff…</text>
+      <text x="30" y="128" fill="#b892ff">claude</text><text x="120" y="128" fill="#5fd39a">reply: retry after 429 unbounded</text>
+      <text x="30" y="164" fill="#6cc5e0">codex</text><text x="120" y="164" fill="#d6dbe4">→ fixed, capped at 5 retries</text>
+      <text x="30" y="216" fill="#8b95a3">quota window low —</text>
+      <text x="30" y="248" fill="#5fd39a">bridge</text><text x="120" y="248" fill="#d6dbe4">→ handing off, auto-resume queued</text>
+    </g>
+  </g>
+
+  <!-- headline -->
+  <g transform="translate(600,150)">
+    <text x="0" y="70" fill="#3ddc97" font-size="40" font-weight="700">🌉 AgentBridge</text>
+    <text x="0" y="150" fill="#e7eaf0" font-size="52" font-weight="700">Claude Code &amp; Codex,</text>
+    <text x="0" y="212" fill="#e7eaf0" font-size="52" font-weight="700">collaborating in</text>
+    <text x="0" y="274" fill="#e7eaf0" font-size="52" font-weight="700">one session.</text>
+    <text x="0" y="336" fill="#99a2b0" font-size="26">Cross-review · task splits · quota relay</text>
+    <text x="0" y="384" fill="#99a2b0" font-size="22" font-family="ui-monospace, Menlo, monospace">npm install -g @raysonmeng/agentbridge</text>
+    <text x="0" y="430" fill="#5b636e" font-size="20">MIT · runs locally · zero runtime deps · 1,700+ tests</text>
+  </g>
+</svg>
