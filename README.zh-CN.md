@@ -7,12 +7,22 @@ English version: [README.md](README.md)
 
 让 Claude Code 和 Codex 在同一个工作会话中进行双向通信的本地 Bridge。
 
-AgentBridge 采用两层进程结构：
+具体能换来什么：
 
-- **bridge.ts** 是由 Claude Code 通过 AgentBridge 插件启动的前台 MCP 客户端
-- **daemon.ts** 是常驻本地的后台进程，持有 Codex app-server 代理和桥接状态
+- **不只是互相说话，是互相 review** —— Codex 写实现，Claude 在**同一会话内**实时 review 这个 diff，并把修改意见直接推回 Codex 的 thread。两家模型互相盯着对方，不用复制粘贴。
+- **一句 prompt 完成分工** —— 让任一侧提出与对方的分工方案，两个 agent 先商量好谁做什么再动手写代码。你把舵，它们协调。
+- **通宵任务的额度接力** —— 一侧订阅额度窗口烧到线时，它在回合边界干净停下，把任务交接给另一侧，让长任务继续跑,而不是撞到上限就死掉。
 
-当 Claude Code 关闭时，前台 MCP 进程退出，后台 daemon 与 Codex 代理继续存活。当 Claude Code 再次启动时，会自动重连（指数退避）。
+<!-- TODO: assets/demo.gif — see docs/demo/RECORDING.md -->
+
+> **这个工具很大程度上就是 Claude Code 和 Codex 通过它本身协作写出来的。**
+> **一个 agent 写的每个 PR,都由另一个 agent review。** AgentBridge 就是它自己的 proof of concept。
+
+## Why not just…（换个方案不行吗)
+
+- **……开两个终端手动复制粘贴?** 可以——但你就成了消息总线,手动搬运文本、靠肉眼判断什么时候能插话。AgentBridge 把这套中转自动化了:消息自己流动,busy-guard 在活跃 turn 期间挡住回复,噪声中间事件被过滤,每一侧只看到对方有意义的输出。
+- **……用一个单向委派插件?** 像 `openai/codex-plugin-cc` 这类工具,是宿主**调用** Codex、拿回一个答案——问进去、答出来,对面没有一个常驻的对等体。AgentBridge 让**两个** agent 都作为常驻对等体活着,任一侧都能在**回合中途**推消息(review 意见在对方还在干活时就落进它会话),而不只是在调用边界。
+- **……接一个外部编排器?** 一个上帝进程调度哑终端是自上而下的:一个大脑、N 个互不说话的 worker。AgentBridge 是对等的——两个完整 agent 在会话内对话、自己提分工、互相 review,人在旁边把舵,而不是脚本化每一跳。
 
 ## 这个项目是什么 / 不是什么
 
@@ -38,7 +48,133 @@ AgentBridge 采用两层进程结构：
 - **Thread 自动续接**：裸 `abg codex` 续接该对上次的 Codex thread；`abg resume` 打印/执行两侧的续接命令。
 - **额度协调、减速线与全自动续接**：让长任务跨订阅额度窗口持续推进，而不是撞到上限就中断。见 [额度协调与自动续接](#额度协调与自动续接)。
 
+## 前置条件
+
+| 依赖 | 版本 | 安装方式 |
+|------|------|----------|
+| [Bun](https://bun.sh) | v1.3.11+ | `curl -fsSL https://bun.sh/install \| bash` |
+| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | v2.1.80+ | `npm install -g @anthropic-ai/claude-code` |
+| [Codex CLI](https://github.com/openai/codex) | latest | `npm install -g @openai/codex` |
+
+> **Bun 是必要运行时**（AgentBridge daemon 和插件服务器都跑在 Bun 上），仅有 Node.js 不够——如果 `abg` 装上了却跑不起来，八成就是缺 Bun（见 [排错](docs/TROUBLESHOOTING.md)）。
+
+## Quick Start
+
+从零到一对跑起来，四步：
+
+```bash
+# 1. 装 Bun（运行时——只有 Node 不行）
+curl -fsSL https://bun.sh/install | bash
+
+# 2. 装 CLI。postinstall 会自动注册 Claude Code 插件市场并安装插件
+#    （best-effort;需要本机已有 bun + claude）。
+npm install -g @raysonmeng/agentbridge
+
+# 3. 启动 Claude Code 并启用 AgentBridge channel
+abg claude
+
+# 4. 在另一个终端启动 Codex TUI 连接同一个 bridge
+abg codex
+```
+
+就这样——daemon 会在需要时自动启动，重启后自动重连。（`abg` 是 `agentbridge` 的简写别名，两者完全等价。）如果 postinstall 的插件步骤被跳过（比如当时还没装 Claude Code），运行 `abg init` 重试，或见 [手动安装插件（兜底）](#手动安装插件兜底)。
+
+> [!WARNING]
+> **`abg claude` 默认带 `--dangerously-skip-permissions` 启动，`abg codex` 默认带 `--yolo` 启动。** 这是故意的——无人值守的 agent 对没法为每个权限停下来问你——但这意味着两个 agent 都能**不经询问**执行命令、改文件。只在你信任的工作区里这么用。要恢复正常询问，加 `--safe`（`abg claude --safe`、`abg codex --safe`）或设 `AGENTBRIDGE_SAFE=1`；你自己显式传权限参数时,默认值也会被自动抑制。
+
+### 你的第一次协作
+
+两侧都跑起来后，给 Claude 一个需要第二个 agent 的任务，例如：
+
+> **对 Claude 说：** *「为 &lt;你的任务&gt; 和 Codex 提一个分工方案，然后让 Codex 实现它那部分、你来 review。」*
+
+你应该会看到：Claude 把一个分工提案发进 Codex 会话、Codex 接受（或反提议）并开始干活、Codex 完成后推回 Claude 会话让它 review——全程不用你手动中转任何东西。
+
+### 手动安装插件（兜底）
+
+如果自动 postinstall 没能注册插件，在 Claude Code 里手动来：
+
+```bash
+# 1. 添加 AgentBridge 市场
+/plugin marketplace add raysonmeng/agent-bridge
+
+# 2. 安装插件
+/plugin install agentbridge@agentbridge
+
+# 3. 重新加载插件以激活
+/reload-plugins
+```
+
+之后更新：`/plugin marketplace update agentbridge` 然后 `/reload-plugins`（或在 `/plugin` → **Marketplaces** → **agentbridge** 里启用自动更新）。
+
+### 本地开发安装
+
+如需修改 AgentBridge 源码，使用本地开发模式：
+
+```bash
+git clone https://github.com/raysonmeng/agent-bridge.git
+cd agent-bridge
+bun install
+bun link
+
+agentbridge dev     # 注册本地 marketplace + 安装插件
+agentbridge init    # 检查依赖、生成 .agentbridge/config.json
+agentbridge claude  # 启动 Claude Code（自动加载插件）
+agentbridge codex   # （另一个终端）启动 Codex TUI 连接 Bridge
+```
+
+> **注意：** `agentbridge claude` 会注入 `--dangerously-load-development-channels plugin:agentbridge@agentbridge`（Research Preview 工作流）。请只启用你信任的 channel 和 MCP server。改完源码后，重新执行 `agentbridge dev` 并重启 Claude Code（或 `/reload-plugins`）。
+
+## CLI 命令参考
+
+> 所有命令同时支持 `agentbridge` 和简写别名 `abg`。
+
+| 命令 | 说明 |
+|------|------|
+| `abg init` | 安装插件、检查依赖（bun/claude/codex）、生成 `.agentbridge/config.json` |
+| `abg claude [args...]` | 启动 Claude Code 并启用 push channel。**默认带 `--dangerously-skip-permissions`**（关闭：`--safe` 或 `AGENTBRIDGE_SAFE=1`）。自动清除上次 `kill` 留下的 sentinel。额外参数透传给 `claude` |
+| `abg codex [args...]` | 启动连接 AgentBridge daemon 的 Codex TUI。**裸 `abg codex` 自动续接该对上次的 thread；`abg codex --new` 开新 thread。TUI 默认带 `--yolo`**（关闭：`--safe` 或 `AGENTBRIDGE_SAFE=1`；`exec` 等非 TUI 子命令不受影响）。额外参数透传给 `codex` |
+| `abg resume [claude\|codex]` | 不带目标：打印本目录上次 Claude 会话 + 本对当前 Codex thread 的续接命令。带目标：直接续接该侧 |
+| `abg pairs` | 列出已注册的对；`abg pairs rm <name\|id>` 删除一个；`abg pairs prune` 预览可回收的孤儿目录 + 滞留 registry 条目，`--apply` 执行删除 |
+| `abg doctor [--json]` | 只读诊断：环境、daemon 健康/就绪、构建漂移、产物对齐、TUI 连接、日志 |
+| `abg budget [--json]` | 两侧订阅额度快照（5h/周窗口、漂移、暂停态） |
+| `abg logs [--codex] [-f] [-n N]` | tail 本对的 daemon 日志（或加 `--codex` tail Codex wrapper 日志）；`-f` 跟随，`-n N` 指定行数（默认 100） |
+| `abg kill` | 优雅停止本对 daemon 和托管的 Codex TUI，写入 killed sentinel；`abg kill --all` 停止所有对 |
+| `abg dev` | （开发用）注册本地 marketplace + 强制同步插件到缓存 |
+| `abg --help` / `abg --version` | 显示帮助 / 版本 |
+
+### 跨网协作命令 *(experimental, v3 preview)*
+
+v3 协作层（跨机器/跨 agent 的共享房间，经 broker）通过下列命令提供。今天可用，但接口可能还会变。
+
+| 命令 | 说明 |
+|------|------|
+| `abg auth issue \| login \| revoke` *(experimental, v3 preview)* | 协作身份 + PSK token 生命周期：`auth issue` 在 broker 上为他人签发 token 并打印（带外传递）；`auth login --token <PSK>` 在边机安装 broker 签发的 token，或 `auth login --id --name` 单机自签；`auth revoke` 吊销某身份的所有 token |
+| `abg broker start` *(experimental, v3 preview)* | 启动常驻控制面 broker（名字服务 + 房间路由，§11.1）+ 一个仅回环的管理面板（看房间/成员、建房间） |
+| `abg room create \| list \| invite \| set-password \| add \| remove` *(experimental, v3 preview)* | 在 broker 上管理协作房间：建/列房间、`invite`（签 token + 授成员 + 打印受邀者的一键 join 命令）、设/清自助加入口令、或直接 add/remove 成员 |
+| `abg join <roomId>` *(experimental, v3 preview)* | 加入房间并让本目录下次自动加入。`--password`/`--password-stdin` 自助加入口令保护的房间；`--broker-url` 会被持久化，让 `abg claude` 自动连接（无需环境变量） |
+| `abg publish`（别名 `announce`）*(experimental, v3 preview)* | 把一条工作/提交摘要发进房间（Stop-hook 驱动，约每会话节流一次），让远端 peer 看到进度 |
+
+成对命令（`claude`、`codex`、`resume`、`kill`、`doctor`、`budget`、`logs`）接受 `--pair <name>` 指定具体的对——默认每个项目目录一对，端口按 +10 步长从 4500 分配。
+
+### Owned flags
+
+部分参数由 CLI 自动注入，不可手动指定：
+
+- `agentbridge claude` 拥有：`--channels`、`--dangerously-load-development-channels`
+- `agentbridge codex` 拥有：`--remote`、`--enable tui_app_server`
+- 两个启动器都消费包装参数 `--safe`（永不透传）：它关闭该次启动的最大权限默认值。当你自己显式传任何权限参数时（codex 的 `-a`/`--ask-for-approval`/`-s`/`--sandbox`；claude 的 `--permission-mode`/`--allow-dangerously-skip-permissions`），默认值也会自动抑制——在显式审批策略旁再注入 `--yolo` 会触发 codex CLI 硬冲突。
+
+手动传入被拥有的参数会报错，并提示使用原生命令。
+
+> **关于 `agentbridge codex` 参数位置：** 无子命令的 TUI 形式，bridge 参数注入到最前面；带自身参数的 TUI 子命令（`resume`、`fork`）注入到子命令名之后；`exec`、`mcp`、`plugin` 等非 TUI 子命令原样透传。完整逻辑见 `src/cli/codex.ts` 的 `buildCodexArgs`。
+
 ## 架构
+
+AgentBridge 是一个**两进程**本地 Bridge：
+
+- **bridge.ts** —— 由 Claude Code 通过 AgentBridge 插件启动的前台 MCP 客户端，Claude Code 关闭时退出。
+- **daemon.ts** —— 常驻本地后台进程，持有 Codex app-server 代理和桥接状态这一唯一真源。跨 Claude Code 重启存活；`bridge.ts` 以指数退避重连。
 
 ```
 ┌──────────────┐    MCP stdio / plugin     ┌────────────────────┐
@@ -72,130 +208,6 @@ AgentBridge 采用两层进程结构：
 
 每条消息都携带 `source` 字段（`"claude"` 或 `"codex"`），Bridge 永远不会把消息转发回它的来源。
 
-## 前置条件
-
-| 依赖 | 版本 | 安装方式 |
-|------|------|----------|
-| [Bun](https://bun.sh) | v1.0+ | `curl -fsSL https://bun.sh/install \| bash` |
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | v2.1.80+ | `npm install -g @anthropic-ai/claude-code` |
-| [Codex CLI](https://github.com/openai/codex) | latest | `npm install -g @openai/codex` |
-
-> **注意：** Bun 是 AgentBridge daemon 和插件服务器的必要运行时，仅有 Node.js 不够。
-
-## Quick Start
-
-### 通过插件市场安装（推荐）
-
-在 Claude Code 中直接安装 AgentBridge 插件：
-
-```bash
-# 1. 在 Claude Code 中，添加 AgentBridge 市场
-/plugin marketplace add raysonmeng/agent-bridge
-
-# 2. 安装插件
-/plugin install agentbridge@agentbridge
-
-# 3. 重新加载插件以激活
-/reload-plugins
-```
-
-然后安装 CLI 工具：
-
-```bash
-# 4. 全局安装 CLI
-npm install -g @raysonmeng/agentbridge
-
-# 5. 生成项目配置（可选）
-abg init
-
-# 6. 启动 Claude Code（自动加载 AgentBridge channel）
-abg claude
-
-# 7. 在另一个终端启动 Codex TUI 连接 Bridge
-abg codex
-```
-
-> **提示：** `abg` 是 `agentbridge` 的简写别名，两个命令完全等价，用哪个都行。
-
-就这样。Daemon 会在需要时自动启动，重启后自动重连。
-
-#### 更新插件
-
-新版本发布后，在 Claude Code 中更新：
-
-```bash
-/plugin marketplace update agentbridge
-/reload-plugins
-```
-
-或启用自动更新：执行 `/plugin` → **Marketplaces** 标签页 → 选择 **agentbridge** → **Enable auto-update**。
-
-### 本地开发安装
-
-如需修改 AgentBridge 源码，使用本地开发模式：
-
-```bash
-# 1. 克隆并安装依赖
-git clone https://github.com/raysonmeng/agent-bridge.git
-cd agent-bridge
-bun install
-bun link
-
-# 2. 安装本地插件 + 生成项目配置
-agentbridge dev     # 注册本地 marketplace + 安装插件
-agentbridge init    # 检查依赖、生成 .agentbridge/config.json
-
-# 3. 启动 Claude Code（自动加载 AgentBridge 插件）
-agentbridge claude
-
-# 4. 在另一个终端启动 Codex TUI 连接 Bridge
-agentbridge codex
-```
-
-> **注意：** `agentbridge claude` 会自动注入 `--dangerously-load-development-channels plugin:agentbridge@agentbridge`。这会把本地开发中的 channel 挂载进 Claude Code（当前属于 Research Preview）。请只启用你信任的 channel 和 MCP server。
-
-#### 修改代码后更新
-
-修改 AgentBridge 源码后，重新执行 `agentbridge dev` 同步插件到缓存，然后重启 Claude Code 或在活跃会话中执行 `/reload-plugins`。
-
-## CLI 命令参考
-
-> 所有命令同时支持 `agentbridge` 和简写别名 `abg`。
-
-| 命令 | 说明 |
-|------|------|
-| `abg init` | 安装插件、检查依赖（bun/claude/codex）、生成 `.agentbridge/config.json` |
-| `abg claude [args...]` | 启动 Claude Code 并启用 push channel。**默认带 `--dangerously-skip-permissions`**（关闭：`--safe` 或 `AGENTBRIDGE_SAFE=1`）。自动清除上次 `kill` 留下的 sentinel。额外参数透传给 `claude` |
-| `abg codex [args...]` | 启动连接 AgentBridge daemon 的 Codex TUI。**裸 `abg codex` 自动续接该对上次的 thread；`abg codex --new` 开新 thread。TUI 默认带 `--yolo`**（关闭：`--safe` 或 `AGENTBRIDGE_SAFE=1`；`exec` 等非 TUI 子命令不受影响）。管理 TUI 进程生命周期（pid 跟踪、清理）。额外参数透传给 `codex` |
-| `abg resume [claude\|codex]` | 不带目标：打印本目录上次 Claude 会话 + 本对当前 Codex thread 的续接命令。带目标：直接续接该侧 |
-| `abg pairs` | 列出已注册的对；`abg pairs rm <name\|id>` 删除一个；`abg pairs prune` 预览可回收的孤儿目录 + 滞留 registry 条目（cwd 不存在/已死/>1 天），`abg pairs prune --apply` 执行删除 |
-| `abg doctor [--json]` | 只读诊断：环境、daemon 健康/就绪、构建漂移、产物对齐、TUI 连接、日志 |
-| `abg budget [--json]` | 两侧订阅额度快照（5h/周窗口、漂移、暂停态） |
-| `abg logs [--codex] [-f] [-n N]` | tail 本对的 daemon 日志（或加 `--codex` tail Codex wrapper 日志）；`-f` 跟随，`-n N` 指定行数（默认 100） |
-| `abg kill` | 优雅停止本对 daemon 和托管的 Codex TUI，写入 killed sentinel；`abg kill --all` 停止所有对 |
-| `abg dev` | （开发用）注册本地 marketplace + 强制同步插件到缓存 |
-| `abg --help` | 显示帮助 |
-| `abg --version` | 显示版本 |
-
-成对命令（`claude`、`codex`、`resume`、`kill`、`doctor`、`budget`、`logs`）接受 `--pair <name>` 指定具体的对——默认每个项目目录一对，端口按 +10 步长从 4500 分配。
-
-### Owned flags
-
-部分参数由 CLI 自动注入，不可手动指定：
-
-- `agentbridge claude` 拥有：`--channels`、`--dangerously-load-development-channels`
-- `agentbridge codex` 拥有：`--remote`、`--enable tui_app_server`
-- 两个启动器都消费包装参数 `--safe`（永不透传）：它关闭该次启动的最大权限默认值。当你自己显式传任何权限参数时（codex 的 `-a`/`--ask-for-approval`/`-s`/`--sandbox`；claude 的 `--permission-mode`/`--allow-dangerously-skip-permissions`），默认值也会自动抑制——在显式审批策略旁再注入 `--yolo` 会触发 codex CLI 硬冲突。
-
-手动传入被拥有的参数会报错，并提示使用原生命令。
-
-> **关于 `agentbridge codex` 参数位置的说明：** 对于无子命令的 TUI 形式
-> （`agentbridge codex …`），bridge 注入的参数放在最前面。对于带有自己参数的
-> TUI 子命令（`resume`、`fork`），bridge 参数注入到**子命令名之后**（这样
-> clap 才会把它们解析为该子命令的选项，而不是根命令的）。`exec`、`mcp`、
-> `plugin`、`remote-control`、`update` 等非 TUI 子命令则原样透传，不注入
-> bridge 参数。完整定位逻辑见 `src/cli/codex.ts` 的 `buildCodexArgs`。
-
 ## 项目配置
 
 运行 `agentbridge init` 会在项目根目录创建 `.agentbridge/` 目录：
@@ -205,56 +217,6 @@ agentbridge codex
 | `config.json` | 机器可读的项目配置（Codex 端口、回合协调、空闲关闭） |
 
 CLI 和 daemon 启动时会加载该配置。重复运行 `init` 是幂等的，不会覆盖已有文件。
-
-## 文件结构
-
-```
-agent_bridge/
-├── .github/
-│   ├── ISSUE_TEMPLATE/           # Bug report 和 feature request 模板
-│   ├── pull_request_template.md
-│   └── workflows/ci.yml          # GitHub Actions CI
-├── assets/                        # 图片资源
-├── docs/                          # 项目成长编年史（阶段 01-09，索引见 docs/README.md）
-│   ├── 01-起步与v1协作核心.md       # 阶段 1：双向桥 + v1 协作核心
-│   ├── 02-Phase3产品化.md          # 阶段 2：两进程架构 + CLI + 插件
-│   ├── …(03-08)                    # 发布 / 可靠性 / 多对 / 协作协议 v2 / 额度 / v2 架构愿景
-│   └── 09-v3协作系统规格.md         # 阶段 9：最新 v3 跨网协作系统规格
-├── plugins/agentbridge/           # Claude Code 插件包
-│   ├── .claude-plugin/plugin.json
-│   ├── commands/init.md
-│   ├── hooks/hooks.json
-│   ├── scripts/health-check.sh
-│   └── server/                    # 打包的 bridge-server.js + daemon.js
-├── src/
-│   ├── bridge.ts                  # Claude 前台 MCP 客户端（插件入口）
-│   ├── daemon.ts                  # 常驻后台 daemon
-│   ├── daemon-client.ts           # daemon 控制端口的 WebSocket 客户端
-│   ├── daemon-lifecycle.ts        # 共享 daemon 生命周期（ensureRunning、kill、启动锁）
-│   ├── control-protocol.ts        # 前后台控制协议类型
-│   ├── claude-adapter.ts          # Claude Code channel 的 MCP server 适配层
-│   ├── codex-adapter.ts           # Codex app-server WebSocket 代理与消息拦截
-│   ├── config-service.ts          # 项目配置（.agentbridge/）读写
-│   ├── state-dir.ts               # 平台感知的状态目录解析
-│   ├── message-filter.ts          # 智能消息过滤（标记、摘要缓冲）
-│   ├── types.ts                   # 共享类型
-│   ├── cli.ts                     # CLI 入口和命令路由
-│   └── cli/
-│       ├── init.ts                # agentbridge init
-│       ├── claude.ts              # agentbridge claude
-│       ├── codex.ts               # agentbridge codex
-│       ├── kill.ts                # agentbridge kill
-│       └── dev.ts                 # agentbridge dev
-├── CLAUDE.md                      # AI Agent 项目规则
-├── CODE_OF_CONDUCT.md
-├── CONTRIBUTING.md
-├── LICENSE
-├── README.md
-├── README.zh-CN.md
-├── SECURITY.md
-├── package.json
-└── tsconfig.json
-```
 
 ## 配置
 
@@ -277,15 +239,7 @@ agent_bridge/
 
 ### 更新提示
 
-`abg claude` 和 `abg codex` 在 npm 上有更新的**稳定**版本时,会向 stderr 打印一行提示,例如:
-
-```
-⚠ AgentBridge update available: 0.1.6 → 0.1.7
-  CLI:    npm install -g @raysonmeng/agentbridge@latest
-  Plugin: /plugin marketplace update agentbridge   (then /reload-plugins)
-```
-
-该检查是 best-effort：提示从缓存打印，npm 检查每天最多在后台跑一次，任何网络/registry 失败都静默忽略。交互式 TTY 下，命中缓存更新会在启动前询问；输入 `y` 会运行 `npm install -g @raysonmeng/agentbridge@latest`，输入 `N`（或 15 秒内无应答）会记住本版本已拒绝并继续启动。非交互(管道)输出和 CI 下绝不询问，可用 `NO_UPDATE_NOTIFIER=1` 关闭提示，或用 `AGENTBRIDGE_UPDATE_PROMPT=0` 保持纯打印。
+`abg claude` 和 `abg codex` 在 npm 上有更新的**稳定**版本时，会向 stderr 打印一行提示。该检查是 best-effort：从缓存打印，npm 检查每天最多在后台跑一次，任何网络/registry 失败都静默忽略。交互式 TTY 下，命中缓存更新会在启动前询问；输入 `y` 执行升级，`N`（或 15 秒内无应答）记住本版本已拒绝并继续。可用 `NO_UPDATE_NOTIFIER=1` 关闭，或用 `AGENTBRIDGE_UPDATE_PROMPT=0` 保持纯打印。
 
 ### 状态目录
 
@@ -298,58 +252,41 @@ daemon 在平台感知的目录中存储运行时状态：
 
 内容：`daemon.pid`、`status.json`、`agentbridge.log`、`killed`（sentinel）、`startup.lock`
 
-### Bridge 禁用状态
-
-Bridge 在无法接受新 MCP 回复时会进入若干休眠状态。每种状态都会以错误信息返回给 agent；瞬态状态还会推送一条带内通知：
-
-| 状态 | 原因 | 恢复方式 |
-|------|------|---------|
-| `killed` | 运行过 `agentbridge kill`，存在 sentinel 文件。 | 重启 Claude Code（`agentbridge claude`），切换到新会话，或运行 `/resume`。 |
-| `rejected` | daemon 拒绝连接：已有另一个 Claude 会话连接中。 | 先关闭另一个会话，或运行 `agentbridge kill` 重置，然后重新 `agentbridge claude`。 |
-| `evicted` | 在位会话未响应存活探测，被更新的会话驱逐（issue #68）。 | 关闭本会话，用 `agentbridge claude` 重新启动一个。 |
-| `probe_in_progress` | 当前正在对在位会话执行存活探测——争用窗口期。瞬态（在 `DISABLED_RECOVERY_INTERVAL_MS` × 重试上限内自动恢复，约 30 秒）。 | 无需操作；恢复轮询会在槽位释放后自动重连。 |
-| `auto_recovery_exhausted` | `probe_in_progress` 的自动恢复轮询用尽了完整的重试预算（6 次，约 30 秒）仍未成功。终态。 | 手动用 `agentbridge claude` 重试。 |
-
 ## 额度协调与自动续接
 
-AgentBridge 能让长任务跨订阅额度窗口持续推进，而不是某一侧撞到上限就中断。这套能力由配套的 **agent-quota-guard** 工具驱动：bridge 读它的额度探针和 `pending` 记录——装上 guard 才会启用。
+AgentBridge 能让长任务跨订阅额度窗口持续推进，而不是某一侧撞到上限就中断。这套能力由配套工具 **[agent-quota-guard](https://www.npmjs.com/package/agent-quota-guard)**（[repo](https://github.com/raysonmeng/agent-quota-guard) · v0.2.0，2026-06-13）驱动——装上 guard 才启用。
 
-daemon 里的额度协调器轮询**两侧**账号级 5h/周额度（经 guard 的探针）并协调两边；`abg budget [--json]` 打印实时快照（两个窗口、漂移、暂停态）。装上 guard 后再激活两项能力：
+- **快照** —— daemon 经 guard 的探针轮询两侧账号级 5h/周额度；`abg budget [--json]` 打印实时快照（两个窗口、漂移、暂停态）。只要装了 guard 的探针就能用。
+- **减速线（中途不腰斩）** —— 接近额度硬线时，guard **不**在工具调用中途 deny，而是让当前 turn 跑完、在回合边界干净停下、写 `.agent/checkpoint.md`，并落一条 bridge 能检测的 `pending` 记录。
+- **全自动续接** —— 被暂停一侧窗口刷新后，bridge 在**原本的交互式 TUI** 里续接：Codex 经排队的 `turn/start` 注入，Claude 经 channel push 并由 `ack_resume` 回执。每条 pending 的幂等墓碑保证同一续接最多注入一次，跨 daemon 重启亦然。
 
-- **减速线——中途不腰斩。** 接近额度硬线时，guard **不**在工具调用中途 deny，而是给一条提醒、让当前 turn 跑完，在**回合边界干净停下**，写 `.agent/checkpoint.md`，并落一条 bridge 能检测的 `pending` 记录。
-- **窗口刷新后全自动续接。** 当被暂停一侧的额度窗口刷新，bridge 在**原本的交互式 TUI** 里续接任务——不开后台无头进程、不需手动：
-  - **Codex**：排队的 `turn/start` 注入（`ResumeInjectionQueue`）开一个新 turn，从 checkpoint 接着干。全自动。
-  - **Claude**：channel push 一条带稳定 `resume_id` 的指令；Claude 经 `ack_resume` MCP tool 回执。未回执则用新 delivery id 重推（`resume_id` 不变）；重试耗尽后落 `SessionStart` 降级 sentinel，下个会话读到恢复提示。
-  - **幂等**：每条 pending 一个 claim/consumed 墓碑（agent+session+cwd+内容哈希 的 sha256），保证同一续接最多注入一次，跨 daemon 重启亦然；陈旧墓碑按 TTL 清理。
-
-任务运行中 bridge 可能发的协调指令：**balance**（把更多活分给 runway 更长 / 剩余可工作时间更多的一侧）、**underutilized**（账号周额度在刷新前烧不满时——多拆并行子任务 / 提高委派密度）、**pause / handoff / resume**。
-
-> 减速线 + 自动续接是可选的、依赖配套 guard 的能力。Claude 侧续接是 best-effort（ack + 重试 + SessionStart 兜底）：对完全空闲会话的 channel push 存在已知的上游不确定性，故 bridge 只有看到真正的 `ack_resume` 才标记该侧已续接。
+> **实验性 / opt-in。** 这是依赖配套 guard 的能力。Claude 侧续接是 best-effort（ack + 重试 + `SessionStart` 兜底）：对完全空闲会话的 channel push 存在已知上游不确定性，故 bridge 只有看到真正的 `ack_resume` 才标记该侧已续接。
 
 ## 当前限制
 
 - 目前只转发 `agentMessage`，不转发 `commandExecution`、`fileChange` 等中间过程事件
 - 每对只有单个 Codex thread，对内暂不支持多会话
 - 每对只有单个 Claude 前台连接；新的 Claude 会话会替换旧连接
-- 多对可在同机并行（每个项目目录一对、按对分配端口）；Windows 暂非官方支持平台
+- 多对可在同机并行（每个项目目录一对）；Windows 暂非官方支持平台
 
-### Codex 的 Git 操作限制
-
-Codex 运行在沙箱环境中，**禁止对 `.git` 目录进行任何写操作**。这意味着 Codex 无法执行 `git commit`、`git push`、`git pull`、`git checkout -b`、`git merge` 等任何修改 Git 元数据的命令。尝试执行这些命令会导致 Codex 会话无限期挂起。
-
-**建议做法：** 让 Claude Code 负责所有 Git 操作（创建分支、提交、推送、创建 PR）。Codex 专注于代码修改，通过 `agentMessage` 汇报完成的工作，由 Claude Code 负责 Git 工作流。
+休眠/禁用状态、Codex `.git` 限制及其它坑，见 **[排错文档](docs/TROUBLESHOOTING.md)**。
 
 ## Roadmap
 
-- **v1.x（当前）**：在不改变架构的前提下优化单桥体验 -- 降噪、控回合、定角色。详见 [docs/01-起步与v1协作核心.md](docs/01-起步与v1协作核心.md)。
-- **v2（规划中）**：引入多 Agent 基础设施 -- Room 作用域协作、稳定身份、正式控制协议、更强的恢复语义。详见 [docs/08-v2架构愿景.md](docs/08-v2架构愿景.md)。
-- **v3+（远期）**：更智能的协作、更丰富的策略、跨 runtime 的高级编排。
+- **更多 adapter** —— 今天 AgentBridge 接的是 Claude Code ↔ Codex。下一个候选：**OpenCode、OpenClaw、Hermes Agent、Gemini CLI**。到 [adapter roadmap issue](https://github.com/quilin-ai/agent-bridge/issues/212) 投票。
+- **能力网格（Capability mesh）** —— 超越消息传递：连上的 agent 会发布自己的命令 / skills / MCP tools，让对等体直接调用——从「传消息」走向「调能力」。
+- **v2 —— 多 Agent 基础设施**（部分已落地）：Room 作用域协作、稳定身份、正式控制协议、更强恢复。见 [docs/08-v2架构愿景.md](docs/08-v2架构愿景.md)。
+- **v3 —— 跨网协作**（preview，见上面的实验性 CLI）：跨机器、跨 agent 的共享房间，经 broker。见 [docs/09-v3协作系统规格.md](docs/09-v3协作系统规格.md)。
+
+## 文档
+
+- **[排错 / Troubleshooting](docs/TROUBLESHOOTING.md)** —— 禁用状态恢复、Codex `.git` 挂死、「装了却跑不起来」、Bun 版本要求
+- **[使用手册](docs/manual/使用手册.md)**（[English](docs/manual/manual-en.md)）—— 端到端使用走查
+- **[项目成长编年史](docs/README.md)** —— AgentBridge 是怎么一步步长起来的（阶段 01–11）
 
 ## 这个项目是怎么建成的
 
-这个项目由 **Claude Code**（Anthropic）和 **Codex**（OpenAI）通过 AgentBridge 本身进行实时双向通信，在人类开发者的指挥下协作完成。开发者负责分配任务、审查进度，并指挥两个 Agent 并行工作、互相 review。
-
-换句话说，AgentBridge 就是它自己的 proof of concept：两个来自不同厂商的 AI Agent，通过实时连接，肩并肩地交付代码。
+这个项目由 **Claude Code**（Anthropic）和 **Codex**（OpenAI）通过 AgentBridge 本身进行实时双向通信，在人类开发者的指挥下协作完成。开发者负责分配任务、审查进度，并指挥两个 Agent 并行工作、互相 review。换句话说，AgentBridge 就是它自己的 proof of concept：两个来自不同厂商的 AI Agent，通过实时连接，肩并肩地交付代码。
 
 ## 联系方式
 
