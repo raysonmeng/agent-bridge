@@ -18,3 +18,14 @@ V1_PROGRESS.md
 # Runtime E2E artifacts and python cache
 artifacts/
 __pycache__/
+
+# v3 collab secrets (abg auth login) — never commit raw PSK tokens / identity DB
+collab.db
+collab.db-wal
+collab.db-shm
+auth-token
+
+# Local scratch files that leak into the repo root (broker probe, editor drafts)
+_t.ts
+PR
+control-master
