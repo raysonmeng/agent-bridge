@@ -281,6 +281,9 @@ header {
    reveals the full example; needs :has() — degrades to static cards without */
 @media (min-width: 761px) {
   #benefits .cards { grid-template-columns: 1fr 1fr 1fr; transition: grid-template-columns .5s cubic-bezier(.4,0,.2,1); }
+  /* expanded card sizes to its content — the terminal hugs the prose, no stretch gap */
+  #benefits .cards:has(.card:hover) { align-items: start; }
+  #benefits .cards:has(.card:hover) .card:hover .term-full { margin-top: 16px; }
   #benefits .cards:has(.card:nth-child(1):hover) { grid-template-columns: 12fr 0fr 0fr; }
   #benefits .cards:has(.card:nth-child(2):hover) { grid-template-columns: 0fr 12fr 0fr; }
   #benefits .cards:has(.card:nth-child(3):hover) { grid-template-columns: 0fr 0fr 12fr; }
