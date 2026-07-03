@@ -276,6 +276,18 @@ header {
 }
 .card .term pre { font-size: .78rem; padding: 12px 14px; }
 .card { overflow: hidden; }
+/* full-width highlight card (multi-pair) */
+.wide-card {
+  margin-top: 20px; border: 1px solid var(--border); border-radius: var(--radius); padding: 24px;
+  background: linear-gradient(180deg, var(--panel), var(--panel2));
+  display: grid; grid-template-columns: 1fr 1.1fr; gap: 26px; align-items: center;
+  transition: border-color .2s ease;
+}
+.wide-card:hover { border-color: rgba(61,220,151,.35); }
+.wide-card h3 { margin: 0 0 8px; font-size: 1.1rem; }
+.wide-card p { margin: 0; color: var(--muted); font-size: .95rem; }
+.wide-card .term pre { font-size: .78rem; padding: 12px 14px; }
+@media (max-width: 760px) { .wide-card { grid-template-columns: 1fr; } }
 .card .term-full { display: none; }
 /* hover-expand: the hovered workflow card silkily takes the whole row and
    reveals the full example; needs :has() — degrades to static cards without */
@@ -541,6 +553,19 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
         </div>
       </div>
 
+    </div>
+
+    <div class="wide-card reveal">
+      <div>
+        <h3>多项目多开，天生支持</h3>
+        <p>每个项目文件夹一对。同时干三个仓库？三座桥并排跑 —— 端口按对自动分配，<code class="mono">--pair &lt;名字&gt;</code> 指定其中一对。</p>
+      </div>
+      <div class="term">
+        <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">多开</span></div>
+<pre><span class="c-muted">~/work/shop</span>   → <span class="c-green">pair 1</span>  <span class="c-claude">claude</span> ⇄ <span class="c-codex">codex</span>  <span class="c-muted">:4510</span>
+<span class="c-muted">~/work/api</span>    → <span class="c-green">pair 2</span>  <span class="c-claude">claude</span> ⇄ <span class="c-codex">codex</span>  <span class="c-muted">:4520</span>
+<span class="c-muted">~/oss/bridge</span>  → <span class="c-green">pair 3</span>  <span class="c-claude">claude</span> ⇄ <span class="c-codex">codex</span>  <span class="c-muted">:4530</span></pre>
+      </div>
     </div>
   </div>
 </section>
