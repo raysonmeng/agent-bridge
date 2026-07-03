@@ -1,9 +1,13 @@
+<p align="center"><img src="site/assets/logo.svg" width="72" alt="AgentBridge logo" /></p>
+
 # AgentBridge
 
 [![CI](https://github.com/raysonmeng/agent-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/raysonmeng/agent-bridge/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 [中文文档](README.zh-CN.md)
+
+**🌐 Website: [quilin-ai.github.io/agent-bridge](https://quilin-ai.github.io/agent-bridge/)** — with a live animated demo of a real session.
 
 Local bridge for bidirectional communication between Claude Code and Codex inside the same working session.
 
@@ -14,6 +18,7 @@ What that buys you, concretely:
 - **Quota relay for overnight runs** — when one side's subscription window runs dry, it stops cleanly at a turn boundary and hands the task off to the other side, so a long job keeps moving instead of dying at a limit.
 
 <!-- TODO: assets/demo.gif — see docs/demo/RECORDING.md -->
+▶ **[Watch the demo on the website](https://quilin-ai.github.io/agent-bridge/)** — an animated replay of a real session: Codex's reply pushed into Claude's live session, a mid-turn injection into Codex, and a quota handoff.
 
 > **This tool was largely built by Claude Code and Codex collaborating through it.**
 > **Every PR written by one agent was reviewed by the other.** AgentBridge is its own proof of concept.

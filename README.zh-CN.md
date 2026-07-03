@@ -1,9 +1,13 @@
+<p align="center"><img src="site/assets/logo.svg" width="72" alt="AgentBridge logo" /></p>
+
 # AgentBridge
 
 English version: [README.md](README.md)
 
 [![CI](https://github.com/raysonmeng/agent-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/raysonmeng/agent-bridge/actions/workflows/ci.yml)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
+**🌐 官网：[quilin-ai.github.io/agent-bridge/zh/](https://quilin-ai.github.io/agent-bridge/zh/)** —— 附真实会话的动画演示。
 
 让 Claude Code 和 Codex 在同一个工作会话中进行双向通信的本地 Bridge。
 
@@ -14,6 +18,7 @@ English version: [README.md](README.md)
 - **通宵任务的额度接力** —— 一侧订阅额度窗口烧到线时，它在回合边界干净停下，把任务交接给另一侧，让长任务继续跑,而不是撞到上限就死掉。
 
 <!-- TODO: assets/demo.gif — see docs/demo/RECORDING.md -->
+▶ **[在官网看演示](https://quilin-ai.github.io/agent-bridge/zh/)** —— 真实会话的动画重放：Codex 回复推进 Claude 活跃会话、回合中途插入、额度接力。
 
 > **这个工具很大程度上就是 Claude Code 和 Codex 通过它本身协作写出来的。**
 > **一个 agent 写的每个 PR,都由另一个 agent review。** AgentBridge 就是它自己的 proof of concept。
