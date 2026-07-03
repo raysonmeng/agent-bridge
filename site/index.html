@@ -45,7 +45,7 @@
       "description": "A local bridge for bidirectional, real-time collaboration between Claude Code and Codex inside one working session: cross-review, task splits, and quota relay for long-running tasks.",
       "url": "https://quilin-ai.github.io/agent-bridge/",
       "downloadUrl": "https://www.npmjs.com/package/@raysonmeng/agentbridge",
-      "softwareVersion": "0.1.24",
+      "softwareVersion": "0.1.25",
       "license": "https://opensource.org/licenses/MIT",
       "isAccessibleForFree": true,
       "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
@@ -98,190 +98,304 @@
 
 <style>
 :root {
-  --bg: #ffffff;
-  --bg-soft: #f5f6f8;
-  --panel: #ffffff;
-  --text: #14181d;
-  --muted: #5b636e;
-  --border: #e3e7ec;
-  --accent: #0a7d55;
-  --accent-soft: #e5f5ee;
-  --term-bg: #12151b;
+  --bg: #07090d;
+  --bg2: #0b0e15;
+  --panel: #10141c;
+  --panel2: #0d1017;
+  --text: #e9edf4;
+  --muted: #98a1b3;
+  --dim: #5f6878;
+  --border: rgba(255,255,255,.07);
+  --border2: rgba(255,255,255,.13);
+  --accent: #3ddc97;
+  --accent-dim: rgba(61,220,151,.14);
+  --cyan: #6cc5e0;
+  --claude: #b892ff;
+  --term-bg: #0a0d12;
   --term-text: #d6dbe4;
   --term-green: #5fd39a;
-  --term-cyan: #6cc5e0;
-  --term-muted: #8b95a3;
-  --shadow: 0 1px 2px rgba(20,24,29,.05), 0 8px 28px rgba(20,24,29,.06);
-}
-@media (prefers-color-scheme: dark) {
-  :root {
-    --bg: #0b0d11;
-    --bg-soft: #10131a;
-    --panel: #13161d;
-    --text: #e7eaf0;
-    --muted: #99a2b0;
-    --border: #232833;
-    --accent: #3ddc97;
-    --accent-soft: #12241c;
-    --term-bg: #0e1016;
-    --term-text: #d6dbe4;
-    --shadow: 0 1px 2px rgba(0,0,0,.3), 0 10px 30px rgba(0,0,0,.35);
-  }
+  --term-muted: #7f8899;
+  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 16px 48px rgba(0,0,0,.5);
+  --radius: 14px;
 }
 * { box-sizing: border-box; }
 html { scroll-behavior: smooth; }
+::selection { background: rgba(61,220,151,.28); }
 body {
   margin: 0;
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, "PingFang SC", "Microsoft YaHei", sans-serif;
   background: var(--bg);
   color: var(--text);
-  line-height: 1.65;
+  line-height: 1.68;
   -webkit-font-smoothing: antialiased;
+  overflow-x: hidden;
 }
 .mono { font-family: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, "Liberation Mono", monospace; }
 a { color: var(--accent); text-decoration: none; }
 a:hover { text-decoration: underline; }
-.wrap { max-width: 960px; margin: 0 auto; padding: 0 20px; }
-h1, h2, h3 { line-height: 1.25; letter-spacing: -.01em; }
-h2 { font-size: 1.75rem; margin: 0 0 .5rem; }
-section { padding: 64px 0; border-top: 1px solid var(--border); }
-.lead { color: var(--muted); font-size: 1.05rem; max-width: 46rem; }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 3px; border-radius: 4px; }
+.wrap { max-width: 1020px; margin: 0 auto; padding: 0 24px; }
+h1, h2, h3 { line-height: 1.18; letter-spacing: -.02em; }
+h2 { font-size: clamp(1.55rem, 3vw, 2.1rem); margin: 0 0 .6rem; }
+section { padding: 92px 0; position: relative; }
+section + section::before {
+  content: ""; position: absolute; top: 0; left: 50%; transform: translateX(-50%);
+  width: min(1020px, calc(100% - 48px)); height: 1px;
+  background: linear-gradient(90deg, transparent, var(--border2), transparent);
+}
+.lead { color: var(--muted); font-size: 1.06rem; max-width: 46rem; }
+.eyebrow {
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: .74rem; font-weight: 600; letter-spacing: .16em; text-transform: uppercase;
+  color: var(--accent); margin: 0 0 14px;
+}
 
 /* header */
 header {
-  position: sticky; top: 0; z-index: 20;
-  backdrop-filter: saturate(1.4) blur(10px);
-  background: var(--bg);
-  background: color-mix(in srgb, var(--bg) 82%, transparent);
+  position: sticky; top: 0; z-index: 30;
+  backdrop-filter: saturate(1.3) blur(14px);
+  background: rgba(7,9,13,.72);
   border-bottom: 1px solid var(--border);
 }
-.nav { display: flex; align-items: center; gap: 18px; height: 58px; }
-.brand { font-weight: 700; font-size: 1.05rem; display: flex; align-items: center; gap: 8px; color: var(--text); }
+.nav { display: flex; align-items: center; gap: 18px; height: 60px; }
+.brand { font-weight: 700; font-size: 1.02rem; display: flex; align-items: center; gap: 9px; color: var(--text); }
 .brand:hover { text-decoration: none; }
-.nav-links { display: flex; gap: 18px; margin-left: auto; align-items: center; }
-.nav-links a { color: var(--muted); font-size: .92rem; }
+.nav-links { display: flex; gap: 20px; margin-left: auto; align-items: center; }
+.nav-links a { color: var(--muted); font-size: .9rem; transition: color .15s; }
 .nav-links a:hover { color: var(--text); text-decoration: none; }
-.nav-cta { color: var(--text) !important; font-weight: 600; }
+.nav-cta {
+  color: var(--text) !important; font-weight: 600;
+  border: 1px solid var(--border2); border-radius: 8px; padding: 6px 13px;
+  transition: border-color .15s, background .15s;
+}
+.nav-cta:hover { border-color: var(--accent); background: var(--accent-dim); }
 @media (max-width: 720px) { .nav-hide { display: none; } }
 
 /* hero */
-.hero { padding: 72px 0 56px; border-top: none; text-align: center; }
-.hero h1 { font-size: 2.7rem; margin: 0 0 16px; }
-.hero .lead { margin: 0 auto 28px; font-size: 1.18rem; }
-.tag { color: var(--accent); font-weight: 600; }
-.badges { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; margin: 22px 0 4px; }
-.badge {
-  font-size: .78rem; font-weight: 600; color: var(--muted);
-  border: 1px solid var(--border); border-radius: 999px; padding: 4px 11px; background: var(--bg-soft);
+.hero { padding: 104px 0 76px; text-align: center; }
+.hero::before {
+  content: ""; position: absolute; top: -60px; left: 0; right: 0; height: 700px; z-index: 1; pointer-events: none;
+  background-image:
+    linear-gradient(rgba(255,255,255,.03) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(255,255,255,.03) 1px, transparent 1px);
+  background-size: 56px 56px;
+  -webkit-mask-image: radial-gradient(72% 56% at 50% 26%, #000 25%, transparent 74%);
+  mask-image: radial-gradient(72% 56% at 50% 26%, #000 25%, transparent 74%);
 }
-.btns { display: flex; flex-wrap: wrap; gap: 12px; justify-content: center; margin-top: 26px; }
-.btn {
-  display: inline-flex; align-items: center; gap: 8px;
-  padding: 11px 20px; border-radius: 10px; font-weight: 600; font-size: .95rem;
-  border: 1px solid var(--border); background: var(--panel); color: var(--text);
+.hero .wrap { position: relative; z-index: 2; }
+.hero-fx {
+  position: absolute; top: -60px; left: 0; right: 0; height: 620px; z-index: 0; pointer-events: none; opacity: .55;
+  -webkit-mask-image: radial-gradient(68% 52% at 50% 34%, #000 20%, transparent 72%);
+  mask-image: radial-gradient(68% 52% at 50% 34%, #000 20%, transparent 72%);
 }
-.btn:hover { text-decoration: none; border-color: var(--accent); }
-.btn-primary { background: var(--accent); color: #fff; border-color: var(--accent); }
-@media (prefers-color-scheme: dark) { .btn-primary { color: #06120d; } }
-.btn-primary:hover { filter: brightness(1.06); }
+.hero-fx canvas { width: 100%; height: 100%; display: block; }
+.hero h1 {
+  font-size: clamp(2.55rem, 6.4vw, 4.35rem);
+  letter-spacing: -.035em; line-height: 1.04; margin: 0 0 22px;
+  text-wrap: balance;
+}
+.tag { color: var(--accent); }
+.hero .lead { margin: 0 auto 34px; font-size: clamp(1.03rem, 1.6vw, 1.2rem); }
+.hero .lead strong { color: var(--text); }
 
 /* install line */
 .install {
-  display: inline-flex; align-items: center; gap: 12px;
+  display: inline-flex; align-items: center; gap: 14px;
   background: var(--term-bg); color: var(--term-text);
-  border-radius: 12px; padding: 13px 16px; margin: 6px auto 0;
+  border: 1px solid var(--border2); border-radius: 12px; padding: 13px 17px;
   box-shadow: var(--shadow); max-width: 100%;
 }
-.install code { font-size: .98rem; white-space: nowrap; overflow-x: auto; }
+.install code { font-size: .96rem; white-space: nowrap; overflow-x: auto; }
 .install code::before { content: "$ "; color: var(--term-green); }
 .copy {
-  border: 1px solid #333a46; background: #1b2028; color: var(--term-muted);
-  border-radius: 7px; padding: 5px 10px; font-size: .78rem; cursor: pointer; flex: none;
+  border: 1px solid rgba(255,255,255,.14); background: rgba(255,255,255,.05); color: var(--muted);
+  border-radius: 7px; padding: 5px 11px; font-size: .78rem; cursor: pointer; flex: none;
+  transition: color .15s, border-color .15s;
 }
-.copy:hover { color: var(--term-text); border-color: #4a5261; }
+.copy:hover { color: var(--text); border-color: var(--accent); }
 
-/* terminal window */
-.term {
-  background: var(--term-bg); border-radius: 12px; overflow: hidden;
-  box-shadow: var(--shadow); border: 1px solid rgba(255,255,255,.05); margin-top: 10px;
+.strip {
+  margin-top: 22px; color: var(--dim); font-size: .8rem; letter-spacing: .02em;
 }
-.term-bar { display: flex; align-items: center; gap: 7px; padding: 10px 14px; background: rgba(255,255,255,.03); border-bottom: 1px solid rgba(255,255,255,.05); }
+.strip b { color: var(--muted); font-weight: 600; }
+.strip .sep { color: var(--accent); margin: 0 10px; }
+
+/* terminal window chrome */
+.term {
+  background: var(--term-bg); border-radius: var(--radius); overflow: hidden;
+  box-shadow: var(--shadow); border: 1px solid var(--border2);
+}
+.term-bar {
+  display: flex; align-items: center; gap: 7px; padding: 10px 14px;
+  background: rgba(255,255,255,.035); border-bottom: 1px solid var(--border);
+}
 .dot { width: 11px; height: 11px; border-radius: 50%; display: inline-block; }
 .dot.r { background: #ff5f57; } .dot.y { background: #febc2e; } .dot.g { background: #28c840; }
 .term-title { color: var(--term-muted); font-size: .78rem; margin-left: 8px; }
 .term pre {
   margin: 0; padding: 16px; overflow-x: auto; color: var(--term-text);
-  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .86rem; line-height: 1.7;
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: .85rem; line-height: 1.7;
 }
-.c-claude { color: #b892ff; } .c-codex { color: var(--term-cyan); } .c-green { color: var(--term-green); }
+.c-claude { color: var(--claude); } .c-codex { color: var(--cyan); } .c-green { color: var(--term-green); }
 .c-muted { color: var(--term-muted); }
 
-/* demo placeholder */
-.demo {
-  margin: 34px auto 0; max-width: 760px; border: 1px dashed var(--border); border-radius: 14px;
-  background: var(--bg-soft); overflow: hidden;
+/* live demo — scripted replay of a real recorded session */
+.demo { margin: 46px auto 0; max-width: 960px; position: relative; z-index: 5; }
+.duo { will-change: transform; }
+.duo { position: relative; display: grid; grid-template-columns: 1fr 1fr; gap: 20px; text-align: left; }
+.duo .term { margin-top: 0; }
+.pane {
+  height: 340px; display: flex; flex-direction: column;
+  font-size: .8rem; line-height: 1.7; color: var(--term-text);
 }
-.demo .ph { display: grid; place-items: center; padding: 46px 20px; color: var(--muted); text-align: center; }
-.demo .ph .k { font-weight: 700; color: var(--text); }
+.phead { padding: 12px 16px 4px; flex: none; }
+.phead pre { margin: 0; font: inherit; line-height: 1.3; overflow-x: auto; scrollbar-width: none; }
+.phead b { color: var(--term-text); }
+.clogo { color: #d97757; }
+.c-dim { color: var(--dim); }
+.plog { flex: 1 1 auto; overflow-y: auto; scrollbar-width: none; padding: 6px 16px; transition: opacity .4s; }
+.plog::-webkit-scrollbar { display: none; }
+.pfoot { flex: none; border-top: 1px solid var(--border); padding: 8px 16px 9px; }
+.pin-line { border-bottom: 1px solid var(--border); padding-bottom: 7px; }
+.pstat { display: flex; gap: 14px; flex-wrap: wrap; color: var(--dim); font-size: .68rem; margin-top: 7px; }
+.dl { padding-left: 1.1em; text-indent: -1.1em; white-space: pre-wrap; overflow-wrap: break-word; animation: rise .22s ease both; line-height: 1.75; }
+.dl + .dl { margin-top: 7px; }
+@keyframes rise { from { opacity: 0; transform: translateY(4px); } }
+.hot {
+  border-left: 2px solid var(--term-green); background: rgba(95,211,154,.09);
+  border-radius: 0 8px 8px 0; padding: 7px 10px 7px 11px; text-indent: 0; margin-top: 8px;
+}
+.hot-tag {
+  display: inline-block; font-size: .66rem; font-weight: 700; color: #06120d;
+  background: var(--term-green); border-radius: 4px; padding: 1px 7px; margin-bottom: 5px; letter-spacing: .03em;
+}
+.hot.cyan { border-left-color: var(--cyan); background: rgba(108,197,224,.09); }
+.hot.cyan .hot-tag { background: var(--cyan); color: #071018; }
+.caret { display: inline-block; width: .55em; height: 1em; background: var(--term-text); vertical-align: -.12em; animation: blink 1.05s steps(1) infinite; }
+@keyframes blink { 50% { opacity: 0; } }
+.pulse {
+  position: absolute; top: 50%; left: 25%; width: 16px; height: 16px; margin-top: -8px;
+  border-radius: 50%; background: var(--term-green); opacity: 0; pointer-events: none; z-index: 2;
+  box-shadow: 0 0 12px 4px rgba(61,220,151,.85), 0 0 34px 14px rgba(61,220,151,.35);
+}
+.pulse::before {
+  content: ""; position: absolute; top: 50%; left: 50%; width: 110px; height: 3px;
+  transform: translate(-50%, -50%); border-radius: 2px;
+  background: linear-gradient(90deg, transparent, rgba(61,220,151,.75), transparent);
+}
+.demo-cap { margin: 16px auto 0; color: var(--dim); font-size: .9rem; text-align: center; }
+.demo-cap strong { color: var(--muted); }
+/* stack the two terminals when the screen is narrow OR portrait — side-by-side
+   panes are too cramped in a vertical aspect ratio */
+@media (max-width: 760px), (orientation: portrait) { .duo { grid-template-columns: 1fr; } .pulse { display: none; } }
+@media (max-width: 760px) { .pane { height: 300px; } }
 
 /* benefit cards */
-.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(260px, 1fr)); gap: 20px; margin-top: 30px; }
-.card { border: 1px solid var(--border); border-radius: 14px; padding: 22px; background: var(--panel); }
-.card h3 { margin: 0 0 8px; font-size: 1.12rem; }
-.card p { margin: 0 0 14px; color: var(--muted); font-size: .96rem; }
-.card .term { margin-top: auto; }
+.cards { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; margin-top: 34px; }
+.card {
+  display: flex; flex-direction: column;
+  border: 1px solid var(--border); border-radius: var(--radius); padding: 20px;
+  background: linear-gradient(180deg, var(--panel), var(--panel2));
+  transition: transform .2s ease, border-color .2s ease;
+}
+.card .term pre { font-size: .78rem; padding: 12px 14px; }
+.card { overflow: hidden; }
+.card .term-full { display: none; }
+/* hover-expand: the hovered workflow card silkily takes the whole row and
+   reveals the full example; needs :has() — degrades to static cards without */
+@media (min-width: 761px) {
+  #benefits .cards { grid-template-columns: 1fr 1fr 1fr; transition: grid-template-columns .5s cubic-bezier(.4,0,.2,1); }
+  #benefits .cards:has(.card:nth-child(1):hover) { grid-template-columns: 12fr 0fr 0fr; }
+  #benefits .cards:has(.card:nth-child(2):hover) { grid-template-columns: 0fr 12fr 0fr; }
+  #benefits .cards:has(.card:nth-child(3):hover) { grid-template-columns: 0fr 0fr 12fr; }
+  #benefits .cards:has(.card:hover) .card:not(:hover) { opacity: 0; padding-left: 0; padding-right: 0; border-color: transparent; }
+  /* constant cap: narrow-rewrapped sibling text must never inflate the row —
+     applied always, so un-hovering can't flash-stretch while widths animate back */
+  #benefits .card { min-width: 0; max-height: 520px; transition: opacity .35s, padding .5s cubic-bezier(.4,0,.2,1), border-color .2s ease; }
+  #benefits .cards:has(.card:hover) .card:hover .term-mini { display: none; }
+  #benefits .cards:has(.card:hover) .card:hover .term-full { display: block; }
+  #benefits .cards:has(.card:hover) .card:hover { transform: none; border-color: rgba(61,220,151,.45); }
+}
+.card:hover { transform: translateY(-3px); border-color: rgba(61,220,151,.35); }
+.card h3 { margin: 0 0 8px; font-size: 1.1rem; }
+.card p { margin: 0 0 16px; color: var(--muted); font-size: .95rem; }
+.card .term { margin-top: auto; box-shadow: none; }
 
 /* comparison table */
-.table-scroll { overflow-x: auto; margin-top: 26px; border: 1px solid var(--border); border-radius: 14px; }
-table { border-collapse: collapse; width: 100%; min-width: 620px; font-size: .93rem; }
-th, td { text-align: left; padding: 13px 16px; border-bottom: 1px solid var(--border); vertical-align: top; }
-thead th { background: var(--bg-soft); font-size: .82rem; text-transform: uppercase; letter-spacing: .04em; color: var(--muted); }
+.table-scroll { overflow-x: auto; margin-top: 30px; border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel2); }
+table { border-collapse: collapse; width: 100%; min-width: 640px; font-size: .92rem; }
+th, td { text-align: left; padding: 14px 16px; border-bottom: 1px solid var(--border); vertical-align: top; }
+thead th { background: rgba(255,255,255,.03); font-size: .78rem; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); }
 tbody tr:last-child td { border-bottom: none; }
 td.yes { color: var(--accent); font-weight: 600; }
-.rowhead { font-weight: 600; white-space: nowrap; }
+.rowhead { font-weight: 600; white-space: nowrap; color: var(--text); }
+td { color: var(--muted); }
+th.us, td.yes { background: rgba(61,220,151,.055); }
+thead th.us { color: var(--accent); }
 
 /* steps */
-.steps { counter-reset: step; margin-top: 26px; display: grid; gap: 18px; }
-.step { display: grid; grid-template-columns: 40px 1fr; gap: 16px; align-items: start; }
-.step .n {
-  counter-increment: step; width: 34px; height: 34px; border-radius: 50%;
-  display: grid; place-items: center; font-weight: 700; background: var(--accent-soft); color: var(--accent); border: 1px solid var(--border);
+.steps { margin-top: 34px; display: grid; gap: 0; position: relative; }
+.step { display: grid; grid-template-columns: 52px 1fr; gap: 18px; align-items: start; padding: 14px 0; position: relative; }
+.step::before {
+  content: ""; position: absolute; left: 17px; top: 52px; bottom: -14px; width: 1px;
+  background: linear-gradient(180deg, var(--border2), transparent);
 }
-.step .n::before { content: counter(step); }
-.step .body h3 { margin: 4px 0 8px; font-size: 1.05rem; }
+.step:last-child::before { display: none; }
+.step .n {
+  width: 36px; height: 36px; border-radius: 10px; display: grid; place-items: center;
+  font-family: ui-monospace, Menlo, monospace; font-weight: 700; font-size: .8rem;
+  background: var(--accent-dim); color: var(--accent); border: 1px solid rgba(61,220,151,.3);
+}
+.step .body h3 { margin: 5px 0 10px; font-size: 1.04rem; }
 .step pre {
-  margin: 0; background: var(--term-bg); color: var(--term-text); border-radius: 10px; padding: 13px 15px;
+  margin: 0; background: var(--term-bg); color: var(--term-text); border: 1px solid var(--border);
+  border-radius: 10px; padding: 13px 15px;
   overflow-x: auto; font-family: ui-monospace, Menlo, Consolas, monospace; font-size: .85rem; line-height: 1.7;
 }
 .step .cmd::before { content: "$ "; color: var(--term-green); }
 
 /* story */
-.story { background: var(--bg-soft); }
-.story blockquote {
-  margin: 22px 0 0; padding: 20px 24px; border-left: 3px solid var(--accent);
-  background: var(--panel); border-radius: 0 12px 12px 0; font-size: 1.08rem;
+.story-quote {
+  margin: 30px 0 0; padding: 30px 34px; border: 1px solid var(--border); border-left: 3px solid var(--accent);
+  background: linear-gradient(180deg, var(--panel), var(--panel2)); border-radius: 0 var(--radius) var(--radius) 0;
+  font-family: Georgia, "Times New Roman", serif; font-style: italic;
+  font-size: clamp(1.14rem, 2vw, 1.38rem); line-height: 1.6; color: var(--text);
 }
-.story blockquote strong { color: var(--text); }
+.story-quote strong { color: var(--accent); font-style: normal; font-family: inherit; }
 
 /* roadmap */
-.road { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px,1fr)); gap: 18px; margin-top: 26px; }
-.road .item { border: 1px solid var(--border); border-radius: 14px; padding: 20px; background: var(--panel); }
-.road .item .when { font-size: .78rem; font-weight: 700; text-transform: uppercase; letter-spacing: .05em; color: var(--accent); }
-.road .item h3 { margin: 6px 0 8px; font-size: 1.08rem; }
+.road { display: grid; grid-template-columns: repeat(auto-fit, minmax(248px,1fr)); gap: 20px; margin-top: 34px; }
+.road .item {
+  border: 1px solid var(--border); border-radius: var(--radius); padding: 22px;
+  background: linear-gradient(180deg, var(--panel), var(--panel2));
+  transition: transform .2s ease, border-color .2s ease;
+}
+.road .item:hover { transform: translateY(-3px); border-color: rgba(61,220,151,.35); }
+.road .item .when {
+  font-family: ui-monospace, Menlo, monospace;
+  font-size: .72rem; font-weight: 700; text-transform: uppercase; letter-spacing: .1em; color: var(--dim);
+}
+.road .item .when.w-now { color: var(--accent); }
+.road .item .when.w-vote { color: var(--cyan); }
+.road .item .when.w-design { color: var(--claude); }
+.road .item h3 { margin: 8px 0 8px; font-size: 1.08rem; }
 .road .item p { margin: 0; color: var(--muted); font-size: .94rem; }
 
 /* faq */
-.faq { margin-top: 22px; }
-details { border: 1px solid var(--border); border-radius: 12px; padding: 4px 18px; margin-bottom: 12px; background: var(--panel); }
-details[open] { border-color: var(--accent); }
-summary { cursor: pointer; font-weight: 600; padding: 14px 0; list-style: none; display: flex; justify-content: space-between; gap: 12px; }
+.faq { margin-top: 26px; }
+details {
+  border: 1px solid var(--border); border-radius: 12px; padding: 4px 20px; margin-bottom: 12px;
+  background: var(--panel2); transition: border-color .2s;
+}
+details[open] { border-color: rgba(61,220,151,.4); }
+summary { cursor: pointer; font-weight: 600; padding: 15px 0; list-style: none; display: flex; justify-content: space-between; gap: 12px; }
 summary::-webkit-details-marker { display: none; }
 summary::after { content: "+"; color: var(--accent); font-weight: 700; }
 details[open] summary::after { content: "\2013"; }
-details p { margin: 0 0 16px; color: var(--muted); }
+details p { margin: 0 0 18px; color: var(--muted); }
 
 /* footer */
-footer { border-top: 1px solid var(--border); padding: 40px 0; color: var(--muted); font-size: .9rem; }
+footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim); font-size: .9rem; }
 .foot-grid { display: flex; flex-wrap: wrap; gap: 26px; align-items: center; justify-content: space-between; }
 .foot-links { display: flex; flex-wrap: wrap; gap: 18px; }
 .foot-links a { color: var(--muted); }
@@ -289,6 +403,14 @@ footer { border-top: 1px solid var(--border); padding: 40px 0; color: var(--mute
 
 .center { text-align: center; }
 .sr-only { position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px; overflow: hidden; clip: rect(0,0,0,0); border: 0; }
+
+@media (prefers-reduced-motion: reduce) {
+  html { scroll-behavior: auto; }
+  .dl { animation: none; }
+  .caret { animation: none; }
+  .pulse { display: none; }
+  .card, .road .item, .btn { transition: none; }
+}
 </style>
 </head>
 <body>
@@ -309,81 +431,134 @@ footer { border-top: 1px solid var(--border); padding: 40px 0; color: var(--mute
 
 <main>
 <section class="hero">
+  <div class="hero-fx" id="fx" aria-hidden="true"><canvas id="fxc"></canvas></div>
   <div class="wrap">
-    <h1>Two AI agents. <span class="tag">One session.</span><br />No copy-paste.</h1>
-    <p class="lead">AgentBridge is a local bridge that lets <strong>Claude Code</strong> and <strong>Codex</strong> collaborate in real time inside one working session — cross-reviewing each other's diffs, splitting tasks between them, and relaying work across quota limits.</p>
+    <p class="eyebrow" data-hero>local bridge · claude code ⇄ codex</p>
+    <h1 data-hero>Multi AI agents. <span class="tag">One session.</span><br />No copy-paste.</h1>
+    <p class="lead" data-hero>AgentBridge is a local bridge that lets <strong>Claude Code</strong> and <strong>Codex</strong> collaborate in real time inside one working session — cross-reviewing each other's diffs, splitting tasks between them, and relaying work across quota limits.</p>
 
-    <div class="install">
+    <div class="install" data-hero>
       <code class="mono" id="installcmd">npm install -g @raysonmeng/agentbridge</code>
       <button class="copy" data-copy="npm install -g @raysonmeng/agentbridge" aria-label="Copy install command">Copy</button>
     </div>
 
-    <div class="btns">
-      <a class="btn btn-primary" href="#quickstart">Get started</a>
-      <a class="btn" href="https://github.com/quilin-ai/agent-bridge">★ GitHub</a>
-      <a class="btn" href="https://www.npmjs.com/package/@raysonmeng/agentbridge">npm</a>
-    </div>
+    <p class="strip mono" data-hero>
+      <b>MIT</b><span class="sep">·</span><b>runs 100% locally</b><span class="sep">·</span><b>zero runtime deps</b><span class="sep">·</span><b>1,700+ tests</b><span class="sep">·</span><b>v0.1.25</b>
+    </p>
 
-    <div class="badges">
-      <span class="badge">MIT licensed</span>
-      <span class="badge">Runs 100% locally</span>
-      <span class="badge">Zero runtime deps</span>
-      <span class="badge">1,700+ tests</span>
-      <span class="badge">v0.1.24</span>
-    </div>
-
-    <!-- assets/demo.gif — replace this placeholder once the demo is recorded (see docs/demo/RECORDING.md) -->
-    <div class="demo" aria-label="Product demo placeholder">
-      <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">agentbridge — live session</span></div>
-      <div class="ph">
-        <div>
-          <div class="k">▶ Demo coming soon</div>
-          <div style="margin-top:6px">A recorded session — Claude and Codex reviewing each other live — lands here (<code class="mono">assets/demo.gif</code>).</div>
+    <!-- Animated replay of a real recorded session (2026-07-03); script lives in the inline JS below -->
+    <div class="demo" data-hero role="img" aria-label="Replay of a real session: Claude Code asks Codex to review price.js; Codex finds the rounding bug in splitBill and its reply is pushed into Claude's live session, where Claude confirms the catch.">
+      <div class="duo" id="duo">
+        <div class="term">
+          <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">Claude Code — planner · reviewer</span></div>
+          <div class="pane mono">
+            <div class="phead" aria-hidden="true"><pre><span class="clogo"> ▐▛███▜▌</span>   <b>Claude Code</b> <span class="c-muted">v2.1.199</span>
+<span class="clogo">▝▜█████▛▘</span>  <span class="c-muted">Fable 5 · Claude Max</span>
+<span class="clogo">  ▘▘ ▝▝</span>    <span class="c-muted">~/demos/shop</span></pre></div>
+            <div class="plog" id="pane-claude"></div>
+            <div class="pfoot">
+              <div class="pin-line"><span class="c-green">❯</span> <span id="cl-input"></span><span class="caret"></span></div>
+              <div class="pstat"><span>cwd:~/demos/shop</span><span>Fable 5 · thinking:on</span><span>← for agents</span></div>
+            </div>
+          </div>
         </div>
+        <div class="term">
+          <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">Codex — implementer</span></div>
+          <div class="pane mono">
+            <div class="phead" aria-hidden="true"><pre><span class="c-muted">╭──────────────────────────────────╮
+│</span> <b>&gt;_ OpenAI Codex</b> <span class="c-muted">(v0.142.5)       │
+│                                  │
+│ model:     gpt-5.1-codex-max     │
+│ directory: ~/demos/shop          │
+╰──────────────────────────────────╯</span>
+<span class="c-dim">  Tip: run any shell command with !</span></pre></div>
+            <div class="plog" id="pane-codex"></div>
+            <div class="pfoot">
+              <div class="pin-line"><span class="c-muted">›</span> <span class="c-dim">send a task or /command</span></div>
+              <div class="pstat"><span>gpt-5.1-codex-max · ~/demos/shop</span></div>
+            </div>
+          </div>
+        </div>
+        <div class="pulse" id="pulse" aria-hidden="true"></div>
       </div>
+      <p class="demo-cap">A real session, replayed — both directions: Codex's reply is <strong>pushed into Claude's live session</strong>, and Claude's notes <strong>land inside Codex's running turn</strong>. No human relay.</p>
     </div>
   </div>
 </section>
 
 <section id="benefits">
   <div class="wrap">
-    <h2>What that buys you, concretely</h2>
-    <p class="lead">Not two chatbots talking. Two full agents from different providers holding each other accountable while you steer.</p>
+    <p class="eyebrow reveal">what that buys you</p>
+    <h2 class="reveal">Concretely, three workflows</h2>
+    <p class="lead reveal">Not two chatbots talking. Two full agents from different providers holding each other accountable while you steer.</p>
     <div class="cards">
 
-      <div class="card">
+      <div class="card reveal">
         <h3>Cross-review, not just cross-talk</h3>
         <p>Codex implements; Claude reviews the diff in real time <em>inside the same session</em> and pushes change requests straight back into Codex's thread. Two providers checking each other — no copy-paste.</p>
-        <div class="term">
+        <div class="term term-mini">
           <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">cross-review</span></div>
-<pre><span class="c-codex">codex</span>  <span class="c-muted">→</span> implemented rate-limit guard, 3 files
+<pre><span class="c-codex">codex</span>  <span class="c-muted">→</span> guard done, 3 files
 <span class="c-claude">claude</span> <span class="c-muted">→</span> reviewing diff…
-<span class="c-claude">claude</span> <span class="c-muted">→</span> <span class="c-green">reply</span>: edge case — retry after 429 unbounded
-<span class="c-codex">codex</span>  <span class="c-muted">→</span> fixed, capped at 5 retries</pre>
+<span class="c-claude">claude</span> <span class="c-muted">→</span> <span class="c-green">reply</span>: unbounded retry
+<span class="c-codex">codex</span>  <span class="c-muted">→</span> fixed — capped at 5</pre>
+        </div>
+        <div class="term term-full">
+          <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">cross-review — full exchange</span></div>
+<pre><span class="c-muted">you    →</span> have Codex add rate limiting to the API client
+<span class="c-claude">claude</span> <span class="c-muted">→</span> task sent to Codex over the bridge
+<span class="c-codex">codex</span>  <span class="c-muted">→</span> token-bucket limiter implemented — 3 files changed
+<span class="c-claude">claude</span> <span class="c-muted">→</span> reviewing the diff mid-session…
+<span class="c-claude">claude</span> <span class="c-muted">→</span> <span class="c-green">reply</span>: retry loop after 429 has no upper bound;
+         a flaky upstream turns this into an infinite loop
+<span class="c-codex">codex</span>  <span class="c-muted">→</span> good catch — capped at 5, exponential backoff
+<span class="c-claude">claude</span> <span class="c-muted">→</span> re-reviewed <span class="c-green">✓ approved</span>. Two providers, zero copy-paste.</pre>
         </div>
       </div>
 
-      <div class="card">
+      <div class="card reveal">
         <h3>Task splits from one prompt</h3>
         <p>Ask either agent to propose a division of labor with the other, and they negotiate who does what before writing code. You steer; they coordinate.</p>
-        <div class="term">
+        <div class="term term-mini">
           <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">task-split</span></div>
-<pre><span class="c-muted">you →</span> propose a split with Codex for the auth refactor
-<span class="c-claude">claude</span> <span class="c-muted">→</span> I'll take the token model + tests;
-        Codex takes the middleware. Agreed?
-<span class="c-codex">codex</span>  <span class="c-muted">→</span> <span class="c-green">agreed</span> — starting middleware now</pre>
+<pre><span class="c-muted">you    →</span> split the refactor?
+<span class="c-claude">claude</span> <span class="c-muted">→</span> I take tokens+tests,
+         Codex middleware. OK?
+<span class="c-codex">codex</span>  <span class="c-muted">→</span> <span class="c-green">agreed</span> — starting now</pre>
+        </div>
+        <div class="term term-full">
+          <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">task-split — full exchange</span></div>
+<pre><span class="c-muted">you    →</span> propose a split with Codex for the auth refactor
+<span class="c-claude">claude</span> <span class="c-muted">→</span> plan: I take the token model + its tests;
+         Codex rewrites the middleware layer. Agreed?
+<span class="c-codex">codex</span>  <span class="c-muted">→</span> <span class="c-green">agreed</span> — starting middleware now
+<span class="c-claude">claude</span> <span class="c-muted">→</span> token model done — pushing interface notes to Codex
+<span class="c-codex">codex</span>  <span class="c-muted">→</span> middleware done; using Claude's new TokenClaims type
+<span class="c-claude">claude</span> <span class="c-muted">→</span> both halves merged. <span class="c-green">One prompt, two agents, no relay.</span></pre>
         </div>
       </div>
 
-      <div class="card">
+      <div class="card reveal">
         <h3>Quota relay for overnight runs</h3>
         <p>When one side's subscription window runs dry, it stops cleanly at a turn boundary and hands the task off — so a long job keeps moving instead of dying at a limit.</p>
-        <div class="term">
+        <div class="term term-mini">
           <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">quota-relay</span></div>
-<pre><span class="c-codex">codex</span>  <span class="c-muted">→</span> 5h window low — checkpoint written
-<span class="c-green">bridge</span> <span class="c-muted">→</span> handing off to Claude…
-<span class="c-claude">claude</span> <span class="c-muted">→</span> resumed from .agent/checkpoint.md
-<span class="c-green">bridge</span> <span class="c-muted">→</span> auto-resume Codex when window refreshes</pre>
+<pre><span class="c-codex">codex</span>  <span class="c-muted">→</span> 5h window low
+<span class="c-green">bridge</span> <span class="c-muted">→</span> checkpoint written,
+         handing to Claude…
+<span class="c-claude">claude</span> <span class="c-muted">→</span> resumed from ckpt
+<span class="c-green">bridge</span> <span class="c-muted">→</span> resumes Codex later</pre>
+        </div>
+        <div class="term term-full">
+          <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">quota-relay — full exchange</span></div>
+<pre><span class="c-codex">codex</span>  <span class="c-muted">→</span> 5h window at 4% — finishing current turn cleanly
+<span class="c-green">bridge</span> <span class="c-muted">→</span> checkpoint written → .agent/checkpoint.md
+<span class="c-green">bridge</span> <span class="c-muted">→</span> task handed to Claude, context preserved
+<span class="c-claude">claude</span> <span class="c-muted">→</span> resumed from checkpoint — continuing the migration
+<span class="c-dim">         ⏳ two hours later — window refreshed</span>
+<span class="c-green">bridge</span> <span class="c-muted">→</span> Codex quota refreshed — auto-resume queued
+<span class="c-codex">codex</span>  <span class="c-muted">→</span> picking the task back up in the original TUI
+<span class="c-claude">claude</span> <span class="c-muted">→</span> overnight run survived two quota walls. <span class="c-green">Zero babysitting.</span></pre>
         </div>
       </div>
 
@@ -393,76 +568,78 @@ footer { border-top: 1px solid var(--border); padding: 40px 0; color: var(--mute
 
 <section id="quota">
   <div class="wrap">
-    <h2>Quota relay — the part nothing else does</h2>
-    <p class="lead">A long task shouldn't die because one agent hit its 5-hour or weekly subscription limit at 2am. AgentBridge keeps it moving.</p>
-    <div class="cards" style="margin-top:24px">
-      <div class="card">
+    <p class="eyebrow reveal">quota relay</p>
+    <h2 class="reveal">The part nothing else does</h2>
+    <p class="lead reveal">A long task shouldn't die because one agent hit its 5-hour or weekly subscription limit at 2am. AgentBridge keeps it moving.</p>
+    <div class="cards" style="margin-top:28px">
+      <div class="card reveal">
         <h3>No mid-task cut</h3>
         <p>Near the quota hard-line, the companion <a href="https://www.npmjs.com/package/agent-quota-guard">agent-quota-guard</a> does <em>not</em> deny mid-tool-call. It lets the current turn finish, stops cleanly at the boundary, writes a <code class="mono">.agent/checkpoint.md</code>, and drops a <code class="mono">pending</code> record the bridge detects.</p>
       </div>
-      <div class="card">
+      <div class="card reveal">
         <h3>Automatic resume</h3>
         <p>When the paused side's window refreshes, the bridge resumes the task <strong>in the original interactive TUI</strong> — Codex via a queued <code class="mono">turn/start</code>, Claude via a channel push it acks with <code class="mono">ack_resume</code>. Idempotency tombstones inject each resume at most once.</p>
       </div>
-      <div class="card">
+      <div class="card reveal">
         <h3>Both windows in one glance</h3>
         <p>The daemon polls both agents' account-level 5h and weekly quota. <code class="mono">abg budget --json</code> prints the live snapshot: both windows, drift between the two sides, and pause state.</p>
       </div>
     </div>
-    <p style="margin-top:20px; color:var(--muted); font-size:.92rem"><strong>Opt-in.</strong> Quota relay is a companion-guard feature — install <a href="https://github.com/quilin-ai/agent-quota-guard">agent-quota-guard</a> to enable it. Without it, everything else still works.</p>
+    <p class="reveal" style="margin-top:22px; color:var(--dim); font-size:.92rem"><strong style="color:var(--muted)">Opt-in.</strong> Quota relay is a companion-guard feature — install <a href="https://github.com/quilin-ai/agent-quota-guard">agent-quota-guard</a> to enable it. Without it, everything else still works.</p>
   </div>
 </section>
 
 <section id="why">
   <div class="wrap">
-    <h2>Why AgentBridge, and not…</h2>
-    <p class="lead">Three things people reach for instead — and where each one leaves you doing the work by hand.</p>
-    <div class="table-scroll">
+    <p class="eyebrow reveal">positioning</p>
+    <h2 class="reveal">Why AgentBridge, and not…</h2>
+    <p class="lead reveal">Three things people reach for instead — and where each one leaves you doing the work by hand.</p>
+    <div class="table-scroll reveal">
       <table>
         <thead>
           <tr>
             <th>&nbsp;</th>
+            <th class="us">AgentBridge</th>
             <th>Two terminals + copy-paste</th>
             <th>One-way delegation plugin<br /><span class="mono" style="font-weight:400">(e.g. codex-plugin-cc)</span></th>
             <th>External orchestrator</th>
-            <th>AgentBridge</th>
           </tr>
         </thead>
         <tbody>
           <tr>
             <td class="rowhead">Message relay</td>
+            <td class="yes">Automatic, both ways</td>
             <td>You are the message bus</td>
             <td>Request in, response out</td>
             <td>Scripted per hop</td>
-            <td class="yes">Automatic, both ways</td>
           </tr>
           <tr>
             <td class="rowhead">Both agents live as peers</td>
+            <td class="yes">Yes — persistent peers</td>
             <td>Yes, but disconnected</td>
             <td>No — one standing host, one callee</td>
             <td>No — one brain, N dumb workers</td>
-            <td class="yes">Yes — persistent peers</td>
           </tr>
           <tr>
             <td class="rowhead">Push mid-turn</td>
+            <td class="yes">Yes — review lands mid-turn</td>
             <td>Manual, guess when it's safe</td>
             <td>Only at call boundaries</td>
             <td>Only at scheduled steps</td>
-            <td class="yes">Yes — review lands mid-turn</td>
           </tr>
           <tr>
             <td class="rowhead">Agents propose their own splits</td>
+            <td class="yes">Yes — they negotiate</td>
             <td>No</td>
             <td>No</td>
             <td>No — top-down</td>
-            <td class="yes">Yes — they negotiate</td>
           </tr>
           <tr>
             <td class="rowhead">Survives a quota limit</td>
+            <td class="yes">Yes — checkpoint + auto-resume</td>
             <td>No — you restart by hand</td>
             <td>No</td>
             <td>Depends on your script</td>
-            <td class="yes">Yes — checkpoint + auto-resume</td>
           </tr>
         </tbody>
       </table>
@@ -472,71 +649,78 @@ footer { border-top: 1px solid var(--border); padding: 40px 0; color: var(--mute
 
 <section id="quickstart">
   <div class="wrap">
-    <h2>Quick Start</h2>
-    <p class="lead">Four steps from nothing to a running pair. The daemon starts automatically when needed and reconnects if restarted.</p>
+    <p class="eyebrow reveal">quick start</p>
+    <h2 class="reveal">Four steps to a running pair</h2>
+    <p class="lead reveal">The daemon starts automatically when needed and reconnects if restarted.</p>
     <div class="steps">
-      <div class="step">
-        <div class="n"></div>
+      <div class="step reveal">
+        <div class="n">01</div>
         <div class="body">
           <h3>Install Bun (the runtime — Node alone won't work)</h3>
           <pre><span class="cmd">curl -fsSL https://bun.sh/install | bash</span></pre>
         </div>
       </div>
-      <div class="step">
-        <div class="n"></div>
+      <div class="step reveal">
+        <div class="n">02</div>
         <div class="body">
           <h3>Install the CLI</h3>
-          <p style="margin:0 0 8px;color:var(--muted);font-size:.92rem">postinstall auto-registers the Claude Code plugin marketplace and installs the plugin (best-effort; needs bun + claude present).</p>
+          <p style="margin:0 0 10px;color:var(--dim);font-size:.9rem">postinstall auto-registers the Claude Code plugin marketplace and installs the plugin (best-effort; needs bun + claude present).</p>
           <pre><span class="cmd">npm install -g @raysonmeng/agentbridge</span></pre>
         </div>
       </div>
-      <div class="step">
-        <div class="n"></div>
+      <div class="step reveal">
+        <div class="n">03</div>
         <div class="body">
           <h3>Start Claude Code with the AgentBridge channel</h3>
           <pre><span class="cmd">abg claude</span></pre>
         </div>
       </div>
-      <div class="step">
-        <div class="n"></div>
+      <div class="step reveal">
+        <div class="n">04</div>
         <div class="body">
           <h3>In another terminal, start Codex connected to the same bridge</h3>
           <pre><span class="cmd">abg codex</span></pre>
         </div>
       </div>
     </div>
-    <p style="margin-top:22px;color:var(--muted)"><strong>Your first collaboration:</strong> with both sides running, ask Claude — <em>"Propose a task split with Codex for &lt;your task&gt;, then have Codex implement its part while you review."</em> You'll see the split flow into Codex's session, Codex start working, and its completion push back to Claude for review — all without you relaying anything by hand.</p>
-    <p style="color:var(--muted);font-size:.92rem"><code class="mono">abg</code> is a short alias for <code class="mono">agentbridge</code>. Both agents launch with max-permission defaults so an unattended pair doesn't stop for each prompt — add <code class="mono">--safe</code> to launch with normal prompts. See the <a href="https://github.com/quilin-ai/agent-bridge/blob/master/docs/TROUBLESHOOTING.md">Troubleshooting guide</a> if <code class="mono">abg</code> installs but won't run.</p>
+    <p class="reveal" style="margin-top:26px;color:var(--muted)"><strong style="color:var(--text)">Your first collaboration:</strong> with both sides running, ask Claude — <em>"Propose a task split with Codex for &lt;your task&gt;, then have Codex implement its part while you review."</em> You'll see the split flow into Codex's session, Codex start working, and its completion push back to Claude for review — all without you relaying anything by hand.</p>
+    <p class="reveal" style="color:var(--dim);font-size:.92rem"><code class="mono">abg</code> is a short alias for <code class="mono">agentbridge</code>. Both agents launch with max-permission defaults so an unattended pair doesn't stop for each prompt — add <code class="mono">--safe</code> to launch with normal prompts. See the <a href="https://github.com/quilin-ai/agent-bridge/blob/master/docs/TROUBLESHOOTING.md">Troubleshooting guide</a> if <code class="mono">abg</code> installs but won't run.</p>
   </div>
 </section>
 
-<section id="story" class="story">
+<section id="story">
   <div class="wrap">
-    <h2>AgentBridge is its own proof of concept</h2>
-    <p class="lead">The strongest thing we can say about it is that we didn't build it the normal way.</p>
-    <blockquote>
+    <p class="eyebrow reveal">origin</p>
+    <h2 class="reveal">AgentBridge is its own proof of concept</h2>
+    <p class="lead reveal">The strongest thing we can say about it is that we didn't build it the normal way.</p>
+    <blockquote class="story-quote reveal">
       This tool was largely built by <strong>Claude Code</strong> (Anthropic) and <strong>Codex</strong> (OpenAI) collaborating <em>through it</em> — the very bridge they were building together. <strong>Every PR written by one agent was reviewed by the other.</strong> A human steered: assigning tasks, reviewing progress, and directing the two to work in parallel and check each other's output.
     </blockquote>
-    <p style="margin-top:18px;color:var(--muted)">Two AI agents from different providers, connected in real time, shipping code side by side — and reviewing each other's PRs across the wire. That's not a marketing metaphor; it's the commit history.</p>
+    <p class="reveal" style="margin-top:20px;color:var(--muted)">Two AI agents from different providers, connected in real time, shipping code side by side — and reviewing each other's PRs across the wire. That's not a marketing metaphor; it's the commit history.</p>
   </div>
 </section>
 
 <section id="roadmap">
   <div class="wrap">
-    <h2>Roadmap</h2>
-    <p class="lead">Claude Code ↔ Codex ships today. Here's where it goes next.</p>
+    <p class="eyebrow reveal">roadmap</p>
+    <h2 class="reveal">Claude Code ↔ Codex ships today. Here's what's coming.</h2>
     <div class="road">
-      <div class="item">
-        <div class="when">Next up · vote</div>
-        <h3>More adapters</h3>
-        <p>Which agent gets wired in next is a public vote — OpenCode, Gemini CLI, and others are candidates. Cast yours on <a href="https://github.com/quilin-ai/agent-bridge/issues/212">issue #212</a>.</p>
+      <div class="item reveal">
+        <div class="when w-now">Testing now · in branch</div>
+        <h3>Multi-machine agent network</h3>
+        <p>Agents on <em>different machines</em> joining one room over your LAN or tailnet — passphrase-gated, with presence and a shared whiteboard. Already passing real three-machine cross-network tests behind experimental <code class="mono">abg room / join / broker</code> commands.</p>
       </div>
-      <div class="item">
-        <div class="when">Longer term</div>
+      <div class="item reveal">
+        <div class="when w-vote">Next · public vote</div>
+        <h3>More agents on the bridge</h3>
+        <p>OpenCode, Gemini CLI, openclaw, hermes — wired in one adapter at a time, each a first-class peer. Which one lands first is your call: vote on <a href="https://github.com/quilin-ai/agent-bridge/issues/212">issue #212</a>.</p>
+      </div>
+      <div class="item reveal">
+        <div class="when w-design">Designing</div>
         <h3>Capability mesh</h3>
-        <p>Beyond a single pair: rooms of agents across machines, each advertising what it's good at, routing work to the right capability instead of a fixed pairing. A v3 cross-network preview already ships behind experimental commands.</p>
+        <p>From exchanging messages to <em>calling each other's abilities</em>: every bridged agent publishes its commands, skills and MCP tools; peers invoke them directly — behind a default permission gate. Chat bridge → agent bus.</p>
       </div>
-      <div class="item">
+      <div class="item reveal">
         <div class="when">Ongoing</div>
         <h3>Sharper collaboration</h3>
         <p>Less noise, better turn discipline, richer coordination policies, and stronger recovery semantics across runtimes.</p>
@@ -547,37 +731,38 @@ footer { border-top: 1px solid var(--border); padding: 40px 0; color: var(--mute
 
 <section id="faq">
   <div class="wrap">
-    <h2>FAQ</h2>
+    <p class="eyebrow reveal">faq</p>
+    <h2 class="reveal">Questions people actually ask</h2>
     <div class="faq">
-      <details>
+      <details class="reveal">
         <summary><span><code class="mono">abg</code> installed but won't run — what's wrong?</span></summary>
         <p>You're almost certainly missing <strong>Bun</strong>. AgentBridge's daemon and plugin server run on the Bun runtime; Node.js alone is not enough. Install it with <code class="mono">curl -fsSL https://bun.sh/install | bash</code>, then re-run <code class="mono">abg claude</code>. This is the single most common install failure.</p>
       </details>
-      <details>
+      <details class="reveal">
         <summary><span>Does AgentBridge support Windows?</span></summary>
         <p>Not officially yet. AgentBridge runs on <strong>macOS and Linux</strong> today. WSL2 may work but is untested and unsupported.</p>
       </details>
-      <details>
+      <details class="reveal">
         <summary><span>Is it safe? What does <code class="mono">--safe</code> do?</span></summary>
         <p>By default <code class="mono">abg claude</code> launches with <code class="mono">--dangerously-skip-permissions</code> and <code class="mono">abg codex</code> with <code class="mono">--yolo</code> — deliberate, because an unattended agent pair can't stop to ask you for each permission. Both can then run commands and edit files without prompting, so <strong>only do this in a workspace you trust</strong>. Add <code class="mono">--safe</code> (or set <code class="mono">AGENTBRIDGE_SAFE=1</code>) to launch with normal prompts. AgentBridge is a local dev tool, not a hardened boundary between untrusted tools.</p>
       </details>
-      <details>
+      <details class="reveal">
         <summary><span>How does quota relay actually work?</span></summary>
         <p>With the companion <a href="https://github.com/quilin-ai/agent-quota-guard">agent-quota-guard</a> installed, the daemon polls both agents' 5h and weekly subscription windows. Near a limit the guard lets the current turn finish, stops cleanly at the turn boundary, writes a <code class="mono">.agent/checkpoint.md</code>, and drops a <code class="mono">pending</code> record. When the window refreshes, the bridge auto-resumes the task in the original interactive TUI — Codex via a queued <code class="mono">turn/start</code>, Claude via an acked channel push.</p>
       </details>
-      <details>
+      <details class="reveal">
         <summary><span>Which agents does it support?</span></summary>
         <p>Today the shipping in-session integration connects <strong>Claude Code and Codex</strong>. Which agent comes next is a public vote — see the adapter roadmap on <a href="https://github.com/quilin-ai/agent-bridge/issues/212">issue #212</a> (OpenCode, Gemini CLI, and more are candidates).</p>
       </details>
-      <details>
+      <details class="reveal">
         <summary><span>How is this different from <code class="mono">codex-plugin-cc</code>?</span></summary>
         <p>One-way delegation plugins like <code class="mono">openai/codex-plugin-cc</code> let a host <em>call</em> Codex and get one answer back — request in, response out, no standing peer on the other side. AgentBridge keeps <strong>both</strong> agents live as persistent peers, and either side can push a message <strong>mid-turn</strong> (a review comment lands while the other is still working), not only at call boundaries.</p>
       </details>
-      <details>
+      <details class="reveal">
         <summary><span>Do I need an account or API keys for AgentBridge itself?</span></summary>
         <p>No. AgentBridge is a local tool with zero runtime dependencies and no hosted service. You use your existing Claude Code and Codex logins; AgentBridge only relays messages between them on your machine — raw work never leaves the box.</p>
       </details>
-      <details>
+      <details class="reveal">
         <summary><span>Can I run more than one pair at once?</span></summary>
         <p>Yes. One Claude+Codex pair per project directory, with ports allocated per pair in +10 strides from 4500. Target a specific pair with <code class="mono">--pair &lt;name&gt;</code> on the pair-aware commands.</p>
       </details>
@@ -602,6 +787,8 @@ footer { border-top: 1px solid var(--border); padding: 40px 0; color: var(--mute
   </div>
 </footer>
 
+<script src="assets/vendor/gsap.min.js"></script>
+<script src="assets/vendor/ScrollTrigger.min.js"></script>
 <script>
 // ponytail: tiny inline copy handler, no lib — command is plain text if JS is off
 document.querySelectorAll('.copy').forEach(function (b) {
@@ -611,6 +798,294 @@ document.querySelectorAll('.copy').forEach(function (b) {
     });
   });
 });
+
+// ---------- demo engine — scripted replay of the real recorded session (2026-07-03) ----------
+// Progress-driven renderer: render(T) draws the conversation state at virtual time T,
+// so a scroll scrubber can play it at any speed, forwards or backwards.
+// Line content and ordering match the actual run; only pacing and line breaks are curated.
+var Demo = (function () {
+  var CL = document.getElementById('pane-claude'), CX = document.getElementById('pane-codex'), PU = document.getElementById('pulse');
+  var TYPE_MS = 24;
+
+  // [pane L/R (or P=pulse), kind (l/type/hot; pulse: direction), html/text, wait-after-ms]
+  var RAW = [
+    ['L', 'l', '<span class="c-green">✓</span> <span class="c-muted">bridge up — Codex connected</span>', 60],
+    ['R', 'l', '<span class="c-green">✓</span> <span class="c-muted">bridge up — Claude connected</span>', 800],
+    ['L', 'type', 'Ask Codex to review price.js for bugs, especially splitBill. One-line verdict when it replies.', 650],
+    ['L', 'l', '<span class="c-claude">⏺</span> Sent to Codex. Reading price.js myself to check its work.', 450],
+    ['P', 'go-r', null, 400],
+    ['R', 'l', '<span class="c-codex">▸ new turn</span> <span class="c-muted">— from Claude, via AgentBridge:</span>', 120],
+    ['R', 'l', '<span class="c-muted">“Review price.js for bugs, especially splitBill.”</span>', 900],
+    ['L', 'l', '<span class="c-muted">← Codex · via bridge: ⏳ working on it…</span>', 500],
+    ['R', 'l', '<span class="c-codex">•</span> reading price.js…', 1200],
+    ['R', 'l', '<b>splitBill — 2 bugs:</b>', 420],
+    ['R', 'l', '<span class="c-green">1.</span> Rounding loss. Math.round(totalCents/people)', 400],
+    ['R', 'l', '   → splitBill(100, 3) = [33, 33, 33] — sum is', 400],
+    ['R', 'l', '   <b>99, not 100</b>. A cent silently vanishes.', 520],
+    ['R', 'l', '<span class="c-green">2.</span> No guard for people === 0 → fills [Infinity].', 850],
+    ['R', 'l', '<span class="c-codex">↩</span> replying to Claude across the bridge…', 300],
+    ['P', 'go-l', null, 300],
+    ['L', 'hot', '<span class="hot-tag">⚡ PUSHED MID-SESSION</span><br /><span class="c-muted">←</span> <span class="c-codex">Codex</span>: Found 2 bugs in splitBill — top one: rounding loss, splitBill(100, 3) → [33,33,33] = 99 ≠ 100…', 950],
+    ['L', 'l', '<span class="c-claude">⏺</span> Caught it — the planted rounding drift, ranked #1. Plus a free find: people === 0.', 700],
+    ['R', 'l', '<span class="c-green">✓</span> reply delivered — turn complete', 400],
+    ['L', 'l', '<span class="c-muted">← Codex: ✅ finished — reply anytime.</span>', 900],
+    ['L', 'type', 'Have Codex fix both bugs and run the tests.', 600],
+    ['L', 'l', '<span class="c-claude">⏺</span> Asking Codex to patch splitBill + guard input.', 400],
+    ['P', 'go-r', null, 350],
+    ['R', 'l', '<span class="c-codex">▸ new turn</span> <span class="c-muted">— from Claude, via AgentBridge:</span>', 120],
+    ['R', 'l', '<span class="c-muted">“Fix both bugs, then run the tests.”</span>', 800],
+    ['R', 'l', '<span class="c-codex">•</span> patching splitBill — spread remainder cents:', 380],
+    ['R', 'l', '  share = floor(total/people), rest to first N', 500],
+    ['L', 'l', '<span class="c-claude">⏺</span> Pushing a note into Codex mid-turn: cover it with a regression test.', 350],
+    ['P', 'go-r', null, 300],
+    ['R', 'hotc', '<span class="hot-tag">⚡ INJECTED MID-TURN</span><br /><span class="c-muted">↪</span> <span class="c-claude">Claude</span>: also add a regression test — the shares must always sum to the total.', 750],
+    ['R', 'l', '<span class="c-codex">•</span> adding test: sum(splitBill(100, 3)) === 100', 500],
+    ['R', 'l', '<span class="c-codex">•</span> guard: people must be a positive integer', 500],
+    ['R', 'l', '<span class="c-muted">$</span> bun test price.test.js', 700],
+    ['R', 'l', '<span class="c-green">✓ 12 pass, 0 fail</span> <span class="c-muted">(3 new tests)</span>', 600],
+    ['R', 'l', '<span class="c-codex">↩</span> replying to Claude across the bridge…', 300],
+    ['P', 'go-l', null, 250],
+    ['L', 'hot', '<span class="hot-tag">⚡ PUSHED MID-SESSION</span><br /><span class="c-muted">←</span> <span class="c-codex">Codex</span>: Both fixed, 12/12 tests green — remainder cents spread across the first N shares.', 900],
+    ['L', 'l', '<span class="c-claude">⏺</span> Verified — splitBill(100, 3) → [34, 33, 33]. Drift gone. Ship it.', 650],
+    ['R', 'l', '<span class="c-green">✓</span> reply delivered — turn complete', 400],
+    ['L', 'l', '<span class="c-muted">← Codex: ✅ finished — review round-trip closed.</span>', 900],
+    ['L', 'type', 'Great. Now write the migration notes and changelog.', 550],
+    ['P', 'go-r', null, 350],
+    ['R', 'l', '<span class="c-codex">▸ new turn</span> <span class="c-muted">— writing migration notes…</span>', 900],
+    ['R', 'l', '<span class="c-muted">⚠ 5h window at 3% — finishing this turn cleanly</span>', 550],
+    ['R', 'l', '<span class="c-green">✓</span> checkpoint → .agent/checkpoint.md', 450],
+    ['P', 'go-l', null, 250],
+    ['L', 'l', '<span class="c-green">← bridge</span>: Codex paused at its quota — task handed to you, context preserved.', 700],
+    ['L', 'l', '<span class="c-claude">⏺</span> Resuming from checkpoint: notes 60% done, finishing the changelog.', 800],
+    ['L', 'l', '<span class="c-claude">⏺</span> Done — migration notes + changelog shipped.', 550],
+    ['L', 'l', '<span class="c-green">← bridge</span>: Codex window refreshes in 2h — auto-resume queued.', 600],
+    ['L', 'l', '<span class="c-muted">One session. Three handoffs. Nothing died at a limit.</span>', 500]
+  ];
+
+  var events = [], cursor = 0;
+  RAW.forEach(function (s) {
+    var ev;
+    if (s[0] === 'P') ev = { kind: 'pulse', dir: s[1], dur: 850 };
+    else if (s[1] === 'type') ev = { kind: 'type', pane: s[0], text: s[2], dur: s[2].length * TYPE_MS + 260 };
+    else ev = { kind: 'line', pane: s[0], html: s[2], cls: s[1] === 'hot' ? 'hot' : s[1] === 'hotc' ? 'hot cyan' : '', dur: 0 };
+    ev.start = cursor;
+    // a typed prompt lives in the footer input while typing; it lands in the
+    // transcript (ev.at) just before its typing window ends
+    ev.at = ev.kind === 'type' ? ev.start + ev.text.length * TYPE_MS + 200 : ev.start;
+    cursor += ev.dur + s[3];
+    events.push(ev);
+  });
+  var TOTAL = cursor;
+  var INP = document.getElementById('cl-input');
+
+  function pane(p) { return p === 'L' ? CL : CX; }
+  var applied = -1;
+
+  function apply(ev) {
+    if (ev.kind === 'pulse') return;
+    var d = document.createElement('div');
+    d.className = 'dl' + (ev.cls ? ' ' + ev.cls : '');
+    if (ev.kind === 'type') {
+      d.innerHTML = '<span class="c-green">❯</span> ';
+      d.appendChild(document.createTextNode(ev.text));
+    } else {
+      d.innerHTML = ev.html;
+    }
+    ev.node = d;
+    pane(ev.pane).appendChild(d);
+    pane(ev.pane).scrollTop = pane(ev.pane).scrollHeight;
+  }
+  function unapply(ev) {
+    if (ev.node) { ev.node.remove(); ev.node = null; }
+  }
+
+  function render(T) {
+    if (!CL || !CX) return;
+    while (applied + 1 < events.length && events[applied + 1].at <= T) apply(events[++applied]);
+    while (applied >= 0 && events[applied].at > T) unapply(events[applied--]);
+    var pulseOn = false;
+    for (var i = 0; i < events.length; i++) {
+      var ev = events[i];
+      if (ev.kind === 'type' && INP) {
+        var n = T < ev.start || T >= ev.at ? 0 : Math.min(Math.floor((T - ev.start) / TYPE_MS), ev.text.length);
+        var want = ev.text.slice(0, n);
+        if (INP.textContent !== want) INP.textContent = want;
+      } else if (ev.kind === 'pulse' && PU) {
+        var q = (T - ev.start) / ev.dur;
+        if (q >= 0 && q <= 1) {
+          pulseOn = true;
+          var a = ev.dir === 'go-r' ? 22 : 78, b = ev.dir === 'go-r' ? 78 : 22;
+          var s = Math.sin(Math.PI * q);
+          PU.style.left = (a + (b - a) * q) + '%';
+          PU.style.opacity = s.toFixed(3);
+          PU.style.transform = 'scale(' + (0.7 + s * 0.9).toFixed(3) + ')';
+        }
+      }
+    }
+    if (PU && !pulseOn) PU.style.opacity = 0;
+  }
+
+  return { render: render, TOTAL: TOTAL };
+})();
+
+// ---------- liquid-metal hero field (tiny WebGL, no deps; skipped on reduced-motion / no GL) ----------
+(function () {
+  var reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var box = document.getElementById('fx'), cv = document.getElementById('fxc');
+  if (!box || !cv || reduced) { if (box && reduced) box.remove(); return; }
+  var gl = cv.getContext('webgl', { antialias: false, alpha: false });
+  if (!gl) { box.remove(); return; }
+
+  var VS = 'attribute vec2 p;void main(){gl_Position=vec4(p,0.,1.);}';
+  var FS = 'precision highp float;uniform vec2 r;uniform float t;' +
+    'float h21(vec2 p){p=fract(p*vec2(234.34,435.345));p+=dot(p,p+34.23);return fract(p.x*p.y);}' +
+    'float n2(vec2 p){vec2 i=floor(p),f=fract(p);f=f*f*(3.-2.*f);' +
+    'return mix(mix(h21(i),h21(i+vec2(1,0)),f.x),mix(h21(i+vec2(0,1)),h21(i+vec2(1,1)),f.x),f.y);}' +
+    'float fbm(vec2 p){float v=0.,a=.5;for(int i=0;i<5;i++){v+=a*n2(p);p*=2.03;a*=.5;}return v;}' +
+    'void main(){vec2 uv=(gl_FragCoord.xy*2.-r)/min(r.x,r.y);float T=t*.035;' +
+    'float f=fbm(uv*1.35+vec2(T*.7,-T*.4)+fbm(uv*2.0-T*.3)*.85);' +
+    'float band=sin(f*16.-t*.22);' +
+    'float sheen=pow(smoothstep(.90,1.,band),1.4);' +
+    'float soft=smoothstep(-.2,1.,band)*.5+.5;' +
+    'vec3 base=mix(vec3(.016,.022,.032),vec3(.035,.05,.066),soft*f);' +
+    'vec3 tint=mix(vec3(.55,.78,.68),vec3(.5,.7,.8),n2(uv*2.+T));' +
+    'vec3 col=base+sheen*tint*.34+f*f*vec3(.01,.022,.02);' +
+    'col*=1.-smoothstep(.15,.95,uv.y*-1.);' +
+    'gl_FragColor=vec4(col,1.);}';
+
+  function sh(type, src) { var s = gl.createShader(type); gl.shaderSource(s, src); gl.compileShader(s); return s; }
+  var pr = gl.createProgram();
+  gl.attachShader(pr, sh(gl.VERTEX_SHADER, VS));
+  gl.attachShader(pr, sh(gl.FRAGMENT_SHADER, FS));
+  gl.linkProgram(pr);
+  if (!gl.getProgramParameter(pr, gl.LINK_STATUS)) { box.remove(); return; }
+  gl.useProgram(pr);
+  var buf = gl.createBuffer();
+  gl.bindBuffer(gl.ARRAY_BUFFER, buf);
+  gl.bufferData(gl.ARRAY_BUFFER, new Float32Array([-1,-1, 3,-1, -1,3]), gl.STATIC_DRAW);
+  var loc = gl.getAttribLocation(pr, 'p');
+  gl.enableVertexAttribArray(loc);
+  gl.vertexAttribPointer(loc, 2, gl.FLOAT, false, 0, 0);
+  var uR = gl.getUniformLocation(pr, 'r'), uT = gl.getUniformLocation(pr, 't');
+
+  var visible = true, dpr = Math.min(devicePixelRatio || 1, 1.5);
+  function size() {
+    var w = box.clientWidth, h = box.clientHeight;
+    cv.width = w * dpr; cv.height = h * dpr;
+    gl.viewport(0, 0, cv.width, cv.height);
+    gl.uniform2f(uR, cv.width, cv.height);
+  }
+  size();
+  addEventListener('resize', size);
+  new IntersectionObserver(function (e) { visible = e[0].isIntersecting; }).observe(box);
+
+  var t0 = performance.now();
+  (function frame(now) {
+    if (visible && !document.hidden) {
+      gl.uniform1f(uT, (now - t0) / 1000);
+      gl.drawArrays(gl.TRIANGLES, 0, 3);
+    }
+    requestAnimationFrame(frame);
+  })(t0);
+})();
+
+// ---------- entrance + scroll choreography (GSAP; graceful without it) ----------
+(function () {
+  var reduced = matchMedia('(prefers-reduced-motion: reduce)').matches;
+  var desktop = matchMedia('(min-width: 761px)').matches;
+
+  if (reduced || !window.gsap) { Demo.render(Demo.TOTAL); return; }
+
+  gsap.registerPlugin(ScrollTrigger);
+
+  gsap.timeline({ defaults: { ease: 'power3.out' } })
+    .from('[data-hero]', { y: 26, opacity: 0, duration: .7, stagger: .09 });
+
+  gsap.utils.toArray('.reveal').forEach(function (n) {
+    gsap.from(n, {
+      y: 24, opacity: 0, duration: .65, ease: 'power2.out',
+      scrollTrigger: { trigger: n, start: 'top 88%', once: true }
+    });
+  });
+
+  var demo = document.querySelector('.demo'), duo = document.getElementById('duo'), cap = document.querySelector('.demo-cap');
+
+  if (desktop) {
+    // Scroll story: pin the demo, grow the terminals like a real window resize
+    // (same font, more rows), scrub the conversation at scroll speed, release.
+    // High-water mark: the conversation only ever advances — no reverse-typing.
+    // Scrolling UP from below skips the story entirely: the pin is torn down
+    // (scroll position corrected, no visual jump) and re-armed once the user
+    // is back above the demo, so the next scroll-down replays from scratch.
+    var CLp = document.getElementById('pane-claude'), CXp = document.getElementById('pane-codex');
+    var st = { t: 0 }, maxT = 0;
+    var growW = function () { return Math.min(innerWidth - 48, 1760); };
+    var growH = function () {
+      // portrait: panes are stacked, so each gets half the viewport budget
+      if (matchMedia('(orientation: portrait)').matches) return Math.max(300, (innerHeight - 200) / 2);
+      return Math.max(420, innerHeight - 146);
+    };
+    gsap.timeline({
+      scrollTrigger: {
+        trigger: demo, start: 'top 80px', end: '+=520%',
+        pin: true, scrub: .55, anticipatePin: 1, invalidateOnRefresh: true,
+        // scrolling up from below: hop straight over the pinned region.
+        // The demo sits at the same screen position at both boundaries,
+        // so the jump is visually seamless — no replay, no reverse.
+        onEnterBack: function (self) {
+          // html{scroll-behavior:smooth} would turn this hop into an animated
+          // scroll back through the whole pinned region — force it off first
+          var de = document.documentElement;
+          de.style.scrollBehavior = 'auto';
+          self.scroll(self.start - 2);
+          self.update();
+          // snap the scrub-smoothing tween to its target instantly, otherwise
+          // it animates back through the whole grow/shrink sequence
+          var tw = self.getTween && self.getTween();
+          if (tw) tw.progress(1);
+          setTimeout(function () { de.style.scrollBehavior = ''; }, 80);
+        },
+        // fully above the demo again: quiet reset so the next scroll-down replays
+        onLeaveBack: function () {
+          CLp.style.opacity = CXp.style.opacity = '0';
+          setTimeout(function () {
+            maxT = 0; st.t = 0; Demo.render(0);
+            CLp.style.opacity = CXp.style.opacity = '';
+          }, 420);
+        }
+      }
+    })
+      .to(duo, {
+        width: function () { return growW() + 'px'; },
+        x: function () { return -((growW() - demo.clientWidth) / 2); },
+        ease: 'power1.inOut', duration: .13
+      }, 0)
+      .to('.pane', { height: function () { return growH() + 'px'; }, ease: 'power1.inOut', duration: .13 }, 0)
+      .to(cap, { opacity: 0, duration: .05 }, 0)
+      .to(st, {
+        t: Demo.TOTAL, ease: 'none', duration: .72,
+        onUpdate: function () { if (st.t > maxT) { maxT = st.t; Demo.render(maxT); } }
+      }, .12)
+      .to(duo, { width: function () { return demo.clientWidth + 'px'; }, x: 0, ease: 'power1.inOut', duration: .13 }, .87)
+      .to('.pane', { height: 340, ease: 'power1.inOut', duration: .13 }, .87)
+      .to(cap, { opacity: 1, duration: .05 }, .92);
+    Demo.render(0);
+  } else {
+    // Mobile: autoplay loop once the demo scrolls into view.
+    var t0 = null;
+    var io = new IntersectionObserver(function (e) {
+      if (!e[0].isIntersecting) return;
+      io.disconnect();
+      requestAnimationFrame(function tick(now) {
+        if (t0 === null) t0 = now;
+        var t = (now - t0) % (Demo.TOTAL + 1200);
+        Demo.render(Math.min(t, Demo.TOTAL));
+        requestAnimationFrame(tick);
+      });
+    }, { threshold: .2 });
+    io.observe(duo);
+  }
+})();
 </script>
 </body>
 </html>
