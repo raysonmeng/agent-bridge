@@ -81,7 +81,7 @@ function runPostinstall() {
       console.warn(`\x1b[33m⚠\x1b[0m AgentBridge: \`bun --version\` timed out — run \`abg init\` after the install completes.`);
     } else {
       console.warn(`
-\x1b[33m⚠ AgentBridge requires Bun (v1.0+) as its runtime.\x1b[0m
+\x1b[33m⚠ AgentBridge requires Bun (v1.3.11+) as its runtime.\x1b[0m
 
 The CLI was installed, but it won't work without Bun.
 Install Bun with:
