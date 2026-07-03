@@ -14706,11 +14706,11 @@ function defineNumber(value, fallback) {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 var BUILD_INFO = Object.freeze({
-  version: defineString("0.1.28", "0.0.0-source"),
+  version: defineString("0.1.29", "0.0.0-source"),
   commit: defineString("99d0f4a", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("6e06df360fe8", "source")
+  codeHash: defineString("bda5189d49a5", "source")
 });
 function sameRuntimeContract(a, b) {
   if (!a || !b)
