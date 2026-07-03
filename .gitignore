@@ -24,3 +24,8 @@ collab.db
 collab.db-wal
 collab.db-shm
 auth-token
+
+# Local scratch files that leak into the repo root (broker probe, editor drafts)
+_t.ts
+PR
+control-master

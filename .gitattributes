@@ -1,0 +1,5 @@
+# The plugin server bundles are build artifacts committed on purpose
+# (see docs/adr-bundle-in-git.md). Mark them generated so GitHub collapses
+# their diffs and they don't skew language stats, and turn off textual diff/merge
+# so a conflict is resolved by rebuilding, never by hand-merging minified output.
+plugins/agentbridge/server/*.js linguist-generated=true -diff
