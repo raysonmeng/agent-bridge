@@ -7,18 +7,18 @@
 <meta name="description" content="AgentBridge 是一个本地运行的桥接工具，让 Claude Code 和 Codex 在同一个会话里实时协作：交叉 review、任务拆分、额度接力，告别双开终端手动复制粘贴。MIT 开源、零运行时依赖、1,700+ 测试。" />
 <meta name="keywords" content="AgentBridge, Claude Code, Codex, 多 agent 协作, 交叉 review, 双开, 任务拆分, 额度接力, MCP, 本地 AI 工具" />
 <meta name="author" content="raysonmeng" />
-<link rel="canonical" href="https://quilin-ai.github.io/agent-bridge/zh/" />
-<link rel="alternate" hreflang="en" href="https://quilin-ai.github.io/agent-bridge/" />
-<link rel="alternate" hreflang="zh-Hans" href="https://quilin-ai.github.io/agent-bridge/zh/" />
-<link rel="alternate" hreflang="x-default" href="https://quilin-ai.github.io/agent-bridge/" />
+<link rel="canonical" href="https://raysonmeng.github.io/agent-bridge/zh/" />
+<link rel="alternate" hreflang="en" href="https://raysonmeng.github.io/agent-bridge/" />
+<link rel="alternate" hreflang="zh-Hans" href="https://raysonmeng.github.io/agent-bridge/zh/" />
+<link rel="alternate" hreflang="x-default" href="https://raysonmeng.github.io/agent-bridge/" />
 
 <!-- Open Graph -->
 <meta property="og:type" content="website" />
 <meta property="og:site_name" content="AgentBridge" />
 <meta property="og:title" content="AgentBridge — 让 Claude Code 和 Codex 在同一会话里协作" />
 <meta property="og:description" content="本地运行的桥接工具：让 Claude Code 和 Codex 在同一会话里实时协作 —— 交叉 review、任务拆分、额度接力。MIT、零运行时依赖。" />
-<meta property="og:url" content="https://quilin-ai.github.io/agent-bridge/zh/" />
-<meta property="og:image" content="https://quilin-ai.github.io/agent-bridge/assets/og.png" />
+<meta property="og:url" content="https://raysonmeng.github.io/agent-bridge/zh/" />
+<meta property="og:image" content="https://raysonmeng.github.io/agent-bridge/assets/og.png" />
 <meta property="og:image:alt" content="AgentBridge — Claude Code 与 Codex 在同一会话协作" />
 <meta property="og:locale" content="zh_CN" />
 <meta property="og:locale:alternate" content="en_US" />
@@ -27,7 +27,7 @@
 <meta name="twitter:card" content="summary_large_image" />
 <meta name="twitter:title" content="AgentBridge — 让 Claude Code 和 Codex 在同一会话里协作" />
 <meta name="twitter:description" content="本地桥接工具：让 Claude Code 和 Codex 在同一会话里实时协作 —— 交叉 review、任务拆分、额度接力。" />
-<meta name="twitter:image" content="https://quilin-ai.github.io/agent-bridge/assets/og.png" />
+<meta name="twitter:image" content="https://raysonmeng.github.io/agent-bridge/assets/og.png" />
 <meta name="twitter:creator" content="@raysonmeng" />
 
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Cpath d='M13 26 L25 35 L13 44' stroke='%23b892ff' stroke-width='7' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3Cpath d='M51 26 L39 35 L51 44' stroke='%236cc5e0' stroke-width='7' stroke-linecap='round' stroke-linejoin='round' fill='none'/%3E%3Cpath d='M13 20 Q32 4 51 20' stroke='%233ddc97' stroke-width='6' stroke-linecap='round' fill='none'/%3E%3C/svg%3E" />
@@ -42,14 +42,14 @@
       "applicationCategory": "DeveloperApplication",
       "operatingSystem": "macOS, Linux",
       "description": "一个本地运行的桥接工具，让 Claude Code 和 Codex 在同一个工作会话里双向实时协作：交叉 review、任务拆分、跨额度窗口的任务接力。",
-      "url": "https://quilin-ai.github.io/agent-bridge/zh/",
+      "url": "https://raysonmeng.github.io/agent-bridge/zh/",
       "downloadUrl": "https://www.npmjs.com/package/@raysonmeng/agentbridge",
       "softwareVersion": "0.1.25",
       "license": "https://opensource.org/licenses/MIT",
       "isAccessibleForFree": true,
       "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
       "author": { "@type": "Person", "name": "raysonmeng", "url": "https://x.com/raysonmeng" },
-      "codeRepository": "https://github.com/quilin-ai/agent-bridge"
+      "codeRepository": "https://github.com/raysonmeng/agent-bridge"
     },
     {
       "@type": "FAQPage",
@@ -414,7 +414,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
       <a class="nav-hide" href="#quickstart">快速开始</a>
       <a class="nav-hide" href="#faq">常见问题</a>
       <a href="/agent-bridge/">EN</a>
-      <a class="nav-cta" href="https://github.com/quilin-ai/agent-bridge">GitHub</a>
+      <a class="nav-cta" href="https://github.com/raysonmeng/agent-bridge">GitHub</a>
     </div>
   </nav>
 </header>
@@ -588,7 +588,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
         <p>daemon 轮询两个 agent 账户级的 5 小时和每周额度。<code class="mono">abg budget --json</code> 打印实时快照：两个窗口、两侧的用量偏差、以及暂停状态。</p>
       </div>
     </div>
-    <p class="reveal" style="margin-top:22px; color:var(--dim); font-size:.92rem"><strong style="color:var(--muted)">可选功能。</strong>额度接力依赖配套的 <a href="https://github.com/quilin-ai/agent-quota-guard">agent-quota-guard</a> —— 装上才启用。不装它，其余功能照常工作。</p>
+    <p class="reveal" style="margin-top:22px; color:var(--dim); font-size:.92rem"><strong style="color:var(--muted)">可选功能。</strong>额度接力依赖配套的 <a href="https://github.com/raysonmeng/agent-quota-guard">agent-quota-guard</a> —— 装上才启用。不装它，其余功能照常工作。</p>
   </div>
 </section>
 
@@ -694,7 +694,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
       </div>
     </div>
     <p class="reveal" style="margin-top:26px;color:var(--muted)"><strong style="color:var(--text)">你的第一次协作：</strong>两边都跑起来后，对 Claude 说 —— <em>「就 &lt;某个任务&gt; 和 Codex 商量个分工，然后让 Codex 实现它那部分，你来 review。」</em> 你会看到分工方案流进 Codex 的会话、Codex 开始干活、干完后又推回 Claude 这边等 review —— 全程你不用手动搬运一句话。</p>
-    <p class="reveal" style="color:var(--dim);font-size:.92rem"><code class="mono">abg</code> 是 <code class="mono">agentbridge</code> 的短别名。两个 agent 默认以最高权限启动，好让无人值守的一对不必逐条问你 —— 加 <code class="mono">--safe</code> 恢复正常权限提示。如果 <code class="mono">abg</code> 装好却跑不起来，看<a href="https://github.com/quilin-ai/agent-bridge/blob/master/docs/TROUBLESHOOTING.md">排错指南</a>。</p>
+    <p class="reveal" style="color:var(--dim);font-size:.92rem"><code class="mono">abg</code> 是 <code class="mono">agentbridge</code> 的短别名。两个 agent 默认以最高权限启动，好让无人值守的一对不必逐条问你 —— 加 <code class="mono">--safe</code> 恢复正常权限提示。如果 <code class="mono">abg</code> 装好却跑不起来，看<a href="https://github.com/raysonmeng/agent-bridge/blob/master/docs/TROUBLESHOOTING.md">排错指南</a>。</p>
   </div>
 </section>
 
@@ -723,7 +723,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
       <div class="item reveal">
         <div class="when w-vote">下一步 · 公开投票</div>
         <h3>更多 agent 上桥</h3>
-        <p>OpenCode、Gemini CLI、openclaw、hermes —— 一次接一个，每个都是一等对等体。先接谁由你决定：去 <a href="https://github.com/quilin-ai/agent-bridge/issues/212">issue #212</a> 投票。</p>
+        <p>OpenCode、Gemini CLI、openclaw、hermes —— 一次接一个，每个都是一等对等体。先接谁由你决定：去 <a href="https://github.com/raysonmeng/agent-bridge/issues/212">issue #212</a> 投票。</p>
       </div>
       <div class="item reveal">
         <div class="when w-design">设计中</div>
@@ -758,11 +758,11 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
       </details>
       <details class="reveal">
         <summary><span>额度接力到底怎么工作？</span></summary>
-        <p>装上配套的 <a href="https://github.com/quilin-ai/agent-quota-guard">agent-quota-guard</a> 后，daemon 轮询两个 agent 的 5 小时和每周订阅额度。临近上限时，guard 让当前 turn 收尾、在回合边界干净停下、写入 <code class="mono">.agent/checkpoint.md</code>、留下一条 <code class="mono">pending</code> 记录。等窗口刷新，bridge 在原来的交互式 TUI 里自动续接 —— Codex 靠排队的 <code class="mono">turn/start</code>，Claude 靠一条被确认的 channel push。</p>
+        <p>装上配套的 <a href="https://github.com/raysonmeng/agent-quota-guard">agent-quota-guard</a> 后，daemon 轮询两个 agent 的 5 小时和每周订阅额度。临近上限时，guard 让当前 turn 收尾、在回合边界干净停下、写入 <code class="mono">.agent/checkpoint.md</code>、留下一条 <code class="mono">pending</code> 记录。等窗口刷新，bridge 在原来的交互式 TUI 里自动续接 —— Codex 靠排队的 <code class="mono">turn/start</code>，Claude 靠一条被确认的 channel push。</p>
       </details>
       <details class="reveal">
         <summary><span>支持哪些 agent？</span></summary>
-        <p>目前已上线的会话内集成连接的是 <strong>Claude Code 和 Codex</strong>。下一个接哪个由公开投票决定 —— 见 <a href="https://github.com/quilin-ai/agent-bridge/issues/212">issue #212</a>（OpenCode、Gemini CLI 等都是候选）。</p>
+        <p>目前已上线的会话内集成连接的是 <strong>Claude Code 和 Codex</strong>。下一个接哪个由公开投票决定 —— 见 <a href="https://github.com/raysonmeng/agent-bridge/issues/212">issue #212</a>（OpenCode、Gemini CLI 等都是候选）。</p>
       </details>
       <details class="reveal">
         <summary><span>和 <code class="mono">codex-plugin-cc</code> 有什么区别？</span></summary>
@@ -789,9 +789,9 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
       <div class="mono" style="margin-top:8px;font-size:.78rem;color:var(--dim)">这座桥由它自己建成 —— Claude Code ⇄ Codex 通过它协作完成。</div>
     </div>
     <div class="foot-links">
-      <a href="https://github.com/quilin-ai/agent-bridge">GitHub</a>
+      <a href="https://github.com/raysonmeng/agent-bridge">GitHub</a>
       <a href="https://www.npmjs.com/package/@raysonmeng/agentbridge">npm</a>
-      <a href="https://github.com/quilin-ai/agent-bridge/blob/master/docs/TROUBLESHOOTING.md">排错指南</a>
+      <a href="https://github.com/raysonmeng/agent-bridge/blob/master/docs/TROUBLESHOOTING.md">排错指南</a>
       <a href="/agent-bridge/">English</a>
       <a href="https://x.com/raysonmeng">@raysonmeng</a>
     </div>
