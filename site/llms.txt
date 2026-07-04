@@ -9,8 +9,8 @@
 - Latest version: v0.1.24
 - Install (CLI): `npm install -g @raysonmeng/agentbridge`
 - npm package: @raysonmeng/agentbridge
-- Repository: https://github.com/quilin-ai/agent-bridge
-- Website: https://quilin-ai.github.io/agent-bridge/
+- Repository: https://github.com/raysonmeng/agent-bridge
+- Website: https://raysonmeng.github.io/agent-bridge/
 - Author: raysonmeng (https://x.com/raysonmeng)
 - Platforms: macOS and Linux (Windows not officially supported yet)
 - Runtime: Bun (required — Node.js alone is not sufficient)
@@ -66,9 +66,9 @@ AgentBridge was largely built by Claude Code and Codex collaborating through it 
 
 ## Roadmap
 
-- More adapters: which agent is wired in next is a public vote at https://github.com/quilin-ai/agent-bridge/issues/212 (candidates include OpenCode and Gemini CLI).
+- More adapters: which agent is wired in next is a public vote at https://github.com/raysonmeng/agent-bridge/issues/212 (candidates include OpenCode and Gemini CLI).
 - Capability mesh: rooms of agents across machines that advertise capabilities and route work accordingly (v3 cross-network preview ships behind experimental commands today).
 
 ## Companion tool
 
-- agent-quota-guard (https://github.com/quilin-ai/agent-quota-guard) — enables the quota-relay / slowdown-line / auto-resume feature. Optional; everything else works without it.
+- agent-quota-guard (https://github.com/raysonmeng/agent-quota-guard) — enables the quota-relay / slowdown-line / auto-resume feature. Optional; everything else works without it.

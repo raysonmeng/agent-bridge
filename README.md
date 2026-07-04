@@ -7,7 +7,7 @@
 
 [中文文档](README.zh-CN.md)
 
-**🌐 Website: [quilin-ai.github.io/agent-bridge](https://quilin-ai.github.io/agent-bridge/)** — with a live animated demo of a real session.
+**🌐 Website: [raysonmeng.github.io/agent-bridge](https://raysonmeng.github.io/agent-bridge/)** — with a live animated demo of a real session.
 
 Local bridge for bidirectional communication between Claude Code and Codex inside the same working session.
 
@@ -18,7 +18,7 @@ What that buys you, concretely:
 - **Quota relay for overnight runs** — when one side's subscription window runs dry, it stops cleanly at a turn boundary and hands the task off to the other side, so a long job keeps moving instead of dying at a limit.
 
 <!-- TODO: assets/demo.gif — see docs/demo/RECORDING.md -->
-▶ **[Watch the demo on the website](https://quilin-ai.github.io/agent-bridge/)** — an animated replay of a real session: Codex's reply pushed into Claude's live session, a mid-turn injection into Codex, and a quota handoff.
+▶ **[Watch the demo on the website](https://raysonmeng.github.io/agent-bridge/)** — an animated replay of a real session: Codex's reply pushed into Claude's live session, a mid-turn injection into Codex, and a quota handoff.
 
 > **This tool was largely built by Claude Code and Codex collaborating through it.**
 > **Every PR written by one agent was reviewed by the other.** AgentBridge is its own proof of concept.
@@ -150,7 +150,7 @@ agentbridge codex   # (another terminal) Start Codex TUI connected to the bridge
 
 ### Cross-network collaboration *(v3 preview)*
 
-The v3 collaboration layer (shared rooms across machines/agents over a broker — `auth`, `broker`, `room`, `join`, `publish`) is in preview on the [`integration/v3-all`](https://github.com/quilin-ai/agent-bridge/tree/integration/v3-all) branch and lands here with v3. Spec: [docs/09-v3协作系统规格.md](docs/09-v3协作系统规格.md).
+The v3 collaboration layer (shared rooms across machines/agents over a broker — `auth`, `broker`, `room`, `join`, `publish`) is in preview on the [`integration/v3-all`](https://github.com/raysonmeng/agent-bridge/tree/integration/v3-all) branch and lands here with v3. Spec: [docs/09-v3协作系统规格.md](docs/09-v3协作系统规格.md).
 
 The pair-aware commands (`claude`, `codex`, `resume`, `kill`, `doctor`, `budget`, `logs`) accept `--pair <name>` to target a specific pair — one pair per project directory by default, with ports allocated per pair in +10 strides from 4500.
 
@@ -270,15 +270,15 @@ For dormant/disabled bridge states, the Codex `.git` restriction, and other gotc
 
 ## Roadmap
 
-- **More adapters** — AgentBridge wires Claude Code ↔ Codex today. Candidates for the next agent: **OpenCode, OpenClaw, Hermes Agent, Gemini CLI**. Vote in the [adapter roadmap issue](https://github.com/quilin-ai/agent-bridge/issues/212).
+- **More adapters** — AgentBridge wires Claude Code ↔ Codex today. Candidates for the next agent: **OpenCode, OpenClaw, Hermes Agent, Gemini CLI**. Vote in the [adapter roadmap issue](https://github.com/raysonmeng/agent-bridge/issues/212).
 - **Capability mesh** — beyond messaging: connected agents will publish their commands / skills / MCP tools so a peer can invoke them directly — moving from *messaging* to *capability invocation*.
 - **v2 — multi-agent foundation** (partly landed): room-scoped collaboration, stable identity, a formal control protocol, stronger recovery. See [docs/08-v2架构愿景.md](docs/08-v2架构愿景.md).
-- **v3 — cross-network collaboration** (preview on the [`integration/v3-all`](https://github.com/quilin-ai/agent-bridge/tree/integration/v3-all) branch): shared rooms across machines and agents over a broker. See [docs/09-v3协作系统规格.md](docs/09-v3协作系统规格.md).
+- **v3 — cross-network collaboration** (preview on the [`integration/v3-all`](https://github.com/raysonmeng/agent-bridge/tree/integration/v3-all) branch): shared rooms across machines and agents over a broker. See [docs/09-v3协作系统规格.md](docs/09-v3协作系统规格.md).
 
 ## Docs
 
 - **[Troubleshooting](docs/TROUBLESHOOTING.md)** — disabled-state recovery, the Codex `.git` hang, "installed but won't run", Bun version requirements
-- **[User manual (EN)](https://github.com/quilin-ai/agent-bridge/blob/integration/v3-all/docs/manual/manual-en.md)** — end-to-end usage walkthrough
+- **[User manual (EN)](https://github.com/raysonmeng/agent-bridge/blob/integration/v3-all/docs/manual/manual-en.md)** — end-to-end usage walkthrough
 - **[Project growth timeline](docs/README.md)** — how AgentBridge was built, stage by stage (01–11)
 
 ## How This Project Was Built
