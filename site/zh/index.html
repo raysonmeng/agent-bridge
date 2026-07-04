@@ -16,7 +16,7 @@
 <meta property="og:type" content="website" />
 <meta property="og:site_name" content="AgentBridge" />
 <meta property="og:title" content="AgentBridge — 让 Claude Code 和 Codex 在同一会话里协作" />
-<meta property="og:description" content="本地运行的桥接工具：让 Claude Code 和 Codex 在同一会话里实时协作 —— 交叉 review、任务拆分、额度接力。MIT、零运行时依赖。" />
+<meta property="og:description" content="本地运行的桥接工具：让 Claude Code 和 Codex 在同一会话里实时协作，提供交叉 review、任务拆分、额度接力。MIT、零运行时依赖。" />
 <meta property="og:url" content="https://raysonmeng.github.io/agent-bridge/zh/" />
 <meta property="og:image" content="https://raysonmeng.github.io/agent-bridge/assets/og.png" />
 <meta property="og:image:alt" content="AgentBridge — Claude Code 与 Codex 在同一会话协作" />
@@ -26,7 +26,7 @@
 <!-- Twitter Card -->
 <meta name="twitter:card" content="summary_large_image" />
 <meta name="twitter:title" content="AgentBridge — 让 Claude Code 和 Codex 在同一会话里协作" />
-<meta name="twitter:description" content="本地桥接工具：让 Claude Code 和 Codex 在同一会话里实时协作 —— 交叉 review、任务拆分、额度接力。" />
+<meta name="twitter:description" content="本地桥接工具：让 Claude Code 和 Codex 在同一会话里实时协作，提供交叉 review、任务拆分、额度接力。" />
 <meta name="twitter:image" content="https://raysonmeng.github.io/agent-bridge/assets/og.png" />
 <meta name="twitter:creator" content="@raysonmeng" />
 
@@ -65,7 +65,7 @@
         { "@type": "Question", "name": "支持哪些 agent？",
           "acceptedAnswer": { "@type": "Answer", "text": "目前已上线的会话内集成连接的是 Claude Code 和 Codex。下一个接哪个 agent 由公开投票决定（issue #212），OpenCode、Gemini CLI 等都是候选。" } },
         { "@type": "Question", "name": "和 codex-plugin-cc 有什么区别？",
-          "acceptedAnswer": { "@type": "Answer", "text": "codex-plugin-cc 这类单向委派插件是宿主调用 Codex、拿一个结果回来 —— 请求进、响应出，对面没有常驻的对等体。AgentBridge 让两个 agent 都作为持久对等体在线，任意一方都能在对方 turn 进行中途推消息，而不只是在调用边界。" } }
+          "acceptedAnswer": { "@type": "Answer", "text": "codex-plugin-cc 这类单向委派插件是宿主调用 Codex、拿一个结果回来：请求进、响应出，对面没有常驻的对等体。AgentBridge 让两个 agent 都作为持久对等体在线，任意一方都能在对方 turn 进行中途推消息，而不只是在调用边界。" } }
       ]
     }
   ]
@@ -425,7 +425,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
   <div class="wrap">
     <p class="eyebrow" data-hero>本地桥 · Claude Code ⇄ Codex</p>
     <h1 data-hero>多个 AI agent，<span class="tag">会话内通信</span>，<br />不再复制粘贴。</h1>
-    <p class="lead" data-hero>AgentBridge 是一个本地桥接工具，让 <strong>Claude Code</strong> 和 <strong>Codex</strong> 在同一个工作会话里实时协作 —— 互相 review 对方的 diff、把任务拆给彼此、在额度撞线时把活儿接力下去。</p>
+    <p class="lead" data-hero>AgentBridge 是一个本地桥接工具，让 <strong>Claude Code</strong> 和 <strong>Codex</strong> 在同一个工作会话里实时协作：互相 review 对方的 diff、把任务拆给彼此、额度撞线时把活儿交给对方接力。</p>
 
     <div class="install" data-hero>
       <code class="mono" id="installcmd">npm install -g @raysonmeng/agentbridge</code>
@@ -471,7 +471,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
         </div>
         <div class="pulse" id="pulse" aria-hidden="true"></div>
       </div>
-      <p class="demo-cap">真实会话重放 —— 双向直达：Codex 的回复<strong>推进 Claude 的活跃会话</strong>，Claude 的指令也能<strong>插进 Codex 正在执行的回合</strong>。全程没有人肉搬运。</p>
+      <p class="demo-cap">真实会话的重放，双向直达：Codex 的回复<strong>推进 Claude 的活跃会话</strong>，Claude 的指令<strong>插进 Codex 正在执行的回合</strong>，全程没有人搬运。</p>
     </div>
   </div>
 </section>
@@ -479,13 +479,13 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
 <section id="benefits">
   <div class="wrap">
     <p class="eyebrow reveal">这能换来什么</p>
-    <h2 class="reveal">具体说，三种工作流</h2>
-    <p class="lead reveal">不是两个聊天机器人对话，而是来自不同厂商的两个完整 agent 互相盯着对方干活，你只负责掌舵。悬停任意一张卡看完整例子。</p>
+    <h2 class="reveal">三种工作流</h2>
+    <p class="lead reveal">来自不同厂商的两个完整 agent 互相盯着对方干活，你只负责掌舵。悬停任意一张卡看完整例子。</p>
     <div class="cards">
 
       <div class="card reveal">
-        <h3>交叉 review，不只是互相喊话</h3>
-        <p>Codex 写实现，Claude 在<em>同一个会话里</em>实时 review 它的 diff，把修改意见直接推回 Codex 的 thread。两个厂商互相把关 —— 全程不用复制粘贴。</p>
+        <h3>会话内交叉 review</h3>
+        <p>Codex 写实现，Claude 在<em>同一个会话里</em>实时 review 它的 diff，把修改意见直接推回 Codex 的 thread。两个厂商互相把关，不用复制粘贴。</p>
         <div class="term term-mini">
           <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">交叉 review</span></div>
 <pre><span class="c-codex">codex</span>  <span class="c-muted">→</span> 限流写完，改 3 个文件
@@ -530,7 +530,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
 
       <div class="card reveal">
         <h3>额度接力，通宵长任务不中断</h3>
-        <p>当一方的订阅额度窗口跑空，它会在回合边界干净停下、把任务交接给另一方 —— 长任务继续推进，而不是撞到上限就死掉。</p>
+        <p>当一方的订阅额度窗口跑空，它会在回合边界干净停下，把任务交接给另一方，长任务继续推进。</p>
         <div class="term term-mini">
           <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">额度接力</span></div>
 <pre><span class="c-codex">codex</span>  <span class="c-muted">→</span> 5 小时窗口告急
@@ -557,7 +557,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
     <div class="wide-card reveal">
       <div>
         <h3>多项目多开，天生支持</h3>
-        <p>每个项目文件夹一对。同时干三个仓库？三座桥并排跑 —— 端口按对自动分配，<code class="mono">--pair &lt;名字&gt;</code> 指定其中一对。</p>
+        <p>每个项目文件夹一对。同时干三个仓库？三座桥并排跑，端口按对自动分配，<code class="mono">--pair &lt;名字&gt;</code> 指定其中一对。</p>
       </div>
       <div class="term">
         <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">多开</span></div>
@@ -581,14 +581,14 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
       </div>
       <div class="card reveal">
         <h3>自动续接</h3>
-        <p>暂停一方的额度窗口刷新后，bridge 会在<strong>原来的交互式 TUI</strong> 里续接任务 —— Codex 通过排队的 <code class="mono">turn/start</code> 注入，Claude 通过它用 <code class="mono">ack_resume</code> 确认的 channel push。幂等墓碑保证每次续接最多注入一次。</p>
+        <p>暂停一方的额度窗口刷新后，bridge 会在<strong>原来的交互式 TUI</strong> 里续接任务：Codex 通过排队的 <code class="mono">turn/start</code> 注入，Claude 通过它用 <code class="mono">ack_resume</code> 确认的 channel push。幂等墓碑保证每次续接最多注入一次。</p>
       </div>
       <div class="card reveal">
         <h3>两个窗口一眼看清</h3>
         <p>daemon 轮询两个 agent 账户级的 5 小时和每周额度。<code class="mono">abg budget --json</code> 打印实时快照：两个窗口、两侧的用量偏差、以及暂停状态。</p>
       </div>
     </div>
-    <p class="reveal" style="margin-top:22px; color:var(--dim); font-size:.92rem"><strong style="color:var(--muted)">可选功能。</strong>额度接力依赖配套的 <a href="https://github.com/raysonmeng/agent-quota-guard">agent-quota-guard</a> —— 装上才启用。不装它，其余功能照常工作。</p>
+    <p class="reveal" style="margin-top:22px; color:var(--dim); font-size:.92rem"><strong style="color:var(--muted)">可选功能。</strong>额度接力依赖配套的 <a href="https://github.com/raysonmeng/agent-quota-guard">agent-quota-guard</a>，装上即启用。不装它，其余功能照常工作。</p>
   </div>
 </section>
 
@@ -596,7 +596,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
   <div class="wrap">
     <p class="eyebrow reveal">定位</p>
     <h2 class="reveal">为什么用 AgentBridge，而不是……</h2>
-    <p class="lead reveal">大家通常会用另外三种方式凑合 —— 看看每一种会把哪些活儿甩回给你手动做。</p>
+    <p class="lead reveal">大家通常拿另外三种方式凑合，每一种都会把一部分活儿甩回给你手动做。</p>
     <div class="table-scroll reveal">
       <table>
         <thead>
@@ -618,36 +618,36 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
           </tr>
           <tr>
             <td class="rowhead">顶级 coding agent 的原生能力</td>
-            <td class="yes">完整保留 —— 两边都是未经修改的原生 CLI 本体</td>
-            <td>保留 —— 但靠你人肉当胶水</td>
-            <td>打折 —— 被调方是一次性子进程</td>
-            <td>丢失 —— agent 被降级成被驱动的工人</td>
+            <td class="yes">完整保留：两边都是未经修改的原生 CLI 本体</td>
+            <td>保留：但靠你人肉当胶水</td>
+            <td>打折：被调方是一次性子进程</td>
+            <td>丢失：agent 被降级成被驱动的工人</td>
           </tr>
           <tr>
             <td class="rowhead">两个 agent 都作为对等体在线</td>
-            <td class="yes">是 —— 持久对等体</td>
+            <td class="yes">是：持久对等体</td>
             <td>在，但彼此断开</td>
-            <td>否 —— 一个宿主一个被调方</td>
-            <td>否 —— 一个大脑 N 个工人</td>
+            <td>否：一个宿主一个被调方</td>
+            <td>否：一个大脑 N 个工人</td>
           </tr>
           <tr>
             <td class="rowhead">turn 进行中途推消息</td>
-            <td class="yes">可以 —— review 中途送达</td>
+            <td class="yes">可以：review 中途送达</td>
             <td>靠手动，还得猜时机</td>
             <td>只能在调用边界</td>
             <td>只能在预定步骤</td>
           </tr>
           <tr>
             <td class="rowhead">agent 自己提分工</td>
-            <td class="yes">可以 —— 它们自己商量</td>
+            <td class="yes">可以：它们自己商量</td>
             <td>不能</td>
             <td>不能</td>
-            <td>不能 —— 自上而下</td>
+            <td>不能：自上而下</td>
           </tr>
           <tr>
             <td class="rowhead">扛得住额度撞线</td>
-            <td class="yes">行 —— 检查点 + 自动续接</td>
-            <td>不行 —— 得你手动重启</td>
+            <td class="yes">行：检查点 + 自动续接</td>
+            <td>不行：得你手动重启</td>
             <td>不行</td>
             <td>看你脚本写得怎么样</td>
           </tr>
@@ -666,7 +666,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
       <div class="step reveal">
         <div class="n">01</div>
         <div class="body">
-          <h3>装 Bun（运行时 —— 只有 Node 跑不起来）</h3>
+          <h3>装 Bun（运行时，只有 Node 跑不起来）</h3>
           <pre><span class="cmd">curl -fsSL https://bun.sh/install | bash</span></pre>
         </div>
       </div>
@@ -693,8 +693,8 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
         </div>
       </div>
     </div>
-    <p class="reveal" style="margin-top:26px;color:var(--muted)"><strong style="color:var(--text)">你的第一次协作：</strong>两边都跑起来后，对 Claude 说 —— <em>「就 &lt;某个任务&gt; 和 Codex 商量个分工，然后让 Codex 实现它那部分，你来 review。」</em> 你会看到分工方案流进 Codex 的会话、Codex 开始干活、干完后又推回 Claude 这边等 review —— 全程你不用手动搬运一句话。</p>
-    <p class="reveal" style="color:var(--dim);font-size:.92rem"><code class="mono">abg</code> 是 <code class="mono">agentbridge</code> 的短别名。两个 agent 默认以最高权限启动，好让无人值守的一对不必逐条问你 —— 加 <code class="mono">--safe</code> 恢复正常权限提示。如果 <code class="mono">abg</code> 装好却跑不起来，看<a href="https://github.com/raysonmeng/agent-bridge/blob/master/docs/TROUBLESHOOTING.md">排错指南</a>。</p>
+    <p class="reveal" style="margin-top:26px;color:var(--muted)"><strong style="color:var(--text)">你的第一次协作：</strong>两边都跑起来后，对 Claude 说：<em>「就 &lt;某个任务&gt; 和 Codex 商量个分工，然后让 Codex 实现它那部分，你来 review。」</em> 你会看到分工方案流进 Codex 的会话、Codex 开始干活、干完后又推回 Claude 这边等 review，全程你不用手动搬运一句话。</p>
+    <p class="reveal" style="color:var(--dim);font-size:.92rem"><code class="mono">abg</code> 是 <code class="mono">agentbridge</code> 的短别名。两个 agent 默认以最高权限启动，好让无人值守的一对不必逐条问你。加 <code class="mono">--safe</code> 恢复正常权限提示。如果 <code class="mono">abg</code> 装好却跑不起来，看<a href="https://github.com/raysonmeng/agent-bridge/blob/master/docs/TROUBLESHOOTING.md">排错指南</a>。</p>
   </div>
 </section>
 
@@ -702,11 +702,11 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
   <div class="wrap">
     <p class="eyebrow reveal">来历</p>
     <h2 class="reveal">AgentBridge 本身就是它自己的概念验证</h2>
-    <p class="lead reveal">关于它，我们能说的最有力的一句话是：它不是按常规方式写出来的。</p>
+    <p class="lead reveal">我们没按常规方式写它。</p>
     <blockquote class="story-quote reveal">
-      这个工具很大程度上是 <strong>Claude Code</strong>（Anthropic）和 <strong>Codex</strong>（OpenAI）<em>通过它自己</em>协作写出来的 —— 它们正是在用这座桥搭这座桥。<strong>其中一个 agent 写的每一个 PR，都由另一个 agent review。</strong>一位人类开发者掌舵：分派任务、审阅进度、指挥两边并行工作、互相把关。
+      这个工具很大程度上是 <strong>Claude Code</strong>（Anthropic）和 <strong>Codex</strong>（OpenAI）<em>通过它自己</em>协作写出来的，它们正是在用这座桥搭这座桥。<strong>其中一个 agent 写的每一个 PR，都由另一个 agent review。</strong>一位人类开发者掌舵：分派任务、审阅进度、指挥两边并行工作、互相把关。
     </blockquote>
-    <p class="reveal" style="margin-top:20px;color:var(--muted)">来自两个不同厂商的 AI agent，实时相连，并肩写代码 —— 还隔着这根线互相 review PR。这不是营销比喻，而是提交历史里实打实的记录。</p>
+    <p class="reveal" style="margin-top:20px;color:var(--muted)">来自两个不同厂商的 AI agent，实时相连，并肩写代码，还隔着这根线互相 review PR，提交历史里有实打实的记录。</p>
   </div>
 </section>
 
@@ -718,17 +718,17 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
       <div class="item reveal">
         <div class="when w-now">正在测试 · 已在分支</div>
         <h3>多机 agent 网络</h3>
-        <p><em>不同机器</em>上的 agent 通过局域网或 tailnet 加入同一个房间 —— 口令门禁、成员在线状态、共享白板。真实三机跨网测试已经打通，实验命令 <code class="mono">abg room / join / broker</code> 已可用。</p>
+        <p><em>不同机器</em>上的 agent 通过局域网或 tailnet 加入同一个房间：口令门禁、成员在线状态、共享白板。真实三机跨网测试已经打通，实验命令 <code class="mono">abg room / join / broker</code> 已可用。</p>
       </div>
       <div class="item reveal">
         <div class="when w-vote">下一步 · 公开投票</div>
         <h3>更多 agent 上桥</h3>
-        <p>OpenCode、Gemini CLI、openclaw、hermes —— 一次接一个，每个都是一等对等体。先接谁由你决定：去 <a href="https://github.com/raysonmeng/agent-bridge/issues/212">issue #212</a> 投票。</p>
+        <p>OpenCode、Gemini CLI、openclaw、hermes，一次接一个，每个都是一等对等体。先接谁由你决定：去 <a href="https://github.com/raysonmeng/agent-bridge/issues/212">issue #212</a> 投票。</p>
       </div>
       <div class="item reveal">
         <div class="when w-design">设计中</div>
         <h3>能力网格</h3>
-        <p>从互发消息升级到<em>互调能力</em>：每个上桥的 agent 公开自己的 command、skill 和 MCP 工具，对方可以直接调用 —— 默认自带权限门。聊天桥 → agent 总线。</p>
+        <p>从互发消息升级到<em>互调能力</em>：每个上桥的 agent 公开自己的 command、skill 和 MCP 工具，对方可以直接调用，默认自带权限门。聊天桥 → agent 总线。</p>
       </div>
       <div class="item reveal">
         <div class="when">持续</div>
@@ -742,7 +742,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
 <section id="faq">
   <div class="wrap">
     <p class="eyebrow reveal">常见问题</p>
-    <h2 class="reveal">大家真的会问的问题</h2>
+    <h2 class="reveal">常见问题</h2>
     <div class="faq">
       <details class="reveal">
         <summary><span><code class="mono">abg</code> 装好了却跑不起来？</span></summary>
@@ -754,23 +754,23 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
       </details>
       <details class="reveal">
         <summary><span>安全吗？<code class="mono">--safe</code> 是干什么的？</span></summary>
-        <p>默认 <code class="mono">abg claude</code> 带 <code class="mono">--dangerously-skip-permissions</code>、<code class="mono">abg codex</code> 带 <code class="mono">--yolo</code> 启动 —— 这是有意为之，无人值守的一对 agent 没法逐条停下来问你权限。代价是两个 agent 可以不经确认执行命令、改文件，所以<strong>只在你信任的工作区里这么用</strong>。加 <code class="mono">--safe</code>（或设 <code class="mono">AGENTBRIDGE_SAFE=1</code>）恢复正常权限提示。它是本地开发工具，不是隔离不可信工具的安全边界。</p>
+        <p>默认 <code class="mono">abg claude</code> 带 <code class="mono">--dangerously-skip-permissions</code>、<code class="mono">abg codex</code> 带 <code class="mono">--yolo</code> 启动。这是有意为之：无人值守的一对 agent 没法逐条停下来问你权限。代价是两个 agent 可以不经确认执行命令、改文件，所以<strong>只在你信任的工作区里这么用</strong>。加 <code class="mono">--safe</code>（或设 <code class="mono">AGENTBRIDGE_SAFE=1</code>）恢复正常权限提示。它是本地开发工具，不是隔离不可信工具的安全边界。</p>
       </details>
       <details class="reveal">
         <summary><span>额度接力到底怎么工作？</span></summary>
-        <p>装上配套的 <a href="https://github.com/raysonmeng/agent-quota-guard">agent-quota-guard</a> 后，daemon 轮询两个 agent 的 5 小时和每周订阅额度。临近上限时，guard 让当前 turn 收尾、在回合边界干净停下、写入 <code class="mono">.agent/checkpoint.md</code>、留下一条 <code class="mono">pending</code> 记录。等窗口刷新，bridge 在原来的交互式 TUI 里自动续接 —— Codex 靠排队的 <code class="mono">turn/start</code>，Claude 靠一条被确认的 channel push。</p>
+        <p>装上配套的 <a href="https://github.com/raysonmeng/agent-quota-guard">agent-quota-guard</a> 后，daemon 轮询两个 agent 的 5 小时和每周订阅额度。临近上限时，guard 让当前 turn 收尾、在回合边界干净停下、写入 <code class="mono">.agent/checkpoint.md</code>、留下一条 <code class="mono">pending</code> 记录。等窗口刷新，bridge 在原来的交互式 TUI 里自动续接：Codex 靠排队的 <code class="mono">turn/start</code>，Claude 靠一条被确认的 channel push。</p>
       </details>
       <details class="reveal">
         <summary><span>支持哪些 agent？</span></summary>
-        <p>目前已上线的会话内集成连接的是 <strong>Claude Code 和 Codex</strong>。下一个接哪个由公开投票决定 —— 见 <a href="https://github.com/raysonmeng/agent-bridge/issues/212">issue #212</a>（OpenCode、Gemini CLI 等都是候选）。</p>
+        <p>目前已上线的会话内集成连接的是 <strong>Claude Code 和 Codex</strong>。下一个接哪个由公开投票决定，见 <a href="https://github.com/raysonmeng/agent-bridge/issues/212">issue #212</a>（OpenCode、Gemini CLI 等都是候选）。</p>
       </details>
       <details class="reveal">
         <summary><span>和 <code class="mono">codex-plugin-cc</code> 有什么区别？</span></summary>
-        <p><code class="mono">openai/codex-plugin-cc</code> 这类单向委派插件是宿主<em>调用</em> Codex、拿一个结果回来 —— 请求进、响应出，对面没有常驻对等体。AgentBridge 让<strong>两个</strong> agent 都作为持久对等体在线，任意一方都能在对方 turn <strong>进行中途</strong>推消息（review 意见能在对方还在干活时就送达），而不只是在调用边界。</p>
+        <p><code class="mono">openai/codex-plugin-cc</code> 这类单向委派插件是宿主<em>调用</em> Codex、拿一个结果回来：请求进、响应出，对面没有常驻对等体。AgentBridge 让<strong>两个</strong> agent 都作为持久对等体在线，任意一方都能在对方 turn <strong>进行中途</strong>推消息（review 意见能在对方还在干活时就送达），而不只是在调用边界。</p>
       </details>
       <details class="reveal">
         <summary><span>用 AgentBridge 本身需要账号或 API key 吗？</span></summary>
-        <p>不需要。它是本地工具，零运行时依赖，也没有任何托管服务。你用现成的 Claude Code 和 Codex 登录即可；AgentBridge 只在你机器上转发它们之间的消息 —— 原始工作内容不出本机。</p>
+        <p>不需要。它是本地工具，零运行时依赖，也没有任何托管服务。你用现成的 Claude Code 和 Codex 登录即可；AgentBridge 只在你机器上转发它们之间的消息，原始工作内容不出本机。</p>
       </details>
       <details class="reveal">
         <summary><span>能同时跑多对吗？</span></summary>
@@ -786,7 +786,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
     <div>
       <div class="brand" style="margin-bottom:6px"><svg width="20" height="20" viewBox="0 0 64 64" aria-hidden="true"><path d="M13 26 L25 35 L13 44" stroke="#b892ff" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/><path d="M51 26 L39 35 L51 44" stroke="#6cc5e0" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/><path d="M13 20 Q32 4 51 20" stroke="#3ddc97" stroke-width="5.5" stroke-linecap="round" fill="none"/></svg> AgentBridge</div>
       <div>连接 Claude Code ↔ Codex 协作的本地桥接工具。MIT 开源。</div>
-      <div class="mono" style="margin-top:8px;font-size:.78rem;color:var(--dim)">这座桥由它自己建成 —— Claude Code ⇄ Codex 通过它协作完成。</div>
+      <div class="mono" style="margin-top:8px;font-size:.78rem;color:var(--dim)">这座桥由它自己建成：Claude Code ⇄ Codex 通过它协作完成。</div>
     </div>
     <div class="foot-links">
       <a href="https://github.com/raysonmeng/agent-bridge">GitHub</a>
