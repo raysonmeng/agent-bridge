@@ -77,12 +77,12 @@
         {
           "@type": "Question",
           "name": "Which agents does AgentBridge support?",
-          "acceptedAnswer": { "@type": "Answer", "text": "Today the shipping in-session integration connects Claude Code and Codex. A public adapter vote (issue #212) decides which agent — OpenCode, Gemini CLI, and others are candidates — is wired in next." }
+          "acceptedAnswer": { "@type": "Answer", "text": "Today the shipping in-session integration connects Claude Code and Codex. A public adapter vote (issue #212) decides which agent is wired in next; OpenCode, Gemini CLI, and others are candidates." }
         },
         {
           "@type": "Question",
           "name": "How is this different from codex-plugin-cc?",
-          "acceptedAnswer": { "@type": "Answer", "text": "One-way delegation plugins like openai/codex-plugin-cc let a host call Codex and get one answer back — request in, response out, no standing peer. AgentBridge keeps both agents live as persistent peers, and either side can push a message mid-turn (a review comment lands while the other is still working), not only at call boundaries." }
+          "acceptedAnswer": { "@type": "Answer", "text": "One-way delegation plugins like openai/codex-plugin-cc let a host call Codex and get one answer back: request in, response out, with no standing peer. AgentBridge keeps both agents live as persistent peers, and either side can push a message mid-turn (a review comment lands while the other is still working), not only at call boundaries." }
         },
         {
           "@type": "Question",
@@ -448,7 +448,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
   <div class="wrap">
     <p class="eyebrow" data-hero>local bridge · claude code ⇄ codex</p>
     <h1 data-hero>Multi AI agents. <span class="tag">In-session comms.</span><br />No copy-paste.</h1>
-    <p class="lead" data-hero>AgentBridge is a local bridge that lets <strong>Claude Code</strong> and <strong>Codex</strong> collaborate in real time inside one working session — cross-reviewing each other's diffs, splitting tasks between them, and relaying work across quota limits.</p>
+    <p class="lead" data-hero>AgentBridge is a local bridge that lets <strong>Claude Code</strong> and <strong>Codex</strong> collaborate in real time inside one working session: they cross-review each other's diffs, split tasks between them, and relay work across quota limits.</p>
 
     <div class="install" data-hero>
       <code class="mono" id="installcmd">npm install -g @raysonmeng/agentbridge</code>
@@ -494,7 +494,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
         </div>
         <div class="pulse" id="pulse" aria-hidden="true"></div>
       </div>
-      <p class="demo-cap">A real session, replayed — both directions: Codex's reply is <strong>pushed into Claude's live session</strong>, and Claude's notes <strong>land inside Codex's running turn</strong>. No human relay.</p>
+      <p class="demo-cap">Replay of a real session. Codex <strong>pushes its reply into Claude's live session</strong>; Claude <strong>drops notes into Codex's running turn</strong>. Nobody relays anything by hand.</p>
     </div>
   </div>
 </section>
@@ -502,13 +502,13 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
 <section id="benefits">
   <div class="wrap">
     <p class="eyebrow reveal">what that buys you</p>
-    <h2 class="reveal">Concretely, three workflows</h2>
-    <p class="lead reveal">Not two chatbots talking. Two full agents from different providers holding each other accountable while you steer.</p>
+    <h2 class="reveal">Three workflows</h2>
+    <p class="lead reveal">Two full agents from different providers check each other's work while you steer. Hover a card for the full exchange.</p>
     <div class="cards">
 
       <div class="card reveal">
-        <h3>Cross-review, not just cross-talk</h3>
-        <p>Codex implements; Claude reviews the diff in real time <em>inside the same session</em> and pushes change requests straight back into Codex's thread. Two providers checking each other — no copy-paste.</p>
+        <h3>Cross-review, inside the session</h3>
+        <p>Codex implements; Claude reviews the diff in real time <em>inside the same session</em> and pushes change requests straight back into Codex's thread. Two providers check each other's work without copy-paste.</p>
         <div class="term term-mini">
           <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">cross-review</span></div>
 <pre><span class="c-codex">codex</span>  <span class="c-muted">→</span> guard done, 3 files
@@ -553,7 +553,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
 
       <div class="card reveal">
         <h3>Quota relay for overnight runs</h3>
-        <p>When one side's subscription window runs dry, it stops cleanly at a turn boundary and hands the task off — so a long job keeps moving instead of dying at a limit.</p>
+        <p>When one side's subscription window runs dry, it stops cleanly at a turn boundary and hands the task off, so the job keeps moving instead of dying at the limit.</p>
         <div class="term term-mini">
           <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">quota-relay</span></div>
 <pre><span class="c-codex">codex</span>  <span class="c-muted">→</span> 5h window low
@@ -580,7 +580,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
     <div class="wide-card reveal">
       <div>
         <h3>Multi-pair by design</h3>
-        <p>Every project folder gets its own pair. Working three repos at once? Run three bridges side by side — ports are allocated automatically per pair, and <code class="mono">--pair &lt;name&gt;</code> targets a specific one.</p>
+        <p>Every project folder gets its own pair. Working three repos at once? Run three bridges side by side; the CLI allocates ports per pair, and <code class="mono">--pair &lt;name&gt;</code> targets a specific one.</p>
       </div>
       <div class="term">
         <div class="term-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="term-title mono">multi-pair</span></div>
@@ -604,14 +604,14 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
       </div>
       <div class="card reveal">
         <h3>Automatic resume</h3>
-        <p>When the paused side's window refreshes, the bridge resumes the task <strong>in the original interactive TUI</strong> — Codex via a queued <code class="mono">turn/start</code>, Claude via a channel push it acks with <code class="mono">ack_resume</code>. Idempotency tombstones inject each resume at most once.</p>
+        <p>When the paused side's window refreshes, the bridge resumes the task <strong>in the original interactive TUI</strong>: Codex via a queued <code class="mono">turn/start</code>, Claude via a channel push it acks with <code class="mono">ack_resume</code>. Idempotency tombstones inject each resume at most once.</p>
       </div>
       <div class="card reveal">
         <h3>Both windows in one glance</h3>
         <p>The daemon polls both agents' account-level 5h and weekly quota. <code class="mono">abg budget --json</code> prints the live snapshot: both windows, drift between the two sides, and pause state.</p>
       </div>
     </div>
-    <p class="reveal" style="margin-top:22px; color:var(--dim); font-size:.92rem"><strong style="color:var(--muted)">Opt-in.</strong> Quota relay is a companion-guard feature — install <a href="https://github.com/raysonmeng/agent-quota-guard">agent-quota-guard</a> to enable it. Without it, everything else still works.</p>
+    <p class="reveal" style="margin-top:22px; color:var(--dim); font-size:.92rem"><strong style="color:var(--muted)">Opt-in.</strong> Quota relay ships as a companion-guard feature. Install <a href="https://github.com/raysonmeng/agent-quota-guard">agent-quota-guard</a> to enable it. Without it, everything else still works.</p>
   </div>
 </section>
 
@@ -619,7 +619,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
   <div class="wrap">
     <p class="eyebrow reveal">positioning</p>
     <h2 class="reveal">Why AgentBridge, and not…</h2>
-    <p class="lead reveal">Three things people reach for instead — and where each one leaves you doing the work by hand.</p>
+    <p class="lead reveal">Three things people reach for instead, and the work each one hands back to you.</p>
     <div class="table-scroll reveal">
       <table>
         <thead>
@@ -689,7 +689,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
       <div class="step reveal">
         <div class="n">01</div>
         <div class="body">
-          <h3>Install Bun (the runtime — Node alone won't work)</h3>
+          <h3>Install Bun (the runtime; Node alone won't work)</h3>
           <pre><span class="cmd">curl -fsSL https://bun.sh/install | bash</span></pre>
         </div>
       </div>
@@ -716,8 +716,8 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
         </div>
       </div>
     </div>
-    <p class="reveal" style="margin-top:26px;color:var(--muted)"><strong style="color:var(--text)">Your first collaboration:</strong> with both sides running, ask Claude — <em>"Propose a task split with Codex for &lt;your task&gt;, then have Codex implement its part while you review."</em> You'll see the split flow into Codex's session, Codex start working, and its completion push back to Claude for review — all without you relaying anything by hand.</p>
-    <p class="reveal" style="color:var(--dim);font-size:.92rem"><code class="mono">abg</code> is a short alias for <code class="mono">agentbridge</code>. Both agents launch with max-permission defaults so an unattended pair doesn't stop for each prompt — add <code class="mono">--safe</code> to launch with normal prompts. See the <a href="https://github.com/raysonmeng/agent-bridge/blob/master/docs/TROUBLESHOOTING.md">Troubleshooting guide</a> if <code class="mono">abg</code> installs but won't run.</p>
+    <p class="reveal" style="margin-top:26px;color:var(--muted)"><strong style="color:var(--text)">Your first collaboration:</strong> with both sides running, ask Claude — <em>"Propose a task split with Codex for &lt;your task&gt;, then have Codex implement its part while you review."</em> You'll see the split flow into Codex's session, Codex start working, and its completion push back to Claude for review, without you relaying anything by hand.</p>
+    <p class="reveal" style="color:var(--dim);font-size:.92rem"><code class="mono">abg</code> is a short alias for <code class="mono">agentbridge</code>. Both agents launch with max-permission defaults so an unattended pair doesn't stop for each prompt. Add <code class="mono">--safe</code> for normal prompts. See the <a href="https://github.com/raysonmeng/agent-bridge/blob/master/docs/TROUBLESHOOTING.md">Troubleshooting guide</a> if <code class="mono">abg</code> installs but won't run.</p>
   </div>
 </section>
 
@@ -725,11 +725,11 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
   <div class="wrap">
     <p class="eyebrow reveal">origin</p>
     <h2 class="reveal">AgentBridge is its own proof of concept</h2>
-    <p class="lead reveal">The strongest thing we can say about it is that we didn't build it the normal way.</p>
+    <p class="lead reveal">We did not build it the normal way.</p>
     <blockquote class="story-quote reveal">
-      This tool was largely built by <strong>Claude Code</strong> (Anthropic) and <strong>Codex</strong> (OpenAI) collaborating <em>through it</em> — the very bridge they were building together. <strong>Every PR written by one agent was reviewed by the other.</strong> A human steered: assigning tasks, reviewing progress, and directing the two to work in parallel and check each other's output.
+      This tool was largely built by <strong>Claude Code</strong> (Anthropic) and <strong>Codex</strong> (OpenAI) collaborating <em>through it</em>, the very bridge they were building together. <strong>Every PR written by one agent was reviewed by the other.</strong> A human steered: assigning tasks, reviewing progress, and directing the two to work in parallel and check each other's output.
     </blockquote>
-    <p class="reveal" style="margin-top:20px;color:var(--muted)">Two AI agents from different providers, connected in real time, shipping code side by side — and reviewing each other's PRs across the wire. That's not a marketing metaphor; it's the commit history.</p>
+    <p class="reveal" style="margin-top:20px;color:var(--muted)">Two AI agents from different providers, connected in real time, shipping code side by side and reviewing each other's PRs across the wire. The commit history shows it.</p>
   </div>
 </section>
 
@@ -741,17 +741,17 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
       <div class="item reveal">
         <div class="when w-now">Testing now · in branch</div>
         <h3>Multi-machine agent network</h3>
-        <p>Agents on <em>different machines</em> joining one room over your LAN or tailnet — passphrase-gated, with presence and a shared whiteboard. Already passing real three-machine cross-network tests behind experimental <code class="mono">abg room / join / broker</code> commands.</p>
+        <p>Agents on <em>different machines</em> joining one room over your LAN or tailnet: passphrase-gated, with presence and a shared whiteboard. Already passing real three-machine cross-network tests behind experimental <code class="mono">abg room / join / broker</code> commands.</p>
       </div>
       <div class="item reveal">
         <div class="when w-vote">Next · public vote</div>
         <h3>More agents on the bridge</h3>
-        <p>OpenCode, Gemini CLI, openclaw, hermes — wired in one adapter at a time, each a first-class peer. Which one lands first is your call: vote on <a href="https://github.com/raysonmeng/agent-bridge/issues/212">issue #212</a>.</p>
+        <p>OpenCode, Gemini CLI, openclaw, hermes, wired in one adapter at a time, each a first-class peer. Which one lands first is your call: vote on <a href="https://github.com/raysonmeng/agent-bridge/issues/212">issue #212</a>.</p>
       </div>
       <div class="item reveal">
         <div class="when w-design">Designing</div>
         <h3>Capability mesh</h3>
-        <p>From exchanging messages to <em>calling each other's abilities</em>: every bridged agent publishes its commands, skills and MCP tools; peers invoke them directly — behind a default permission gate. Chat bridge → agent bus.</p>
+        <p>From exchanging messages to <em>calling each other's abilities</em>: every bridged agent publishes its commands, skills and MCP tools; peers invoke them directly, behind a default permission gate. Chat bridge → agent bus.</p>
       </div>
       <div class="item reveal">
         <div class="when">Ongoing</div>
@@ -765,11 +765,11 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
 <section id="faq">
   <div class="wrap">
     <p class="eyebrow reveal">faq</p>
-    <h2 class="reveal">Questions people actually ask</h2>
+    <h2 class="reveal">Questions people ask</h2>
     <div class="faq">
       <details class="reveal">
         <summary><span><code class="mono">abg</code> installed but won't run — what's wrong?</span></summary>
-        <p>You're almost certainly missing <strong>Bun</strong>. AgentBridge's daemon and plugin server run on the Bun runtime; Node.js alone is not enough. Install it with <code class="mono">curl -fsSL https://bun.sh/install | bash</code>, then re-run <code class="mono">abg claude</code>. This is the single most common install failure.</p>
+        <p>You're almost certainly missing <strong>Bun</strong>. AgentBridge's daemon and plugin server run on the Bun runtime; Node.js alone is not enough. Install it with <code class="mono">curl -fsSL https://bun.sh/install | bash</code>, then re-run <code class="mono">abg claude</code>. This is the most common install failure.</p>
       </details>
       <details class="reveal">
         <summary><span>Does AgentBridge support Windows?</span></summary>
@@ -777,23 +777,23 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
       </details>
       <details class="reveal">
         <summary><span>Is it safe? What does <code class="mono">--safe</code> do?</span></summary>
-        <p>By default <code class="mono">abg claude</code> launches with <code class="mono">--dangerously-skip-permissions</code> and <code class="mono">abg codex</code> with <code class="mono">--yolo</code> — deliberate, because an unattended agent pair can't stop to ask you for each permission. Both can then run commands and edit files without prompting, so <strong>only do this in a workspace you trust</strong>. Add <code class="mono">--safe</code> (or set <code class="mono">AGENTBRIDGE_SAFE=1</code>) to launch with normal prompts. AgentBridge is a local dev tool, not a hardened boundary between untrusted tools.</p>
+        <p>By default <code class="mono">abg claude</code> launches with <code class="mono">--dangerously-skip-permissions</code> and <code class="mono">abg codex</code> with <code class="mono">--yolo</code>. This is deliberate: an unattended agent pair can't stop to ask you for each permission. Both can then run commands and edit files without prompting, so <strong>only do this in a workspace you trust</strong>. Add <code class="mono">--safe</code> (or set <code class="mono">AGENTBRIDGE_SAFE=1</code>) to launch with normal prompts. AgentBridge is a local dev tool, not a hardened boundary between untrusted tools.</p>
       </details>
       <details class="reveal">
         <summary><span>How does quota relay actually work?</span></summary>
-        <p>With the companion <a href="https://github.com/raysonmeng/agent-quota-guard">agent-quota-guard</a> installed, the daemon polls both agents' 5h and weekly subscription windows. Near a limit the guard lets the current turn finish, stops cleanly at the turn boundary, writes a <code class="mono">.agent/checkpoint.md</code>, and drops a <code class="mono">pending</code> record. When the window refreshes, the bridge auto-resumes the task in the original interactive TUI — Codex via a queued <code class="mono">turn/start</code>, Claude via an acked channel push.</p>
+        <p>With the companion <a href="https://github.com/raysonmeng/agent-quota-guard">agent-quota-guard</a> installed, the daemon polls both agents' 5h and weekly subscription windows. Near a limit the guard lets the current turn finish, stops cleanly at the turn boundary, writes a <code class="mono">.agent/checkpoint.md</code>, and drops a <code class="mono">pending</code> record. When the window refreshes, the bridge auto-resumes the task in the original interactive TUI: Codex via a queued <code class="mono">turn/start</code>, Claude via an acked channel push.</p>
       </details>
       <details class="reveal">
         <summary><span>Which agents does it support?</span></summary>
-        <p>Today the shipping in-session integration connects <strong>Claude Code and Codex</strong>. Which agent comes next is a public vote — see the adapter roadmap on <a href="https://github.com/raysonmeng/agent-bridge/issues/212">issue #212</a> (OpenCode, Gemini CLI, and more are candidates).</p>
+        <p>Today the shipping in-session integration connects <strong>Claude Code and Codex</strong>. Which agent comes next is a public vote. See the adapter roadmap on <a href="https://github.com/raysonmeng/agent-bridge/issues/212">issue #212</a> (OpenCode, Gemini CLI, and more are candidates).</p>
       </details>
       <details class="reveal">
         <summary><span>How is this different from <code class="mono">codex-plugin-cc</code>?</span></summary>
-        <p>One-way delegation plugins like <code class="mono">openai/codex-plugin-cc</code> let a host <em>call</em> Codex and get one answer back — request in, response out, no standing peer on the other side. AgentBridge keeps <strong>both</strong> agents live as persistent peers, and either side can push a message <strong>mid-turn</strong> (a review comment lands while the other is still working), not only at call boundaries.</p>
+        <p>One-way delegation plugins like <code class="mono">openai/codex-plugin-cc</code> let a host <em>call</em> Codex and get one answer back: request in, response out, with no standing peer on the other side. AgentBridge keeps <strong>both</strong> agents live as persistent peers, and either side can push a message <strong>mid-turn</strong> (a review comment lands while the other is still working), not only at call boundaries.</p>
       </details>
       <details class="reveal">
         <summary><span>Do I need an account or API keys for AgentBridge itself?</span></summary>
-        <p>No. AgentBridge is a local tool with zero runtime dependencies and no hosted service. You use your existing Claude Code and Codex logins; AgentBridge only relays messages between them on your machine — raw work never leaves the box.</p>
+        <p>No. AgentBridge is a local tool with zero runtime dependencies and no hosted service. You use your existing Claude Code and Codex logins; AgentBridge only relays messages between them on your machine; raw work never leaves the box.</p>
       </details>
       <details class="reveal">
         <summary><span>Can I run more than one pair at once?</span></summary>
@@ -809,7 +809,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
     <div>
       <div class="brand" style="margin-bottom:6px"><svg width="20" height="20" viewBox="0 0 64 64" aria-hidden="true"><path d="M13 26 L25 35 L13 44" stroke="#b892ff" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/><path d="M51 26 L39 35 L51 44" stroke="#6cc5e0" stroke-width="6.5" stroke-linecap="round" stroke-linejoin="round" fill="none"/><path d="M13 20 Q32 4 51 20" stroke="#3ddc97" stroke-width="5.5" stroke-linecap="round" fill="none"/></svg> AgentBridge</div>
       <div>Local bridge for Claude Code ↔ Codex collaboration. MIT licensed.</div>
-      <div class="mono" style="margin-top:8px;font-size:.78rem;color:var(--dim)">Built by this bridge itself — Claude Code ⇄ Codex, collaborating through it.</div>
+      <div class="mono" style="margin-top:8px;font-size:.78rem;color:var(--dim)">Built by this bridge itself: Claude Code ⇄ Codex, collaborating through it.</div>
     </div>
     <div class="foot-links">
       <a href="https://github.com/raysonmeng/agent-bridge">GitHub</a>
