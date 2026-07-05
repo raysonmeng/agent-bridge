@@ -1,0 +1,5 @@
+{"date":"2026-07-06","views":{"message":"Resource not accessible by integration","documentation_url":"https://docs.github.com/rest/metrics/traffic#get-page-views","status":"403"}null,"referrers":{
+  "message": "Not Found",
+  "documentation_url": "https://docs.github.com/rest",
+  "status": "404"
+}null,"clones":{"message":"Resource not accessible by integration","documentation_url":"https://docs.github.com/rest/metrics/traffic#get-repository-clones","status":"403"}null}
