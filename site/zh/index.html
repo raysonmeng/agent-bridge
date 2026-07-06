@@ -54,6 +54,8 @@
     {
       "@type": "FAQPage",
       "mainEntity": [
+        { "@type": "Question", "name": "实时双向通信，上下文会不会越滚越大、爆掉？",
+          "acceptedAnswer": { "@type": "Answer", "text": "不会。桥传的是消息，不是上下文：两个 agent 各自维护自己的上下文窗口，桥从不会把一方的完整对话历史拷进另一方。三层过滤让跨桥的东西尽量少：(1) 只转发 agentMessage，agent 执行命令的输出、文件 diff、推理过程这些中间噪声不过桥；(2) 三级标签路由，[IMPORTANT] 立刻转发、[STATUS] 缓冲合并成摘要、[FYI] 直接丢；(3) 协作契约只一次性存在项目的 AGENTS.md 里，不附带在每条消息上。所以每一方收到的是对方精选过的消息，上下文增长跟的是有效交流条数，不是对方活动的原始量。需要完整原文时也有 full 模式可关掉过滤。" } },
         { "@type": "Question", "name": "abg 装好了却跑不起来，是什么原因？",
           "acceptedAnswer": { "@type": "Answer", "text": "大概率是没装 Bun。AgentBridge 的 daemon 和插件服务跑在 Bun 运行时上，只有 Node.js 不够。用 curl -fsSL https://bun.sh/install | bash 装好 Bun，再重新执行 abg claude。" } },
         { "@type": "Question", "name": "支持 Windows 吗？",
@@ -752,6 +754,13 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
     <p class="eyebrow reveal">常见问题</p>
     <h2 class="reveal">常见问题</h2>
     <div class="faq">
+      <details class="reveal" open>
+        <summary><span>实时双向通信，上下文会不会越滚越大、爆掉？</span></summary>
+        <p><strong>不会，因为桥传的是消息，不是上下文。</strong>两个 agent 各自维护自己的上下文窗口，桥从不会把一方的完整对话历史拷进另一方。在这个前提上，再叠三层过滤，让真正跨过桥的东西尽量少：</p>
+        <p>1. <strong>只转发 <code class="mono">agentMessage</code>。</strong>daemon 只截取 agent 真正说出来的话，它执行命令的输出、文件 diff、推理过程这些中间噪声根本不过桥。每一方看到的是对方的结论，不是干活的流水账。</p>
+        <p>2. <strong>三级标签路由</strong>（默认）。每条消息带标签，daemon 按标签决定去留：<code class="mono">[IMPORTANT]</code> 立刻转发，<code class="mono">[STATUS]</code> 先缓冲、攒几条（默认 3 条或 15 秒）合并成一条摘要，<code class="mono">[FYI]</code> 直接丢。规则写在项目的 <code class="mono">AGENTS.md</code> 里（<code class="mono">abg init</code> 注入），启动读一次。</p>
+        <p>3. <strong>协作契约只存一份</strong>在 <code class="mono">AGENTS.md</code>，不是每条消息都附带。所以每一方收到的是对方精选过的有意义消息——上下文的增长跟的是"有效交流的条数"，不是"对方活动的原始量"。需要看完整原文时也留了 <code class="mono">full</code> 模式可关掉过滤。</p>
+      </details>
       <details class="reveal">
         <summary><span><code class="mono">abg</code> 装好了却跑不起来？</span></summary>
         <p>大概率是<strong>没装 Bun</strong>。AgentBridge 的 daemon 和插件服务跑在 Bun 运行时上，只有 Node.js 不够。用 <code class="mono">curl -fsSL https://bun.sh/install | bash</code> 装好，再重新执行 <code class="mono">abg claude</code>。这是最常见的安装失败原因。</p>
