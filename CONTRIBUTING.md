@@ -2,6 +2,14 @@
 
 Thanks for contributing to AgentBridge.
 
+## Contributor License Agreement
+
+Before your first pull request can be merged, please sign our lightweight
+[Contributor License Agreement](CLA.md). A bot will prompt you on the PR; you
+reply once and all future PRs are covered. The CLA keeps the project's licensing
+options open (e.g. a future commercial edition alongside the open-source one)
+while you keep full ownership of your own contributions.
+
 ## Prerequisites
 
 - [Bun](https://bun.sh) v1.0+
