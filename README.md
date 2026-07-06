@@ -57,9 +57,9 @@ What that buys you, concretely:
 
 ## Context handling — real-time, without the context blowing up
 
-A common worry about real-time bidirectional messaging is that the two agents' contexts merge and grow without bound. They don't. **The bridge passes messages, not context** — each agent keeps its own context window, and the bridge never copies one agent's full transcript into the other. Three filters keep what actually crosses small:
+A common worry about real-time bidirectional messaging is that the two agents' contexts merge and grow without bound. They don't. **The bridge passes messages, not context** — each agent keeps its own context window, and the bridge never copies one agent's full transcript into the other. (And which agent plans vs executes is your call — the roles aren't fixed; Codex can drive Claude just as easily.) Three filters keep what actually crosses small:
 
-1. **Only `agentMessage` crosses.** The daemon forwards an agent's actual output, not its tool-call noise — `commandExecution`, `fileChange`, and reasoning deltas never reach the other side. Each agent sees the other's conclusions, not its scrollback.
+1. **Only `agentMessage` crosses.** The bridge forwards an agent's actual conclusions, not its tool-call noise — `commandExecution`, `fileChange`, and reasoning deltas never reach the other side, nor does its full scrollback.
 2. **Three-tier marker routing** (default `filtered` mode). Each message is tagged and the daemon routes by tag: `[IMPORTANT]` forwards immediately, `[STATUS]` is buffered and batched into one periodic summary (default: 3 updates or 15s), `[FYI]` is dropped. The marker rules live once in the project's `AGENTS.md` (written by `abg init`), loaded at agent startup.
 3. **The collaboration contract lives once** in `AGENTS.md`, not appended to every message (which would pollute every thread and its resume title).
 
