@@ -9,7 +9,7 @@ mkdir -p traffic-archive
 STARS=$(gh api "repos/$REPO" -q .stargazers_count)
 FORKS=$(gh api "repos/$REPO" -q .forks_count)
 VIEWS_JSON=$(gh api "repos/$REPO/traffic/views" 2>/dev/null || echo null)
-REFS_JSON=$(gh api "repos/$REPO/traffic/referrers" 2>/dev/null || echo null)
+REFS_JSON=$(gh api "repos/$REPO/traffic/popular/referrers" 2>/dev/null || echo null)
 CLONES_JSON=$(gh api "repos/$REPO/traffic/clones" 2>/dev/null || echo null)
 NPM_DAY=$(curl -s "https://api.npmjs.org/downloads/point/last-day/$PKG" | python3 -c "import json,sys; print(json.load(sys.stdin).get('downloads',''))" || echo "")
 NPM_WEEK=$(curl -s "https://api.npmjs.org/downloads/point/last-week/$PKG" | python3 -c "import json,sys; print(json.load(sys.stdin).get('downloads',''))" || echo "")
