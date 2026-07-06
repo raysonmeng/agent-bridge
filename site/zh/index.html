@@ -660,7 +660,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
 <section id="quickstart">
   <div class="wrap">
     <p class="eyebrow reveal">快速开始</p>
-    <h2 class="reveal">四步跑起一对 agent</h2>
+    <h2 class="reveal">五步跑起一对 agent</h2>
     <p class="lead reveal">daemon 需要时自动启动，重启后自动重连。</p>
     <div class="steps">
       <div class="step reveal">
@@ -681,12 +681,20 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
       <div class="step reveal">
         <div class="n">03</div>
         <div class="body">
+          <h3>初始化项目</h3>
+          <p style="margin:0 0 10px;color:var(--dim);font-size:.9rem">检查依赖（bun/claude/codex），postinstall 没装成插件的话补装，并写入 <code class="mono">.agentbridge/config.json</code>。每个项目跑一次。</p>
+          <pre><span class="cmd">abg init</span></pre>
+        </div>
+      </div>
+      <div class="step reveal">
+        <div class="n">04</div>
+        <div class="body">
           <h3>启动带 AgentBridge channel 的 Claude Code</h3>
           <pre><span class="cmd">abg claude</span></pre>
         </div>
       </div>
       <div class="step reveal">
-        <div class="n">04</div>
+        <div class="n">05</div>
         <div class="body">
           <h3>另开一个终端，启动接入同一 bridge 的 Codex</h3>
           <pre><span class="cmd">abg codex</span></pre>

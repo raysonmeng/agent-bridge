@@ -683,7 +683,7 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
 <section id="quickstart">
   <div class="wrap">
     <p class="eyebrow reveal">quick start</p>
-    <h2 class="reveal">Four steps to a running pair</h2>
+    <h2 class="reveal">Five steps to a running pair</h2>
     <p class="lead reveal">The daemon starts automatically when needed and reconnects if restarted.</p>
     <div class="steps">
       <div class="step reveal">
@@ -704,12 +704,20 @@ footer { border-top: 1px solid var(--border); padding: 44px 0; color: var(--dim)
       <div class="step reveal">
         <div class="n">03</div>
         <div class="body">
+          <h3>Initialize the project</h3>
+          <p style="margin:0 0 10px;color:var(--dim);font-size:.9rem">Checks dependencies (bun/claude/codex), installs the plugin if the postinstall skipped it, and writes <code class="mono">.agentbridge/config.json</code>. Run once per project.</p>
+          <pre><span class="cmd">abg init</span></pre>
+        </div>
+      </div>
+      <div class="step reveal">
+        <div class="n">04</div>
+        <div class="body">
           <h3>Start Claude Code with the AgentBridge channel</h3>
           <pre><span class="cmd">abg claude</span></pre>
         </div>
       </div>
       <div class="step reveal">
-        <div class="n">04</div>
+        <div class="n">05</div>
         <div class="body">
           <h3>In another terminal, start Codex connected to the same bridge</h3>
           <pre><span class="cmd">abg codex</span></pre>
