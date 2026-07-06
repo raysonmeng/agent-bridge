@@ -67,7 +67,7 @@ English version: [README.md](README.md)
 
 ## Quick Start
 
-从零到一对跑起来，四步：
+从零到一对跑起来，五步：
 
 ```bash
 # 1. 装 Bun（运行时，只有 Node 不行）
@@ -77,10 +77,13 @@ curl -fsSL https://bun.sh/install | bash
 #    （best-effort;需要本机已有 bun + claude）。
 npm install -g @raysonmeng/agentbridge
 
-# 3. 启动 Claude Code 并启用 AgentBridge channel
+# 3. 初始化项目(检查依赖、必要时补装插件、写入 .agentbridge/config.json)
+abg init
+
+# 4. 启动 Claude Code 并启用 AgentBridge channel
 abg claude
 
-# 4. 在另一个终端启动 Codex TUI 连接同一个 bridge
+# 5. 在另一个终端启动 Codex TUI 连接同一个 bridge
 abg codex
 ```
 

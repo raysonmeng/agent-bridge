@@ -67,7 +67,7 @@ What that buys you, concretely:
 
 ## Quick Start
 
-Four steps from nothing to a running pair:
+Five steps from nothing to a running pair:
 
 ```bash
 # 1. Install Bun (the runtime; Node alone won't work)
@@ -77,10 +77,13 @@ curl -fsSL https://bun.sh/install | bash
 #    marketplace AND installs the plugin (best-effort; needs bun + claude present).
 npm install -g @raysonmeng/agentbridge
 
-# 3. Start Claude Code with the AgentBridge channel enabled
+# 3. Initialize the project (check deps, install plugin if needed, write .agentbridge/config.json)
+abg init
+
+# 4. Start Claude Code with the AgentBridge channel enabled
 abg claude
 
-# 4. In another terminal, start Codex TUI connected to the same bridge
+# 5. In another terminal, start Codex TUI connected to the same bridge
 abg codex
 ```
 
