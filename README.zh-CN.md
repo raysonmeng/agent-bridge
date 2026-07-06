@@ -9,6 +9,8 @@ English version: [README.md](README.md)
 
 **🌐 官网：[raysonmeng.github.io/agent-bridge/zh/](https://raysonmeng.github.io/agent-bridge/zh/)**，附真实会话的动画重放。
 
+> 在 [LINUX DO](https://linux.do) 开发者社区交流讨论。
+
 让 Claude Code 和 Codex 在同一个工作会话中进行双向通信的本地 Bridge。
 
 具体能换来什么：

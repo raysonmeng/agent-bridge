@@ -9,6 +9,8 @@
 
 **🌐 Website: [raysonmeng.github.io/agent-bridge](https://raysonmeng.github.io/agent-bridge/)**, with an animated replay of a real session.
 
+> Discussed on [LINUX DO](https://linux.do) — the developer community. / 在 [LINUX DO](https://linux.do) 开发者社区交流。
+
 Local bridge for bidirectional communication between Claude Code and Codex inside the same working session.
 
 What that buys you, concretely:
