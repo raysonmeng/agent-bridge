@@ -13,17 +13,22 @@ English version: [README.md](README.md)
 
 让 Claude Code 和 Codex 在同一个工作会话中进行双向通信的本地 Bridge。
 
+<p align="center">
+  <img src="assets/readme-demo.gif" width="820" alt="Claude Code 和 Codex 在同一个会话里互相 review" />
+  <br />
+  <sub>真实会话重放 —— Codex 的 review 被直接推进 Claude 的活跃会话，全程没有人肉搬运。<a href="https://raysonmeng.github.io/agent-bridge/zh/">完整动画演示 →</a></sub>
+</p>
+
 具体能换来什么：
 
 - **交叉 review**：Codex 写实现，Claude 在**同一会话内**实时 review 这个 diff，并把修改意见直接推回 Codex 的 thread。两家模型互相盯着对方，不用复制粘贴。
 - **一句 prompt 完成分工**：让任一侧提出与对方的分工方案，两个 agent 先商量好谁做什么再动手写代码。你把舵，它们协调。
 - **通宵任务的额度接力**：一侧订阅额度窗口烧到线时，它在回合边界干净停下，把任务交接给另一侧，让长任务继续跑。
 
-<!-- TODO: assets/demo.gif — see docs/demo/RECORDING.md -->
-▶ **[在官网看演示](https://raysonmeng.github.io/agent-bridge/zh/)**：真实会话的动画重放，Codex 回复推进 Claude 活跃会话、回合中途插入、额度接力。
-
 > **这个工具很大程度上就是 Claude Code 和 Codex 通过它本身协作写出来的。**
 > **一个 agent 写的每个 PR,都由另一个 agent review。** AgentBridge 就是它自己的 proof of concept。
+
+> ⭐ 如果 AgentBridge 对你有用，点个 star 能帮到其他双开的人找到它。
 
 ## Why not just…（换个方案不行吗)
 

@@ -13,17 +13,22 @@
 
 Local bridge for bidirectional communication between Claude Code and Codex inside the same working session.
 
+<p align="center">
+  <img src="assets/readme-demo.gif" width="820" alt="Claude Code and Codex reviewing each other in one live session" />
+  <br />
+  <sub>A real session, replayed — Codex's review is pushed into Claude's live session, no human relay. <a href="https://raysonmeng.github.io/agent-bridge/">Full animated demo →</a></sub>
+</p>
+
 What that buys you, concretely:
 
 - **Cross-review** — Codex implements; Claude reviews the diff *inside the same session* and pushes change requests straight back into Codex's thread. Two providers check each other's work without copy-paste.
 - **Task splits from one prompt** — ask either agent to propose a division of labor with the other, and they negotiate who does what before writing code. You steer; they coordinate.
 - **Quota relay for overnight runs** — when one side's subscription window runs dry, it stops cleanly at a turn boundary and hands the task off to the other side, so a long job keeps moving instead of dying at a limit.
 
-<!-- TODO: assets/demo.gif — see docs/demo/RECORDING.md -->
-▶ **[Watch the demo on the website](https://raysonmeng.github.io/agent-bridge/)**: an animated replay of a real session. Codex pushes a reply into Claude's live session, Claude injects a note mid-turn, and the task survives a quota handoff.
-
 > **This tool was largely built by Claude Code and Codex collaborating through it.**
 > **Every PR written by one agent was reviewed by the other.** AgentBridge is its own proof of concept.
+
+> ⭐ If AgentBridge is useful to you, a star helps other people running two agents find it.
 
 ## Why not just…
 
