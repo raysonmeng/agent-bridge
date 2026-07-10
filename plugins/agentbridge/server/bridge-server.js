@@ -10150,7 +10150,7 @@ function finalize(ctx, schema) {
     result.$schema = "http://json-schema.org/draft-07/schema#";
   } else if (ctx.target === "draft-04") {
     result.$schema = "http://json-schema.org/draft-04/schema#";
-  } else if (ctx.target === "openapi-3.0") {} else {}
+  } else if (ctx.target === "openapi-3.0") {}
   if (ctx.external?.uri) {
     const id = ctx.external.registry.get(schema)?.id;
     if (!id)
@@ -10372,7 +10372,7 @@ var literalProcessor = (schema, ctx, json, _params) => {
     if (val === undefined) {
       if (ctx.unrepresentable === "throw") {
         throw new Error("Literal `undefined` cannot be represented in JSON Schema");
-      } else {}
+      }
     } else if (typeof val === "bigint") {
       if (ctx.unrepresentable === "throw") {
         throw new Error("BigInt literals cannot be represented in JSON Schema");
@@ -14286,6 +14286,8 @@ class ClaudeAdapter extends EventEmitter {
   async pushViaChannel(message) {
     const deliveryAttemptId = `codex_msg_${this.notificationIdPrefix}_${++this.notificationSeq}`;
     const ts = new Date(message.timestamp).toISOString();
+    const mirrorToQueue = process.env.AGENTBRIDGE_ALWAYS_QUEUE === "1" && typeof message.id === "string" && !message.id.startsWith("system_");
+    let queuedInCatch = false;
     try {
       await this.server.notification({
         method: "notifications/claude/channel",
@@ -14307,6 +14309,11 @@ class ClaudeAdapter extends EventEmitter {
     } catch (e) {
       this.log(`Push notification failed: ${e.message}`);
       this.queueFallbackMessage(message);
+      queuedInCatch = true;
+    }
+    if (mirrorToQueue && !queuedInCatch) {
+      this.queueFallbackMessage(message);
+      this.log(`Always-queue: mirrored ${message.id} to fallback queue (#223)`);
     }
   }
   rememberDelivery(message) {
@@ -14707,10 +14714,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.30", "0.0.0-source"),
-  commit: defineString("99d0f4a", "source"),
+  commit: defineString("a3e927f", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("0cb79932198b", "source")
+  codeHash: defineString("cb386a074708", "source")
 });
 function sameRuntimeContract(a, b) {
   if (!a || !b)
