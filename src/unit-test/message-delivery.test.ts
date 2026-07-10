@@ -100,6 +100,53 @@ describe("Push-only delivery: AGENTBRIDGE_MODE is ignored", () => {
   });
 });
 
+// #223: with AGENTBRIDGE_ALWAYS_QUEUE=1 the channel push still fires, but real
+// Codex replies are ALSO mirrored into the fallback queue so get_messages is a
+// reliable pull path even when the Claude session is idle and the fire-and-
+// forget channel push is silently dropped.
+describe("Message delivery: AGENTBRIDGE_ALWAYS_QUEUE (#223)", () => {
+  const origAlwaysQueue = process.env.AGENTBRIDGE_ALWAYS_QUEUE;
+  afterEach(() => {
+    if (origAlwaysQueue !== undefined) process.env.AGENTBRIDGE_ALWAYS_QUEUE = origAlwaysQueue;
+    else delete process.env.AGENTBRIDGE_ALWAYS_QUEUE;
+  });
+
+  test("mirrors a real Codex reply to the fallback queue while still pushing", async () => {
+    const adapter = createAdapter();
+    const notifications = withMockedChannel(adapter);
+    process.env.AGENTBRIDGE_ALWAYS_QUEUE = "1";
+    await adapter.pushNotification(makeBridgeMessage("codex reply", undefined, "msg_abc123"));
+    expect(notifications).toHaveLength(1); // channel push still happens
+    expect(adapter.pendingMessages).toHaveLength(1); // and it is drainable via get_messages
+    expect(adapter.pendingMessages[0].content).toBe("codex reply");
+  });
+
+  test("does not mirror system messages (system_ id prefix)", async () => {
+    const adapter = createAdapter();
+    withMockedChannel(adapter);
+    process.env.AGENTBRIDGE_ALWAYS_QUEUE = "1";
+    await adapter.pushNotification(makeBridgeMessage("turn started", undefined, "system_turn_started_1"));
+    expect(adapter.pendingMessages).toHaveLength(0);
+  });
+
+  test("does not double-queue when the channel push fails", async () => {
+    const adapter = createAdapter();
+    withMockedChannel(adapter, "fail");
+    process.env.AGENTBRIDGE_ALWAYS_QUEUE = "1";
+    await adapter.pushNotification(makeBridgeMessage("codex reply", undefined, "msg_def456"));
+    expect(adapter.pendingMessages).toHaveLength(1); // queued exactly once (catch path)
+  });
+
+  test("default (flag unset) keeps push-only behavior — nothing queued", async () => {
+    const adapter = createAdapter();
+    const notifications = withMockedChannel(adapter);
+    delete process.env.AGENTBRIDGE_ALWAYS_QUEUE;
+    await adapter.pushNotification(makeBridgeMessage("codex reply", undefined, "msg_ghi789"));
+    expect(notifications).toHaveLength(1);
+    expect(adapter.pendingMessages).toHaveLength(0);
+  });
+});
+
 describe("Message delivery: fallback queue", () => {
   test("queueFallbackMessage adds message to pendingMessages", () => {
     const adapter = createAdapter();

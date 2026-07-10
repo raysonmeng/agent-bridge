@@ -7,6 +7,12 @@
  * (The old AGENTBRIDGE_MODE=pull delivery mode was removed: it could not wake
  * an idle session, which silently broke the budget RESUME chain.)
  *
+ * #223: the channel push is fire-and-forget and is silently dropped when the
+ * Claude session is idle, so the fallback catch never fires and the reply is
+ * lost. Opt-in AGENTBRIDGE_ALWAYS_QUEUE=1 additionally mirrors real Codex
+ * replies into the fallback queue, making get_messages a reliable pull path
+ * for idle sessions. Off by default → delivery behavior is unchanged.
+ *
  * Emits:
  *   - "ready"   ()                   — MCP connected
  *   - "reply"   (msg: BridgeMessage) — Claude used the reply tool
@@ -241,6 +247,27 @@ export class ClaudeAdapter extends EventEmitter {
     const deliveryAttemptId = `codex_msg_${this.notificationIdPrefix}_${++this.notificationSeq}`;
     const ts = new Date(message.timestamp).toISOString();
 
+    // #223: notifications/claude/channel is fire-and-forget and is silently
+    // dropped when the Claude session is idle, so the catch below never runs
+    // and the reply is lost with get_messages staying empty. With
+    // AGENTBRIDGE_ALWAYS_QUEUE=1, mirror real Codex replies (non-system ids)
+    // into the fallback queue as well, so get_messages is a reliable pull path
+    // even for idle sessions. Off by default → delivery behavior is unchanged.
+    //
+    // NOTE: system messages are identified by their id prefix ("system_*")
+    // because BridgeMessage has no structural kind/type field (both system and
+    // agent messages carry source="codex"). If a structural discriminator (e.g.
+    // a `kind` field) is added in the future, prefer it over the id prefix.
+    //
+    // SECURITY: with this flag on, the fallback queue retains real agent reply
+    // content until drained by get_messages. This does not introduce a new data
+    // class but extends the retention window — document accordingly.
+    const mirrorToQueue =
+      process.env.AGENTBRIDGE_ALWAYS_QUEUE === "1" &&
+      typeof message.id === "string" &&
+      !message.id.startsWith("system_");
+    let queuedInCatch = false;
+
     try {
       await this.server.notification({
         method: "notifications/claude/channel",
@@ -265,6 +292,12 @@ export class ClaudeAdapter extends EventEmitter {
     } catch (e: any) {
       this.log(`Push notification failed: ${e.message}`);
       this.queueFallbackMessage(message);
+      queuedInCatch = true;
+    }
+
+    if (mirrorToQueue && !queuedInCatch) {
+      this.queueFallbackMessage(message);
+      this.log(`Always-queue: mirrored ${message.id} to fallback queue (#223)`);
     }
   }
 
