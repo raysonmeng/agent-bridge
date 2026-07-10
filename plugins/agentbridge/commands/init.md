@@ -36,6 +36,9 @@ If `.agentbridge/config.json` is missing, create it with this default template:
     "attentionWindowSeconds": 15,
     "busyGuard": true
   },
+  "injection": {
+    "runtime": true
+  },
   "idleShutdownSeconds": 30
 }
 ```

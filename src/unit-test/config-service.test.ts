@@ -52,6 +52,7 @@ describe("ConfigService", () => {
     expect(config.codex.appPort).toBe(4500);
     expect(config.codex.proxyPort).toBe(4501);
     expect(config.turnCoordination.attentionWindowSeconds).toBe(15);
+    expect(config.injection.runtime).toBe(true);
   });
 
   test("save and load round-trips correctly", () => {
@@ -127,6 +128,22 @@ describe("ConfigService", () => {
     expect(loaded.codex.proxyPort).toBe(4601);
     expect(loaded.turnCoordination.attentionWindowSeconds).toBe(20);
     expect(loaded.idleShutdownSeconds).toBe(45);
+  });
+
+  test("load reads injection.runtime and defaults invalid or absent values to true", () => {
+    const configDir = join(tempDir, ".agentbridge");
+    const configPath = join(configDir, "config.json");
+    mkdirSync(configDir, { recursive: true });
+
+    writeFileSync(configPath, JSON.stringify({ injection: { runtime: false } }));
+    expect(expectParsed(new ConfigService(tempDir)).injection.runtime).toBe(false);
+    expect(new ConfigService(tempDir).describeConfig().customValues).toBe(true);
+
+    writeFileSync(configPath, JSON.stringify({ injection: { runtime: "off" } }));
+    expect(expectParsed(new ConfigService(tempDir)).injection.runtime).toBe(true);
+
+    writeFileSync(configPath, JSON.stringify({}));
+    expect(expectParsed(new ConfigService(tempDir)).injection.runtime).toBe(true);
   });
 
   test("initDefaults creates only config.json", () => {

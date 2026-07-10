@@ -31,6 +31,20 @@ export interface ThreadIdentity {
   cwd: string;
 }
 
+export interface CodexContractInjection {
+  threadId: string;
+  contractHash: string;
+  injectedAt: string;
+}
+
+export interface CodexContractState {
+  version: 1;
+  injections: CodexContractInjection[];
+}
+
+const MAX_CODEX_CONTRACT_INJECTIONS = 256;
+const CODEX_CONTRACT_HASH_RE = /^[0-9a-f]{12}$/;
+
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -60,6 +74,81 @@ export function readRawCurrentThread(stateDir: StateDirResolver): CurrentThreadS
     // Missing/corrupt state is treated as no usable mapping. Doctor can report it later.
   }
   return null;
+}
+
+function parseCodexContractInjection(value: unknown): CodexContractInjection | null {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return null;
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.threadId !== "string" || record.threadId.length === 0 ||
+    typeof record.contractHash !== "string" || !CODEX_CONTRACT_HASH_RE.test(record.contractHash) ||
+    typeof record.injectedAt !== "string" || record.injectedAt.length === 0
+  ) {
+    return null;
+  }
+  return {
+    threadId: record.threadId,
+    contractHash: record.contractHash,
+    injectedAt: record.injectedAt,
+  };
+}
+
+/** Read the bounded per-pair runtime-contract ledger. Missing/corrupt = empty. */
+export function readCodexContractState(stateDir: StateDirResolver): CodexContractState {
+  try {
+    const parsed = JSON.parse(readFileSync(stateDir.codexContractStateFile, "utf-8"));
+    if (parsed?.version !== 1 || !Array.isArray(parsed.injections)) {
+      return { version: 1, injections: [] };
+    }
+    return {
+      version: 1,
+      injections: parsed.injections
+        .map(parseCodexContractInjection)
+        .filter((entry: CodexContractInjection | null): entry is CodexContractInjection => entry !== null)
+        .slice(-MAX_CODEX_CONTRACT_INJECTIONS),
+    };
+  } catch {
+    return { version: 1, injections: [] };
+  }
+}
+
+export function readCodexContractHash(
+  stateDir: StateDirResolver,
+  threadId: string,
+): string | null {
+  const injections = readCodexContractState(stateDir).injections;
+  for (let index = injections.length - 1; index >= 0; index--) {
+    if (injections[index]?.threadId === threadId) {
+      return injections[index]!.contractHash;
+    }
+  }
+  return null;
+}
+
+/**
+ * Atomically upsert the latest injected contract for a thread. The ledger is
+ * bounded because pair state can outlive many archived Codex threads.
+ */
+export function persistCodexContractInjection(
+  stateDir: StateDirResolver,
+  threadId: string,
+  contractHash: string,
+): CodexContractState {
+  if (!threadId || !CODEX_CONTRACT_HASH_RE.test(contractHash)) {
+    throw new Error("Codex contract state requires a non-empty threadId and a 12-character lowercase hex hash");
+  }
+  const prior = readCodexContractState(stateDir).injections.filter(
+    (entry) => entry.threadId !== threadId,
+  );
+  const state: CodexContractState = {
+    version: 1,
+    injections: [
+      ...prior,
+      { threadId, contractHash, injectedAt: nowIso() },
+    ].slice(-MAX_CODEX_CONTRACT_INJECTIONS),
+  };
+  atomicWriteJson(stateDir.codexContractStateFile, state);
+  return state;
 }
 
 export function findCodexRolloutFile(

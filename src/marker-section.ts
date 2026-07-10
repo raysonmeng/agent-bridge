@@ -58,3 +58,59 @@ export function upsertMarkedSection(
   const trimmed = content.endsWith("\n") ? content : content + "\n";
   return trimmed + "\n" + block + "\n";
 }
+
+/**
+ * Remove a marked section (markers included) from a markdown string — the
+ * inverse of upsertMarkedSection, used by `abg deinit`.
+ *
+ * Collapses the blank line upsert introduced around the block so that
+ * upsert → remove round-trips an existing file back to (at most a trailing
+ * newline of) its original shape. A file that contained ONLY the block
+ * collapses to the empty string.
+ *
+ * @returns removed=false (content untouched) when no markers are present.
+ * @throws on a malformed marker pair, mirroring upsertMarkedSection — a lone
+ *         marker means we cannot know the block's true extent, and guessing
+ *         could delete user content.
+ */
+export function removeMarkedSection(
+  content: string,
+  sectionId: string,
+): { content: string; removed: boolean } {
+  const startMarker = MARKER_START(sectionId);
+  const endMarker = MARKER_END(sectionId);
+
+  const startIdx = content.indexOf(startMarker);
+  const endIdx = content.indexOf(endMarker);
+  const hasStart = startIdx !== -1;
+  const hasEnd = endIdx !== -1;
+
+  if (!hasStart && !hasEnd) {
+    return { content, removed: false };
+  }
+
+  if (!(hasStart && hasEnd && startIdx < endIdx)) {
+    throw new Error(
+      `Malformed ${sectionId} markers in file (start=${startIdx}, end=${endIdx}). ` +
+        `Please repair the file manually — remove the stray marker(s) or restore the pair.`,
+    );
+  }
+
+  let before = content.slice(0, startIdx);
+  let after = content.slice(endIdx + endMarker.length);
+
+  // The whole file was just the block (case 1 of upsert) → empty string.
+  if (before.trim() === "" && after.trim() === "") {
+    return { content: "", removed: true };
+  }
+
+  // Collapse the separator blank line(s) upsert added: leave `before` ending in
+  // a single newline, and drop the newline(s) that immediately followed the
+  // end marker.
+  before = before.replace(/\n+$/, "\n");
+  after = after.replace(/^\n+/, "");
+  if (after !== "" && !before.endsWith("\n") && before !== "") {
+    before += "\n";
+  }
+  return { content: before + after, removed: true };
+}

@@ -2,6 +2,7 @@ const APP_SERVER_REQUEST_METHODS = [
   "initialize",
   "thread/start",
   "thread/resume",
+  "thread/inject_items",
   "thread/name/set",
   "thread/list",
   "review/start",
@@ -74,6 +75,12 @@ export type AppServerUserInput =
 export interface TurnStartParams {
   threadId: string;
   input: AppServerUserInput[];
+  [key: string]: unknown;
+}
+
+export interface ThreadInjectItemsParams {
+  threadId: string;
+  items: Array<Record<string, unknown>>;
   [key: string]: unknown;
 }
 

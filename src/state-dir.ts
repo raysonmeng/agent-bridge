@@ -97,6 +97,15 @@ export class StateDirResolver {
     return join(this.stateDir, "current-thread.json");
   }
 
+  /**
+   * Per-pair record of the runtime collaboration contract injected into Codex
+   * threads. Kept separate from current-thread.json because a pair can resume
+   * several historical threads while only one thread is current.
+   */
+  get codexContractStateFile(): string {
+    return join(this.stateDir, "codex-contracts.json");
+  }
+
   get logFile(): string {
     return join(this.stateDir, "agentbridge.log");
   }

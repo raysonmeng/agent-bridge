@@ -32,9 +32,10 @@ export interface DepCheck {
   hint?: string;
 }
 
-export async function runInit() {
+export async function runInit(args: string[] = []) {
   console.log("AgentBridge Init\n");
   const cli = cliInvocationName();
+  const injectDocs = args.includes("--inject-docs");
 
   // Step 1: Check dependencies. Collect ALL results first, then report them
   // together — the old flow exited on the FIRST missing dep, so a user missing
@@ -68,12 +69,24 @@ export async function runInit() {
   }
   console.log("");
 
-  // Step 3: Write collaboration sections to CLAUDE.md and AGENTS.md
-  console.log("Writing collaboration sections...");
-  const projectRoot = process.cwd();
-  const collabResults = writeCollaborationSections(projectRoot);
-  for (const result of collabResults) {
-    console.log(`  ${result}`);
+  // Step 3: Collaboration guidance. Runtime delivery is the default — the
+  // plugin SessionStart hook (Claude) and the codex proxy's developer contract
+  // (Codex) inject guidance only while a bridge is actually running, so the
+  // project keeps zero static footprint. --inject-docs preserves the legacy
+  // behaviour of writing marker-delimited sections into CLAUDE.md / AGENTS.md
+  // (e.g. for agents/tooling that never see the runtime channels); `deinit`
+  // removes those sections again.
+  if (injectDocs) {
+    console.log("Writing collaboration sections (--inject-docs)...");
+    const projectRoot = process.cwd();
+    const collabResults = writeCollaborationSections(projectRoot);
+    for (const result of collabResults) {
+      console.log(`  ${result}`);
+    }
+  } else {
+    console.log("Collaboration guidance: delivered at runtime while the bridge is up.");
+    console.log(`  CLAUDE.md / AGENTS.md left untouched (use "${cli} init --inject-docs" for static sections,`);
+    console.log(`  "${cli} deinit" to remove previously injected ones).`);
   }
   console.log("");
 

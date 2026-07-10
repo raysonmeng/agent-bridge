@@ -147,7 +147,12 @@ const daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_POR
 const DAEMON_NONCE = randomUUID();
 const DAEMON_STARTED_AT = Date.now();
 
-const codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile);
+const codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile, {
+  runtimeInjection: {
+    enabled: config.injection.runtime,
+    stateDir,
+  },
+});
 const attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
 
 let controlServer: ReturnType<typeof Bun.serve> | null = null;

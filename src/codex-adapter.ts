@@ -13,6 +13,15 @@ import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { EventEmitter } from "node:events";
 import { StateDirResolver } from "./state-dir";
+import {
+  persistCodexContractInjection,
+  readCodexContractHash,
+} from "./thread-state";
+import {
+  CODEX_DEVELOPER_CONTRACT,
+  codexContractSupersedePayload,
+  contractHash,
+} from "./collaboration-contract";
 import { cleanupPorts, portPidsCommand } from "./port-cleanup";
 import { createProcessLogger, type ProcessLogger } from "./process-log";
 import type { BridgeMessage } from "./types";
@@ -33,6 +42,7 @@ import {
   type AppServerServerRequestMethod,
   type AppServerTrackedRequestMethod,
   type TurnInterruptParams,
+  type ThreadInjectItemsParams,
   type TurnStartParams,
   type TurnSteerParams,
 } from "./app-server-protocol";
@@ -56,6 +66,7 @@ import {
 } from "./turn-notices";
 import { isAllowedWsUpgrade, wsOriginRejectedResponse } from "./ws-origin-guard";
 import { PendingRequestRegistry } from "./pending-request-registry";
+import { compareVersions, isStableVersion } from "./version-utils";
 
 interface TuiSocketData {
   connId: number;
@@ -87,12 +98,34 @@ interface PendingServerResponse {
 interface PendingRequest {
   method: AppServerTrackedRequestMethod;
   threadId?: string;
+  /** Contract merged into this thread/start request, persisted on success. */
+  runtimeContractHash?: string;
   /**
    * Monotonic "thread switch" sequence (latest-issued) for thread/start and
    * thread/resume. Used so an out-of-order OLD response can't clobber the active
    * thread the user most recently switched to (#70).
    */
   threadSwitchSeq?: number;
+}
+
+interface PendingRuntimeContractInjection {
+  requestId: number;
+  connId: number;
+  threadId: string;
+  contractHash: string;
+  resumeResponse: AppServerResponse;
+  timer: ReturnType<typeof setTimeout>;
+}
+
+export interface CodexAdapterOptions {
+  runtimeInjection?: {
+    /** Defaults to true. The daemon wires this from config.injection.runtime. */
+    enabled?: boolean;
+    /** Pair-scoped state directory; injectable for hermetic tests. */
+    stateDir?: StateDirResolver;
+    /** Internal thread/inject_items acknowledgement timeout. */
+    timeoutMs?: number;
+  };
 }
 
 /**
@@ -117,6 +150,11 @@ interface PendingRequest {
  *      the success result shape (codex-rs v2/account.rs:254-258).
  *   5. thread/closed sniff — handleAppServerPayload. String-matches the
  *      `thread/closed` notification method to explain a silent TUI exit(0).
+ *   6. runtime developer contract — prepareRuntimeThreadRequest merges
+ *      thread/start.developerInstructions; resumed threads use the stable
+ *      thread/inject_items endpoint with a raw Responses API developer message.
+ *      Both shapes were verified on codex-cli 0.144.1 and are guarded by the
+ *      MIN_RUNTIME_INJECTION_VERSION compatibility check.
  *
  * The captured app-server version (exposed via `appServerInfo` →
  * DaemonStatus → /healthz + `abg doctor`) lets an operator see, at a glance,
@@ -125,6 +163,10 @@ interface PendingRequest {
  */
 export class CodexAdapter extends EventEmitter {
   private static readonly RESPONSE_TRACKING_TTL_MS = 30000;
+  /** Oldest protocol snapshot verified to support both required carriers. */
+  private static readonly MIN_RUNTIME_INJECTION_VERSION = "0.144.1";
+  private static readonly RUNTIME_INJECTION_TIMEOUT_MS = 5000;
+  private static readonly RUNTIME_INJECTION_ERROR_CODE = -32041;
 
   private proc: ChildProcess | null = null;
   /** pid of the spawned `codex app-server` child; survives `stop()` nulling `proc`. */
@@ -146,6 +188,11 @@ export class CodexAdapter extends EventEmitter {
   private proxyPort: number;
   private readonly logFile: string;
   private readonly logger: ProcessLogger;
+  private readonly runtimeInjectionEnabled: boolean;
+  private readonly runtimeStateDir: StateDirResolver;
+  private readonly runtimeContractHash: string;
+  private readonly runtimeInjectionTimeoutMs: number;
+  private pendingRuntimeContractInjections = new Map<number, PendingRuntimeContractInjection>();
   private tuiConnId = 0; // tracks which TUI connection is "current" (primary)
   private connIdCounter = 0; // monotonically increasing counter for unique conn IDs
   // Secondary (picker) connections: each gets its own dedicated app-server WS
@@ -272,12 +319,22 @@ export class CodexAdapter extends EventEmitter {
   private replayMethods = new Map<number | string, string>();
   private static readonly SESSION_REPLAY_TIMEOUT_MS = 5000;
 
-  constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile) {
+  constructor(
+    appPort = 4500,
+    proxyPort = 4501,
+    logFile = new StateDirResolver().logFile,
+    options: CodexAdapterOptions = {},
+  ) {
     super();
     this.appPort = appPort;
     this.proxyPort = proxyPort;
     this.logFile = logFile;
     this.logger = createProcessLogger({ component: "CodexAdapter", logFile: this.logFile });
+    this.runtimeInjectionEnabled = options.runtimeInjection?.enabled ?? true;
+    this.runtimeStateDir = options.runtimeInjection?.stateDir ?? new StateDirResolver();
+    this.runtimeContractHash = contractHash();
+    this.runtimeInjectionTimeoutMs =
+      options.runtimeInjection?.timeoutMs ?? CodexAdapter.RUNTIME_INJECTION_TIMEOUT_MS;
   }
 
   get appServerUrl() { return `ws://127.0.0.1:${this.appPort}`; }
@@ -443,6 +500,7 @@ export class CodexAdapter extends EventEmitter {
     // Cancel any outage recovery in flight
     this.outageQueue = [];
     this.clearOutageTimer();
+    this.cancelRuntimeContractInjections("adapter disconnected", false);
 
     this.appServerWs?.close();
     this.appServerWs = null;
@@ -944,6 +1002,7 @@ export class CodexAdapter extends EventEmitter {
       `App-server connection closed (intentional=${intentional}, tuiConnected=${tuiConnected}, turnInProgress=${this.turnInProgress})`,
     );
     this.appServerWs = null;
+    this.cancelRuntimeContractInjections("app-server connection closed", !intentional);
     // Approval request/response ids are scoped to the current app-server session.
     // If the socket reconnects, replaying old approval state would forward stale ids.
     this.clearResponseTrackingState();
@@ -1577,6 +1636,7 @@ export class CodexAdapter extends EventEmitter {
 
       // Rewrite request id to globally unique proxy id
       if (parsed.id !== undefined && parsed.method) {
+        if (!this.prepareRuntimeThreadRequest(ws, parsed)) return;
         const proxyId = this.nextProxyId++;
         this.upstreamToClient.set(proxyId, { connId, clientId: parsed.id });
         this.trackPendingRequest(parsed, connId, proxyId);
@@ -1605,6 +1665,103 @@ export class CodexAdapter extends EventEmitter {
       this.log(
         `WARNING: app-server closed between OPEN check and send — message lost (connId=${ws.data.connId})`,
       );
+    }
+  }
+
+  /**
+   * Apply the native runtime carrier before a TUI thread request is forwarded.
+   * Returns false after sending a request-scoped JSON-RPC error to the TUI.
+   */
+  private prepareRuntimeThreadRequest(
+    ws: ServerWebSocket<TuiSocketData>,
+    message: AppServerRequest | Record<string, unknown>,
+  ): boolean {
+    if (!this.runtimeInjectionEnabled) return true;
+    const method = typeof message.method === "string" ? message.method : null;
+    if (method !== "thread/start" && method !== "thread/resume") return true;
+
+    const params = typeof message.params === "object" && message.params !== null && !Array.isArray(message.params)
+      ? message.params as Record<string, unknown>
+      : {};
+
+    // A resume whose exact contract is already recorded needs no new protocol
+    // feature, so do not reject it merely because Codex was later downgraded.
+    if (method === "thread/resume") {
+      const threadId = params.threadId;
+      if (
+        typeof threadId === "string" && threadId.length > 0 &&
+        readCodexContractHash(this.runtimeStateDir, threadId) === this.runtimeContractHash
+      ) {
+        return true;
+      }
+    }
+
+    const compatibilityError = this.runtimeInjectionCompatibilityError();
+    if (compatibilityError) {
+      this.sendRuntimeRequestError(ws, message.id, compatibilityError);
+      return false;
+    }
+
+    if (method === "thread/start") {
+      const existing = params.developerInstructions;
+      if (existing !== undefined && existing !== null && typeof existing !== "string") {
+        this.sendRuntimeRequestError(
+          ws,
+          message.id,
+          "AgentBridge cannot merge the runtime contract because " +
+            "thread/start.params.developerInstructions is not a string or null.",
+        );
+        return false;
+      }
+      if (typeof existing !== "string" || existing.length === 0) {
+        params.developerInstructions = CODEX_DEVELOPER_CONTRACT;
+      } else if (!existing.includes(CODEX_DEVELOPER_CONTRACT)) {
+        params.developerInstructions = `${existing}\n\n${CODEX_DEVELOPER_CONTRACT}`;
+      }
+      message.params = params;
+    }
+
+    return true;
+  }
+
+  private runtimeInjectionCompatibilityError(): string | null {
+    const version = this.appServerInfo?.version ?? null;
+    if (
+      version !== null &&
+      isStableVersion(version) &&
+      compareVersions(version, CodexAdapter.MIN_RUNTIME_INJECTION_VERSION) >= 0
+    ) {
+      return null;
+    }
+    return (
+      `AgentBridge runtime collaboration injection requires Codex app-server >= ` +
+      `${CodexAdapter.MIN_RUNTIME_INJECTION_VERSION}; detected ${version ?? "unknown"}. ` +
+      `Upgrade Codex, or set {"injection":{"runtime":false}} in .agentbridge/config.json ` +
+      `and restart AgentBridge. ` +
+      `AgentBridge will not silently fall back to modifying AGENTS.md.`
+    );
+  }
+
+  private runtimeErrorResponse(id: unknown, message: string): string {
+    return JSON.stringify({
+      id: id as number | string,
+      error: {
+        code: CodexAdapter.RUNTIME_INJECTION_ERROR_CODE,
+        message,
+      },
+    });
+  }
+
+  private sendRuntimeRequestError(
+    ws: ServerWebSocket<TuiSocketData>,
+    id: unknown,
+    message: string,
+  ): void {
+    this.log(`Runtime contract request rejected: ${message}`);
+    try {
+      ws.send(this.runtimeErrorResponse(id, message));
+    } catch (error) {
+      this.log(`Failed to send runtime contract error to TUI: ${(error as Error).message}`);
     }
   }
 
@@ -1811,6 +1968,14 @@ export class CodexAdapter extends EventEmitter {
   private handleAppServerResponse(parsed: AppServerResponse, raw: string): string | null {
     const responseId = parsed.id;
     const numericId = this.normalizeNumericId(responseId);
+
+    if (!isNaN(numericId)) {
+      const runtimeInjection = this.pendingRuntimeContractInjections.get(numericId);
+      if (runtimeInjection) {
+        return this.completeRuntimeContractInjection(parsed, runtimeInjection);
+      }
+    }
+
     const mapping = !isNaN(numericId) ? this.upstreamToClient.get(numericId) : undefined;
 
     if (mapping) {
@@ -1831,6 +1996,8 @@ export class CodexAdapter extends EventEmitter {
 
       parsed.id = mapping.clientId;
       this.log(`app-server → TUI: response (proxy id=${numericId} → client id=${String(mapping.clientId)}, conn #${mapping.connId})`);
+      const runtimeResponse = this.handleMappedRuntimeContractResponse(parsed, mapping.connId);
+      if (runtimeResponse !== false) return runtimeResponse;
       const forwarded = this.patchResponse(parsed, JSON.stringify(parsed));
       this.interceptServerMessage(parsed, mapping.connId);
       return forwarded;
@@ -1908,6 +2075,243 @@ export class CodexAdapter extends EventEmitter {
 
     this.log(`Dropping unmatched app-server response id ${String(responseId)}`);
     return null;
+  }
+
+  /**
+   * Persist a successful thread/start carrier, or defer thread/resume until an
+   * internal developer item has been acknowledged and persisted. `false`
+   * means the ordinary mapped-response path should continue.
+   */
+  private handleMappedRuntimeContractResponse(
+    response: AppServerResponse,
+    connId: number,
+  ): false | string | null {
+    if (!this.runtimeInjectionEnabled || response.error) return false;
+    const key = this.pendingKey(response.id, connId);
+    const pending = key ? this.pendingRequests.get(key) : undefined;
+    if (!pending) return false;
+
+    if (pending.method === "thread/start" && pending.runtimeContractHash) {
+      const threadId = (response.result as { thread?: { id?: unknown } } | undefined)?.thread?.id;
+      if (typeof threadId !== "string" || threadId.length === 0) {
+        return this.failTrackedRuntimeRequest(
+          response,
+          connId,
+          "Codex returned a successful thread/start response without thread.id; " +
+            "AgentBridge could not persist runtime-contract idempotency state.",
+        );
+      }
+      try {
+        persistCodexContractInjection(
+          this.runtimeStateDir,
+          threadId,
+          pending.runtimeContractHash,
+        );
+      } catch (error) {
+        return this.failTrackedRuntimeRequest(
+          response,
+          connId,
+          `AgentBridge injected the runtime contract but could not persist pair state: ${(error as Error).message}`,
+        );
+      }
+      this.log(`Runtime contract ${pending.runtimeContractHash} persisted for new thread ${threadId}`);
+      return false;
+    }
+
+    if (pending.method !== "thread/resume" || !this.isLatestThreadSwitch(pending)) {
+      return false;
+    }
+
+    const threadId = (response.result as { thread?: { id?: unknown } } | undefined)?.thread?.id;
+    if (typeof threadId !== "string" || threadId.length === 0) {
+      return this.failTrackedRuntimeRequest(
+        response,
+        connId,
+        "Codex returned a successful thread/resume response without thread.id; " +
+          "AgentBridge could not inject the runtime contract.",
+      );
+    }
+
+    const previousHash = readCodexContractHash(this.runtimeStateDir, threadId);
+    if (previousHash === this.runtimeContractHash) return false;
+
+    const compatibilityError = this.runtimeInjectionCompatibilityError();
+    if (compatibilityError) {
+      return this.failTrackedRuntimeRequest(response, connId, compatibilityError);
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      return this.failTrackedRuntimeRequest(
+        response,
+        connId,
+        "Codex app-server disconnected before AgentBridge could inject the runtime contract.",
+      );
+    }
+
+    const payload = previousHash === null
+      ? CODEX_DEVELOPER_CONTRACT
+      : codexContractSupersedePayload(previousHash);
+    const requestId = this.nextInjectionId--;
+    const timer = setTimeout(() => {
+      this.handleRuntimeContractInjectionTimeout(requestId);
+    }, this.runtimeInjectionTimeoutMs);
+    timer.unref?.();
+    const runtimeInjection: PendingRuntimeContractInjection = {
+      requestId,
+      connId,
+      threadId,
+      contractHash: this.runtimeContractHash,
+      resumeResponse: response,
+      timer,
+    };
+    this.pendingRuntimeContractInjections.set(requestId, runtimeInjection);
+
+    const params: ThreadInjectItemsParams = {
+      threadId,
+      items: [{
+        type: "message",
+        role: "developer",
+        content: [{ type: "input_text", text: payload }],
+      }],
+    };
+    try {
+      this.appServerWs.send(JSON.stringify({
+        id: requestId,
+        method: "thread/inject_items",
+        params,
+      }));
+    } catch (error) {
+      clearTimeout(timer);
+      this.pendingRuntimeContractInjections.delete(requestId);
+      return this.failTrackedRuntimeRequest(
+        response,
+        connId,
+        `AgentBridge could not send thread/inject_items: ${(error as Error).message}`,
+      );
+    }
+
+    this.log(
+      `Holding thread/resume for ${threadId} until runtime contract ${this.runtimeContractHash} ` +
+        `is acknowledged (request ${requestId}${previousHash ? `, supersedes ${previousHash}` : ""})`,
+    );
+    return null;
+  }
+
+  private completeRuntimeContractInjection(
+    response: AppServerResponse,
+    pending: PendingRuntimeContractInjection,
+  ): string | null {
+    clearTimeout(pending.timer);
+    this.pendingRuntimeContractInjections.delete(pending.requestId);
+
+    if (response.error) {
+      const detail = response.error.message ?? "unknown app-server error";
+      return this.failTrackedRuntimeRequest(
+        pending.resumeResponse,
+        pending.connId,
+        `Codex rejected AgentBridge thread/inject_items: ${detail}. ` +
+          "No AGENTS.md fallback was applied.",
+      );
+    }
+
+    try {
+      persistCodexContractInjection(
+        this.runtimeStateDir,
+        pending.threadId,
+        pending.contractHash,
+      );
+    } catch (error) {
+      return this.failTrackedRuntimeRequest(
+        pending.resumeResponse,
+        pending.connId,
+        `AgentBridge injected the runtime contract but could not persist pair state: ${(error as Error).message}`,
+      );
+    }
+
+    this.log(
+      `Runtime contract ${pending.contractHash} injected and persisted for resumed thread ${pending.threadId}`,
+    );
+    if (pending.connId !== this.tuiConnId) {
+      const key = this.pendingKey(pending.resumeResponse.id, pending.connId);
+      if (key) this.pendingRequests.delete(key);
+      this.log(
+        `Dropping deferred thread/resume response for retired TUI conn #${pending.connId}`,
+      );
+      return null;
+    }
+
+    try {
+      this.interceptServerMessage(pending.resumeResponse, pending.connId);
+    } catch (error) {
+      const message =
+        `AgentBridge injected and persisted the runtime contract, but failed to release ` +
+        `the resumed thread safely: ${(error as Error).message}`;
+      this.log(`Runtime contract resume release failed: ${message}`);
+      return this.runtimeErrorResponse(pending.resumeResponse.id, message);
+    }
+    return this.patchResponse(
+      pending.resumeResponse,
+      JSON.stringify(pending.resumeResponse),
+    );
+  }
+
+  private handleRuntimeContractInjectionTimeout(requestId: number): void {
+    const pending = this.pendingRuntimeContractInjections.get(requestId);
+    if (!pending) return;
+    this.pendingRuntimeContractInjections.delete(requestId);
+    const message =
+      `Timed out after ${this.runtimeInjectionTimeoutMs}ms waiting for Codex ` +
+      `thread/inject_items while resuming ${pending.threadId}. No AGENTS.md fallback was applied.`;
+    const response = this.failTrackedRuntimeRequest(
+      pending.resumeResponse,
+      pending.connId,
+      message,
+    );
+    if (pending.connId !== this.tuiConnId || !this.tuiWs) return;
+    try {
+      this.tuiWs.send(response);
+    } catch (error) {
+      this.log(`Failed to send runtime injection timeout to TUI: ${(error as Error).message}`);
+    }
+  }
+
+  private cancelRuntimeContractInjections(reason: string, notifyTui: boolean): void {
+    for (const pending of [...this.pendingRuntimeContractInjections.values()]) {
+      clearTimeout(pending.timer);
+      this.pendingRuntimeContractInjections.delete(pending.requestId);
+      const response = this.failTrackedRuntimeRequest(
+        pending.resumeResponse,
+        pending.connId,
+        `AgentBridge runtime contract injection was cancelled: ${reason}.`,
+      );
+      if (!notifyTui || pending.connId !== this.tuiConnId || !this.tuiWs) continue;
+      try {
+        this.tuiWs.send(response);
+      } catch (error) {
+        this.log(`Failed to send runtime injection cancellation to TUI: ${(error as Error).message}`);
+      }
+    }
+  }
+
+  private failTrackedRuntimeRequest(
+    successfulResponse: AppServerResponse,
+    connId: number,
+    message: string,
+  ): string {
+    this.log(`Runtime contract injection failed: ${message}`);
+    try {
+      this.interceptServerMessage({
+        id: successfulResponse.id,
+        error: {
+          code: CodexAdapter.RUNTIME_INJECTION_ERROR_CODE,
+          message,
+        },
+      }, connId);
+    } catch (error) {
+      // Never let an internal thread/inject_items response escape the proxy
+      // with its negative id merely because cleanup/replay code threw.
+      this.log(`Runtime contract failure cleanup also failed: ${(error as Error).message}`);
+    }
+    return this.runtimeErrorResponse(successfulResponse.id, message);
   }
 
   /**
@@ -2089,14 +2493,22 @@ export class CodexAdapter extends EventEmitter {
     if (!key || !isTrackedAppServerRequestMethod(method)) return;
 
     const pending: PendingRequest = { method };
-    if (method === "turn/start") {
-      const params = "params" in message && typeof message.params === "object" && message.params !== null
-        ? message.params as Record<string, unknown>
-        : undefined;
+    const params = "params" in message && typeof message.params === "object" && message.params !== null
+      ? message.params as Record<string, unknown>
+      : undefined;
+    if (method === "turn/start" || method === "thread/resume") {
       const threadId = params?.threadId;
       if (typeof threadId === "string" && threadId.length > 0) {
         pending.threadId = threadId;
       }
+    }
+    if (
+      method === "thread/start" &&
+      this.runtimeInjectionEnabled &&
+      typeof params?.developerInstructions === "string" &&
+      params.developerInstructions.includes(CODEX_DEVELOPER_CONTRACT)
+    ) {
+      pending.runtimeContractHash = this.runtimeContractHash;
     }
     // #70: stamp explicit thread switches (thread/start, thread/resume) with the
     // latest-issued sequence so an out-of-order OLD response can't clobber the

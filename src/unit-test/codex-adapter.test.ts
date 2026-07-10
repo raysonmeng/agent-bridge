@@ -1,6 +1,6 @@
 import { describe, expect, test } from "bun:test";
 import { execSync, spawn } from "node:child_process";
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, Socket, type AddressInfo, type Server } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -8,6 +8,16 @@ import { existsSync, writeFileSync } from "node:fs";
 import { CodexAdapter } from "../codex-adapter";
 import { TcpToUnixRelay } from "../codex-transport";
 import { CLIENT_REPLY_TIMEOUT_MS, MAX_INTERRUPT_TIMEOUT_MS } from "../interrupt-timing";
+import { StateDirResolver } from "../state-dir";
+import {
+  CODEX_DEVELOPER_CONTRACT,
+  codexContractSupersedePayload,
+  contractHash,
+} from "../collaboration-contract";
+import {
+  persistCodexContractInjection,
+  readCodexContractHash,
+} from "../thread-state";
 
 // Hermetic log sink: the constructor's default logFile resolves the REAL pair
 // state dir — these tests were appending into (and could rotate!) a live
@@ -15,7 +25,9 @@ import { CLIENT_REPLY_TIMEOUT_MS, MAX_INTERRUPT_TIMEOUT_MS } from "../interrupt-
 const TEST_LOG_FILE = join(mkdtempSync(join(tmpdir(), "abg-codex-adapter-test-")), "test.log");
 
 function createAdapter() {
-  return new CodexAdapter(4510, 4511, TEST_LOG_FILE) as any;
+  return new CodexAdapter(4510, 4511, TEST_LOG_FILE, {
+    runtimeInjection: { enabled: false },
+  }) as any;
 }
 
 function sleep(ms: number) {
@@ -238,6 +250,339 @@ describe("CodexAdapter app-server response handling", () => {
     expect(intercepted).toEqual([]);
 
     adapter.clearResponseTrackingState();
+  });
+});
+
+function createRuntimeAdapter(options: { version?: string | null; timeoutMs?: number } = {}) {
+  const root = mkdtempSync(join(tmpdir(), "abg-runtime-contract-test-"));
+  const stateDir = new StateDirResolver(join(root, "pair-state"));
+  const adapter = new CodexAdapter(4510, 4511, TEST_LOG_FILE, {
+    runtimeInjection: {
+      enabled: true,
+      stateDir,
+      timeoutMs: options.timeoutMs,
+    },
+  }) as any;
+  const version = options.version === undefined ? "0.144.1" : options.version;
+  adapter.appServerInfo = version === null
+    ? null
+    : {
+        version,
+        userAgent: `codex_cli_rs/${version}`,
+        platformFamily: "unix",
+        platformOs: "linux",
+      };
+  return {
+    adapter,
+    stateDir,
+    cleanup() {
+      adapter.cancelRuntimeContractInjections("test cleanup", false);
+      adapter.clearResponseTrackingState();
+      rmSync(root, { recursive: true, force: true });
+    },
+  };
+}
+
+describe("CodexAdapter runtime developer-contract injection", () => {
+  test("thread/start preserves client developerInstructions, appends the contract, and persists its hash", () => {
+    const runtime = createRuntimeAdapter();
+    const { adapter, stateDir } = runtime;
+    const appSent: string[] = [];
+    const tuiSent: string[] = [];
+    try {
+      adapter.appServerWs = {
+        readyState: WebSocket.OPEN,
+        send: (raw: string) => appSent.push(raw),
+      } as any;
+      adapter.tuiConnId = 1;
+      const ws = { data: { connId: 1 }, send: (raw: string) => tuiSent.push(raw) } as any;
+
+      adapter.onTuiMessage(ws, JSON.stringify({
+        id: "start-client",
+        method: "thread/start",
+        params: { cwd: "/repo", developerInstructions: "CLIENT CONTRACT" },
+      }));
+
+      expect(tuiSent).toEqual([]);
+      expect(appSent).toHaveLength(1);
+      const request = JSON.parse(appSent[0]);
+      expect(request.params.developerInstructions).toBe(
+        `CLIENT CONTRACT\n\n${CODEX_DEVELOPER_CONTRACT}`,
+      );
+
+      const forwarded = adapter.handleAppServerPayload(JSON.stringify({
+        id: request.id,
+        result: { thread: { id: "thread-new-contract" } },
+      }));
+      expect(JSON.parse(forwarded).id).toBe("start-client");
+      expect(readCodexContractHash(stateDir, "thread-new-contract")).toBe(contractHash());
+      expect(adapter.activeThreadId).toBe("thread-new-contract");
+    } finally {
+      runtime.cleanup();
+    }
+  });
+
+  test("runtime injection disabled leaves thread/start untouched even on an old protocol", () => {
+    const adapter = createAdapter();
+    const appSent: string[] = [];
+    adapter.appServerInfo = {
+      version: "0.100.0",
+      userAgent: "codex_cli_rs/0.100.0",
+      platformFamily: "unix",
+      platformOs: "linux",
+    };
+    adapter.appServerWs = {
+      readyState: WebSocket.OPEN,
+      send: (raw: string) => appSent.push(raw),
+    } as any;
+    adapter.tuiConnId = 1;
+
+    adapter.onTuiMessage({ data: { connId: 1 } } as any, JSON.stringify({
+      id: 1,
+      method: "thread/start",
+      params: { developerInstructions: "CLIENT ONLY" },
+    }));
+
+    expect(JSON.parse(appSent[0]).params.developerInstructions).toBe("CLIENT ONLY");
+    adapter.clearResponseTrackingState();
+  });
+
+  test("old Codex protocol receives an explicit error and no static-doc fallback", () => {
+    const runtime = createRuntimeAdapter({ version: "0.143.9" });
+    const { adapter } = runtime;
+    const appSent: string[] = [];
+    const tuiSent: string[] = [];
+    try {
+      adapter.appServerWs = {
+        readyState: WebSocket.OPEN,
+        send: (raw: string) => appSent.push(raw),
+      } as any;
+      adapter.tuiConnId = 1;
+      const ws = { data: { connId: 1 }, send: (raw: string) => tuiSent.push(raw) } as any;
+
+      adapter.onTuiMessage(ws, JSON.stringify({
+        id: "old-start",
+        method: "thread/start",
+        params: {},
+      }));
+
+      expect(appSent).toEqual([]);
+      expect(tuiSent).toHaveLength(1);
+      const error = JSON.parse(tuiSent[0]);
+      expect(error.id).toBe("old-start");
+      expect(error.error.message).toContain("requires Codex app-server >= 0.144.1");
+      expect(error.error.message).toContain("will not silently fall back");
+    } finally {
+      runtime.cleanup();
+    }
+  });
+
+  test("thread/resume is held until developer injection succeeds and state is persisted", () => {
+    const runtime = createRuntimeAdapter();
+    const { adapter, stateDir } = runtime;
+    const appSent: string[] = [];
+    const tuiSent: string[] = [];
+    try {
+      adapter.appServerWs = {
+        readyState: WebSocket.OPEN,
+        send: (raw: string) => appSent.push(raw),
+      } as any;
+      adapter.tuiConnId = 1;
+      const ws = { data: { connId: 1 }, send: (raw: string) => tuiSent.push(raw) } as any;
+      adapter.tuiWs = ws;
+      adapter.pendingServerRequests = [{
+        raw: JSON.stringify({
+          id: 77,
+          method: "item/fileChange/requestApproval",
+          params: { threadId: "thread-existing", file: "contract.ts" },
+        }),
+        serverId: 77,
+        method: "item/fileChange/requestApproval",
+        threadId: "thread-existing",
+      }];
+
+      adapter.onTuiMessage(ws, JSON.stringify({
+        id: "resume-client",
+        method: "thread/resume",
+        params: { threadId: "thread-existing" },
+      }));
+      const resumeRequest = JSON.parse(appSent[0]);
+      const held = adapter.handleAppServerPayload(JSON.stringify({
+        id: resumeRequest.id,
+        result: { thread: { id: "thread-existing" } },
+      }));
+
+      expect(held).toBeNull();
+      expect(adapter.activeThreadId).toBeNull();
+      expect(readCodexContractHash(stateDir, "thread-existing")).toBeNull();
+      expect(tuiSent).toEqual([]);
+      expect(adapter.pendingServerRequests).toHaveLength(1);
+      const injection = JSON.parse(appSent[1]);
+      expect(injection.method).toBe("thread/inject_items");
+      expect(injection.params.threadId).toBe("thread-existing");
+      expect(injection.params.items[0]).toEqual({
+        type: "message",
+        role: "developer",
+        content: [{ type: "input_text", text: CODEX_DEVELOPER_CONTRACT }],
+      });
+
+      const released = adapter.handleAppServerPayload(JSON.stringify({
+        id: injection.id,
+        result: {},
+      }));
+      expect(JSON.parse(released).id).toBe("resume-client");
+      expect(adapter.activeThreadId).toBe("thread-existing");
+      expect(readCodexContractHash(stateDir, "thread-existing")).toBe(contractHash());
+      expect(tuiSent).toHaveLength(1);
+      expect(JSON.parse(tuiSent[0]).method).toBe("item/fileChange/requestApproval");
+    } finally {
+      runtime.cleanup();
+    }
+  });
+
+  test("same (threadId, contractHash) skips injection, including after a Codex downgrade", () => {
+    const runtime = createRuntimeAdapter({ version: "0.100.0" });
+    const { adapter, stateDir } = runtime;
+    const appSent: string[] = [];
+    try {
+      persistCodexContractInjection(stateDir, "thread-known", contractHash());
+      adapter.appServerWs = {
+        readyState: WebSocket.OPEN,
+        send: (raw: string) => appSent.push(raw),
+      } as any;
+      adapter.tuiConnId = 1;
+      const ws = { data: { connId: 1 }, send: () => {} } as any;
+      adapter.tuiWs = ws;
+
+      adapter.onTuiMessage(ws, JSON.stringify({
+        id: 2,
+        method: "thread/resume",
+        params: { threadId: "thread-known" },
+      }));
+      const request = JSON.parse(appSent[0]);
+      const forwarded = adapter.handleAppServerPayload(JSON.stringify({
+        id: request.id,
+        result: { thread: { id: "thread-known" } },
+      }));
+
+      expect(JSON.parse(forwarded).id).toBe(2);
+      expect(appSent).toHaveLength(1);
+      expect(adapter.activeThreadId).toBe("thread-known");
+    } finally {
+      runtime.cleanup();
+    }
+  });
+
+  test("changed hash injects the content module's full supersede payload", () => {
+    const runtime = createRuntimeAdapter();
+    const { adapter, stateDir } = runtime;
+    const appSent: string[] = [];
+    try {
+      persistCodexContractInjection(stateDir, "thread-upgrade", "0123456789ab");
+      adapter.appServerWs = {
+        readyState: WebSocket.OPEN,
+        send: (raw: string) => appSent.push(raw),
+      } as any;
+      adapter.tuiConnId = 1;
+      const ws = { data: { connId: 1 }, send: () => {} } as any;
+      adapter.tuiWs = ws;
+
+      adapter.onTuiMessage(ws, JSON.stringify({
+        id: 3,
+        method: "thread/resume",
+        params: { threadId: "thread-upgrade" },
+      }));
+      const resume = JSON.parse(appSent[0]);
+      expect(adapter.handleAppServerPayload(JSON.stringify({
+        id: resume.id,
+        result: { thread: { id: "thread-upgrade" } },
+      }))).toBeNull();
+
+      const injection = JSON.parse(appSent[1]);
+      expect(injection.params.items[0].content[0].text).toBe(
+        codexContractSupersedePayload("0123456789ab"),
+      );
+      adapter.handleAppServerPayload(JSON.stringify({ id: injection.id, result: {} }));
+      expect(readCodexContractHash(stateDir, "thread-upgrade")).toBe(contractHash());
+    } finally {
+      runtime.cleanup();
+    }
+  });
+
+  test("thread/inject_items rejection terminates resume with an explicit client-id error", () => {
+    const runtime = createRuntimeAdapter();
+    const { adapter, stateDir } = runtime;
+    const appSent: string[] = [];
+    try {
+      adapter.appServerWs = {
+        readyState: WebSocket.OPEN,
+        send: (raw: string) => appSent.push(raw),
+      } as any;
+      adapter.tuiConnId = 1;
+      const ws = { data: { connId: 1 }, send: () => {} } as any;
+      adapter.tuiWs = ws;
+      adapter.onTuiMessage(ws, JSON.stringify({
+        id: "resume-rejected",
+        method: "thread/resume",
+        params: { threadId: "thread-rejected" },
+      }));
+      const resume = JSON.parse(appSent[0]);
+      adapter.handleAppServerPayload(JSON.stringify({
+        id: resume.id,
+        result: { thread: { id: "thread-rejected" } },
+      }));
+      const injection = JSON.parse(appSent[1]);
+
+      const rejected = adapter.handleAppServerPayload(JSON.stringify({
+        id: injection.id,
+        error: { code: -32601, message: "method not found" },
+      }));
+      const error = JSON.parse(rejected);
+      expect(error.id).toBe("resume-rejected");
+      expect(error.error.message).toContain("thread/inject_items");
+      expect(error.error.message).toContain("No AGENTS.md fallback");
+      expect(adapter.activeThreadId).toBeNull();
+      expect(readCodexContractHash(stateDir, "thread-rejected")).toBeNull();
+      expect(adapter.pendingRequests.size).toBe(0);
+    } finally {
+      runtime.cleanup();
+    }
+  });
+
+  test("thread/inject_items timeout sends a terminal resume error instead of hanging", async () => {
+    const runtime = createRuntimeAdapter({ timeoutMs: 20 });
+    const { adapter } = runtime;
+    const appSent: string[] = [];
+    const tuiSent: string[] = [];
+    try {
+      adapter.appServerWs = {
+        readyState: WebSocket.OPEN,
+        send: (raw: string) => appSent.push(raw),
+      } as any;
+      adapter.tuiConnId = 1;
+      const ws = { data: { connId: 1 }, send: (raw: string) => tuiSent.push(raw) } as any;
+      adapter.tuiWs = ws;
+      adapter.onTuiMessage(ws, JSON.stringify({
+        id: "resume-timeout",
+        method: "thread/resume",
+        params: { threadId: "thread-timeout" },
+      }));
+      const resume = JSON.parse(appSent[0]);
+      expect(adapter.handleAppServerPayload(JSON.stringify({
+        id: resume.id,
+        result: { thread: { id: "thread-timeout" } },
+      }))).toBeNull();
+
+      await sleep(60);
+      expect(tuiSent).toHaveLength(1);
+      const error = JSON.parse(tuiSent[0]);
+      expect(error.id).toBe("resume-timeout");
+      expect(error.error.message).toContain("Timed out after 20ms");
+      expect(adapter.pendingRuntimeContractInjections.size).toBe(0);
+      expect(adapter.pendingRequests.size).toBe(0);
+    } finally {
+      runtime.cleanup();
+    }
   });
 });
 
@@ -1530,7 +1875,9 @@ describe("CodexAdapter server-to-client request passthrough", () => {
       },
     });
 
-    const adapter = new CodexAdapter(server.port, 4511, TEST_LOG_FILE) as any;
+    const adapter = new CodexAdapter(server.port, 4511, TEST_LOG_FILE, {
+      runtimeInjection: { enabled: false },
+    }) as any;
     adapter.log = () => {};
     adapter.connIdCounter = 1;
     adapter.tuiConnId = 1;

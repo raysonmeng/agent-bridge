@@ -102,6 +102,23 @@ EOF
   # stale → sentinel consumed above; fall through to the normal health check below.
 fi
 
+# ── injection.runtime opt-out ────────────────────────────────────────────────
+# An explicit injection.runtime=false silences this hook for the workspace
+# ENTIRELY: the user opted the project out of runtime delivery, so neither
+# collaboration context nor start-the-bridge notices should reach the session.
+# The verdict comes from the SAME code path the context injection uses
+# (isRuntimeInjectionEnabled via the bundled helper's --check mode) — shell
+# never re-implements JSON parsing. Only a literal "disabled" exits; any
+# helper failure (missing bun/bundle, crash) fails OPEN so a broken helper
+# cannot mute the notices. The resume-ack sentinel above stays exempt on
+# purpose: it is a one-shot, consume-once recovery escape hatch.
+if command -v bun >/dev/null 2>&1 && [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
+  injection_state="$(bun "${CLAUDE_PLUGIN_ROOT}/server/bridge-server.js" --print-session-context --check --workspace "$workspace" 2>/dev/null || true)"
+  if [ "$injection_state" = "disabled" ]; then
+    exit 0
+  fi
+fi
+
 if ! command -v curl >/dev/null 2>&1; then
   exit 0
 fi
@@ -110,6 +127,40 @@ mkdir -p "$state_root" 2>/dev/null || true
 workspace_key="$(printf '%s' "$workspace" | cksum | awk '{print $1}')"
 stamp_file="${state_root}/sessionstart-${workspace_key}.stamp"
 now="$(date +%s)"
+
+# In-session plugin-update reminder: compare the INSTALLED plugin version against
+# the latest npm version cached by the CLI notifier (src/update-notifier.ts). This
+# is how a user who updated the npm CLI but not the plugin learns of the mismatch
+# from inside Claude Code. Best-effort + silent: never blocks the hook.
+# Computed BEFORE the cooldown gate because the runtime-context path below
+# bypasses that gate and also carries the notice.
+plugin_notice=""
+if command -v bun >/dev/null 2>&1 && [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
+  plugin_notice="$(bun "${CLAUDE_PLUGIN_ROOT}/scripts/plugin-update-notice.mjs" "${CLAUDE_PLUGIN_ROOT}/.claude-plugin/plugin.json" 2>/dev/null || true)"
+fi
+
+health_json="$(curl -fsS --max-time 1 "http://127.0.0.1:${port}/healthz" 2>/dev/null || true)"
+
+tui_connected="false"
+if [ -n "$health_json" ] && printf '%s' "$health_json" | grep -q '"tuiConnected":true'; then
+  tui_connected="true"
+fi
+
+# ── Runtime collaboration context (the pluggable CLAUDE.md replacement) ──────
+# When the bridge is fully up (daemon healthy + Codex TUI attached), delegate to
+# the bundled server entry: it decides whether `injection.runtime` allows it and
+# prints the COMPLETE hook JSON (status line + collaboration context). This path
+# deliberately BYPASSES the cooldown stamp — the context is load-bearing and
+# every new session (startup/resume/clear/compact) must receive it, unlike the
+# informational notices below. Empty output (injection disabled by config, or
+# the entry failed) falls through to the cooldown-gated short notices.
+if [ "$tui_connected" = "true" ] && command -v bun >/dev/null 2>&1 && [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
+  context_json="$(bun "${CLAUDE_PLUGIN_ROOT}/server/bridge-server.js" --print-session-context --workspace "$workspace" --notice "${plugin_notice}" 2>/dev/null || true)"
+  if [ -n "$context_json" ]; then
+    printf '%s\n' "$context_json"
+    exit 0
+  fi
+fi
 
 if [ -f "$stamp_file" ]; then
   last_notice="$(cat "$stamp_file" 2>/dev/null || echo 0)"
@@ -120,23 +171,7 @@ fi
 
 printf '%s' "$now" >"$stamp_file" 2>/dev/null || true
 
-# In-session plugin-update reminder: compare the INSTALLED plugin version against
-# the latest npm version cached by the CLI notifier (src/update-notifier.ts). This
-# is how a user who updated the npm CLI but not the plugin learns of the mismatch
-# from inside Claude Code. Best-effort + silent: never blocks the hook.
-plugin_notice=""
-if command -v bun >/dev/null 2>&1 && [ -n "${CLAUDE_PLUGIN_ROOT:-}" ]; then
-  plugin_notice="$(bun "${CLAUDE_PLUGIN_ROOT}/scripts/plugin-update-notice.mjs" "${CLAUDE_PLUGIN_ROOT}/.claude-plugin/plugin.json" 2>/dev/null || true)"
-fi
-
-health_json="$(curl -fsS --max-time 1 "http://127.0.0.1:${port}/healthz" 2>/dev/null || true)"
-
 if [ -n "$health_json" ]; then
-  tui_connected="false"
-  if printf '%s' "$health_json" | grep -q '"tuiConnected":true'; then
-    tui_connected="true"
-  fi
-
   if [ "$tui_connected" = "true" ]; then
     cat <<EOF
 {"hookSpecificOutput":{"hookEventName":"SessionStart","additionalContext":"AgentBridge is running. Daemon healthy, Codex TUI connected. Bridge is ready for communication.${plugin_notice:+ $plugin_notice}"}}

@@ -6,7 +6,10 @@ import { StateDirResolver } from "../state-dir";
 import {
   findCodexRolloutFile,
   persistCurrentThreadWithRolloutRetry,
+  persistCodexContractInjection,
   promoteCurrentThreadIfRolloutExists,
+  readCodexContractHash,
+  readCodexContractState,
   readRawCurrentThread,
   readUsableCurrentThread,
   writePendingCurrentThread,
@@ -27,6 +30,55 @@ function identity(root: string, codexHome: string) {
 }
 
 describe("thread-state", () => {
+  test("persists runtime contract idempotency per (threadId, contractHash)", () => {
+    const root = tempDir("agentbridge-contract-state-");
+    try {
+      const stateDir = new StateDirResolver(join(root, "pair-state"));
+      persistCodexContractInjection(stateDir, "thread-A", "aaaaaaaaaaaa");
+      persistCodexContractInjection(stateDir, "thread-B", "bbbbbbbbbbbb");
+
+      expect(readCodexContractHash(stateDir, "thread-A")).toBe("aaaaaaaaaaaa");
+      expect(readCodexContractHash(stateDir, "thread-B")).toBe("bbbbbbbbbbbb");
+      expect(readCodexContractHash(stateDir, "thread-missing")).toBeNull();
+
+      persistCodexContractInjection(stateDir, "thread-A", "cccccccccccc");
+      const state = readCodexContractState(stateDir);
+      expect(state.version).toBe(1);
+      expect(state.injections).toHaveLength(2);
+      expect(readCodexContractHash(stateDir, "thread-A")).toBe("cccccccccccc");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("missing or corrupt runtime contract state is treated as empty", () => {
+    const root = tempDir("agentbridge-contract-state-");
+    try {
+      const stateDir = new StateDirResolver(join(root, "pair-state"));
+      expect(readCodexContractState(stateDir)).toEqual({ version: 1, injections: [] });
+
+      mkdirSync(stateDir.dir, { recursive: true });
+      writeFileSync(stateDir.codexContractStateFile, "{broken", "utf-8");
+      expect(readCodexContractState(stateDir)).toEqual({ version: 1, injections: [] });
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  test("rejects invalid contract hashes instead of interpolating untrusted state", () => {
+    const root = tempDir("agentbridge-contract-state-");
+    try {
+      const stateDir = new StateDirResolver(join(root, "pair-state"));
+      expect(() => persistCodexContractInjection(
+        stateDir,
+        "thread-A",
+        "not-a-contract-hash",
+      )).toThrow("12-character lowercase hex hash");
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   test("pending current thread is not usable for resume", () => {
     const root = tempDir("agentbridge-thread-state-");
     const codexHome = tempDir("agentbridge-codex-home-");

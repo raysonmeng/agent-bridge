@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.30", "0.0.0-source"),
-  commit: defineString("99d0f4a", "source"),
+  commit: defineString("a3e927f", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("0cb79932198b", "source")
+  codeHash: defineString("c90d680de869", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -281,6 +281,9 @@ class StateDirResolver {
   get currentThreadFile() {
     return join(this.stateDir, "current-thread.json");
   }
+  get codexContractStateFile() {
+    return join(this.stateDir, "codex-contracts.json");
+  }
   get logFile() {
     return join(this.stateDir, "agentbridge.log");
   }
@@ -296,6 +299,310 @@ class StateDirResolver {
   get updateCheckFile() {
     return join(this.stateDir, "update-check.json");
   }
+}
+
+// src/thread-state.ts
+import {
+  existsSync as existsSync2,
+  readdirSync,
+  readFileSync as readFileSync2
+} from "fs";
+import { homedir as homedir2 } from "os";
+import { basename, join as join2 } from "path";
+var MAX_CODEX_CONTRACT_INJECTIONS = 256;
+var CODEX_CONTRACT_HASH_RE = /^[0-9a-f]{12}$/;
+function nowIso() {
+  return new Date().toISOString();
+}
+function threadTag(identity) {
+  const name = identity.pairName ?? identity.pairId ?? "manual";
+  return `abg:${name}:${identity.cwd}`;
+}
+function codexHome(env = process.env) {
+  return env.CODEX_HOME && env.CODEX_HOME.length > 0 ? env.CODEX_HOME : join2(homedir2(), ".codex");
+}
+function readRawCurrentThread(stateDir) {
+  try {
+    const parsed = JSON.parse(readFileSync2(stateDir.currentThreadFile, "utf-8"));
+    if (parsed?.version === 1 && typeof parsed.threadId === "string" && parsed.threadId.length > 0 && (parsed.status === "pending" || parsed.status === "current") && typeof parsed.cwd === "string") {
+      return parsed;
+    }
+  } catch {}
+  return null;
+}
+function parseCodexContractInjection(value) {
+  if (typeof value !== "object" || value === null || Array.isArray(value))
+    return null;
+  const record = value;
+  if (typeof record.threadId !== "string" || record.threadId.length === 0 || typeof record.contractHash !== "string" || !CODEX_CONTRACT_HASH_RE.test(record.contractHash) || typeof record.injectedAt !== "string" || record.injectedAt.length === 0) {
+    return null;
+  }
+  return {
+    threadId: record.threadId,
+    contractHash: record.contractHash,
+    injectedAt: record.injectedAt
+  };
+}
+function readCodexContractState(stateDir) {
+  try {
+    const parsed = JSON.parse(readFileSync2(stateDir.codexContractStateFile, "utf-8"));
+    if (parsed?.version !== 1 || !Array.isArray(parsed.injections)) {
+      return { version: 1, injections: [] };
+    }
+    return {
+      version: 1,
+      injections: parsed.injections.map(parseCodexContractInjection).filter((entry) => entry !== null).slice(-MAX_CODEX_CONTRACT_INJECTIONS)
+    };
+  } catch {
+    return { version: 1, injections: [] };
+  }
+}
+function readCodexContractHash(stateDir, threadId) {
+  const injections = readCodexContractState(stateDir).injections;
+  for (let index = injections.length - 1;index >= 0; index--) {
+    if (injections[index]?.threadId === threadId) {
+      return injections[index].contractHash;
+    }
+  }
+  return null;
+}
+function persistCodexContractInjection(stateDir, threadId, contractHash) {
+  if (!threadId || !CODEX_CONTRACT_HASH_RE.test(contractHash)) {
+    throw new Error("Codex contract state requires a non-empty threadId and a 12-character lowercase hex hash");
+  }
+  const prior = readCodexContractState(stateDir).injections.filter((entry) => entry.threadId !== threadId);
+  const state = {
+    version: 1,
+    injections: [
+      ...prior,
+      { threadId, contractHash, injectedAt: nowIso() }
+    ].slice(-MAX_CODEX_CONTRACT_INJECTIONS)
+  };
+  atomicWriteJson(stateDir.codexContractStateFile, state);
+  return state;
+}
+function findCodexRolloutFile(threadId, env = process.env, maxEntries = 20000) {
+  const sessionsDir = join2(codexHome(env), "sessions");
+  if (!threadId || !existsSync2(sessionsDir))
+    return null;
+  const exactName = `rollout-${threadId}.jsonl`;
+  const stack = [sessionsDir];
+  let visited = 0;
+  while (stack.length > 0 && visited < maxEntries) {
+    const dir = stack.pop();
+    let entries;
+    try {
+      entries = readdirSync(dir, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      visited++;
+      const path = join2(dir, entry.name);
+      if (entry.isDirectory()) {
+        stack.push(path);
+        continue;
+      }
+      if (!entry.isFile())
+        continue;
+      const name = basename(entry.name);
+      if (name === exactName || name.startsWith("rollout-") && name.endsWith(".jsonl") && name.includes(threadId)) {
+        return path;
+      }
+    }
+  }
+  return null;
+}
+function writePendingCurrentThread(identity, threadId, reason) {
+  const state = {
+    version: 1,
+    status: "pending",
+    pairId: identity.pairId,
+    pairName: identity.pairName,
+    cwd: identity.cwd,
+    threadId,
+    updatedAt: nowIso(),
+    reason,
+    tag: threadTag(identity)
+  };
+  atomicWriteJson(identity.stateDir.currentThreadFile, state);
+  return state;
+}
+function promoteCurrentThreadIfRolloutExists(identity, threadId, reason, env = process.env) {
+  const rolloutPath = findCodexRolloutFile(threadId, env);
+  const state = {
+    version: 1,
+    status: rolloutPath ? "current" : "pending",
+    pairId: identity.pairId,
+    pairName: identity.pairName,
+    cwd: identity.cwd,
+    threadId,
+    updatedAt: nowIso(),
+    reason,
+    tag: threadTag(identity),
+    ...rolloutPath ? { rolloutPath, rolloutVerifiedAt: nowIso() } : {}
+  };
+  atomicWriteJson(identity.stateDir.currentThreadFile, state);
+  return state;
+}
+async function persistCurrentThreadWithRolloutRetry(identity, threadId, reason, options = {}) {
+  const env = options.env ?? process.env;
+  const attempts = options.attempts ?? 20;
+  const delayMs = options.delayMs ?? 250;
+  const shouldContinue = options.shouldContinue ?? (() => true);
+  if (!shouldContinue())
+    return null;
+  writePendingCurrentThread(identity, threadId, reason);
+  for (let attempt = 1;attempt <= attempts; attempt++) {
+    if (!shouldContinue()) {
+      options.log?.(`Abandoned current-thread persistence for ${threadId}: a newer thread became active`);
+      return null;
+    }
+    const state = promoteCurrentThreadIfRolloutExists(identity, threadId, reason, env);
+    if (state.status === "current") {
+      options.log?.(`Current Codex thread persisted: ${threadId} (${state.rolloutPath})`);
+      return state;
+    }
+    if (attempt < attempts) {
+      await new Promise((resolve) => setTimeout(resolve, delayMs));
+    }
+  }
+  if (!shouldContinue())
+    return null;
+  options.log?.(`Current Codex thread left pending because no rollout file was found: ${threadId}`);
+  return readRawCurrentThread(identity.stateDir) ?? writePendingCurrentThread(identity, threadId, reason);
+}
+
+// src/collaboration-contract.ts
+import { createHash } from "crypto";
+
+// src/collaboration-content.ts
+var BUDGET_PACING = `### Budget pacing \u2014 drive the WEEKLY quota to ~100% over the week, evenly, without reaching a 5h cap (active when agent-quota-guard is installed)
+- **Core principle: token is the means, value is the end.** Raising intensity means producing more real parallel value (deeper reviews, more independent exploration / verification / genuine subtasks) \u2014 never manufacturing low-value work to consume quota. The budget to MAXIMIZE is the **weekly** quota (refreshed once a week): drive each side's weekly toward ~100% by its weekly reset, and consume it **evenly** across the week \u2014 front-loading then starving, or under-consuming throughout, both leave weekly quota unredeemed (forfeited). The **5h window is NOT a quota bucket to fill \u2014 it is a RATE CAP**: stay under it within any 5h period; reaching it = a forced pause until the 5h resets = wasted time, not progress.
+- **Re-query your budget before EVERY allocation decision** \u2014 Claude: \`get_budget\` \u2192 **rendered text** covering both sides; Codex: \`check_budget\` with \`agent:"claude"|"codex"\` \u2192 **normalized JSON**, per side. (Two different shapes \u2014 read the right one below.) Never reuse remembered numbers: a weekly window can refresh EARLY (resetting both 5h and weekly), fully restoring a side you believed was exhausted.
+- **Even-pacing test (per side \u2014 Claude runs it)** \u2014 compare two quantities: *budget-windows* = how many 5h windows the weekly quota still covers at the current burn rate; *clock-windows* = how many 5h windows physically fit before the weekly reset = (weekly reset \u2212 now) \xF7 5h. **Claude** (\`get_budget\` text) carries BOTH, pre-computed for BOTH sides: the lines "\u6309\u5F53\u524D\u8282\u594F\uFF0C\u5468\u989D\u5EA6\u8FD8\u591F \u2026 \u4E2A 5h \u7A97\u53E3" (budget-windows) and "\u8DDD\u5468\u5237\u65B0\u8FD8\u80FD\u5BB9\u7EB3 \u2026 \u4E2A 5h \u7A97\u53E3\uFF08\u65F6\u949F\uFF09" (clock-windows). **Codex** (\`check_budget\` JSON) today carries only per-bucket \`util\` / \`reset_epoch\` / \`reset_after_seconds\` \u2014 no burn rate, no \`five_hour_windows_left\` \u2014 so Codex CANNOT compute budget-windows itself; it reads its weekly \`util\` and clock-windows only. To locate Codex's weekly bucket: of the \`buckets[]\` entries whose \`id\` contains \`seven_day\` or \`secondary_window\` (there can be several \u2014 e.g. a model-specific \`additional_rate_limits[\u2026]\` one at 0%), take the HIGHEST-util one (the binding account-level window, matching how the bridge parses it); its clock-windows = \`reset_after_seconds\` \xF7 5h (never the top-level \`reset_epoch\`, which tracks the current limiter, not necessarily the weekly window). For the budget-windows half and the raise/hold/reduce verdict, Codex relies on Claude's \`get_budget\` (the burn projection lives there, for both sides) and reports its own weekly \`util\` + reset timing so Claude can run the test. (If a future \`check_budget\` exposes \`five_hour_windows_left\` on the weekly bucket, Codex reads it directly.) **The verdict (Claude computes it, per side):** budget > clock \u2192 **under-consuming** (weekly will be left unused) \u2192 **raise intensity**; budget < clock \u2192 **over-consuming** (won't last to the weekly reset) \u2192 **reduce intensity**; within ~1 window, or no confident rate \u2192 **hold**. **Codex, absent a fresh Claude verdict, holds at its current intensity (it never escalates unilaterally) and stays clear of the 5h cap \u2014 surfacing its weekly \`util\` + reset timing so Claude can issue the verdict.**
+- **Raise intensity \u2014 use the levers your role has.** Orchestrator (Claude): pick larger, more-decomposable tasks; run more parallel subagents at once (3\u20135+ vs 1); raise delegation density; open more concurrent streams (review + explore + verify in parallel). Executor (Codex): go deeper in-turn, take larger chunks, run more verification/repro. Both: deepen quality (multi-angle review, broader test/repro) \u2014 never manufacture make-work. **Reduce intensity:** fewer/serial subagents (Claude), short bounded chunks, defer optional deep work. Stay below the **\u52A8\u6001\u6682\u505C\u7EBF** (shown in \`get_budget\`; its \`\u4F59\u91CF\` = headroom from your current util to that soft line, measured on the resettable hard-winner window \u2014 the 5h OR the weekly window, whichever currently limits you) \u2014 that soft ceiling, not the raw 5h cap, is the "do not cross, avoid a forced pause" line. **If that line is absent, or you only have JSON (Codex),** fall back to the 5h bucket's raw util vs 100% (Codex: of the \`buckets[]\` entries whose \`id\` contains \`five_hour\` or \`primary_window\`, take the HIGHEST-util one) and keep clear of the 5h cap.
+- **Distinguish 5h from weekly:** a 5h window resetting does NOT consume or waste weekly budget \u2014 it only refreshes your rate headroom, so you can keep going when weekly is under-consumed. A near 5h reset is therefore not urgency but the release of a rate limit. The real "unused = forfeited" is the **weekly budget as its WEEKLY reset nears**: if weekly is still under-consumed then, raise intensity (within the 5h cap) to use it. If even pacing needs a rate beyond one 5h window's capacity, you are rate-limited \u2192 keep each 5h window as full as possible (under the cap).
+- **Two-subscription imbalance \u2014 the quotas are INDEPENDENT and differ in BOTH amount AND reset timing** (each side's weekly and 5h windows reset on different clocks). **The cross-side split is the orchestrator's (Claude) decision:** route more work to the side that is MORE under-consuming on the even-pacing test (the larger budget-windows \u2212 clock-windows gap); when EITHER side lacks a confident rate (so the gap can't be compared), fall back to the more budget-rich side (larger absolute weekly headroom). On any tie (equal gap, or equal headroom), prefer the side whose **weekly resets SOONER** (its leftover is forfeited earlier). **As the executor (Codex) you do NOT decide the global split** \u2014 execute what you're assigned, and when your own budget is rich report it (with evidence) so Claude routes more to you. The tighter / over-consuming side carries less.
+- **Side-aware pause (the hard floor the code enforces \u2014 obey, do not reinvent), with each side's own action:** **Codex exhausted** (\`system_budget_pause\`) \u2192 Codex's turns stop (gate closed); **Claude** must not retry replies and continues solo on independent work, checkpointing the split point \u2014 but the SAME \`system_budget_pause\` is ALSO emitted when both sides are exhausted, so do not infer "solo" from the directive name alone: read its content (it names the paused side[s]) or re-check \`get_budget\`, and continue solo ONLY while Claude's own side is healthy; if Claude is also at its line, handle it as **Both** below. **Claude exhausted** (\`system_budget_handoff\`) \u2192 **Claude** sends ONE handoff (remaining tasks / context / artifact locations / acceptance criteria) then stops; **Codex** receives the baton and carries the work forward as far as its remaining quota allows that turn. **Both** \u2192 joint pause; checkpoint and wait for \`resume\` (Claude's own quota-guard also hard-stops Claude independently). A transient probe **429 is NOT exhaustion** \u2192 fall back to cached util and keep working.`;
+var CLAUDE_MD_SECTION = `## AgentBridge \u2014 Multi-Agent Collaboration
+
+You are working in a **multi-agent environment** powered by AgentBridge.
+Another AI agent (Codex, by OpenAI) is available in a parallel session on this machine.
+
+### Communication mechanism
+- **Claude \u2192 Codex**: Use the AgentBridge MCP tools (\`reply\` / \`get_messages\`) \u2014 these are yours only.
+- **Codex \u2192 Claude**: Codex has no symmetric tool. The bridge transparently intercepts Codex's normal output and forwards it to you as push notifications (if a push fails, drain the fallback queue with \`get_messages\`).
+- If Codex ever complains it can't find a "send-to-Claude" API, remind it that its side is transparent \u2014 it just writes a reply and you'll see it.
+
+### When to collaborate vs. work solo
+- **Collaborate** when the task benefits from a second perspective, parallel execution, or capabilities you lack (e.g., sandboxed code execution, independent verification).
+- **Work solo** for simple, self-contained tasks where the coordination overhead isn't worth it.
+- When in doubt, **propose a task split** to Codex rather than doing everything yourself.
+
+### Capability comparison
+| Capability | Claude (you) | Codex |
+|---|---|---|
+| Architecture & planning | Strong | Moderate |
+| Code review & analysis | Strong | Strong |
+| Sandboxed code execution | No | Yes |
+| File editing & refactoring | Yes (via tools) | Yes (via sandbox) |
+| Web search & docs | Yes | Limited |
+| Independent verification | Cross-review | Reproduce & test |
+
+### How to start collaborating
+1. When you receive a complex task, **proactively propose a division of labor** to Codex via the reply tool.
+2. State what you'll handle and what you'd like Codex to take on.
+3. Ask for Codex's agreement or counter-proposal before proceeding.
+4. After task completion, **cross-review** each other's work.
+
+${BUDGET_PACING}`;
+var AGENTS_MD_SECTION = `## AgentBridge \u2014 Multi-Agent Collaboration
+
+You are working in a **multi-agent environment** powered by AgentBridge.
+Another AI agent (Claude, by Anthropic) is available in a parallel session on this machine.
+
+### Communication mechanism (read this first)
+AgentBridge is a **transparent proxy** on your side. You do **not** have a tool to "send a message to Claude".
+
+- **Codex \u2192 Claude**: Just write your normal response. The bridge intercepts your \`agentMessage\` output and forwards it to Claude automatically. No tool call needed.
+- **Claude \u2192 Codex**: Claude uses its own MCP tools (\`reply\` / \`get_messages\`). Those messages arrive in your session as new user turns \u2014 you'll see them like any other user input.
+
+**Do not** search the AgentBridge source for a Codex-side "send" / "reply" / "sendToClaude" API \u2014 it does not exist, and looking for it wastes turns. If you catch yourself thinking "I need to find how to message Claude", stop and just write your reply as normal text.
+
+### When to collaborate vs. work solo
+- **Collaborate** when the task benefits from a second perspective, parallel execution, or capabilities the other agent has.
+- **Work solo** for simple, self-contained tasks where the coordination overhead isn't worth it.
+- When in doubt, **propose a task split** to Claude rather than doing everything yourself.
+
+### Capability comparison
+| Capability | Codex (you) | Claude |
+|---|---|---|
+| Sandboxed code execution | Yes | No |
+| Reproduce & verify bugs | Strong | Limited |
+| Architecture & planning | Moderate | Strong |
+| Code review & analysis | Strong | Strong |
+| Web search & docs | Limited | Yes |
+| File editing & refactoring | Yes (via sandbox) | Yes (via tools) |
+
+### How to start collaborating
+1. When you receive a complex task, **proactively propose a division of labor** in your response (Claude will receive it).
+2. State what you'll handle and what you'd like Claude to take on.
+3. Ask for Claude's agreement or counter-proposal before proceeding.
+4. After task completion, **cross-review** each other's work.
+
+### Message markers
+Put a marker at the **very start** of each \`agentMessage\` (it must be the first text \u2014 e.g. \`[IMPORTANT] Task done\`, not \`Task done [IMPORTANT]\`):
+- \`[IMPORTANT]\` \u2014 decisions, reviews, completions, blockers
+- \`[STATUS]\` \u2014 progress updates
+- \`[FYI]\` \u2014 background context
+
+Keep \`agentMessage\` for high-value communication only.
+
+### Git operations \u2014 FORBIDDEN for you
+You MUST NOT run git **write** commands: \`commit\`, \`push\`, \`pull\`, \`fetch\`, \`checkout -b\`, \`branch\`, \`merge\`, \`rebase\`, \`cherry-pick\`, \`tag\`, \`stash\`. They write the \`.git\` directory (blocked by your sandbox) and will hang your session. Read-only git (\`status\`, \`log\`, \`diff\`, \`show\`, \`rev-parse\`) is fine. Delegate **all** git writes to Claude: report what you changed and let Claude handle branching, committing, and pushing.
+
+### Role guidance
+- Your default role: **Implementer, Executor, Verifier**.
+- Analytical / review tasks: **Independent Analysis & Convergence**.
+- Implementation tasks: **Architect \u2192 Builder \u2192 Critic**.
+- Debugging tasks: **Hypothesis \u2192 Experiment \u2192 Interpretation**.
+- Do not blindly follow Claude \u2014 challenge with evidence when you disagree.
+- Use explicit collaboration phrases: "My independent view is:", "I agree on:", "I disagree on:", "Current consensus:".
+
+${BUDGET_PACING}`;
+
+// src/collaboration-contract.ts
+var CODEX_CONTRACT_SCOPE_CLAUSE = `[AgentBridge runtime contract \u2014 read this scope rule first]
+This developer context is injected by AgentBridge (a local Claude<->Codex
+bridge) and is BINDING ONLY while the bridge is actively attached to this
+thread. The ONLY proof of attachment is bridged messages from Claude (or
+AgentBridge system notices) arriving in the CURRENT session. Collaborate when
+such messages arrive. NEVER wait for, block on, or address Claude merely
+because this contract exists. If this thread was resumed outside the bridge
+(no bridged messages in the current session), ignore everything below and
+operate as a normal solo Codex session.`;
+var CLAUDE_CONTEXT_SCOPE_CLAUSE = `[AgentBridge runtime context]
+Injected by the AgentBridge plugin because the bridge daemon was healthy when
+this session started. If the bridge later becomes unreachable (reply tool
+errors, no channel messages arriving), treat collaboration as unavailable and
+continue solo \u2014 do not wait for Codex.`;
+var CODEX_DEVELOPER_CONTRACT = `${CODEX_CONTRACT_SCOPE_CLAUSE}
+
+${AGENTS_MD_SECTION}`;
+var CLAUDE_SESSION_CONTEXT = `${CLAUDE_CONTEXT_SCOPE_CLAUSE}
+
+${CLAUDE_MD_SECTION}`;
+function contractHash(content = CODEX_DEVELOPER_CONTRACT) {
+  return createHash("sha256").update(content, "utf8").digest("hex").slice(0, 12);
+}
+function codexContractSupersedePayload(previousHash) {
+  return `[AgentBridge contract update]
+This REPLACES the AgentBridge runtime contract injected earlier in this thread
+(hash ${previousHash}). Disregard that earlier version entirely and follow only
+the contract below.
+
+${CODEX_DEVELOPER_CONTRACT}`;
 }
 
 // src/port-cleanup.ts
@@ -399,11 +706,11 @@ async function cleanupPorts(options) {
 }
 
 // src/rotating-log.ts
-import { appendFileSync, existsSync as existsSync2, renameSync as renameSync2, statSync, unlinkSync as unlinkSync2 } from "fs";
+import { appendFileSync, existsSync as existsSync3, renameSync as renameSync2, statSync, unlinkSync as unlinkSync2 } from "fs";
 import { dirname as dirname2 } from "path";
 var DEFAULT_MAX_BYTES = 5 * 1024 * 1024;
 var DEFAULT_KEEP = 3;
-var REAL_FS_OPS = { statSync, renameSync: renameSync2, unlinkSync: unlinkSync2, appendFileSync, existsSync: existsSync2 };
+var REAL_FS_OPS = { statSync, renameSync: renameSync2, unlinkSync: unlinkSync2, appendFileSync, existsSync: existsSync3 };
 function appendRotatingLog(path, content, options = {}, fsOps = REAL_FS_OPS) {
   const maxBytes = options.maxBytes ?? positiveIntFromEnv("AGENTBRIDGE_LOG_MAX_BYTES", DEFAULT_MAX_BYTES);
   const keep = options.keep ?? positiveIntFromEnv("AGENTBRIDGE_LOG_ROTATE_KEEP", DEFAULT_KEEP);
@@ -615,7 +922,7 @@ function clampInterruptTimeoutMs(requested) {
 import { createServer, connect } from "net";
 import { spawnSync } from "child_process";
 import { mkdirSync as mkdirSync3, rmSync, chmodSync } from "fs";
-import { join as join2 } from "path";
+import { join as join3 } from "path";
 import { tmpdir } from "os";
 var CODEX_TRANSPORT_ENV = "AGENTBRIDGE_CODEX_TRANSPORT";
 var HEADER_SEP = `\r
@@ -664,8 +971,8 @@ function resolveCodexTransport(mode, runHelp = defaultRunCodexAppServerHelp) {
 }
 function codexSocketPath(appPort, baseTmpDir = tmpdir()) {
   const uid = typeof process.getuid === "function" ? process.getuid() : 0;
-  const dir = join2(baseTmpDir, `agentbridge-${uid}`);
-  const path = join2(dir, `codex-${appPort}.sock`);
+  const dir = join3(baseTmpDir, `agentbridge-${uid}`);
+  const path = join3(dir, `codex-${appPort}.sock`);
   if (path.length >= 104) {
     throw new Error(`Codex unix socket path is too long for the platform (${path.length} >= 104): ${path}. ` + `Set a shorter TMPDIR or use ${CODEX_TRANSPORT_ENV}=ws.`);
   }
@@ -944,9 +1251,31 @@ class PendingRequestRegistry {
   }
 }
 
+// src/version-utils.ts
+var STABLE_SEMVER_RE = /^\d+\.\d+\.\d+$/;
+function isStableVersion(v) {
+  return STABLE_SEMVER_RE.test(v.trim());
+}
+function compareVersions(a, b) {
+  const pa = a.split(".").map(Number);
+  const pb = b.split(".").map(Number);
+  for (let i = 0;i < 3; i++) {
+    const va = pa[i] ?? 0;
+    const vb = pb[i] ?? 0;
+    if (va < vb)
+      return -1;
+    if (va > vb)
+      return 1;
+  }
+  return 0;
+}
+
 // src/codex-adapter.ts
 class CodexAdapter extends EventEmitter {
   static RESPONSE_TRACKING_TTL_MS = 30000;
+  static MIN_RUNTIME_INJECTION_VERSION = "0.144.1";
+  static RUNTIME_INJECTION_TIMEOUT_MS = 5000;
+  static RUNTIME_INJECTION_ERROR_CODE = -32041;
   proc = null;
   appServerPid = null;
   appServerWs = null;
@@ -961,6 +1290,11 @@ class CodexAdapter extends EventEmitter {
   proxyPort;
   logFile;
   logger;
+  runtimeInjectionEnabled;
+  runtimeStateDir;
+  runtimeContractHash;
+  runtimeInjectionTimeoutMs;
+  pendingRuntimeContractInjections = new Map;
   tuiConnId = 0;
   connIdCounter = 0;
   secondaryConnections = new Map;
@@ -1001,12 +1335,16 @@ class CodexAdapter extends EventEmitter {
   replayPending = new PendingRequestRegistry;
   replayMethods = new Map;
   static SESSION_REPLAY_TIMEOUT_MS = 5000;
-  constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile) {
+  constructor(appPort = 4500, proxyPort = 4501, logFile = new StateDirResolver().logFile, options = {}) {
     super();
     this.appPort = appPort;
     this.proxyPort = proxyPort;
     this.logFile = logFile;
     this.logger = createProcessLogger({ component: "CodexAdapter", logFile: this.logFile });
+    this.runtimeInjectionEnabled = options.runtimeInjection?.enabled ?? true;
+    this.runtimeStateDir = options.runtimeInjection?.stateDir ?? new StateDirResolver;
+    this.runtimeContractHash = contractHash();
+    this.runtimeInjectionTimeoutMs = options.runtimeInjection?.timeoutMs ?? CodexAdapter.RUNTIME_INJECTION_TIMEOUT_MS;
   }
   get appServerUrl() {
     return `ws://127.0.0.1:${this.appPort}`;
@@ -1101,6 +1439,7 @@ class CodexAdapter extends EventEmitter {
     }
     this.outageQueue = [];
     this.clearOutageTimer();
+    this.cancelRuntimeContractInjections("adapter disconnected", false);
     this.appServerWs?.close();
     this.appServerWs = null;
     for (const [id, sec] of this.secondaryConnections) {
@@ -1430,6 +1769,7 @@ class CodexAdapter extends EventEmitter {
     const tuiConnected = this.tuiWs !== null;
     this.log(`App-server connection closed (intentional=${intentional}, tuiConnected=${tuiConnected}, turnInProgress=${this.turnInProgress})`);
     this.appServerWs = null;
+    this.cancelRuntimeContractInjections("app-server connection closed", !intentional);
     this.clearResponseTrackingState();
     this.resetTurnState("app-server connection closed");
     if (!intentional) {
@@ -1859,6 +2199,8 @@ class CodexAdapter extends EventEmitter {
       const method = parsed.method ?? `response:${parsed.id}`;
       this.log(`TUI \u2192 app-server: ${method}`);
       if (parsed.id !== undefined && parsed.method) {
+        if (!this.prepareRuntimeThreadRequest(ws, parsed))
+          return;
         const proxyId = this.nextProxyId++;
         this.upstreamToClient.set(proxyId, { connId, clientId: parsed.id });
         this.trackPendingRequest(parsed, connId, proxyId);
@@ -1877,6 +2219,65 @@ class CodexAdapter extends EventEmitter {
       this.appServerWs.send(forwarded);
     } else {
       this.log(`WARNING: app-server closed between OPEN check and send \u2014 message lost (connId=${ws.data.connId})`);
+    }
+  }
+  prepareRuntimeThreadRequest(ws, message) {
+    if (!this.runtimeInjectionEnabled)
+      return true;
+    const method = typeof message.method === "string" ? message.method : null;
+    if (method !== "thread/start" && method !== "thread/resume")
+      return true;
+    const params = typeof message.params === "object" && message.params !== null && !Array.isArray(message.params) ? message.params : {};
+    if (method === "thread/resume") {
+      const threadId = params.threadId;
+      if (typeof threadId === "string" && threadId.length > 0 && readCodexContractHash(this.runtimeStateDir, threadId) === this.runtimeContractHash) {
+        return true;
+      }
+    }
+    const compatibilityError = this.runtimeInjectionCompatibilityError();
+    if (compatibilityError) {
+      this.sendRuntimeRequestError(ws, message.id, compatibilityError);
+      return false;
+    }
+    if (method === "thread/start") {
+      const existing = params.developerInstructions;
+      if (existing !== undefined && existing !== null && typeof existing !== "string") {
+        this.sendRuntimeRequestError(ws, message.id, "AgentBridge cannot merge the runtime contract because " + "thread/start.params.developerInstructions is not a string or null.");
+        return false;
+      }
+      if (typeof existing !== "string" || existing.length === 0) {
+        params.developerInstructions = CODEX_DEVELOPER_CONTRACT;
+      } else if (!existing.includes(CODEX_DEVELOPER_CONTRACT)) {
+        params.developerInstructions = `${existing}
+
+${CODEX_DEVELOPER_CONTRACT}`;
+      }
+      message.params = params;
+    }
+    return true;
+  }
+  runtimeInjectionCompatibilityError() {
+    const version = this.appServerInfo?.version ?? null;
+    if (version !== null && isStableVersion(version) && compareVersions(version, CodexAdapter.MIN_RUNTIME_INJECTION_VERSION) >= 0) {
+      return null;
+    }
+    return `AgentBridge runtime collaboration injection requires Codex app-server >= ` + `${CodexAdapter.MIN_RUNTIME_INJECTION_VERSION}; detected ${version ?? "unknown"}. ` + `Upgrade Codex, or set {"injection":{"runtime":false}} in .agentbridge/config.json ` + `and restart AgentBridge. ` + `AgentBridge will not silently fall back to modifying AGENTS.md.`;
+  }
+  runtimeErrorResponse(id, message) {
+    return JSON.stringify({
+      id,
+      error: {
+        code: CodexAdapter.RUNTIME_INJECTION_ERROR_CODE,
+        message
+      }
+    });
+  }
+  sendRuntimeRequestError(ws, id, message) {
+    this.log(`Runtime contract request rejected: ${message}`);
+    try {
+      ws.send(this.runtimeErrorResponse(id, message));
+    } catch (error) {
+      this.log(`Failed to send runtime contract error to TUI: ${error.message}`);
     }
   }
   detectJsonMethod(raw) {
@@ -2014,6 +2415,12 @@ class CodexAdapter extends EventEmitter {
   handleAppServerResponse(parsed, raw) {
     const responseId = parsed.id;
     const numericId = this.normalizeNumericId(responseId);
+    if (!isNaN(numericId)) {
+      const runtimeInjection = this.pendingRuntimeContractInjections.get(numericId);
+      if (runtimeInjection) {
+        return this.completeRuntimeContractInjection(parsed, runtimeInjection);
+      }
+    }
     const mapping = !isNaN(numericId) ? this.upstreamToClient.get(numericId) : undefined;
     if (mapping) {
       this.upstreamToClient.delete(numericId);
@@ -2026,6 +2433,9 @@ class CodexAdapter extends EventEmitter {
       }
       parsed.id = mapping.clientId;
       this.log(`app-server \u2192 TUI: response (proxy id=${numericId} \u2192 client id=${String(mapping.clientId)}, conn #${mapping.connId})`);
+      const runtimeResponse = this.handleMappedRuntimeContractResponse(parsed, mapping.connId);
+      if (runtimeResponse !== false)
+        return runtimeResponse;
       const forwarded = this.patchResponse(parsed, JSON.stringify(parsed));
       this.interceptServerMessage(parsed, mapping.connId);
       return forwarded;
@@ -2069,6 +2479,153 @@ class CodexAdapter extends EventEmitter {
     }
     this.log(`Dropping unmatched app-server response id ${String(responseId)}`);
     return null;
+  }
+  handleMappedRuntimeContractResponse(response, connId) {
+    if (!this.runtimeInjectionEnabled || response.error)
+      return false;
+    const key = this.pendingKey(response.id, connId);
+    const pending = key ? this.pendingRequests.get(key) : undefined;
+    if (!pending)
+      return false;
+    if (pending.method === "thread/start" && pending.runtimeContractHash) {
+      const threadId2 = response.result?.thread?.id;
+      if (typeof threadId2 !== "string" || threadId2.length === 0) {
+        return this.failTrackedRuntimeRequest(response, connId, "Codex returned a successful thread/start response without thread.id; " + "AgentBridge could not persist runtime-contract idempotency state.");
+      }
+      try {
+        persistCodexContractInjection(this.runtimeStateDir, threadId2, pending.runtimeContractHash);
+      } catch (error) {
+        return this.failTrackedRuntimeRequest(response, connId, `AgentBridge injected the runtime contract but could not persist pair state: ${error.message}`);
+      }
+      this.log(`Runtime contract ${pending.runtimeContractHash} persisted for new thread ${threadId2}`);
+      return false;
+    }
+    if (pending.method !== "thread/resume" || !this.isLatestThreadSwitch(pending)) {
+      return false;
+    }
+    const threadId = response.result?.thread?.id;
+    if (typeof threadId !== "string" || threadId.length === 0) {
+      return this.failTrackedRuntimeRequest(response, connId, "Codex returned a successful thread/resume response without thread.id; " + "AgentBridge could not inject the runtime contract.");
+    }
+    const previousHash = readCodexContractHash(this.runtimeStateDir, threadId);
+    if (previousHash === this.runtimeContractHash)
+      return false;
+    const compatibilityError = this.runtimeInjectionCompatibilityError();
+    if (compatibilityError) {
+      return this.failTrackedRuntimeRequest(response, connId, compatibilityError);
+    }
+    if (!this.appServerWs || this.appServerWs.readyState !== WebSocket.OPEN) {
+      return this.failTrackedRuntimeRequest(response, connId, "Codex app-server disconnected before AgentBridge could inject the runtime contract.");
+    }
+    const payload = previousHash === null ? CODEX_DEVELOPER_CONTRACT : codexContractSupersedePayload(previousHash);
+    const requestId = this.nextInjectionId--;
+    const timer = setTimeout(() => {
+      this.handleRuntimeContractInjectionTimeout(requestId);
+    }, this.runtimeInjectionTimeoutMs);
+    timer.unref?.();
+    const runtimeInjection = {
+      requestId,
+      connId,
+      threadId,
+      contractHash: this.runtimeContractHash,
+      resumeResponse: response,
+      timer
+    };
+    this.pendingRuntimeContractInjections.set(requestId, runtimeInjection);
+    const params = {
+      threadId,
+      items: [{
+        type: "message",
+        role: "developer",
+        content: [{ type: "input_text", text: payload }]
+      }]
+    };
+    try {
+      this.appServerWs.send(JSON.stringify({
+        id: requestId,
+        method: "thread/inject_items",
+        params
+      }));
+    } catch (error) {
+      clearTimeout(timer);
+      this.pendingRuntimeContractInjections.delete(requestId);
+      return this.failTrackedRuntimeRequest(response, connId, `AgentBridge could not send thread/inject_items: ${error.message}`);
+    }
+    this.log(`Holding thread/resume for ${threadId} until runtime contract ${this.runtimeContractHash} ` + `is acknowledged (request ${requestId}${previousHash ? `, supersedes ${previousHash}` : ""})`);
+    return null;
+  }
+  completeRuntimeContractInjection(response, pending) {
+    clearTimeout(pending.timer);
+    this.pendingRuntimeContractInjections.delete(pending.requestId);
+    if (response.error) {
+      const detail = response.error.message ?? "unknown app-server error";
+      return this.failTrackedRuntimeRequest(pending.resumeResponse, pending.connId, `Codex rejected AgentBridge thread/inject_items: ${detail}. ` + "No AGENTS.md fallback was applied.");
+    }
+    try {
+      persistCodexContractInjection(this.runtimeStateDir, pending.threadId, pending.contractHash);
+    } catch (error) {
+      return this.failTrackedRuntimeRequest(pending.resumeResponse, pending.connId, `AgentBridge injected the runtime contract but could not persist pair state: ${error.message}`);
+    }
+    this.log(`Runtime contract ${pending.contractHash} injected and persisted for resumed thread ${pending.threadId}`);
+    if (pending.connId !== this.tuiConnId) {
+      const key = this.pendingKey(pending.resumeResponse.id, pending.connId);
+      if (key)
+        this.pendingRequests.delete(key);
+      this.log(`Dropping deferred thread/resume response for retired TUI conn #${pending.connId}`);
+      return null;
+    }
+    try {
+      this.interceptServerMessage(pending.resumeResponse, pending.connId);
+    } catch (error) {
+      const message = `AgentBridge injected and persisted the runtime contract, but failed to release ` + `the resumed thread safely: ${error.message}`;
+      this.log(`Runtime contract resume release failed: ${message}`);
+      return this.runtimeErrorResponse(pending.resumeResponse.id, message);
+    }
+    return this.patchResponse(pending.resumeResponse, JSON.stringify(pending.resumeResponse));
+  }
+  handleRuntimeContractInjectionTimeout(requestId) {
+    const pending = this.pendingRuntimeContractInjections.get(requestId);
+    if (!pending)
+      return;
+    this.pendingRuntimeContractInjections.delete(requestId);
+    const message = `Timed out after ${this.runtimeInjectionTimeoutMs}ms waiting for Codex ` + `thread/inject_items while resuming ${pending.threadId}. No AGENTS.md fallback was applied.`;
+    const response = this.failTrackedRuntimeRequest(pending.resumeResponse, pending.connId, message);
+    if (pending.connId !== this.tuiConnId || !this.tuiWs)
+      return;
+    try {
+      this.tuiWs.send(response);
+    } catch (error) {
+      this.log(`Failed to send runtime injection timeout to TUI: ${error.message}`);
+    }
+  }
+  cancelRuntimeContractInjections(reason, notifyTui) {
+    for (const pending of [...this.pendingRuntimeContractInjections.values()]) {
+      clearTimeout(pending.timer);
+      this.pendingRuntimeContractInjections.delete(pending.requestId);
+      const response = this.failTrackedRuntimeRequest(pending.resumeResponse, pending.connId, `AgentBridge runtime contract injection was cancelled: ${reason}.`);
+      if (!notifyTui || pending.connId !== this.tuiConnId || !this.tuiWs)
+        continue;
+      try {
+        this.tuiWs.send(response);
+      } catch (error) {
+        this.log(`Failed to send runtime injection cancellation to TUI: ${error.message}`);
+      }
+    }
+  }
+  failTrackedRuntimeRequest(successfulResponse, connId, message) {
+    this.log(`Runtime contract injection failed: ${message}`);
+    try {
+      this.interceptServerMessage({
+        id: successfulResponse.id,
+        error: {
+          code: CodexAdapter.RUNTIME_INJECTION_ERROR_CODE,
+          message
+        }
+      }, connId);
+    } catch (error) {
+      this.log(`Runtime contract failure cleanup also failed: ${error.message}`);
+    }
+    return this.runtimeErrorResponse(successfulResponse.id, message);
   }
   captureAppServerInfo(result) {
     const init = typeof result === "object" && result !== null ? result : {};
@@ -2201,12 +2758,15 @@ class CodexAdapter extends EventEmitter {
     if (!key || !isTrackedAppServerRequestMethod(method))
       return;
     const pending = { method };
-    if (method === "turn/start") {
-      const params = "params" in message && typeof message.params === "object" && message.params !== null ? message.params : undefined;
+    const params = "params" in message && typeof message.params === "object" && message.params !== null ? message.params : undefined;
+    if (method === "turn/start" || method === "thread/resume") {
       const threadId = params?.threadId;
       if (typeof threadId === "string" && threadId.length > 0) {
         pending.threadId = threadId;
       }
+    }
+    if (method === "thread/start" && this.runtimeInjectionEnabled && typeof params?.developerInstructions === "string" && params.developerInstructions.includes(CODEX_DEVELOPER_CONTRACT)) {
+      pending.runtimeContractHash = this.runtimeContractHash;
     }
     if (method === "thread/start" || method === "thread/resume") {
       pending.threadSwitchSeq = ++this.threadSwitchSeq;
@@ -2563,12 +3123,12 @@ var CLOSE_CODE_TOKEN_MISMATCH = 4005;
 var CLOSE_CODE_CONTRACT_MISMATCH = 4006;
 
 // src/control-token.ts
-import { chmodSync as chmodSync2, readFileSync as readFileSync2 } from "fs";
-import { join as join3 } from "path";
+import { chmodSync as chmodSync2, readFileSync as readFileSync3 } from "fs";
+import { join as join4 } from "path";
 import { randomUUID as randomUUID2 } from "crypto";
 var CONTROL_TOKEN_FILENAME = "control-token";
 function resolveControlTokenPath(stateDir) {
-  return join3(stateDir, CONTROL_TOKEN_FILENAME);
+  return join4(stateDir, CONTROL_TOKEN_FILENAME);
 }
 function generateControlToken() {
   return randomUUID2();
@@ -2894,7 +3454,7 @@ class TuiConnectionState {
 
 // src/daemon-lifecycle.ts
 import { spawn as spawn2 } from "child_process";
-import { existsSync as existsSync3, readFileSync as readFileSync3, statSync as statSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2, openSync as openSync2, closeSync as closeSync2, constants } from "fs";
+import { existsSync as existsSync4, readFileSync as readFileSync4, statSync as statSync2, unlinkSync as unlinkSync3, writeFileSync as writeFileSync2, openSync as openSync2, closeSync as closeSync2, constants } from "fs";
 import { fileURLToPath } from "url";
 
 // src/process-lifecycle.ts
@@ -3178,7 +3738,7 @@ class DaemonLifecycle {
   }
   readStatus() {
     try {
-      const raw = readFileSync3(this.stateDir.statusFile, "utf-8");
+      const raw = readFileSync4(this.stateDir.statusFile, "utf-8");
       return JSON.parse(raw);
     } catch {
       return null;
@@ -3189,7 +3749,7 @@ class DaemonLifecycle {
   }
   readPid() {
     try {
-      const raw = readFileSync3(this.stateDir.pidFile, "utf-8").trim();
+      const raw = readFileSync4(this.stateDir.pidFile, "utf-8").trim();
       if (!raw)
         return null;
       const pid = Number.parseInt(raw, 10);
@@ -3223,7 +3783,7 @@ class DaemonLifecycle {
     } catch {}
   }
   wasKilled() {
-    return existsSync3(this.stateDir.killedFile);
+    return existsSync4(this.stateDir.killedFile);
   }
   launch() {
     this.stateDir.ensure();
@@ -3304,7 +3864,7 @@ class DaemonLifecycle {
         if (reclaimed)
           return false;
         try {
-          const holderPid = Number.parseInt(readFileSync3(this.stateDir.lockFile, "utf-8").trim(), 10);
+          const holderPid = Number.parseInt(readFileSync4(this.stateDir.lockFile, "utf-8").trim(), 10);
           if (Number.isFinite(holderPid) && !isProcessAlive(holderPid)) {
             this.log(`Stale startup lock from dead process ${holderPid}, reclaiming`);
             this.releaseLock();
@@ -3473,8 +4033,8 @@ function consumeCheckpointBaton(path, fiveHourResetEpoch, log = () => {}) {
 }
 
 // src/config-service.ts
-import { readFileSync as readFileSync4, mkdirSync as mkdirSync4, existsSync as existsSync4 } from "fs";
-import { join as join4 } from "path";
+import { readFileSync as readFileSync5, mkdirSync as mkdirSync4, existsSync as existsSync5 } from "fs";
+import { join as join5 } from "path";
 var DEFAULT_BUDGET_CONFIG = {
   enabled: true,
   pollSeconds: 300,
@@ -3515,6 +4075,9 @@ var DEFAULT_CONFIG = {
   },
   turnCoordination: {
     attentionWindowSeconds: 15
+  },
+  injection: {
+    runtime: true
   },
   idleShutdownSeconds: 30,
   budget: DEFAULT_BUDGET_CONFIG
@@ -3595,7 +4158,7 @@ function hasCustomDecisionValues(config) {
   const d = DEFAULT_CONFIG;
   const b = config.budget;
   const db = d.budget;
-  return config.idleShutdownSeconds !== d.idleShutdownSeconds || config.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config.codex.appPort !== d.codex.appPort || config.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.budgetFreshTtlSec !== db.budgetFreshTtlSec || b.idleAdviceActivityWindowSec !== db.idleAdviceActivityWindowSec || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct || b.maximize.admissionAt !== db.maximize.admissionAt || b.maximize.wrapUpQuota !== db.maximize.wrapUpQuota || b.allocation.minRunwayRatio !== db.allocation.minRunwayRatio || b.allocation.minRunwayGapHours !== db.allocation.minRunwayGapHours;
+  return config.idleShutdownSeconds !== d.idleShutdownSeconds || config.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds || config.injection.runtime !== d.injection.runtime || config.codex.appPort !== d.codex.appPort || config.codex.proxyPort !== d.codex.proxyPort || b.enabled !== db.enabled || b.pollSeconds !== db.pollSeconds || b.budgetFreshTtlSec !== db.budgetFreshTtlSec || b.idleAdviceActivityWindowSec !== db.idleAdviceActivityWindowSec || b.pauseAt !== db.pauseAt || b.resumeBelow !== db.resumeBelow || b.syncDriftPct !== db.syncDriftPct || b.parallel.minRemainingPct !== db.parallel.minRemainingPct || b.parallel.timeWindowSec !== db.parallel.timeWindowSec || b.codexTierControl !== db.codexTierControl || b.maximize.targetUtil !== db.maximize.targetUtil || b.maximize.reserveSlopePctPerHour !== db.maximize.reserveSlopePctPerHour || b.maximize.reserveMaxPct !== db.maximize.reserveMaxPct || b.maximize.finishingHorizonMinutes !== db.maximize.finishingHorizonMinutes || b.maximize.resumeHysteresisPct !== db.maximize.resumeHysteresisPct || b.maximize.admissionAt !== db.maximize.admissionAt || b.maximize.wrapUpQuota !== db.maximize.wrapUpQuota || b.allocation.minRunwayRatio !== db.allocation.minRunwayRatio || b.allocation.minRunwayGapHours !== db.allocation.minRunwayGapHours;
 }
 function normalizeInteger(value, fallback) {
   if (typeof value === "number" && Number.isFinite(value))
@@ -3744,6 +4307,7 @@ function normalizeConfig(raw) {
   const codex = isRecord(config.codex) ? config.codex : {};
   const daemon = isRecord(config.daemon) ? config.daemon : {};
   const turnCoordination = isRecord(config.turnCoordination) ? config.turnCoordination : {};
+  const injection = isRecord(config.injection) ? config.injection : {};
   return {
     version: typeof config.version === "string" ? config.version : DEFAULT_CONFIG.version,
     codex: {
@@ -3752,6 +4316,9 @@ function normalizeConfig(raw) {
     },
     turnCoordination: {
       attentionWindowSeconds: normalizeBoundedInteger(turnCoordination.attentionWindowSeconds, DEFAULT_CONFIG.turnCoordination.attentionWindowSeconds, 0, Number.MAX_SAFE_INTEGER)
+    },
+    injection: {
+      runtime: normalizeBoolean(injection.runtime, DEFAULT_CONFIG.injection.runtime)
     },
     idleShutdownSeconds: normalizeBoundedInteger(config.idleShutdownSeconds, DEFAULT_CONFIG.idleShutdownSeconds, 1, Number.MAX_SAFE_INTEGER),
     budget: normalizeBudgetConfig(config.budget)
@@ -3763,16 +4330,16 @@ class ConfigService {
   configPath;
   constructor(projectRoot) {
     const root = projectRoot ?? process.cwd();
-    this.configDir = join4(root, CONFIG_DIR);
-    this.configPath = join4(this.configDir, CONFIG_FILE);
+    this.configDir = join5(root, CONFIG_DIR);
+    this.configPath = join5(this.configDir, CONFIG_FILE);
   }
   hasConfig() {
-    return existsSync4(this.configPath);
+    return existsSync5(this.configPath);
   }
   load() {
     let raw;
     try {
-      raw = readFileSync4(this.configPath, "utf-8");
+      raw = readFileSync5(this.configPath, "utf-8");
     } catch (err) {
       if (err?.code === "ENOENT") {
         return { state: "absent" };
@@ -3806,7 +4373,7 @@ class ConfigService {
     if (result.state === "parsed")
       return result.config;
     if (result.state === "corrupt") {
-      log(`config.json at ${this.configPath} is unusable (${result.reason}); ` + "falling back to defaults \u2014 your custom budget thresholds / idle-shutdown settings are NOT in effect. " + "Fix the file and restart to re-apply them.");
+      log(`config.json at ${this.configPath} is unusable (${result.reason}); ` + "falling back to defaults \u2014 your custom budget / runtime-injection / idle-shutdown settings are NOT in effect. " + "Fix the file and restart to re-apply them.");
     }
     return structuredClone(DEFAULT_CONFIG);
   }
@@ -3830,7 +4397,7 @@ class ConfigService {
   initDefaults() {
     this.ensureConfigDir();
     const created = [];
-    if (!existsSync4(this.configPath)) {
+    if (!existsSync5(this.configPath)) {
       this.save(DEFAULT_CONFIG);
       created.push(this.configPath);
     }
@@ -3840,14 +4407,14 @@ class ConfigService {
     return this.configPath;
   }
   ensureConfigDir() {
-    if (!existsSync4(this.configDir)) {
+    if (!existsSync5(this.configDir)) {
       mkdirSync4(this.configDir, { recursive: true });
     }
   }
 }
 
 // src/budget/budget-coordinator.ts
-import { homedir as homedir2 } from "os";
+import { homedir as homedir3 } from "os";
 
 // src/budget/budget-gate.ts
 function matchingGateReset(usage) {
@@ -4412,8 +4979,8 @@ function computeBudgetState(claude, codex, cfg, now, runway = NO_RUNWAY) {
 }
 
 // src/budget/advice-cooldown.ts
-import { readFileSync as readFileSync5 } from "fs";
-import { join as join5 } from "path";
+import { readFileSync as readFileSync6 } from "fs";
+import { join as join6 } from "path";
 var DEFAULT_ADVICE_COOLDOWN_SEC = 1800;
 var COOLDOWN_FILENAME = "advice-cooldown.json";
 function resolveAdviceCooldownSec(env = process.env) {
@@ -4429,7 +4996,7 @@ function resolveStateDir(homeDir) {
   const override = process.env.BUDGET_STATE_DIR;
   if (override && override.trim() !== "")
     return override.trim();
-  return join5(homeDir, ".budget-guard");
+  return join6(homeDir, ".budget-guard");
 }
 
 class AdviceCooldown {
@@ -4437,7 +5004,7 @@ class AdviceCooldown {
   cooldownSec;
   log;
   constructor(options) {
-    this.path = join5(resolveStateDir(options.homeDir), COOLDOWN_FILENAME);
+    this.path = join6(resolveStateDir(options.homeDir), COOLDOWN_FILENAME);
     this.cooldownSec = options.cooldownSec ?? DEFAULT_ADVICE_COOLDOWN_SEC;
     this.log = options.log ?? (() => {});
   }
@@ -4453,7 +5020,7 @@ class AdviceCooldown {
   read() {
     let raw;
     try {
-      raw = readFileSync5(this.path, "utf-8");
+      raw = readFileSync6(this.path, "utf-8");
     } catch {
       return {};
     }
@@ -4878,7 +5445,7 @@ class BudgetCoordinator {
     this.onResume = options.onResume ?? (() => {});
     this.resumeSignals = options.resumeSignals ?? null;
     this.adviceCooldown = options.adviceCooldown ?? new AdviceCooldown({
-      homeDir: homedir2(),
+      homeDir: homedir3(),
       cooldownSec: resolveAdviceCooldownSec(),
       log: this.log
     });
@@ -5228,9 +5795,9 @@ class BudgetCoordinator {
 
 // src/budget/quota-source.ts
 import { execFile } from "child_process";
-import { existsSync as existsSync5 } from "fs";
-import { homedir as homedir3 } from "os";
-import { basename, join as join6 } from "path";
+import { existsSync as existsSync6 } from "fs";
+import { homedir as homedir4 } from "os";
+import { basename as basename2, join as join7 } from "path";
 function parseBurnFields(record) {
   const group = {};
   let any = false;
@@ -5300,7 +5867,7 @@ function defaultRunner(command, args, options) {
   });
 }
 function commandKind(command) {
-  return basename(command) === "probe.mjs" ? "probe-mjs" : "budget-probe";
+  return basename2(command) === "probe.mjs" ? "probe-mjs" : "budget-probe";
 }
 function argsFor(candidate, agent) {
   if (candidate.kind === "probe-mjs")
@@ -5517,7 +6084,7 @@ class QuotaSource {
   unknownSchemaVersionsLogged = new Set;
   constructor(options = {}) {
     this.env = options.env ?? process.env;
-    this.homeDir = options.homeDir ?? homedir3();
+    this.homeDir = options.homeDir ?? homedir4();
     this.timeoutMs = options.timeoutMs ?? DEFAULT_TIMEOUT_MS;
     this.runner = options.runner ?? defaultRunner;
     this.log = options.log ?? (() => {});
@@ -5549,12 +6116,12 @@ class QuotaSource {
       add(command, commandKind(command));
       return candidates;
     }
-    const binDir = join6(this.homeDir, ".budget-guard/bin");
-    const installedProbeMjs = join6(binDir, "probe.mjs");
-    if (existsSync5(installedProbeMjs))
+    const binDir = join7(this.homeDir, ".budget-guard/bin");
+    const installedProbeMjs = join7(binDir, "probe.mjs");
+    if (existsSync6(installedProbeMjs))
       add(installedProbeMjs, "probe-mjs");
-    const installedBudgetProbe = join6(binDir, "budget-probe");
-    if (existsSync5(installedBudgetProbe))
+    const installedBudgetProbe = join7(binDir, "budget-probe");
+    if (existsSync6(installedBudgetProbe))
       add(installedBudgetProbe, "budget-probe");
     return candidates;
   }
@@ -5617,8 +6184,8 @@ function createQuotaSource(options) {
 }
 
 // src/budget/pending-reader.ts
-import { createHash } from "crypto";
-import { join as join7 } from "path";
+import { createHash as createHash2 } from "crypto";
+import { join as join8 } from "path";
 function nodeFs2() {
   return __require("fs");
 }
@@ -5653,13 +6220,13 @@ function parsePendingPayload(value) {
   return { status, agent, sessionId, cwd, resetEpoch, util, warnUtil, at, sourcePath: "", contentHash: "" };
 }
 function sha256(value) {
-  return createHash("sha256").update(value).digest("hex");
+  return createHash2("sha256").update(value).digest("hex");
 }
 function resolveStateDir2(homeDir) {
   const override = process.env.BUDGET_STATE_DIR;
   if (override && override.trim() !== "")
     return override.trim();
-  return join7(homeDir, ".budget-guard");
+  return join8(homeDir, ".budget-guard");
 }
 function readPendingFile(path, log) {
   let raw;
@@ -5685,7 +6252,7 @@ function readPendingFile(path, log) {
   return { ...entry, sourcePath: path, contentHash: sha256(text) };
 }
 function listScopeFiles(stateDir, agent, log) {
-  const pendingDir = join7(stateDir, "pending");
+  const pendingDir = join8(stateDir, "pending");
   let names;
   try {
     names = nodeFs2().readdirSync(pendingDir);
@@ -5693,14 +6260,14 @@ function listScopeFiles(stateDir, agent, log) {
     return [];
   }
   const prefix = `${agent}_`;
-  return names.filter((name) => name.startsWith(prefix) && name.endsWith(".json")).map((name) => join7(pendingDir, name));
+  return names.filter((name) => name.startsWith(prefix) && name.endsWith(".json")).map((name) => join8(pendingDir, name));
 }
 function readGuardPending(opts) {
   const log = opts.log ?? (() => {});
   const stateDir = resolveStateDir2(opts.homeDir);
   const paths = [
     ...listScopeFiles(stateDir, opts.agent, log),
-    join7(stateDir, `pending_${opts.agent}.json`)
+    join8(stateDir, `pending_${opts.agent}.json`)
   ];
   const bySession = new Map;
   for (const path of paths) {
@@ -5721,9 +6288,9 @@ function readGuardPending(opts) {
 }
 
 // src/budget/resume-injection-queue.ts
-import { createHash as createHash2 } from "crypto";
-import { closeSync as closeSync3, existsSync as existsSync6, mkdirSync as mkdirSync5, openSync as openSync3, readdirSync, readFileSync as readFileSync6, realpathSync, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "fs";
-import { join as join8 } from "path";
+import { createHash as createHash3 } from "crypto";
+import { closeSync as closeSync3, existsSync as existsSync7, mkdirSync as mkdirSync5, openSync as openSync3, readdirSync as readdirSync2, readFileSync as readFileSync7, realpathSync, unlinkSync as unlinkSync4, writeFileSync as writeFileSync3 } from "fs";
+import { join as join9 } from "path";
 
 // src/budget/resume-prompt.ts
 var RESUME_PROMPT = "\u989D\u5EA6\u7A97\u53E3\u5DF2\u5237\u65B0\uFF0C\u7EE7\u7EED\u4E0A\u6B21\u672A\u5B8C\u6210\u7684\u4EFB\u52A1\uFF1A\u4ECE .agent/checkpoint.md \u7684\u300C\u4E0B\u4E00\u6B65\u300D\u63A5\u7740\u505A\uFF1B\u5B8C\u6210\u540E\u505C\u4E0B\u5E76\u6807 DONE\u3002";
@@ -5960,7 +6527,7 @@ function realpathOrRaw(path) {
   }
 }
 function sha2562(value) {
-  return createHash2("sha256").update(value).digest("hex");
+  return createHash3("sha256").update(value).digest("hex");
 }
 function writeJsonWx(path, value) {
   let fd;
@@ -5989,7 +6556,7 @@ function unlinkIfExists(path) {
 }
 function readClaimedAt(path) {
   try {
-    const parsed = JSON.parse(readFileSync6(path, "utf-8"));
+    const parsed = JSON.parse(readFileSync7(path, "utf-8"));
     const claimedAt = parsed?.claimed_at;
     return typeof claimedAt === "number" && Number.isFinite(claimedAt) ? claimedAt : null;
   } catch {
@@ -5999,16 +6566,16 @@ function readClaimedAt(path) {
 function pruneStaleResumeArtifacts(dir, tsField, ttlSec, nowSec, log) {
   let names;
   try {
-    names = readdirSync(dir);
+    names = readdirSync2(dir);
   } catch {
     return;
   }
   for (const name of names) {
     if (!name.endsWith(".json"))
       continue;
-    const p = join8(dir, name);
+    const p = join9(dir, name);
     try {
-      const parsed = JSON.parse(readFileSync6(p, "utf-8"));
+      const parsed = JSON.parse(readFileSync7(p, "utf-8"));
       const ts = parsed?.[tsField];
       if (typeof ts === "number" && Number.isFinite(ts) && nowSec - ts > ttlSec) {
         unlinkIfExists(p);
@@ -6031,18 +6598,18 @@ function tryClaimPendingResume(opts) {
     cwd,
     contentHash
   ].join("\x00"));
-  const claimsDir = join8(opts.stateDir, "claims");
-  const consumedDir = join8(opts.stateDir, "consumed");
-  const claimPath = join8(claimsDir, `${identity}.json`);
-  const consumedPath = join8(consumedDir, `${identity}.json`);
+  const claimsDir = join9(opts.stateDir, "claims");
+  const consumedDir = join9(opts.stateDir, "consumed");
+  const claimPath = join9(claimsDir, `${identity}.json`);
+  const consumedPath = join9(consumedDir, `${identity}.json`);
   mkdirSync5(claimsDir, { recursive: true });
   mkdirSync5(consumedDir, { recursive: true });
   const nowSec = now();
   pruneStaleResumeArtifacts(consumedDir, "consumed_at", consumedTtlSec, nowSec, opts.log);
   pruneStaleResumeArtifacts(claimsDir, "claimed_at", claimTtlSec, nowSec, opts.log);
-  if (existsSync6(consumedPath))
+  if (existsSync7(consumedPath))
     return { ok: false, reason: "consumed" };
-  if (existsSync6(claimPath)) {
+  if (existsSync7(claimPath)) {
     const claimedAt = readClaimedAt(claimPath);
     if (claimedAt !== null && nowSec - claimedAt > claimTtlSec) {
       try {
@@ -6188,10 +6755,10 @@ function routeResume(side, resumeId, deps) {
 
 // src/budget/resume-ack-sentinel.ts
 import { renameSync as renameSync3, writeFileSync as writeFileSync4 } from "fs";
-import { join as join9 } from "path";
+import { join as join10 } from "path";
 var RESUME_ACK_DEGRADED_SENTINEL = "resume-ack-degraded.json";
 function resumeAckSentinelPath(stateDir) {
-  return join9(stateDir, RESUME_ACK_DEGRADED_SENTINEL);
+  return join10(stateDir, RESUME_ACK_DEGRADED_SENTINEL);
 }
 function writeResumeAckDegradedSentinel(opts) {
   const now = opts.now ?? (() => Date.now());
@@ -6211,8 +6778,8 @@ function writeResumeAckDegradedSentinel(opts) {
 }
 
 // src/daemon-identity-ownership.ts
-import { readFileSync as readFileSync7 } from "fs";
-var defaultRead2 = (path) => readFileSync7(path, "utf-8");
+import { readFileSync as readFileSync8 } from "fs";
+var defaultRead2 = (path) => readFileSync8(path, "utf-8");
 function pidFileOwnedByUs(pidFilePath, ourPid, read = defaultRead2) {
   let raw;
   try {
@@ -6378,125 +6945,6 @@ class ReplyRequiredTracker {
   }
 }
 
-// src/thread-state.ts
-import {
-  existsSync as existsSync7,
-  readdirSync as readdirSync2,
-  readFileSync as readFileSync8
-} from "fs";
-import { homedir as homedir4 } from "os";
-import { basename as basename2, join as join10 } from "path";
-function nowIso() {
-  return new Date().toISOString();
-}
-function threadTag(identity) {
-  const name = identity.pairName ?? identity.pairId ?? "manual";
-  return `abg:${name}:${identity.cwd}`;
-}
-function codexHome(env = process.env) {
-  return env.CODEX_HOME && env.CODEX_HOME.length > 0 ? env.CODEX_HOME : join10(homedir4(), ".codex");
-}
-function readRawCurrentThread(stateDir) {
-  try {
-    const parsed = JSON.parse(readFileSync8(stateDir.currentThreadFile, "utf-8"));
-    if (parsed?.version === 1 && typeof parsed.threadId === "string" && parsed.threadId.length > 0 && (parsed.status === "pending" || parsed.status === "current") && typeof parsed.cwd === "string") {
-      return parsed;
-    }
-  } catch {}
-  return null;
-}
-function findCodexRolloutFile(threadId, env = process.env, maxEntries = 20000) {
-  const sessionsDir = join10(codexHome(env), "sessions");
-  if (!threadId || !existsSync7(sessionsDir))
-    return null;
-  const exactName = `rollout-${threadId}.jsonl`;
-  const stack = [sessionsDir];
-  let visited = 0;
-  while (stack.length > 0 && visited < maxEntries) {
-    const dir = stack.pop();
-    let entries;
-    try {
-      entries = readdirSync2(dir, { withFileTypes: true });
-    } catch {
-      continue;
-    }
-    for (const entry of entries) {
-      visited++;
-      const path = join10(dir, entry.name);
-      if (entry.isDirectory()) {
-        stack.push(path);
-        continue;
-      }
-      if (!entry.isFile())
-        continue;
-      const name = basename2(entry.name);
-      if (name === exactName || name.startsWith("rollout-") && name.endsWith(".jsonl") && name.includes(threadId)) {
-        return path;
-      }
-    }
-  }
-  return null;
-}
-function writePendingCurrentThread(identity, threadId, reason) {
-  const state = {
-    version: 1,
-    status: "pending",
-    pairId: identity.pairId,
-    pairName: identity.pairName,
-    cwd: identity.cwd,
-    threadId,
-    updatedAt: nowIso(),
-    reason,
-    tag: threadTag(identity)
-  };
-  atomicWriteJson(identity.stateDir.currentThreadFile, state);
-  return state;
-}
-function promoteCurrentThreadIfRolloutExists(identity, threadId, reason, env = process.env) {
-  const rolloutPath = findCodexRolloutFile(threadId, env);
-  const state = {
-    version: 1,
-    status: rolloutPath ? "current" : "pending",
-    pairId: identity.pairId,
-    pairName: identity.pairName,
-    cwd: identity.cwd,
-    threadId,
-    updatedAt: nowIso(),
-    reason,
-    tag: threadTag(identity),
-    ...rolloutPath ? { rolloutPath, rolloutVerifiedAt: nowIso() } : {}
-  };
-  atomicWriteJson(identity.stateDir.currentThreadFile, state);
-  return state;
-}
-async function persistCurrentThreadWithRolloutRetry(identity, threadId, reason, options = {}) {
-  const env = options.env ?? process.env;
-  const attempts = options.attempts ?? 20;
-  const delayMs = options.delayMs ?? 250;
-  const shouldContinue = options.shouldContinue ?? (() => true);
-  if (!shouldContinue())
-    return null;
-  writePendingCurrentThread(identity, threadId, reason);
-  for (let attempt = 1;attempt <= attempts; attempt++) {
-    if (!shouldContinue()) {
-      options.log?.(`Abandoned current-thread persistence for ${threadId}: a newer thread became active`);
-      return null;
-    }
-    const state = promoteCurrentThreadIfRolloutExists(identity, threadId, reason, env);
-    if (state.status === "current") {
-      options.log?.(`Current Codex thread persisted: ${threadId} (${state.rolloutPath})`);
-      return state;
-    }
-    if (attempt < attempts) {
-      await new Promise((resolve) => setTimeout(resolve, delayMs));
-    }
-  }
-  if (!shouldContinue())
-    return null;
-  options.log?.(`Current Codex thread left pending because no rollout file was found: ${threadId}`);
-  return readRawCurrentThread(identity.stateDir) ?? writePendingCurrentThread(identity, threadId, reason);
-}
-
 // src/waiting-message.ts
 function formatWaitingForCodexTuiMessage(options) {
   const pairName = options.pairName ?? "unknown";
@@ -6619,7 +7067,12 @@ var RESUME_ACK_RETRIES = parsePositiveIntEnv("AGENTBRIDGE_RESUME_ACK_RETRIES", 3
 var daemonLifecycle = new DaemonLifecycle({ stateDir, controlPort: CONTROL_PORT, log });
 var DAEMON_NONCE = randomUUID4();
 var DAEMON_STARTED_AT = Date.now();
-var codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile);
+var codex = new CodexAdapter(CODEX_APP_PORT, CODEX_PROXY_PORT, stateDir.logFile, {
+  runtimeInjection: {
+    enabled: config.injection.runtime,
+    stateDir
+  }
+});
 var attachCmd = `codex --enable tui_app_server --remote ${codex.proxyUrl}`;
 var controlServer = null;
 var boundControlPort = false;
