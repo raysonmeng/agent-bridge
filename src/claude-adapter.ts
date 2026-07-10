@@ -253,6 +253,15 @@ export class ClaudeAdapter extends EventEmitter {
     // AGENTBRIDGE_ALWAYS_QUEUE=1, mirror real Codex replies (non-system ids)
     // into the fallback queue as well, so get_messages is a reliable pull path
     // even for idle sessions. Off by default → delivery behavior is unchanged.
+    //
+    // NOTE: system messages are identified by their id prefix ("system_*")
+    // because BridgeMessage has no structural kind/type field (both system and
+    // agent messages carry source="codex"). If a structural discriminator (e.g.
+    // a `kind` field) is added in the future, prefer it over the id prefix.
+    //
+    // SECURITY: with this flag on, the fallback queue retains real agent reply
+    // content until drained by get_messages. This does not introduce a new data
+    // class but extends the retention window — document accordingly.
     const mirrorToQueue =
       process.env.AGENTBRIDGE_ALWAYS_QUEUE === "1" &&
       typeof message.id === "string" &&
