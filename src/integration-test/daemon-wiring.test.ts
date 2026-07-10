@@ -21,6 +21,7 @@ import { readControlToken, resolveControlTokenPath } from "../control-token";
 import { CONTRACT_VERSION } from "../contract-version";
 import { installFakeCodex } from "./fixtures/fake-codex-install";
 import { RESUME_PROMPT, claudeResumePrompt } from "../budget/resume-prompt";
+import { contractHash } from "../collaboration-contract";
 
 const DAEMON_PATH = join(process.cwd(), "src", "daemon.ts");
 const DEFAULT_TEST_SLOT_START = 2500 + (process.pid % 500);
@@ -110,6 +111,40 @@ describe("daemon wiring", () => {
     expect(waiting.content).toContain(`proxy=ws://127.0.0.1:${harness.proxyPort}`);
     expect(waiting.content).toContain("different cwd");
     expect(waiting.content).toContain("another pair");
+  }, 20000);
+
+  test("config injection.runtime=false bypasses native injection for an old Codex protocol", async () => {
+    const harness = await startHarness({
+      pairId: "main-injectoff",
+      pairName: "main",
+      projectConfig: { injection: { runtime: false } },
+      extraEnv: { FAKE_CODEX_VERSION: "0.100.0" },
+    });
+
+    await harness.attachClaude();
+    await harness.connectTui();
+
+    const response = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
+    const status = (await response.json()) as DaemonStatus;
+    expect(status.bridgeReady).toBe(true);
+    expect(status.appServerInfo?.version).toBe("0.100.0");
+  }, 20000);
+
+  test("default runtime injection persists the new thread contract in pair state", async () => {
+    const harness = await startHarness({ pairId: "main-injecton", pairName: "main" });
+
+    await harness.attachClaude();
+    await harness.connectTui();
+
+    const state = JSON.parse(
+      readFileSync(join(harness.stateDir, "codex-contracts.json"), "utf-8"),
+    );
+    expect(state.version).toBe(1);
+    expect(state.injections).toHaveLength(1);
+    expect(state.injections[0]).toMatchObject({
+      threadId: "thread-fake-1",
+      contractHash: contractHash(),
+    });
   }, 20000);
 
   test("turnAborted event emits system_turn_aborted to the attached Claude client", async () => {
@@ -2108,6 +2143,28 @@ async function startHarness(opts: {
           reject(new Error("TUI ws connect error"));
         };
       });
+      const initialized = new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("TUI initialize response timeout")), 5000);
+        tuiWs.onmessage = (event) => {
+          try {
+            const message = JSON.parse(String(event.data));
+            if (message.id !== 0) return;
+            clearTimeout(timer);
+            if (message.error) {
+              reject(new Error(`TUI initialize rejected: ${message.error.message ?? "unknown"}`));
+            } else {
+              resolve();
+            }
+          } catch {}
+        };
+      });
+      tuiWs.send(JSON.stringify({
+        id: 0,
+        method: "initialize",
+        params: { clientInfo: { name: "agentbridge-test-tui", version: "0" } },
+      }));
+      await initialized;
+      tuiWs.send(JSON.stringify({ method: "initialized", params: {} }));
       tuiWs.send(JSON.stringify({ id: 1, method: "thread/start", params: {} }));
       // Wait until the daemon reports bridge-ready over /healthz.
       await waitFor(async () => {

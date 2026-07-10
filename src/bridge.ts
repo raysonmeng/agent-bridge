@@ -23,6 +23,15 @@ import {
 import type { ControlClientIdentity } from "./control-protocol";
 import type { BridgeMessage } from "./types";
 
+// SessionStart-hook helper mode: print the runtime collaboration context and
+// exit. Must run BEFORE every bridge bootstrap side effect below (env guard,
+// state-dir creation, daemon client) — the hook wants a payload on stdout,
+// never a bridge process.
+if (process.argv.includes("--print-session-context")) {
+  const { runPrintSessionContext } = await import("./session-context-hook");
+  process.exit(runPrintSessionContext(process.argv.slice(2)));
+}
+
 const originalEnv = { ...process.env };
 const bootstrapLogger = createProcessLogger({ component: "AgentBridgeFrontend" });
 const envGuardResult = guardAgentBridgeEnv({

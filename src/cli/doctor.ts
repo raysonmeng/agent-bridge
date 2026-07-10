@@ -527,9 +527,10 @@ function extractBundleStamp(path: string): { commit: string; codeHash: string | 
 
 /**
  * Config parseability + whether custom values are actually in effect. A corrupt
- * config.json silently reverts the user's custom budget/idle thresholds to
- * defaults at startup (P1); surface that loudly here so doctor — run by someone
- * already stuck — can see it instead of chasing why their thresholds "don't work".
+ * config.json silently reverts the user's custom budget/runtime-injection/idle
+ * settings to defaults at startup (P1); surface that loudly here so doctor —
+ * run by someone already stuck — can see it instead of chasing why a setting
+ * "doesn't work".
  */
 function configParseabilityCheck(cwd: string, cli: string): DoctorCheck {
   const desc = new ConfigService(cwd).describeConfig();
@@ -544,9 +545,9 @@ function configParseabilityCheck(cwd: string, cli: string): DoctorCheck {
     return {
       name: "config.json",
       status: "warn",
-      detail: `unparseable at ${desc.path} (${desc.reason}) — custom thresholds NOT in effect, using defaults`,
+      detail: `unparseable at ${desc.path} (${desc.reason}) — custom settings NOT in effect, using defaults`,
       hint:
-        "config.json 损坏或字段类型错误：bridge 已回退到默认阈值，你的自定义 budget/idle 设置未生效。" +
+        "config.json 损坏或字段类型错误：bridge 已回退到默认值，你的自定义 budget/runtime-injection/idle 设置未生效。" +
         `修正该文件的 JSON 语法/字段类型后重启 \`${cli} claude\` 即可重新生效。`,
     };
   }

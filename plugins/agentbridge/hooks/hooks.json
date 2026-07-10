@@ -1,5 +1,5 @@
 {
-  "description": "Hint-only health checks for AgentBridge startup. These hooks never orchestrate the daemon.",
+  "description": "SessionStart delivery for AgentBridge: injects the runtime collaboration context while the bridge is up (daemon healthy + Codex TUI attached), falls back to informational health notices otherwise. Never orchestrates the daemon.",
   "hooks": {
     "SessionStart": [
       {

@@ -18,8 +18,9 @@
  *  - "minimal":        healthz/readyz + WS accept + clean SIGTERM. Nothing
  *                      more — the daemon only needs the app-server to be
  *                      reachable and to die cleanly (e2e-reconnect lifecycle).
- *  - "handshake":      minimal + auto-respond to `thread/start` so the adapter
- *                      can set an active thread and reach "ready".
+ *  - "handshake":      minimal + initialize/thread/start/thread/inject_items
+ *                      responses so the adapter can set an active thread,
+ *                      install its runtime developer contract, and reach ready.
  *  - "command-driven": handshake + the full turn protocol the daemon-wiring
  *                      tests drive: turn/start (+ optional log), turn/interrupt
  *                      (+ optional log, + FAKE_APP_INTERRUPT_DELAY_MS deferral),
@@ -47,6 +48,8 @@
  *                               during an in-progress boot retry); subsequent spawns
  *                               (the retry) boot normally. Lets tests reproduce a
  *                               fail-once-then-recover boot without a 10s healthz wait.
+ *  - FAKE_CODEX_VERSION         app-server version returned from initialize
+ *                               (default 0.144.1).
  *
  * Command-file commands (command-driven, one per line, file is consumed each poll):
  *  - start-turn / complete-turn / agent-message:<text> / close-app-server (WS only)
@@ -92,6 +95,7 @@ function main(): void {
   }
 
   const capability = parseCapability(process.env.FAKE_CODEX_CAPABILITY);
+  const fakeVersion = process.env.FAKE_CODEX_VERSION || "0.144.1";
 
   const listenIndex = process.argv.indexOf("--listen");
   const listen = process.argv[listenIndex + 1];
@@ -140,7 +144,13 @@ function main(): void {
     let msg: {
       id?: unknown;
       method?: unknown;
-      params?: { turnId?: string; expectedTurnId?: unknown; input?: Array<{ text?: string }> };
+      params?: {
+        turnId?: string;
+        expectedTurnId?: unknown;
+        input?: Array<{ text?: string }>;
+        developerInstructions?: unknown;
+        items?: unknown[];
+      };
     };
     try {
       msg = JSON.parse(typeof raw === "string" ? raw : raw.toString());
@@ -148,10 +158,27 @@ function main(): void {
       return;
     }
 
+    if (handshakeEnabled && msg.method === "initialize") {
+      ws.send(JSON.stringify({
+        id: msg.id,
+        result: {
+          userAgent: `codex_cli_rs/${fakeVersion} (Linux fake; x86_64)`,
+          platformFamily: "unix",
+          platformOs: "linux",
+        },
+      }));
+      return;
+    }
+
     // handshake: auto-respond to thread/start so the adapter can detect an
     // active thread and emit "ready" (used by budget/ready-gate tests).
     if (handshakeEnabled && msg.method === "thread/start") {
       ws.send(JSON.stringify({ id: msg.id, result: { thread: { id: "thread-fake-1" } } }));
+      return;
+    }
+
+    if (handshakeEnabled && msg.method === "thread/inject_items") {
+      ws.send(JSON.stringify({ id: msg.id, result: {} }));
       return;
     }
 

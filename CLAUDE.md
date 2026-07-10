@@ -28,6 +28,7 @@ Runtime is **Bun** — do not change the local Bun version.
 | Validate plugin manifest | `bun run validate:plugin` (requires `claude` CLI) |
 | Local dev link | `bun link` then `agentbridge dev` (registers local marketplace + installs plugin; repo checkout only) |
 | Update global CLI + plugin | `bun run install:global` (one command: rebuild, replace global install, sync plugin; `--skip-plugin` to opt out) |
+| Remove legacy doc sections | `agentbridge deinit` (strips the `<!-- AgentBridge -->` blocks from CLAUDE.md / AGENTS.md; runtime delivery unaffected) |
 | Start session | `agentbridge claude` (one terminal) + `agentbridge codex` (another) |
 | Show quota snapshot | `agentbridge budget [--json]` (both agents' 5h/weekly usage, drift, pause state) |
 | Stop everything | `agentbridge kill` |
@@ -59,8 +60,9 @@ Claude Code ── MCP stdio ──▶ bridge.ts (foreground)
 - **`src/daemon-lifecycle.ts`** — shared `ensureRunning` / `kill` / startup-lock logic; both the CLI and `bridge.ts` call into this.
 - **`src/daemon-client.ts`** — typed WS client used by `bridge.ts` to talk to the daemon control port.
 - **`src/config-service.ts`** + **`src/state-dir.ts`** — read/write `.agentbridge/config.json` and resolve the platform state dir (`daemon.pid`, `status.json`, `agentbridge.log`, `killed` sentinel, `startup.lock`).
-- **`src/cli.ts` + `src/cli/*.ts`** — `abg` / `agentbridge` command router (`init`, `claude`, `codex`, `pairs`, `doctor`, `budget`, `kill`, `dev`).
-- **`src/marker-section.ts` + `src/collaboration-content.ts`** — idempotent marker-based injection of the `<!-- AgentBridge:start/end -->` block into `CLAUDE.md` and `AGENTS.md` during `abg init`. (Other agent config files — GEMINI.md / .cursorrules / .kiro etc. — are NOT injected today; backlog, not shipped behavior.)
+- **`src/cli.ts` + `src/cli/*.ts`** — `abg` / `agentbridge` command router (`init`, `deinit`, `claude`, `codex`, `pairs`, `doctor`, `budget`, `kill`, `dev`).
+- **`src/collaboration-contract.ts` + `src/session-context-hook.ts`** — the runtime collaboration carriers (the default since the pluggable-injection change): the codex proxy injects `CODEX_DEVELOPER_CONTRACT` as native developer context (idempotent per `(threadId, contractHash())`), and the plugin SessionStart hook emits `CLAUDE_SESSION_CONTEXT` via `bridge-server.js --print-session-context` only while the daemon is healthy + TUI attached. Projects keep zero static footprint.
+- **`src/marker-section.ts` + `src/collaboration-content.ts`** — legacy marker-based injection of the `<!-- AgentBridge:start/end -->` block into `CLAUDE.md` and `AGENTS.md`; opt-in via `abg init --inject-docs`, removable with `abg deinit`. (Other agent config files — GEMINI.md / .cursorrules / .kiro etc. — are NOT injected; backlog, not shipped behavior.)
 - **`src/bridge-disabled-state.ts` + `src/tui-connection-state.ts`** — disabled-reason and TUI-connect state machines used by the kickoff + reconnect UX.
 
 ### Data flow invariants

@@ -65,8 +65,8 @@ English version: [README.md](README.md)
 很多人对"实时双向通信"最大的担心是：两个 agent 的上下文会不会合并、越滚越大。不会。**桥传的是消息，不是上下文** —— 每个 agent 各自维护自己的上下文窗口，桥从不会把一方的完整对话历史拷进另一方。（而且谁规划、谁执行完全由你定，角色不写死，让 Codex 指挥 Claude 也一样。）在这个前提上，三层过滤让真正跨过桥的东西尽量少：
 
 1. **只转发 `agentMessage`。** 桥只转发 agent 真正说出来的结论，它执行命令的输出、`commandExecution`、`fileChange`、推理过程这些中间噪声和完整 scrollback 都不过桥。每一方看到的是对方的结论，不是干活的流水账。
-2. **三级标签路由**（默认 `filtered` 模式）。每条消息带标签，daemon 按标签决定去留：`[IMPORTANT]` 立刻转发，`[STATUS]` 先缓冲、攒几条（默认 3 条或 15 秒）合并成一条摘要，`[FYI]` 直接丢。标签规则一次性写在项目的 `AGENTS.md` 里（`abg init` 注入），agent 启动读一次。
-3. **协作契约只存一份**在 `AGENTS.md`，不附带在每条消息上（否则每个 thread 和它的 resume 标题都会被污染）。
+2. **三级标签路由**（默认 `filtered` 模式）。每条消息带标签，daemon 按标签决定去留：`[IMPORTANT]` 立刻转发，`[STATUS]` 先缓冲、攒几条（默认 3 条或 15 秒）合并成一条摘要，`[FYI]` 直接丢。标签规则随运行时协作契约自动下发，桥接着才生效。
+3. **协作契约每个 thread 只注入一份**——桥接上时以原生 developer 上下文注入（Claude 侧则由插件 hook 按会话注入），既不写进你的项目文件，也不附带在每条消息上（否则每个 thread 和它的 resume 标题都会被污染）。你的 `CLAUDE.md` / `AGENTS.md` 保持原样，没有桥的新会话不会收到协作契约（至多一条"如何启动桥"的运营短提示）。一个诚实的边界：**桥接过的** Codex thread 会在它自己的会话历史里保留已注入的契约（存在 Codex 的存储里，不在你的仓库）——契约开头的失效条款会在脱桥后使其自动中和（"没有真实桥消息就忽略本契约、独立工作"）。
 
 最终效果：每一方收到的是对方精选过的有意义消息，上下文的增长跟的是"有效交流的条数"，不是"对方活动的原始量"。需要看完整原文时，设 `AGENTBRIDGE_FILTER_MODE=full` 即可关掉过滤。
 
@@ -156,7 +156,8 @@ agentbridge codex   # （另一个终端）启动 Codex TUI 连接 Bridge
 
 | 命令 | 说明 |
 |------|------|
-| `abg init` | 安装插件、检查依赖（bun/claude/codex）、生成 `.agentbridge/config.json` |
+| `abg init [--inject-docs]` | 安装插件、检查依赖（bun/claude/codex）、生成 `.agentbridge/config.json`。协作指引在桥运行时自动下发；`--inject-docs` 才会额外把旧版静态段落写进 `CLAUDE.md` / `AGENTS.md` |
+| `abg deinit` | 移除以前注入到本项目 `CLAUDE.md` / `AGENTS.md` 的 AgentBridge 段落（不影响运行时下发） |
 | `abg claude [args...]` | 启动 Claude Code 并启用 push channel。**默认带 `--dangerously-skip-permissions`**（关闭：`--safe` 或 `AGENTBRIDGE_SAFE=1`）。自动清除上次 `kill` 留下的 sentinel。额外参数透传给 `claude` |
 | `abg codex [args...]` | 启动连接 AgentBridge daemon 的 Codex TUI。**裸 `abg codex` 自动续接该对上次的 thread；`abg codex --new` 开新 thread。TUI 默认带 `--yolo`**（关闭：`--safe` 或 `AGENTBRIDGE_SAFE=1`；`exec` 等非 TUI 子命令不受影响）。额外参数透传给 `codex` |
 | `abg resume [claude\|codex]` | 不带目标：打印本目录上次 Claude 会话 + 本对当前 Codex thread 的续接命令。带目标：直接续接该侧 |
@@ -231,7 +232,9 @@ AgentBridge 是一个**两进程**本地 Bridge：
 
 | 文件 | 用途 |
 |------|------|
-| `config.json` | 机器可读的项目配置（Codex 端口、回合协调、空闲关闭） |
+| `config.json` | 机器可读的项目配置（Codex 端口、回合协调、空闲关闭、运行时注入） |
+
+值得一提的开关：`"injection": {"runtime": true}`（默认）控制协作契约在**双侧**的运行时下发——设为 `false` 可让项目整体退出（Codex 侧 developer 上下文注入关闭，Claude 侧 SessionStart hook 对该工作区完全静默）。
 
 CLI 和 daemon 启动时会加载该配置。重复运行 `init` 是幂等的，不会覆盖已有文件。
 

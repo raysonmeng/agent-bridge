@@ -1,5 +1,5 @@
 import { describe, expect, test } from "bun:test";
-import { upsertMarkedSection } from "../marker-section";
+import { removeMarkedSection, upsertMarkedSection } from "../marker-section";
 
 const SECTION_ID = "TestSection";
 const START = `<!-- ${SECTION_ID}:start -->`;
@@ -88,5 +88,61 @@ describe("upsertMarkedSection", () => {
     expect(() => upsertMarkedSection(existing, SECTION_ID, "NEW")).toThrow(
       /Malformed .* markers/,
     );
+  });
+});
+
+describe("removeMarkedSection", () => {
+  test("no markers → untouched, removed=false", () => {
+    const content = "# My Project\n\nSome content here.\n";
+    const result = removeMarkedSection(content, SECTION_ID);
+    expect(result.removed).toBe(false);
+    expect(result.content).toBe(content);
+  });
+
+  test("file that was ONLY the block collapses to empty string", () => {
+    const onlyBlock = upsertMarkedSection("", SECTION_ID, "Hello World");
+    const result = removeMarkedSection(onlyBlock, SECTION_ID);
+    expect(result.removed).toBe(true);
+    expect(result.content).toBe("");
+  });
+
+  test("upsert → remove round-trips an existing file", () => {
+    const original = "# My Project\n\nSome content here.\n";
+    const withBlock = upsertMarkedSection(original, SECTION_ID, "Injected section");
+    const result = removeMarkedSection(withBlock, SECTION_ID);
+    expect(result.removed).toBe(true);
+    expect(result.content).toBe(original);
+  });
+
+  test("upsert → remove on a file without trailing newline adds at most that newline", () => {
+    const original = "# My Project\n\nSome content here.";
+    const withBlock = upsertMarkedSection(original, SECTION_ID, "Injected section");
+    const result = removeMarkedSection(withBlock, SECTION_ID);
+    expect(result.removed).toBe(true);
+    expect(result.content).toBe(original + "\n");
+  });
+
+  test("mid-file block: keeps surrounding content, collapses separator blank lines", () => {
+    const existing = `# Title\n\n${START}\nBlock body\n${END}\n\n## Footer\nText.\n`;
+    const result = removeMarkedSection(existing, SECTION_ID);
+    expect(result.removed).toBe(true);
+    expect(result.content).toBe("# Title\n## Footer\nText.\n");
+  });
+
+  test("different section IDs are not touched", () => {
+    const existing = `<!-- Other:start -->\nKeep this\n<!-- Other:end -->\n`;
+    const result = removeMarkedSection(existing, SECTION_ID);
+    expect(result.removed).toBe(false);
+    expect(result.content).toBe(existing);
+  });
+
+  test("malformed: orphan start marker → throws (never guess the block extent)", () => {
+    const existing = `# Title\n${START}\nOld notes\nUser content\n`;
+    expect(() => removeMarkedSection(existing, SECTION_ID)).toThrow(/Malformed .* markers/);
+  });
+
+  test("malformed: end marker before start marker → throws", () => {
+    const existing = `# Title\n${END}\nUser notes\n${START}\nOld block\n`;
+    expect(() => removeMarkedSection(existing, SECTION_ID)).toThrow(/Malformed .* markers/);
   });
 });

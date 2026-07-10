@@ -81,7 +81,11 @@ async function main(command: string | undefined, restArgs: string[]) {
   switch (command) {
     case "init":
       const { runInit } = await import("./cli/init");
-      await runInit();
+      await runInit(restArgs);
+      break;
+    case "deinit":
+      const { runDeinit } = await import("./cli/deinit");
+      await runDeinit();
       break;
     case "dev":
       const { runDev } = await import("./cli/dev");
@@ -148,7 +152,13 @@ Usage:
   abg [--pair <name>] <command> [args...]
 
 Commands:
-  init               Install plugin, check dependencies, generate project config
+  init [--inject-docs]
+                     Install plugin, check dependencies, generate project config.
+                     Collaboration guidance is delivered at runtime (only while
+                     the bridge runs); --inject-docs additionally writes the
+                     legacy static sections into CLAUDE.md / AGENTS.md
+  deinit             Remove AgentBridge sections previously injected into this
+                     project's CLAUDE.md / AGENTS.md
   dev                Register local marketplace + install plugin (for local dev)
   claude [args...]   Start Claude Code with push channel enabled
   codex [args...]    Start Codex TUI connected to AgentBridge daemon

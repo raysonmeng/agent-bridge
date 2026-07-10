@@ -65,8 +65,8 @@ What that buys you, concretely:
 A common worry about real-time bidirectional messaging is that the two agents' contexts merge and grow without bound. They don't. **The bridge passes messages, not context** — each agent keeps its own context window, and the bridge never copies one agent's full transcript into the other. (And which agent plans vs executes is your call — the roles aren't fixed; Codex can drive Claude just as easily.) Three filters keep what actually crosses small:
 
 1. **Only `agentMessage` crosses.** The bridge forwards an agent's actual conclusions, not its tool-call noise — `commandExecution`, `fileChange`, and reasoning deltas never reach the other side, nor does its full scrollback.
-2. **Three-tier marker routing** (default `filtered` mode). Each message is tagged and the daemon routes by tag: `[IMPORTANT]` forwards immediately, `[STATUS]` is buffered and batched into one periodic summary (default: 3 updates or 15s), `[FYI]` is dropped. The marker rules live once in the project's `AGENTS.md` (written by `abg init`), loaded at agent startup.
-3. **The collaboration contract lives once** in `AGENTS.md`, not appended to every message (which would pollute every thread and its resume title).
+2. **Three-tier marker routing** (default `filtered` mode). Each message is tagged and the daemon routes by tag: `[IMPORTANT]` forwards immediately, `[STATUS]` is buffered and batched into one periodic summary (default: 3 updates or 15s), `[FYI]` is dropped. The marker rules ride the runtime collaboration contract, delivered automatically while the bridge is attached.
+3. **The collaboration contract lives once per thread** — injected as native developer context when the bridge attaches (and for Claude, per session via the plugin hook), not written into your project files and not appended to every message (which would pollute every thread and its resume title). Your `CLAUDE.md` / `AGENTS.md` stay untouched, and new sessions started without a bridge receive no collaboration contract (at most a short operational notice on how to start the bridge). One honest caveat: a Codex thread that *was* bridged keeps the injected contract in its own session history (Codex's storage, not your repo) — the contract's opening scope clause neutralizes it there ("no live bridge messages → ignore this, work solo").
 
 Net effect: each side receives a curated stream of meaningful messages, so context grows with the number of real exchanges — not the other agent's raw activity. Set `AGENTBRIDGE_FILTER_MODE=full` (or the config equivalent) when you *do* want the unfiltered stream.
 
@@ -156,7 +156,8 @@ agentbridge codex   # (another terminal) Start Codex TUI connected to the bridge
 
 | Command | Description |
 |---------|-------------|
-| `abg init` | Install plugin, check dependencies (bun/claude/codex), generate `.agentbridge/config.json` |
+| `abg init [--inject-docs]` | Install plugin, check dependencies (bun/claude/codex), generate `.agentbridge/config.json`. Collaboration guidance is delivered at runtime while the bridge runs; `--inject-docs` additionally writes the legacy static sections into `CLAUDE.md` / `AGENTS.md` |
+| `abg deinit` | Remove AgentBridge sections previously injected into this project's `CLAUDE.md` / `AGENTS.md` (runtime delivery is unaffected) |
 | `abg claude [args...]` | Start Claude Code with push channel enabled. **Runs with `--dangerously-skip-permissions` by default** (opt out: `--safe` or `AGENTBRIDGE_SAFE=1`). Clears any killed sentinel from a previous `kill`. Pass-through args are forwarded to `claude` |
 | `abg codex [args...]` | Start Codex TUI connected to AgentBridge daemon. **Bare `abg codex` auto-resumes the pair's last thread; use `abg codex --new` for a fresh thread. TUI launches run with `--yolo` by default** (opt out: `--safe` or `AGENTBRIDGE_SAFE=1`; non-TUI subcommands like `exec` are never touched). Pass-through args forwarded to `codex` |
 | `abg resume [claude\|codex]` | No target: print the resume commands for this directory's last Claude session and this pair's current Codex thread. With a target: resume that side directly |
@@ -231,7 +232,9 @@ Running `agentbridge init` creates a `.agentbridge/` directory in your project r
 
 | File | Purpose |
 |------|---------|
-| `config.json` | Machine-readable project config (Codex ports, turn coordination, idle shutdown) |
+| `config.json` | Machine-readable project config (Codex ports, turn coordination, idle shutdown, runtime injection) |
+
+Notable switch: `"injection": {"runtime": true}` (default) controls the runtime delivery of the collaboration contract on **both** sides — set it to `false` to opt a project out entirely (Codex developer-context injection off, and the plugin's SessionStart hook goes fully silent for that workspace).
 
 The config is loaded by the CLI and daemon at startup. Re-running `init` is idempotent and will not overwrite existing files.
 

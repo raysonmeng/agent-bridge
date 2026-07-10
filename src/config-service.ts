@@ -13,6 +13,9 @@ export interface AgentBridgeConfig {
   turnCoordination: {
     attentionWindowSeconds: number;
   };
+  injection: {
+    runtime: boolean;
+  };
   idleShutdownSeconds: number;
   budget: BudgetConfig;
 }
@@ -78,6 +81,9 @@ const DEFAULT_CONFIG: AgentBridgeConfig = {
   turnCoordination: {
     attentionWindowSeconds: 15,
   },
+  injection: {
+    runtime: true,
+  },
   idleShutdownSeconds: 30,
   budget: DEFAULT_BUDGET_CONFIG,
 };
@@ -132,6 +138,9 @@ interface LegacyAgentBridgeConfig {
   };
   turnCoordination?: {
     attentionWindowSeconds?: unknown;
+  };
+  injection?: {
+    runtime?: unknown;
   };
   idleShutdownSeconds?: unknown;
   budget?: unknown;
@@ -241,6 +250,7 @@ function hasCustomDecisionValues(config: AgentBridgeConfig): boolean {
   return (
     config.idleShutdownSeconds !== d.idleShutdownSeconds ||
     config.turnCoordination.attentionWindowSeconds !== d.turnCoordination.attentionWindowSeconds ||
+    config.injection.runtime !== d.injection.runtime ||
     config.codex.appPort !== d.codex.appPort ||
     config.codex.proxyPort !== d.codex.proxyPort ||
     b.enabled !== db.enabled ||
@@ -556,6 +566,7 @@ function normalizeConfig(raw: unknown): AgentBridgeConfig | null {
   const codex = isRecord(config.codex) ? config.codex : {};
   const daemon = isRecord(config.daemon) ? config.daemon : {};
   const turnCoordination = isRecord(config.turnCoordination) ? config.turnCoordination : {};
+  const injection = isRecord(config.injection) ? config.injection : {};
 
   return {
     version: typeof config.version === "string" ? config.version : DEFAULT_CONFIG.version,
@@ -583,6 +594,9 @@ function normalizeConfig(raw: unknown): AgentBridgeConfig | null {
         0,
         Number.MAX_SAFE_INTEGER,
       ),
+    },
+    injection: {
+      runtime: normalizeBoolean(injection.runtime, DEFAULT_CONFIG.injection.runtime),
     },
     // A negative idleShutdownSeconds becomes a negative *1000 ms timeout, which
     // setTimeout clamps to 0 → the daemon self-shuts ~immediately after boot,
@@ -674,7 +688,7 @@ export class ConfigService {
     if (result.state === "corrupt") {
       log(
         `config.json at ${this.configPath} is unusable (${result.reason}); ` +
-          "falling back to defaults — your custom budget thresholds / idle-shutdown settings are NOT in effect. " +
+          "falling back to defaults — your custom budget / runtime-injection / idle-shutdown settings are NOT in effect. " +
           "Fix the file and restart to re-apply them.",
       );
     }
