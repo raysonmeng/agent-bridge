@@ -1,9 +1,10 @@
 /**
- * Claude Code MCP Server — Push Message Transport
+ * Claude Code MCP Server — Always-Queue + Push Message Transport
  *
- * Delivery is always push (real-time notifications/claude/channel). When a
- * push fails, the message falls back to an in-memory queue drained by the
- * get_messages tool — a per-message fallback, not a configurable mode.
+ * Every message is queued first for reliable retrieval via get_messages, then
+ * pushed as a real-time optimization. When the push is dropped (e.g. Claude
+ * idle — a known upstream variability of notifications/claude/channel), the
+ * queue guarantees the message is still reachable.
  * (The old AGENTBRIDGE_MODE=pull delivery mode was removed: it could not wake
  * an idle session, which silently broke the budget RESUME chain.)
  *
@@ -63,7 +64,7 @@ export const CLAUDE_INSTRUCTIONS = [
   "",
   "## Message delivery",
   "Messages from Codex arrive as <channel source=\"agentbridge\" chat_id=\"...\" user=\"Codex\" ...> tags (push).",
-  "If a push fails, the message is queued — call get_messages to drain the fallback queue.",
+  "Messages are always queued — call get_messages to drain the fallback queue. Push delivery is a best-effort real-time optimization that may not arrive when Claude is idle.",
   "",
   "## Collaboration roles",
   "Default roles in this setup:",
@@ -81,7 +82,7 @@ export const CLAUDE_INSTRUCTIONS = [
   "",
   "## How to interact",
   "- Use the reply tool to send messages back to Codex — pass chat_id back.",
-  "- Use the get_messages tool to check for pending messages from Codex.",
+  "- Use the get_messages tool to check for pending messages from Codex. Messages stay in the mailbox until acknowledged — pass ack_ids (from the [id: ...] labels) to confirm receipt and remove them.",
   "- After sending a reply, call get_messages to check for responses.",
   "- When the user asks about Codex status or progress, call get_messages.",
   "",
@@ -112,9 +113,12 @@ export class ClaudeAdapter extends EventEmitter {
   private readonly logFile: string;
   private readonly logger: ProcessLogger;
 
-  // Push transport with a per-message fallback queue (drained by get_messages).
-  private pendingMessages: BridgeMessage[] = [];
-  private pendingMessageByteSizes: number[] = [];
+  // ACK mailbox: every message is queued with an acked flag. get_messages
+  // returns un-acked entries but keeps them in the mailbox; only an explicit
+  // ack_ids parameter removes them. This guarantees at-least-once delivery
+  // even across multiple get_messages calls or MCP process restarts (once
+  // the mailbox is persisted — currently in-memory).
+  private messageEntries: { message: BridgeMessage; bytes: number; acked: boolean }[] = [];
   private pendingMessageBytes = 0;
   private readonly maxBufferedMessages: number;
   private readonly maxBufferedBytes: number;
@@ -212,7 +216,7 @@ export class ClaudeAdapter extends EventEmitter {
 
   /** Returns the number of messages waiting in the fallback queue. */
   getPendingMessageCount(): number {
-    return this.pendingMessages.length;
+    return this.messageEntries.filter(e => !e.acked).length;
   }
 
   /** Cache the latest budget snapshot from the daemon (null clears it). */
@@ -234,6 +238,11 @@ export class ClaudeAdapter extends EventEmitter {
   async pushNotification(message: BridgeMessage) {
     this.log(`pushNotification (instance=${this.instanceId}, msgId=${message.id}, len=${message.content.length})`);
     if (!this.rememberDelivery(message)) return;
+    // Always queue first so get_messages is a reliable fallback even when
+    // the push is silently dropped (e.g. Claude idle — known upstream
+    // variability of notifications/claude/channel). The push below is a
+    // best-effort real-time optimization.
+    this.queueFallbackMessage(message);
     await this.pushViaChannel(message);
   }
 
@@ -263,8 +272,7 @@ export class ClaudeAdapter extends EventEmitter {
       });
       this.log(`Pushed notification: ${message.id} (attempt=${deliveryAttemptId})`);
     } catch (e: any) {
-      this.log(`Push notification failed: ${e.message}`);
-      this.queueFallbackMessage(message);
+      this.log(`Push notification failed: ${e.message} (message remains in get_messages queue)`);
     }
   }
 
@@ -298,7 +306,7 @@ export class ClaudeAdapter extends EventEmitter {
     }
   }
 
-  /** Per-message fallback when a push fails; drained by the get_messages tool. */
+  /** Enqueue a message into the ACK mailbox. Older acked entries are evicted first on overflow. */
   private queueFallbackMessage(message: BridgeMessage) {
     const messageBytes = utf8ByteLength(message.content);
     if (messageBytes > this.maxBufferedBytes) {
@@ -314,53 +322,84 @@ export class ClaudeAdapter extends EventEmitter {
       return;
     }
 
+    // Evict already-acked entries first (they've been consumed), then oldest
+    // un-acked entries if still over capacity.
     let dropped = 0;
     while (
-      this.pendingMessages.length >= this.maxBufferedMessages ||
+      this.messageEntries.length >= this.maxBufferedMessages ||
       this.pendingMessageBytes + messageBytes > this.maxBufferedBytes
     ) {
-      const droppedMessage = this.pendingMessages.shift();
-      const droppedBytes = this.pendingMessageByteSizes.shift() ?? 0;
-      if (!droppedMessage) break;
-      this.pendingMessageBytes = Math.max(0, this.pendingMessageBytes - droppedBytes);
-      this.droppedMessageCount++;
-      dropped++;
+      // Prefer evicting acked entries
+      const ackedIdx = this.messageEntries.findIndex(e => e.acked);
+      const evictIdx = ackedIdx !== -1 ? ackedIdx : 0;
+      const evicted = this.messageEntries[evictIdx];
+      if (!evicted) break;
+      this.pendingMessageBytes = Math.max(0, this.pendingMessageBytes - evicted.bytes);
+      this.messageEntries.splice(evictIdx, 1);
+      if (!evicted.acked) {
+        this.droppedMessageCount++;
+        dropped++;
+      }
     }
     if (dropped > 0) {
       this.log(
-        `Fallback queue overflow: dropped ${dropped} oldest message${dropped > 1 ? "s" : ""} ` +
-        `(${this.pendingMessages.length} pending, ${formatBytes(this.pendingMessageBytes)} buffered, ` +
+        `Fallback queue overflow: dropped ${dropped} oldest un-acked message${dropped > 1 ? "s" : ""} ` +
+        `(${this.messageEntries.filter(e => !e.acked).length} un-acked pending, ` +
+        `${formatBytes(this.pendingMessageBytes)} buffered, ` +
         `${this.droppedMessageCount} dropped since last drain)`,
       );
     }
 
-    this.pendingMessages.push(message);
-    this.pendingMessageByteSizes.push(messageBytes);
+    this.messageEntries.push({ message, bytes: messageBytes, acked: false });
     this.pendingMessageBytes += messageBytes;
     this.log(
-      `Queued fallback message (${this.pendingMessages.length} pending, ` +
+      `Queued message (${this.messageEntries.filter(e => !e.acked).length} un-acked, ` +
       `${formatBytes(this.pendingMessageBytes)} buffered, instance=${this.instanceId})`,
     );
   }
 
   // ── get_messages ───────────────────────────────────────────
 
-  private drainMessages(): { content: Array<{ type: "text"; text: string }> } {
+  /**
+   * ACK mailbox drain.
+   *
+   * @param ackIds  Message IDs to acknowledge — these are removed from the mailbox.
+   *                IDs not found (already acked, never existed) are silently ignored.
+   * @returns       All currently un-acked messages. They stay in the mailbox until
+   *                explicitly acked via a subsequent get_messages call with ack_ids.
+   */
+  private drainMessages(ackIds?: string[]): { content: Array<{ type: "text"; text: string }> } {
+    const unackedBefore = this.messageEntries.filter(e => !e.acked).length;
     this.log(
-      `get_messages called (instance=${this.instanceId}, pending=${this.pendingMessages.length}, ` +
-      `bytes=${this.pendingMessageBytes}, dropped=${this.droppedMessageCount}, oversized=${this.oversizedMessageCount})`,
+      `get_messages called (instance=${this.instanceId}, unacked=${unackedBefore}, ` +
+      `total=${this.messageEntries.length}, bytes=${this.pendingMessageBytes}, ` +
+      `dropped=${this.droppedMessageCount}, oversized=${this.oversizedMessageCount}` +
+      `${ackIds && ackIds.length > 0 ? `, ackIds=${ackIds.join(",")}` : ""})`,
     );
-    if (this.pendingMessages.length === 0 && this.droppedMessageCount === 0 && this.oversizedMessageCount === 0) {
-      return {
-        content: [{ type: "text" as const, text: "No new messages from Codex." }],
-      };
+
+    // Process acknowledgments: remove acked entries from the mailbox.
+    if (ackIds && ackIds.length > 0) {
+      const ackSet = new Set(ackIds);
+      let ackedCount = 0;
+      this.messageEntries = this.messageEntries.filter(entry => {
+        if (ackSet.has(entry.message.id)) {
+          this.pendingMessageBytes = Math.max(0, this.pendingMessageBytes - entry.bytes);
+          ackedCount++;
+          return false;
+        }
+        return true;
+      });
+      if (ackedCount > 0) {
+        this.log(`Acked ${ackedCount} message(s), ${this.messageEntries.filter(e => !e.acked).length} un-acked remaining`);
+      }
     }
 
-    // Snapshot and clear atomically to avoid issues with concurrent writes
-    const messages = this.pendingMessages;
-    this.pendingMessages = [];
-    this.pendingMessageByteSizes = [];
-    this.pendingMessageBytes = 0;
+    // Collect un-acked messages to return (they stay in the mailbox).
+    const unacked = this.messageEntries.filter(e => !e.acked);
+    const count = unacked.length;
+    const totalInMailbox = this.messageEntries.length;
+
+    // Report dropped/oversized since last call, then reset.
     const dropped = this.droppedMessageCount;
     this.droppedMessageCount = 0;
     const oversizedSourceCounts = this.oversizedMessageSourceCounts;
@@ -370,7 +409,12 @@ export class ClaudeAdapter extends EventEmitter {
     this.oversizedMessageCount = 0;
     this.oversizedMessageBytes = 0;
 
-    const count = messages.length;
+    if (count === 0 && dropped === 0 && oversized === 0) {
+      return {
+        content: [{ type: "text" as const, text: "No new messages from Codex." }],
+      };
+    }
+
     const notices: string[] = [];
     if (dropped > 0) {
       notices.push(
@@ -388,24 +432,29 @@ export class ClaudeAdapter extends EventEmitter {
       }
     }
 
-    const formatted = messages
-      .map((msg, i) => {
-        const ts = new Date(msg.timestamp).toISOString();
-        return `---\n[${i + 1}] ${ts}\nCodex: ${msg.content}`;
+    const formatted = unacked
+      .map((entry, i) => {
+        const ts = new Date(entry.message.timestamp).toISOString();
+        return `---\n[${i + 1}] ${ts} [id: ${entry.message.id}]\nCodex: ${entry.message.content}`;
       })
       .join("\n\n");
 
     const noticeText = notices.map((notice) => `WARNING: ${notice}`).join("\n");
     const parts: string[] = [];
     if (count > 0) {
-      parts.push(`[${count} new message${count > 1 ? "s" : ""} from Codex]\nchat_id: ${this.sessionId}`);
+      parts.push(`[${count} un-acked message${count > 1 ? "s" : ""} from Codex]\nchat_id: ${this.sessionId}`);
     }
     if (noticeText) parts.push(noticeText);
     if (formatted) parts.push(formatted);
+    // Emit ack IDs so the model can acknowledge them on the next call.
+    const ackHint = unacked.map(e => e.message.id);
+    if (ackHint.length > 0) {
+      parts.push(`To acknowledge receipt, call get_messages with ack_ids: ${JSON.stringify(ackHint)}`);
+    }
 
     this.log(
-      `get_messages returning ${count} message(s) ` +
-      `(instance=${this.instanceId}, dropped=${dropped}, oversized=${oversized}, oversizedBytes=${oversizedBytes})`,
+      `get_messages returning ${count} un-acked message(s) ` +
+      `(${totalInMailbox} total in mailbox, instance=${this.instanceId})`,
     );
     return {
       content: [
@@ -461,10 +510,16 @@ export class ClaudeAdapter extends EventEmitter {
         {
           name: "get_messages",
           description:
-            "Check for new messages from Codex. Call this after sending a reply or when you expect a response from Codex.",
+            "Check for new messages from Codex. Call this after sending a reply or when you expect a response from Codex. Messages remain in the mailbox until acknowledged — pass ack_ids (from the [id: ...] labels in the output) to confirm receipt and remove them.",
           inputSchema: {
             type: "object" as const,
-            properties: {},
+            properties: {
+              ack_ids: {
+                type: "array",
+                items: { type: "string" },
+                description: "Optional list of message IDs to acknowledge. Acknowledged messages are permanently removed from the mailbox. Use the IDs shown in [id: ...] labels from previous get_messages output.",
+              },
+            },
             required: [],
           },
         },
@@ -510,7 +565,12 @@ export class ClaudeAdapter extends EventEmitter {
       }
 
       if (name === "get_messages") {
-        return this.drainMessages();
+        const ackIds = Array.isArray((args as Record<string, unknown>)?.ack_ids)
+          ? ((args as Record<string, unknown>).ack_ids as string[]).filter(
+              (id: unknown) => typeof id === "string" && id.length > 0,
+            )
+          : undefined;
+        return this.drainMessages(ackIds);
       }
 
       if (name === "get_budget") {
@@ -703,7 +763,7 @@ export class ClaudeAdapter extends EventEmitter {
     }
 
     // Include pending message hint
-    const pending = this.pendingMessages.length;
+    const pending = this.messageEntries.filter(e => !e.acked).length;
     let responseText = "Reply sent to Codex.";
     if (onBusy === "steer") {
       responseText = "Reply sent to Codex (will be steered into the running turn if one is active; watch for a system_steer_failed notice if the app-server rejects it).";
