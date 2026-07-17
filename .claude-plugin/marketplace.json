@@ -11,7 +11,7 @@
   "plugins": [
     {
       "name": "agentbridge",
-      "description": "Bridge Claude Code and Codex through a shared daemon, push channel delivery, and reply/get_messages tools.",
+      "description": "Bridge Claude Code and Codex through a shared daemon, acknowledged channel delivery, and reply/get_messages/ack_messages tools.",
       "version": "0.1.30",
       "author": {
         "name": "AgentBridge Contributors",

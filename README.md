@@ -53,7 +53,7 @@ What that buys you, concretely:
 ## Features
 
 - **Bidirectional Claude ↔ Codex messaging** in one working session — the daemon intercepts Codex output and pushes it to Claude as channel notifications; Claude replies via the `reply` MCP tool, and the bridge injects the reply into the Codex thread as a `turn/start`.
-- **Push delivery with fallback** — messages arrive as channel notifications; a failed push falls back to an in-memory queue drained by `get_messages`. Loop prevention via the per-message `source` field.
+- **Acknowledged at-least-once delivery** - every Codex message enters a bounded in-memory mailbox before its Channel push. Each admission gets an immutable delivery-generation ID, separate from the daemon source ID, so a delayed ACK cannot delete a newer message. Claude acknowledges processed IDs with `ack_messages`; missed pushes remain visible through non-destructive `get_messages` polling, and unacknowledged pushes receive bounded FIFO retries. Loop prevention uses the per-message `source` field.
 - **Turn coordination** — a busy-guard rejects replies during an active Codex turn; a per-turn inactivity watchdog stops a lost `turn/completed` from locking injection forever; noisy intermediate events are collapsed so only meaningful `agentMessage` payloads reach Claude.
 - **Multiple pairs side by side** — one Claude+Codex pair per project directory, ports allocated per pair in +10 strides from 4500. Pair-aware `claude` / `codex` / `resume` / `kill` / `doctor` / `budget` via `--pair`.
 - **Resilient lifecycle** — a persistent background daemon survives Claude Code restarts (auto-reconnect with backoff); orphan-process cleanup; `abg doctor` read-only diagnostics; `abg pairs prune` reclaims stranded state.
@@ -249,6 +249,10 @@ The config is loaded by the CLI and daemon at startup. Re-running `init` is idem
 | `AGENTBRIDGE_CODEX_TRANSPORT` | `auto` | How the daemon reaches the Codex app-server: `auto` (probe `codex app-server --help`, use `ws://` if supported else fall back to a `unix://` socket via a transparent relay), `ws` (force ws), or `unix` (force unix socket + relay). For builds that drop `ws://` listen support (issue #85) |
 | `AGENTBRIDGE_STATE_DIR` | Platform default | State directory for pid, status, logs (macOS: `~/Library/Application Support/agentbridge/`, Linux: `$XDG_STATE_HOME/agentbridge/`) |
 | `AGENTBRIDGE_DAEMON_ENTRY` | `./daemon.ts` | Override daemon entry point (used by plugin bundles) |
+| `AGENTBRIDGE_MAX_BUFFERED_MESSAGES` | `100` | Maximum unacknowledged messages in the Claude adapter mailbox; overflow evicts the oldest entry with an observable warning |
+| `AGENTBRIDGE_MAX_BUFFERED_BYTES` | `4194304` | Maximum UTF-8 content bytes in the mailbox; a single larger message is omitted with an observable warning |
+| `AGENTBRIDGE_DELIVERY_RETRY_BASE_MS` | `60000` | Delay before retrying an unacknowledged Channel push; later retries use exponential backoff |
+| `AGENTBRIDGE_DELIVERY_MAX_ATTEMPTS` | `3` | Total Channel attempts per ordinary message, including the initial push; exhausted messages remain available through `get_messages` |
 | `NO_UPDATE_NOTIFIER` | unset | Set to any value to disable the "update available" notice (ecosystem-standard opt-out) |
 | `AGENTBRIDGE_NO_UPDATE_NOTIFIER` | unset | Namespaced opt-out for the update notice (same effect as `NO_UPDATE_NOTIFIER`) |
 | `AGENTBRIDGE_UPDATE_PROMPT` | unset | Set to `0` to disable the interactive update prompt and keep pure notice-only behavior |
@@ -282,6 +286,9 @@ AgentBridge can keep a long task moving across subscription-quota windows instea
 ## Current Limitations
 
 - Only forwards `agentMessage` items, not intermediate `commandExecution`, `fileChange`, or similar events
+- The acknowledged mailbox is in the Claude adapter process and is not persisted. It survives daemon or Codex reconnects while that adapter stays alive, but a Claude adapter/plugin process restart loses unacknowledged entries. This is not crash-durable delivery.
+- Channel retry improves latency and recovery probability but cannot guarantee that a fully idle Claude session wakes automatically. `get_messages` is the recovery path once Claude is active.
+- Delivery is at least once, not exactly once. Claude must finish processing a stable message ID before acknowledging it; a lost acknowledgement can cause a bounded redelivery.
 - Single Codex thread per pair, no multi-session support within a pair yet
 - Single Claude foreground connection per pair; a new Claude session replaces the previous one
 - Multiple pairs run side-by-side on one machine (one per project directory); Windows is not an officially supported platform yet

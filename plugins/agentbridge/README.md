@@ -1,6 +1,6 @@
 # AgentBridge Plugin
 
-Claude Code plugin for AgentBridge. This plugin packages the AgentBridge MCP frontend with push channel delivery (a failed push falls back to an in-memory queue drained by `get_messages`), the `/agentbridge:init` command, and a non-blocking SessionStart health check.
+Claude Code plugin for AgentBridge. This plugin packages the AgentBridge MCP frontend with acknowledged Channel delivery, the `/agentbridge:init` command, and a non-blocking SessionStart health check. Every admissible message is queued before push, receives an immutable delivery-generation ID, and remains available through `get_messages` until Claude confirms that ID with `ack_messages` (a message exceeding the mailbox size bound is not retained — it is delivered best-effort only and omitted with an observable warning).
 
 ## Structure
 
@@ -38,6 +38,7 @@ This creates self-contained bundles at:
 ## Notes
 
 - The plugin frontend launches the sibling daemon bundle via `AGENTBRIDGE_DAEMON_ENTRY=./daemon.js`.
-- Claude delivery is always push notifications. If a push fails, the message is queued and can be drained via `get_messages` (per-message fallback — the legacy `AGENTBRIDGE_MODE=pull` mode was removed and the env var is ignored with a one-time warning).
+- Claude delivery uses Channel push as a latency optimization over a bounded in-memory mailbox. `get_messages` repeats unacknowledged stable IDs without deleting them; `ack_messages` removes only IDs Claude has finished processing. Ordinary unacknowledged pushes retry twice by default with exponential backoff. The legacy `AGENTBRIDGE_MODE=pull` value remains ignored with a one-time warning.
+- Mailbox state is not persisted. A Claude adapter/plugin process restart loses it, and Channel cannot guarantee that a fully idle Claude session wakes automatically. Delivery is at least once while the adapter is alive, not exactly once or crash durable.
 - The SessionStart hook is informational only. It never starts or stops the daemon.
 - The command at `/agentbridge:init` edits project-local `.agentbridge/` files only; plugin installation and marketplace registration remain terminal-side tasks (`agentbridge init` / `agentbridge dev`).

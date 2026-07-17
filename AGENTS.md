@@ -3,7 +3,7 @@
 
 You are working in a **multi-agent environment** powered by AgentBridge.
 Another AI agent (Claude, by Anthropic) is available in a parallel session on this machine.
-Communication happens via AgentBridge MCP tools — Claude has `reply` and `get_messages` tools.
+Communication happens via AgentBridge MCP tools — Claude has `reply`, `get_messages`, and `ack_messages` tools.
 
 ### When to collaborate vs. work solo
 - **Collaborate** when the task benefits from a second perspective, parallel execution, or capabilities the other agent has.

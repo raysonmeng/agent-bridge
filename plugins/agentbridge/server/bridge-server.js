@@ -13661,7 +13661,7 @@ class StdioServerTransport {
 
 // src/claude-adapter.ts
 import { EventEmitter } from "events";
-import { randomUUID } from "crypto";
+import { createHash, randomUUID } from "crypto";
 import { performance } from "perf_hooks";
 
 // src/rotating-log.ts
@@ -14161,13 +14161,18 @@ var DEFAULT_MAX_BUFFERED_MESSAGES = 100;
 var DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 var DEFAULT_DEDUPE_CAPACITY = 2048;
 var DEFAULT_DEDUPE_TTL_MS = 20 * 60 * 1000;
+var DEFAULT_DELIVERY_RETRY_BASE_MS = 60 * 1000;
+var DEFAULT_DELIVERY_MAX_ATTEMPTS = 3;
 var DEFAULT_BUDGET_FRESH_TTL_MS = 25 * 1000;
 var CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
   "",
   "## Message delivery",
   'Messages from Codex arrive as <channel source="agentbridge" chat_id="..." user="Codex" ...> tags (push).',
-  "If a push fails, the message is queued \u2014 call get_messages to drain the fallback queue.",
+  "Every message is queued before push. Channel delivery is a latency optimization, not proof of receipt.",
+  "A repeated delivery ID is the same logical message. Never repeat completed work for an ID you already processed.",
+  "After fully processing a pushed message, call ack_messages with its meta.message_id. Do not acknowledge before processing.",
+  "If a push is missed, call get_messages. It returns the same stable message IDs until ack_messages confirms them.",
   "",
   "## Collaboration roles",
   "Default roles in this setup:",
@@ -14185,7 +14190,7 @@ var CLAUDE_INSTRUCTIONS = [
   "",
   "## How to interact",
   "- Use the reply tool to send messages back to Codex \u2014 pass chat_id back.",
-  "- Use the get_messages tool to check for pending messages from Codex.",
+  "- Use the get_messages tool to check for pending messages from Codex, then call ack_messages only for IDs you fully processed.",
   "- After sending a reply, call get_messages to check for responses.",
   "- When the user asks about Codex status or progress, call get_messages.",
   "",
@@ -14204,6 +14209,7 @@ var CLAUDE_INSTRUCTIONS = [
 class ClaudeAdapter extends EventEmitter {
   server;
   notificationSeq = 0;
+  deliverySeq = 0;
   sessionId;
   notificationIdPrefix;
   instanceId;
@@ -14216,6 +14222,7 @@ class ClaudeAdapter extends EventEmitter {
   pendingMessageBytes = 0;
   maxBufferedMessages;
   maxBufferedBytes;
+  ackIdsCap;
   droppedMessageCount = 0;
   oversizedMessageCount = 0;
   oversizedMessageBytes = 0;
@@ -14224,6 +14231,10 @@ class ClaudeAdapter extends EventEmitter {
   dedupeTtlMs;
   monotonicNow;
   deliveredMessageIds = new Map;
+  deliveryRetryBaseMs;
+  deliveryMaxAttempts;
+  deliveryScheduler;
+  deliveryRetries = new Map;
   budgetSnapshot = null;
   budgetFreshTtlMs;
   wallNow;
@@ -14242,9 +14253,13 @@ class ClaudeAdapter extends EventEmitter {
     }
     this.maxBufferedMessages = positiveIntegerOr(options.maxBufferedMessages, parsePositiveIntegerEnv("AGENTBRIDGE_MAX_BUFFERED_MESSAGES", DEFAULT_MAX_BUFFERED_MESSAGES));
     this.maxBufferedBytes = positiveIntegerOr(options.maxBufferedBytes, parsePositiveIntegerEnv("AGENTBRIDGE_MAX_BUFFERED_BYTES", DEFAULT_MAX_BUFFERED_BYTES));
+    this.ackIdsCap = Math.max(100, this.maxBufferedMessages);
     this.dedupeCapacity = positiveIntegerOr(options.dedupeCapacity, DEFAULT_DEDUPE_CAPACITY);
     this.dedupeTtlMs = positiveIntegerOr(options.dedupeTtlMs, DEFAULT_DEDUPE_TTL_MS);
     this.monotonicNow = options.now ?? (() => performance.now());
+    this.deliveryRetryBaseMs = positiveIntegerOr(options.deliveryRetryBaseMs, parsePositiveIntegerEnv("AGENTBRIDGE_DELIVERY_RETRY_BASE_MS", DEFAULT_DELIVERY_RETRY_BASE_MS));
+    this.deliveryMaxAttempts = positiveIntegerOr(options.deliveryMaxAttempts, parsePositiveIntegerEnv("AGENTBRIDGE_DELIVERY_MAX_ATTEMPTS", DEFAULT_DELIVERY_MAX_ATTEMPTS));
+    this.deliveryScheduler = options.deliveryScheduler ?? globalThis;
     this.budgetFreshTtlMs = positiveIntegerOr(options.budgetFreshTtlMs, parsePositiveIntegerEnv("AGENTBRIDGE_BUDGET_FRESH_TTL_SEC", DEFAULT_BUDGET_FRESH_TTL_MS / 1000) * 1000);
     this.wallNow = options.wallNow ?? (() => Date.now());
     this.server = new Server({ name: "agentbridge", version: "0.1.0" }, {
@@ -14279,22 +14294,34 @@ class ClaudeAdapter extends EventEmitter {
   }
   async pushNotification(message) {
     this.log(`pushNotification (instance=${this.instanceId}, msgId=${message.id}, len=${message.content.length})`);
-    if (!this.rememberDelivery(message))
+    const delivery = this.rememberDelivery(message);
+    if (!delivery)
       return;
-    await this.pushViaChannel(message);
+    const queued = this.queueFallbackMessage(delivery);
+    if (!queued) {
+      this.deliveredMessageIds.delete(delivery.sourceMessageId);
+    }
+    if (queued && !delivery.resumeId) {
+      this.armDeliveryRetry(delivery, 1);
+    }
+    await this.pushViaChannel(delivery, queued);
   }
-  async pushViaChannel(message) {
+  async pushViaChannel(message, admitted = true) {
     const deliveryAttemptId = `codex_msg_${this.notificationIdPrefix}_${++this.notificationSeq}`;
     const ts = new Date(message.timestamp).toISOString();
     try {
       await this.server.notification({
         method: "notifications/claude/channel",
         params: {
-          content: message.content,
+          content: this.channelContent(message, admitted),
           meta: {
             chat_id: this.sessionId,
             message_id: message.id,
+            source_message_id: message.originalSourceMessageId,
+            ...message.sourceMessageId !== message.originalSourceMessageId ? { dedupe_source_message_id: message.sourceMessageId } : {},
             delivery_attempt_id: deliveryAttemptId,
+            ack_required: admitted,
+            ...admitted ? { ack_tool: message.resumeId ? "ack_resume" : "ack_messages" } : {},
             user: "Codex",
             user_id: "codex",
             ts,
@@ -14305,43 +14332,108 @@ class ClaudeAdapter extends EventEmitter {
       });
       this.log(`Pushed notification: ${message.id} (attempt=${deliveryAttemptId})`);
     } catch (e) {
-      this.log(`Push notification failed: ${e.message}`);
-      this.queueFallbackMessage(message);
+      this.log(`Push notification failed: ${e.message} (message remains in mailbox)`);
     }
   }
-  rememberDelivery(message) {
-    const now = this.monotonicNow();
-    this.pruneDeliveredMessageIds(now);
-    if (this.deliveredMessageIds.has(message.id)) {
-      this.deliveredMessageIds.delete(message.id);
-      this.deliveredMessageIds.set(message.id, now);
-      this.log(`Duplicate Codex message suppressed (msgId=${message.id}, source=${message.source}, ` + `instance=${this.instanceId})`);
-      return false;
+  channelContent(message, admitted = true) {
+    if (message.resumeId)
+      return message.content;
+    if (!admitted) {
+      return `[AgentBridge oversized delivery id: ${message.id}. This message exceeded the mailbox size ` + `bound and is NOT retained: it cannot be recovered via get_messages and must not be ` + `acknowledged. If you already processed a message with this exact content, do not repeat the work.]
+
+` + message.content;
     }
-    this.deliveredMessageIds.set(message.id, now);
+    const ackIds = JSON.stringify([message.id]);
+    return `[AgentBridge delivery id: ${message.id}. If this ID is already being processed or was processed, ` + `do not repeat the work. After fully processing this message, ` + `call ack_messages with ack_ids ${ackIds}. Do not acknowledge before processing.]
+
+` + message.content;
+  }
+  rememberDelivery(message, originalSourceMessageId) {
+    const sourceMessageId = normalizeDeliveryId(message.id);
+    const originalSourceId = originalSourceMessageId ?? sourceMessageId;
+    if (sourceMessageId !== message.id) {
+      this.log(`WARNING: normalized unsafe Codex message id to ${sourceMessageId}`);
+      message = { ...message, id: sourceMessageId };
+    }
+    const now = this.monotonicNow();
+    const fingerprint = deliveryFingerprint(message);
+    const activeLogicalMessage = this.pendingMessages.find((pending) => pending.originalSourceMessageId === originalSourceId && deliveryFingerprint(pending) === fingerprint);
+    if (activeLogicalMessage) {
+      this.deliveredMessageIds.delete(activeLogicalMessage.sourceMessageId);
+      this.deliveredMessageIds.set(activeLogicalMessage.sourceMessageId, { seenAt: now, fingerprint });
+      this.enforceDedupeCapacity();
+      this.log(`Duplicate active Codex message suppressed (msgId=${sourceMessageId}, source=${message.source}, ` + `instance=${this.instanceId})`);
+      return null;
+    }
+    const active = this.pendingMessages.find((pending) => pending.sourceMessageId === sourceMessageId);
+    if (active) {
+      const activeFingerprint = deliveryFingerprint(active);
+      this.deliveredMessageIds.delete(sourceMessageId);
+      this.deliveredMessageIds.set(sourceMessageId, { seenAt: now, fingerprint: activeFingerprint });
+      this.enforceDedupeCapacity();
+      return this.preserveIdCollision(message, fingerprint, originalSourceId);
+    }
+    this.pruneDeliveredMessageIds(now);
+    const previous = this.deliveredMessageIds.get(sourceMessageId);
+    if (previous) {
+      this.deliveredMessageIds.delete(sourceMessageId);
+      this.deliveredMessageIds.set(sourceMessageId, { seenAt: now, fingerprint: previous.fingerprint });
+      this.enforceDedupeCapacity();
+      if (previous.fingerprint === fingerprint) {
+        this.log(`Duplicate Codex message suppressed (msgId=${message.id}, source=${message.source}, ` + `instance=${this.instanceId})`);
+        return null;
+      }
+      return this.preserveIdCollision(message, fingerprint, originalSourceId);
+    }
+    this.deliveredMessageIds.set(sourceMessageId, { seenAt: now, fingerprint });
+    this.enforceDedupeCapacity();
+    return {
+      ...message,
+      id: this.allocateDeliveryId(sourceMessageId),
+      sourceMessageId,
+      originalSourceMessageId: originalSourceId
+    };
+  }
+  enforceDedupeCapacity() {
     while (this.deliveredMessageIds.size > this.dedupeCapacity) {
       const oldest = this.deliveredMessageIds.keys().next().value;
       if (oldest === undefined)
         break;
       this.deliveredMessageIds.delete(oldest);
     }
-    return true;
+  }
+  allocateDeliveryId(sourceMessageId) {
+    const suffix = `_delivery_${this.notificationIdPrefix}_${++this.deliverySeq}`;
+    return `${sourceMessageId.slice(0, 512 - suffix.length)}${suffix}`;
+  }
+  preserveIdCollision(message, fingerprint, originalSourceMessageId) {
+    const suffix = `_collision_${fingerprint.slice(0, 12)}`;
+    const collisionId = `${message.id.slice(0, 512 - suffix.length)}${suffix}`;
+    this.log(`WARNING: conflicting Codex message id ${message.id}; preserving the later payload as ${collisionId}`);
+    return this.rememberDelivery({ ...message, id: collisionId }, originalSourceMessageId);
   }
   pruneDeliveredMessageIds(now) {
-    for (const [id, seenAt] of this.deliveredMessageIds) {
-      if (now - seenAt <= this.dedupeTtlMs)
+    for (const [id, record3] of this.deliveredMessageIds) {
+      if (now - record3.seenAt <= this.dedupeTtlMs)
         break;
       this.deliveredMessageIds.delete(id);
     }
   }
   queueFallbackMessage(message) {
+    if (!("sourceMessageId" in message)) {
+      message = {
+        ...message,
+        sourceMessageId: message.id,
+        originalSourceMessageId: message.id
+      };
+    }
     const messageBytes = utf8ByteLength(message.content);
     if (messageBytes > this.maxBufferedBytes) {
       this.oversizedMessageCount++;
       this.oversizedMessageBytes += messageBytes;
       this.oversizedMessageSourceCounts[message.source] = (this.oversizedMessageSourceCounts[message.source] ?? 0) + 1;
       this.log(`Fallback queue omitted oversized ${message.source} message ` + `(${formatBytes(messageBytes)} > ${formatBytes(this.maxBufferedBytes)}; ` + `total oversized: ${this.oversizedMessageCount})`);
-      return;
+      return false;
     }
     let dropped = 0;
     while (this.pendingMessages.length >= this.maxBufferedMessages || this.pendingMessageBytes + messageBytes > this.maxBufferedBytes) {
@@ -14349,6 +14441,8 @@ class ClaudeAdapter extends EventEmitter {
       const droppedBytes = this.pendingMessageByteSizes.shift() ?? 0;
       if (!droppedMessage)
         break;
+      this.cancelDeliveryRetry(droppedMessage.id);
+      this.deliveredMessageIds.delete(droppedMessage.sourceMessageId);
       this.pendingMessageBytes = Math.max(0, this.pendingMessageBytes - droppedBytes);
       this.droppedMessageCount++;
       dropped++;
@@ -14360,18 +14454,114 @@ class ClaudeAdapter extends EventEmitter {
     this.pendingMessageByteSizes.push(messageBytes);
     this.pendingMessageBytes += messageBytes;
     this.log(`Queued fallback message (${this.pendingMessages.length} pending, ` + `${formatBytes(this.pendingMessageBytes)} buffered, instance=${this.instanceId})`);
+    return true;
   }
-  drainMessages() {
+  hasPendingMessage(messageId) {
+    return this.pendingMessages.some((message) => message.id === messageId);
+  }
+  armDeliveryRetry(message, attempts) {
+    this.cancelDeliveryRetry(message.id);
+    if (!this.hasPendingMessage(message.id))
+      return;
+    if (attempts >= this.deliveryMaxAttempts)
+      return;
+    const exponent = Math.max(0, attempts - 1);
+    const delayMs = Math.min(this.deliveryRetryBaseMs * 2 ** exponent, 2147483647);
+    const entry = { message, attempts };
+    this.deliveryRetries.set(message.id, entry);
+    entry.timer = this.deliveryScheduler.setTimeout(() => {
+      delete entry.timer;
+      this.retryPendingDelivery(entry);
+    }, delayMs);
+    entry.timer?.unref?.();
+  }
+  async retryPendingDelivery(entry) {
+    const current = this.deliveryRetries.get(entry.message.id);
+    if (current !== entry || !this.hasPendingMessage(entry.message.id)) {
+      if (current === entry)
+        this.deliveryRetries.delete(entry.message.id);
+      return;
+    }
+    const nextAttempt = entry.attempts + 1;
+    this.log(`Retrying unacknowledged Channel delivery: ${entry.message.id} (attempt=${nextAttempt})`);
+    this.armDeliveryRetry(entry.message, nextAttempt);
+    await this.pushViaChannel(entry.message);
+    if (nextAttempt >= this.deliveryMaxAttempts && this.hasPendingMessage(entry.message.id)) {
+      this.log(`Channel delivery unacknowledged after ${nextAttempt} attempt(s): ${entry.message.id}; ` + "message remains available via get_messages");
+    }
+  }
+  cancelDeliveryRetry(messageId) {
+    const entry = this.deliveryRetries.get(messageId);
+    if (!entry)
+      return;
+    if (entry.timer !== undefined) {
+      this.deliveryScheduler.clearTimeout(entry.timer);
+    }
+    this.deliveryRetries.delete(messageId);
+  }
+  acknowledgeMessages(messageIds, acknowledgeResumeControl = true) {
+    const requested = [...new Set(messageIds)];
+    const requestedSet = new Set(requested);
+    const resumeIds = new Set(this.pendingMessages.filter((message) => requestedSet.has(message.id) && message.resumeId).map((message) => message.resumeId));
+    for (const message of this.pendingMessages) {
+      if (message.resumeId && resumeIds.has(message.resumeId)) {
+        requestedSet.add(message.id);
+      }
+    }
+    const acknowledged = [];
+    const remainingMessages = [];
+    const remainingSizes = [];
+    for (let i = 0;i < this.pendingMessages.length; i++) {
+      const message = this.pendingMessages[i];
+      const bytes = this.pendingMessageByteSizes[i] ?? utf8ByteLength(message.content);
+      if (requestedSet.has(message.id)) {
+        acknowledged.push(message.id);
+        this.pendingMessageBytes = Math.max(0, this.pendingMessageBytes - bytes);
+        this.cancelDeliveryRetry(message.id);
+      } else {
+        remainingMessages.push(message);
+        remainingSizes.push(bytes);
+      }
+    }
+    this.pendingMessages = remainingMessages;
+    this.pendingMessageByteSizes = remainingSizes;
+    if (acknowledgeResumeControl) {
+      for (const resumeId of resumeIds) {
+        if (this.resumeAckHandler) {
+          this.resumeAckHandler(resumeId, "resumed");
+        } else {
+          this.log(`Resume mailbox message acknowledged without a daemon ACK handler (resume_id=${resumeId})`);
+        }
+      }
+    }
+    const acknowledgedSet = new Set(acknowledged);
+    const unknown3 = requested.filter((id) => !acknowledgedSet.has(id));
+    if (acknowledged.length > 0 || unknown3.length > 0) {
+      this.log(`ack_messages (instance=${this.instanceId}, acknowledged=${acknowledged.length}, ` + `unknown=${unknown3.length}, pending=${this.pendingMessages.length})`);
+    }
+    return { acknowledged, unknown: unknown3 };
+  }
+  acknowledgeResume(resumeId) {
+    const ids = this.pendingMessages.filter((message) => message.resumeId === resumeId).map((message) => message.id);
+    return this.acknowledgeMessages(ids, false).acknowledged.length;
+  }
+  drainMessages(ackIds = []) {
+    const ackResult = ackIds.length > 0 ? this.acknowledgeMessages(ackIds) : { acknowledged: [], unknown: [] };
     this.log(`get_messages called (instance=${this.instanceId}, pending=${this.pendingMessages.length}, ` + `bytes=${this.pendingMessageBytes}, dropped=${this.droppedMessageCount}, oversized=${this.oversizedMessageCount})`);
     if (this.pendingMessages.length === 0 && this.droppedMessageCount === 0 && this.oversizedMessageCount === 0) {
+      if (ackResult.acknowledged.length > 0 || ackResult.unknown.length > 0) {
+        return {
+          content: [{
+            type: "text",
+            text: formatAckResult(ackResult) + " No unacknowledged messages from Codex."
+          }]
+        };
+      }
       return {
         content: [{ type: "text", text: "No new messages from Codex." }]
       };
     }
-    const messages = this.pendingMessages;
-    this.pendingMessages = [];
-    this.pendingMessageByteSizes = [];
-    this.pendingMessageBytes = 0;
+    const messages = [...this.pendingMessages];
     const dropped = this.droppedMessageCount;
     this.droppedMessageCount = 0;
     const oversizedSourceCounts = this.oversizedMessageSourceCounts;
@@ -14393,7 +14583,7 @@ class ClaudeAdapter extends EventEmitter {
     const formatted = messages.map((msg, i) => {
       const ts = new Date(msg.timestamp).toISOString();
       return `---
-[${i + 1}] ${ts}
+[${i + 1}] ${ts} [id: ${msg.id}]
 Codex: ${msg.content}`;
     }).join(`
 
@@ -14401,14 +14591,20 @@ Codex: ${msg.content}`;
     const noticeText = notices.map((notice) => `WARNING: ${notice}`).join(`
 `);
     const parts2 = [];
+    if (ackResult.acknowledged.length > 0 || ackResult.unknown.length > 0) {
+      parts2.push(formatAckResult(ackResult));
+    }
     if (count > 0) {
-      parts2.push(`[${count} new message${count > 1 ? "s" : ""} from Codex]
+      parts2.push(`[${count} unacknowledged message${count > 1 ? "s" : ""} from Codex]
 chat_id: ${this.sessionId}`);
     }
     if (noticeText)
       parts2.push(noticeText);
     if (formatted)
       parts2.push(formatted);
+    if (messages.length > 0) {
+      parts2.push(`After fully processing these messages, call ack_messages with ack_ids: ` + JSON.stringify(messages.map((message) => message.id)));
+    }
     this.log(`get_messages returning ${count} message(s) ` + `(instance=${this.instanceId}, dropped=${dropped}, oversized=${oversized}, oversizedBytes=${oversizedBytes})`);
     return {
       content: [
@@ -14461,11 +14657,35 @@ chat_id: ${this.sessionId}`);
         },
         {
           name: "get_messages",
-          description: "Check for new messages from Codex. Call this after sending a reply or when you expect a response from Codex.",
+          description: "Return all unacknowledged Codex messages in stable order. Messages remain until ack_messages confirms their stable IDs. Optionally acknowledge IDs from a previous result with ack_ids before reading the remaining mailbox.",
           inputSchema: {
             type: "object",
-            properties: {},
+            properties: {
+              ack_ids: {
+                type: "array",
+                items: { type: "string", minLength: 1, maxLength: 512 },
+                maxItems: this.ackIdsCap,
+                description: "Optional stable message IDs from a previous get_messages result to acknowledge before returning the remaining mailbox."
+              }
+            },
             required: []
+          }
+        },
+        {
+          name: "ack_messages",
+          description: "Acknowledge Codex messages only after fully processing them. Works for messages received through Channel push or get_messages. Removes only the requested stable IDs and cancels their retries.",
+          inputSchema: {
+            type: "object",
+            properties: {
+              ack_ids: {
+                type: "array",
+                items: { type: "string", minLength: 1, maxLength: 512 },
+                minItems: 1,
+                maxItems: this.ackIdsCap,
+                description: "Stable message IDs to acknowledge, from Channel meta.message_id or get_messages [id: ...] labels."
+              }
+            },
+            required: ["ack_ids"]
           }
         },
         {
@@ -14504,7 +14724,13 @@ chat_id: ${this.sessionId}`);
         return this.handleReply(args);
       }
       if (name === "get_messages") {
-        return this.drainMessages();
+        const parsed = parseAckIds(args?.ack_ids, false, this.ackIdsCap);
+        if (!parsed.ok)
+          return ackIdsError(parsed.error);
+        return this.drainMessages(parsed.ids);
+      }
+      if (name === "ack_messages") {
+        return this.handleAckMessages(args);
       }
       if (name === "get_budget") {
         return this.handleGetBudget();
@@ -14517,6 +14743,15 @@ chat_id: ${this.sessionId}`);
         isError: true
       };
     });
+  }
+  handleAckMessages(args) {
+    const parsed = parseAckIds(args?.ack_ids, true, this.ackIdsCap);
+    if (!parsed.ok)
+      return ackIdsError(parsed.error);
+    const result = this.acknowledgeMessages(parsed.ids);
+    return {
+      content: [{ type: "text", text: formatAckResult(result) }]
+    };
   }
   async handleAckResume(args) {
     const resumeIdRaw = args?.resume_id;
@@ -14549,8 +14784,12 @@ chat_id: ${this.sessionId}`);
     }
     this.log(`ack_resume received (resume_id=${resumeIdRaw}, status=${status}, instance=${this.instanceId})`);
     this.resumeAckHandler(resumeIdRaw, status);
+    const mailboxAcknowledged = this.acknowledgeResume(resumeIdRaw);
     return {
-      content: [{ type: "text", text: `Resume acknowledged (resume_id=${resumeIdRaw}, status=${status}).` }]
+      content: [{
+        type: "text",
+        text: `Resume acknowledged (resume_id=${resumeIdRaw}, status=${status}, ` + `mailbox_messages=${mailboxAcknowledged}).`
+      }]
     };
   }
   async handleGetBudget() {
@@ -14653,7 +14892,7 @@ chat_id: ${this.sessionId}`);
       responseText = "Reply sent to Codex as a new turn (any turn still running was interrupted first; if it had already finished, your message was simply injected).";
     }
     if (pending > 0) {
-      responseText += ` Note: ${pending} unread Codex message${pending > 1 ? "s" : ""} already waiting \u2014 call get_messages to read them.`;
+      responseText += ` Note: ${pending} unacknowledged Codex message${pending > 1 ? "s" : ""} in the mailbox \u2014 ` + "call get_messages if any are unprocessed, and acknowledge processed IDs with ack_messages.";
     }
     return {
       content: [{ type: "text", text: responseText }]
@@ -14662,6 +14901,51 @@ chat_id: ${this.sessionId}`);
   log(msg) {
     this.logger.log(msg);
   }
+}
+function parseAckIds(value, required2, maxItems = 100) {
+  if (value === undefined) {
+    return required2 ? { ok: false, error: "missing required parameter 'ack_ids'" } : { ok: true, ids: [] };
+  }
+  if (!Array.isArray(value)) {
+    return { ok: false, error: "ack_ids must be an array of message ID strings" };
+  }
+  if (required2 && value.length === 0) {
+    return { ok: false, error: "ack_ids must contain at least one message ID" };
+  }
+  if (value.length > maxItems) {
+    return { ok: false, error: `ack_ids has ${value.length} items; maximum is ${maxItems}` };
+  }
+  for (const id of value) {
+    if (typeof id !== "string" || id.length === 0 || id.length > 512) {
+      return { ok: false, error: "each ack_ids item must be a non-empty string of at most 512 characters" };
+    }
+  }
+  return { ok: true, ids: value };
+}
+function ackIdsError(error2) {
+  return {
+    content: [{ type: "text", text: `Error: ${error2}.` }],
+    isError: true
+  };
+}
+function formatAckResult(result) {
+  const parts2 = [`Acknowledged ${result.acknowledged.length} message${result.acknowledged.length === 1 ? "" : "s"}.`];
+  if (result.acknowledged.length > 0) {
+    parts2.push(`IDs: ${JSON.stringify(result.acknowledged)}.`);
+  }
+  if (result.unknown.length > 0) {
+    parts2.push(`Already acknowledged or unknown IDs: ${JSON.stringify(result.unknown)}.`);
+  }
+  return parts2.join(" ");
+}
+function deliveryFingerprint(message) {
+  return createHash("sha256").update(JSON.stringify([message.source, message.content, message.resumeId ?? null])).digest("hex");
+}
+function normalizeDeliveryId(id) {
+  if (id.length > 0 && id.length <= 512 && /^[A-Za-z0-9._:-]+$/.test(id))
+    return id;
+  const digest = createHash("sha256").update(id).digest("hex").slice(0, 32);
+  return `agentbridge_${digest}`;
 }
 function parsePositiveIntegerEnv(name, fallback) {
   return positiveIntegerOr(parseInt(process.env[name] ?? "", 10), fallback);
@@ -14707,10 +14991,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.30", "0.0.0-source"),
-  commit: defineString("99d0f4a", "source"),
+  commit: defineString("a3e927f", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("0cb79932198b", "source")
+  codeHash: defineString("816c8f8d8b5a", "source")
 });
 function sameRuntimeContract(a, b) {
   if (!a || !b)
@@ -16150,7 +16434,7 @@ import {
   unlinkSync as unlinkSync4,
   writeFileSync as writeFileSync3
 } from "fs";
-import { createHash, randomUUID as randomUUID3 } from "crypto";
+import { createHash as createHash2, randomUUID as randomUUID3 } from "crypto";
 import { basename as basename2, join as join3, resolve, sep } from "path";
 var PAIR_BASE_PORT = 4500;
 var PAIR_SLOT_STRIDE = 10;
@@ -16175,7 +16459,7 @@ function derivePairId(cwd, name) {
   } catch {
     real = cwd;
   }
-  const hash = createHash("sha256").update(real).update("\x00").update(name.toLowerCase()).digest("hex").slice(0, 8);
+  const hash = createHash2("sha256").update(real).update("\x00").update(name.toLowerCase()).digest("hex").slice(0, 8);
   const slug = name.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 32) || "pair";
   return `${slug}-${hash}`;
 }
@@ -16573,7 +16857,7 @@ daemonClient.on("status", (status) => {
       "\uD83E\uDD1D Codex has connected via AgentBridge.",
       "You are now in a multi-agent collaboration session.",
       "When you receive a complex task, propose a division of labor to Codex.",
-      "Use `reply` to send messages and `get_messages` to check for responses."
+      "Use `reply` to send messages and `get_messages` to check for responses; acknowledge processed message IDs with `ack_messages`."
     ].join(`
 `)));
   }
