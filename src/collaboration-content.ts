@@ -37,8 +37,8 @@ You are working in a **multi-agent environment** powered by AgentBridge.
 Another AI agent (Codex, by OpenAI) is available in a parallel session on this machine.
 
 ### Communication mechanism
-- **Claude → Codex**: Use the AgentBridge MCP tools (\`reply\` / \`get_messages\`) — these are yours only.
-- **Codex → Claude**: Codex has no symmetric tool. The bridge transparently intercepts Codex's normal output and forwards it to you as push notifications (if a push fails, drain the fallback queue with \`get_messages\`).
+- **Claude → Codex**: Use the AgentBridge MCP tools (\`reply\` / \`get_messages\` / \`ack_messages\`) — these are yours only.
+- **Codex → Claude**: Codex has no symmetric tool. The bridge transparently intercepts Codex's normal output and forwards it to you as push notifications. Every message is also held in an acknowledged mailbox: \`get_messages\` re-reads pending messages **without removing them**, and only \`ack_messages\` (with the stable message IDs) removes the ones you have fully processed. Acknowledge after processing — a repeated delivery ID is the same logical message, so never repeat completed work for an ID you already handled.
 - If Codex ever complains it can't find a "send-to-Claude" API, remind it that its side is transparent — it just writes a reply and you'll see it.
 
 ### When to collaborate vs. work solo
@@ -74,7 +74,7 @@ Another AI agent (Claude, by Anthropic) is available in a parallel session on th
 AgentBridge is a **transparent proxy** on your side. You do **not** have a tool to "send a message to Claude".
 
 - **Codex → Claude**: Just write your normal response. The bridge intercepts your \`agentMessage\` output and forwards it to Claude automatically. No tool call needed.
-- **Claude → Codex**: Claude uses its own MCP tools (\`reply\` / \`get_messages\`). Those messages arrive in your session as new user turns — you'll see them like any other user input.
+- **Claude → Codex**: Claude uses its own MCP tools (\`reply\` / \`get_messages\` / \`ack_messages\`). Those messages arrive in your session as new user turns — you'll see them like any other user input.
 
 **Do not** search the AgentBridge source for a Codex-side "send" / "reply" / "sendToClaude" API — it does not exist, and looking for it wastes turns. If you catch yourself thinking "I need to find how to message Claude", stop and just write your reply as normal text.
 

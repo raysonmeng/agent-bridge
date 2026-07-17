@@ -185,7 +185,7 @@ daemonClient.on("status", (status) => {
         "🤝 Codex has connected via AgentBridge.",
         "You are now in a multi-agent collaboration session.",
         "When you receive a complex task, propose a division of labor to Codex.",
-        "Use `reply` to send messages and `get_messages` to check for responses.",
+        "Use `reply` to send messages and `get_messages` to check for responses; acknowledge processed message IDs with `ack_messages`.",
       ].join("\n"),
     ));
   }

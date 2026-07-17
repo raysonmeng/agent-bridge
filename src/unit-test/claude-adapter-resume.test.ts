@@ -33,14 +33,13 @@ function makeCodexMessage(content: string, extra: Record<string, unknown> = {}) 
 }
 
 describe("ack_resume MCP tool — registration", () => {
-  test("ack_resume appears in ListTools as the fourth tool", async () => {
+  test("ack_resume appears in ListTools after the general message ACK tool", async () => {
     const adapter = new ClaudeAdapter() as any;
     const result = await listTools(adapter);
     const names = result.tools.map((t: any) => t.name);
 
-    // Snapshot: reply, get_messages, get_budget were the prior three.
-    expect(names).toEqual(["reply", "get_messages", "get_budget", "ack_resume"]);
-    expect(result.tools).toHaveLength(4);
+    expect(names).toEqual(["reply", "get_messages", "ack_messages", "get_budget", "ack_resume"]);
+    expect(result.tools).toHaveLength(5);
   });
 
   test("ack_resume schema requires resume_id and constrains status enum", async () => {
@@ -274,8 +273,9 @@ describe("channel resume push — meta.resume_id", () => {
 
     // Neither was dropped by LRU dedup — both delivered.
     expect(notifications).toHaveLength(2);
-    expect(notifications[0].params.meta.message_id).toBe(attempt0);
-    expect(notifications[1].params.meta.message_id).toBe(attempt1);
+    expect(notifications[0].params.meta.source_message_id).toBe(attempt0);
+    expect(notifications[1].params.meta.source_message_id).toBe(attempt1);
+    expect(notifications[0].params.meta.message_id).not.toBe(notifications[1].params.meta.message_id);
     // Both carry the SAME stable resumeId so Claude's single ack correlates.
     expect(notifications[0].params.meta.resume_id).toBe(rid);
     expect(notifications[1].params.meta.resume_id).toBe(rid);

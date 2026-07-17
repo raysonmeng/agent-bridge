@@ -1,9 +1,9 @@
 /**
  * Claude Code MCP Server — Push Message Transport
  *
- * Delivery is always push (real-time notifications/claude/channel). When a
- * push fails, the message falls back to an in-memory queue drained by the
- * get_messages tool — a per-message fallback, not a configurable mode.
+ * Every logical message enters an in-memory, explicitly acknowledged mailbox
+ * before notifications/claude/channel is attempted. Channel push is a bounded
+ * retry latency optimization; get_messages is the at-least-once recovery path.
  * (The old AGENTBRIDGE_MODE=pull delivery mode was removed: it could not wake
  * an idle session, which silently broke the budget RESUME chain.)
  *
@@ -19,7 +19,7 @@ import {
   CallToolRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
 import { EventEmitter } from "node:events";
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import { performance } from "node:perf_hooks";
 import { createProcessLogger, type ProcessLogger } from "./process-log";
 import { StateDirResolver } from "./state-dir";
@@ -42,6 +42,12 @@ export interface ClaudeAdapterOptions {
   dedupeTtlMs?: number;
   /** Monotonic milliseconds for internal dedupe TTL; defaults to performance.now(). */
   now?: () => number;
+  /** Delay before the first no-ack Channel retry. Defaults to 60000 ms. */
+  deliveryRetryBaseMs?: number;
+  /** Total Channel attempts, including the initial push. Defaults to 3. */
+  deliveryMaxAttempts?: number;
+  /** Timer seam for deterministic delivery-retry tests. */
+  deliveryScheduler?: DeliveryScheduler;
   /**
    * Freshness TTL (ms) for the get_budget tool: when the cached snapshot is older
    * than this, get_budget asks the daemon for a fresh read-only refresh before
@@ -56,14 +62,42 @@ const DEFAULT_MAX_BUFFERED_MESSAGES = 100;
 const DEFAULT_MAX_BUFFERED_BYTES = 4 * 1024 * 1024;
 const DEFAULT_DEDUPE_CAPACITY = 2048;
 const DEFAULT_DEDUPE_TTL_MS = 20 * 60 * 1000;
+const DEFAULT_DELIVERY_RETRY_BASE_MS = 60 * 1000;
+const DEFAULT_DELIVERY_MAX_ATTEMPTS = 3;
 const DEFAULT_BUDGET_FRESH_TTL_MS = 25 * 1000;
+
+export interface DeliveryScheduler {
+  setTimeout(callback: () => void, delayMs: number): unknown;
+  clearTimeout(handle: unknown): void;
+}
+
+interface DeliveredMessageRecord {
+  seenAt: number;
+  fingerprint: string;
+}
+
+interface MailboxMessage extends BridgeMessage {
+  /** Daemon/source ID before the adapter allocates a unique ACK generation. */
+  sourceMessageId: string;
+  /** Original normalized source ID, retained when a conflict uses an alias. */
+  originalSourceMessageId: string;
+}
+
+interface PendingDeliveryRetry {
+  message: MailboxMessage;
+  attempts: number;
+  timer?: unknown;
+}
 
 export const CLAUDE_INSTRUCTIONS = [
   "Codex is an AI coding agent (OpenAI) running in a separate session on the same machine.",
   "",
   "## Message delivery",
   "Messages from Codex arrive as <channel source=\"agentbridge\" chat_id=\"...\" user=\"Codex\" ...> tags (push).",
-  "If a push fails, the message is queued — call get_messages to drain the fallback queue.",
+  "Every message is queued before push. Channel delivery is a latency optimization, not proof of receipt.",
+  "A repeated delivery ID is the same logical message. Never repeat completed work for an ID you already processed.",
+  "After fully processing a pushed message, call ack_messages with its meta.message_id. Do not acknowledge before processing.",
+  "If a push is missed, call get_messages. It returns the same stable message IDs until ack_messages confirms them.",
   "",
   "## Collaboration roles",
   "Default roles in this setup:",
@@ -81,7 +115,7 @@ export const CLAUDE_INSTRUCTIONS = [
   "",
   "## How to interact",
   "- Use the reply tool to send messages back to Codex — pass chat_id back.",
-  "- Use the get_messages tool to check for pending messages from Codex.",
+  "- Use the get_messages tool to check for pending messages from Codex, then call ack_messages only for IDs you fully processed.",
   "- After sending a reply, call get_messages to check for responses.",
   "- When the user asks about Codex status or progress, call get_messages.",
   "",
@@ -99,6 +133,7 @@ export const CLAUDE_INSTRUCTIONS = [
 export class ClaudeAdapter extends EventEmitter {
   private server: Server;
   private notificationSeq = 0;
+  private deliverySeq = 0;
   private sessionId: string;
   private readonly notificationIdPrefix: string;
   private readonly instanceId: string;
@@ -112,12 +147,16 @@ export class ClaudeAdapter extends EventEmitter {
   private readonly logFile: string;
   private readonly logger: ProcessLogger;
 
-  // Push transport with a per-message fallback queue (drained by get_messages).
-  private pendingMessages: BridgeMessage[] = [];
+  // Authoritative in-memory mailbox. Messages enter before Channel push and
+  // remain until explicitly acknowledged or observably evicted by a bound.
+  private pendingMessages: MailboxMessage[] = [];
   private pendingMessageByteSizes: number[] = [];
   private pendingMessageBytes = 0;
   private readonly maxBufferedMessages: number;
   private readonly maxBufferedBytes: number;
+  /** ack_ids batch cap; never below the mailbox capacity so the drain
+   *  epilogue's "ack all pending IDs" instruction is always executable. */
+  private readonly ackIdsCap: number;
   private droppedMessageCount = 0;
   private oversizedMessageCount = 0;
   private oversizedMessageBytes = 0;
@@ -125,7 +164,11 @@ export class ClaudeAdapter extends EventEmitter {
   private readonly dedupeCapacity: number;
   private readonly dedupeTtlMs: number;
   private readonly monotonicNow: () => number;
-  private deliveredMessageIds = new Map<string, number>();
+  private deliveredMessageIds = new Map<string, DeliveredMessageRecord>();
+  private readonly deliveryRetryBaseMs: number;
+  private readonly deliveryMaxAttempts: number;
+  private readonly deliveryScheduler: DeliveryScheduler;
+  private deliveryRetries = new Map<string, PendingDeliveryRetry>();
 
   // Latest budget snapshot, fed by bridge from DaemonStatus.budget broadcasts.
   private budgetSnapshot: BudgetSnapshot | null = null;
@@ -163,9 +206,19 @@ export class ClaudeAdapter extends EventEmitter {
       options.maxBufferedBytes,
       parsePositiveIntegerEnv("AGENTBRIDGE_MAX_BUFFERED_BYTES", DEFAULT_MAX_BUFFERED_BYTES),
     );
+    this.ackIdsCap = Math.max(100, this.maxBufferedMessages);
     this.dedupeCapacity = positiveIntegerOr(options.dedupeCapacity, DEFAULT_DEDUPE_CAPACITY);
     this.dedupeTtlMs = positiveIntegerOr(options.dedupeTtlMs, DEFAULT_DEDUPE_TTL_MS);
     this.monotonicNow = options.now ?? (() => performance.now());
+    this.deliveryRetryBaseMs = positiveIntegerOr(
+      options.deliveryRetryBaseMs,
+      parsePositiveIntegerEnv("AGENTBRIDGE_DELIVERY_RETRY_BASE_MS", DEFAULT_DELIVERY_RETRY_BASE_MS),
+    );
+    this.deliveryMaxAttempts = positiveIntegerOr(
+      options.deliveryMaxAttempts,
+      parsePositiveIntegerEnv("AGENTBRIDGE_DELIVERY_MAX_ATTEMPTS", DEFAULT_DELIVERY_MAX_ATTEMPTS),
+    );
+    this.deliveryScheduler = options.deliveryScheduler ?? globalThis;
     this.budgetFreshTtlMs = positiveIntegerOr(
       options.budgetFreshTtlMs,
       parsePositiveIntegerEnv("AGENTBRIDGE_BUDGET_FRESH_TTL_SEC", DEFAULT_BUDGET_FRESH_TTL_MS / 1000) * 1000,
@@ -233,11 +286,27 @@ export class ClaudeAdapter extends EventEmitter {
 
   async pushNotification(message: BridgeMessage) {
     this.log(`pushNotification (instance=${this.instanceId}, msgId=${message.id}, len=${message.content.length})`);
-    if (!this.rememberDelivery(message)) return;
-    await this.pushViaChannel(message);
+    const delivery = this.rememberDelivery(message);
+    if (!delivery) return;
+
+    // Queue before the first await. A resolved Channel write only means the
+    // transport accepted bytes; the mailbox remains authoritative until ACK.
+    const queued = this.queueFallbackMessage(delivery);
+    if (!queued) {
+      // Do not leave a dedupe tombstone for content the mailbox could not
+      // admit. A source replay must get another observable delivery attempt.
+      this.deliveredMessageIds.delete(delivery.sourceMessageId);
+    }
+
+    // Budget resume already owns a dedicated ACK/retry state machine. General
+    // messages schedule in arrival order before any transport promise settles.
+    if (queued && !delivery.resumeId) {
+      this.armDeliveryRetry(delivery, 1);
+    }
+    await this.pushViaChannel(delivery, queued);
   }
 
-  private async pushViaChannel(message: BridgeMessage) {
+  private async pushViaChannel(message: MailboxMessage, admitted = true) {
     const deliveryAttemptId = `codex_msg_${this.notificationIdPrefix}_${++this.notificationSeq}`;
     const ts = new Date(message.timestamp).toISOString();
 
@@ -245,11 +314,19 @@ export class ClaudeAdapter extends EventEmitter {
       await this.server.notification({
         method: "notifications/claude/channel",
         params: {
-          content: message.content,
+          content: this.channelContent(message, admitted),
           meta: {
             chat_id: this.sessionId,
             message_id: message.id,
+            source_message_id: message.originalSourceMessageId,
+            ...(message.sourceMessageId !== message.originalSourceMessageId
+              ? { dedupe_source_message_id: message.sourceMessageId }
+              : {}),
             delivery_attempt_id: deliveryAttemptId,
+            // An unadmitted (oversized) message is best-effort only: it is not
+            // in the mailbox, so an ACK contract would be a lie — see channelContent.
+            ack_required: admitted,
+            ...(admitted ? { ack_tool: message.resumeId ? "ack_resume" : "ack_messages" } : {}),
             user: "Codex",
             user_id: "codex",
             ts,
@@ -263,43 +340,146 @@ export class ClaudeAdapter extends EventEmitter {
       });
       this.log(`Pushed notification: ${message.id} (attempt=${deliveryAttemptId})`);
     } catch (e: any) {
-      this.log(`Push notification failed: ${e.message}`);
-      this.queueFallbackMessage(message);
+      this.log(`Push notification failed: ${e.message} (message remains in mailbox)`);
     }
   }
 
-  private rememberDelivery(message: BridgeMessage): boolean {
+  private channelContent(message: MailboxMessage, admitted = true): string {
+    if (message.resumeId) return message.content;
+    if (!admitted) {
+      return (
+        `[AgentBridge oversized delivery id: ${message.id}. This message exceeded the mailbox size ` +
+        `bound and is NOT retained: it cannot be recovered via get_messages and must not be ` +
+        `acknowledged. If you already processed a message with this exact content, do not repeat the work.]\n\n` +
+        message.content
+      );
+    }
+    const ackIds = JSON.stringify([message.id]);
+    return (
+      `[AgentBridge delivery id: ${message.id}. If this ID is already being processed or was processed, ` +
+      `do not repeat the work. After fully processing this message, ` +
+      `call ack_messages with ack_ids ${ackIds}. Do not acknowledge before processing.]\n\n` +
+      message.content
+    );
+  }
+
+  private rememberDelivery(
+    message: BridgeMessage,
+    originalSourceMessageId?: string,
+  ): MailboxMessage | null {
+    const sourceMessageId = normalizeDeliveryId(message.id);
+    const originalSourceId = originalSourceMessageId ?? sourceMessageId;
+    if (sourceMessageId !== message.id) {
+      this.log(`WARNING: normalized unsafe Codex message id to ${sourceMessageId}`);
+      message = { ...message, id: sourceMessageId };
+    }
     const now = this.monotonicNow();
-    this.pruneDeliveredMessageIds(now);
-    if (this.deliveredMessageIds.has(message.id)) {
-      // Refresh recency so duplicate bursts do not evict a still-active key.
-      this.deliveredMessageIds.delete(message.id);
-      this.deliveredMessageIds.set(message.id, now);
+    const fingerprint = deliveryFingerprint(message);
+
+    // A conflict alias must still dedupe replays addressed to the original
+    // source ID. Match original source + payload before considering the current
+    // alias key, otherwise an expired original tombstone can admit the same
+    // logical payload twice under two different ACK generations.
+    const activeLogicalMessage = this.pendingMessages.find(
+      (pending) => pending.originalSourceMessageId === originalSourceId &&
+        deliveryFingerprint(pending) === fingerprint,
+    );
+    if (activeLogicalMessage) {
+      this.deliveredMessageIds.delete(activeLogicalMessage.sourceMessageId);
+      this.deliveredMessageIds.set(activeLogicalMessage.sourceMessageId, { seenAt: now, fingerprint });
+      this.enforceDedupeCapacity();
       this.log(
-        `Duplicate Codex message suppressed (msgId=${message.id}, source=${message.source}, ` +
+        `Duplicate active Codex message suppressed (msgId=${sourceMessageId}, source=${message.source}, ` +
         `instance=${this.instanceId})`,
       );
-      return false;
+      return null;
     }
 
-    this.deliveredMessageIds.set(message.id, now);
+    // An unacknowledged mailbox entry must remain authoritative even after the
+    // bounded dedupe cache expires or evicts its tombstone. Otherwise the same
+    // source ID could be queued twice and one ACK would accidentally delete two
+    // different logical messages.
+    const active = this.pendingMessages.find((pending) => pending.sourceMessageId === sourceMessageId);
+    if (active) {
+      const activeFingerprint = deliveryFingerprint(active);
+      this.deliveredMessageIds.delete(sourceMessageId);
+      this.deliveredMessageIds.set(sourceMessageId, { seenAt: now, fingerprint: activeFingerprint });
+      this.enforceDedupeCapacity();
+      return this.preserveIdCollision(message, fingerprint, originalSourceId);
+    }
+
+    this.pruneDeliveredMessageIds(now);
+    const previous = this.deliveredMessageIds.get(sourceMessageId);
+    if (previous) {
+      // Refresh recency so duplicate bursts do not evict a still-active key.
+      this.deliveredMessageIds.delete(sourceMessageId);
+      this.deliveredMessageIds.set(sourceMessageId, { seenAt: now, fingerprint: previous.fingerprint });
+      this.enforceDedupeCapacity();
+      if (previous.fingerprint === fingerprint) {
+        this.log(
+          `Duplicate Codex message suppressed (msgId=${message.id}, source=${message.source}, ` +
+          `instance=${this.instanceId})`,
+        );
+        return null;
+      }
+
+      // One ACK key cannot safely represent two different payloads. Preserve
+      // the later payload under a deterministic collision ID and warn loudly.
+      return this.preserveIdCollision(message, fingerprint, originalSourceId);
+    }
+
+    this.deliveredMessageIds.set(sourceMessageId, { seenAt: now, fingerprint });
+    this.enforceDedupeCapacity();
+    return {
+      ...message,
+      id: this.allocateDeliveryId(sourceMessageId),
+      sourceMessageId,
+      originalSourceMessageId: originalSourceId,
+    };
+  }
+
+  private enforceDedupeCapacity(): void {
     while (this.deliveredMessageIds.size > this.dedupeCapacity) {
       const oldest = this.deliveredMessageIds.keys().next().value;
       if (oldest === undefined) break;
       this.deliveredMessageIds.delete(oldest);
     }
-    return true;
+  }
+
+  private allocateDeliveryId(sourceMessageId: string): string {
+    const suffix = `_delivery_${this.notificationIdPrefix}_${++this.deliverySeq}`;
+    return `${sourceMessageId.slice(0, 512 - suffix.length)}${suffix}`;
+  }
+
+  private preserveIdCollision(
+    message: BridgeMessage,
+    fingerprint: string,
+    originalSourceMessageId: string,
+  ): MailboxMessage | null {
+    const suffix = `_collision_${fingerprint.slice(0, 12)}`;
+    const collisionId = `${message.id.slice(0, 512 - suffix.length)}${suffix}`;
+    this.log(
+      `WARNING: conflicting Codex message id ${message.id}; preserving the later payload as ${collisionId}`,
+    );
+    return this.rememberDelivery({ ...message, id: collisionId }, originalSourceMessageId);
   }
 
   private pruneDeliveredMessageIds(now: number): void {
-    for (const [id, seenAt] of this.deliveredMessageIds) {
-      if (now - seenAt <= this.dedupeTtlMs) break;
+    for (const [id, record] of this.deliveredMessageIds) {
+      if (now - record.seenAt <= this.dedupeTtlMs) break;
       this.deliveredMessageIds.delete(id);
     }
   }
 
-  /** Per-message fallback when a push fails; drained by the get_messages tool. */
-  private queueFallbackMessage(message: BridgeMessage) {
+  /** Insert into the authoritative mailbox before Channel push. */
+  private queueFallbackMessage(message: MailboxMessage | BridgeMessage): boolean {
+    if (!("sourceMessageId" in message)) {
+      message = {
+        ...message,
+        sourceMessageId: message.id,
+        originalSourceMessageId: message.id,
+      };
+    }
     const messageBytes = utf8ByteLength(message.content);
     if (messageBytes > this.maxBufferedBytes) {
       this.oversizedMessageCount++;
@@ -311,7 +491,7 @@ export class ClaudeAdapter extends EventEmitter {
         `(${formatBytes(messageBytes)} > ${formatBytes(this.maxBufferedBytes)}; ` +
         `total oversized: ${this.oversizedMessageCount})`,
       );
-      return;
+      return false;
     }
 
     let dropped = 0;
@@ -322,6 +502,8 @@ export class ClaudeAdapter extends EventEmitter {
       const droppedMessage = this.pendingMessages.shift();
       const droppedBytes = this.pendingMessageByteSizes.shift() ?? 0;
       if (!droppedMessage) break;
+      this.cancelDeliveryRetry(droppedMessage.id);
+      this.deliveredMessageIds.delete(droppedMessage.sourceMessageId);
       this.pendingMessageBytes = Math.max(0, this.pendingMessageBytes - droppedBytes);
       this.droppedMessageCount++;
       dropped++;
@@ -341,26 +523,155 @@ export class ClaudeAdapter extends EventEmitter {
       `Queued fallback message (${this.pendingMessages.length} pending, ` +
       `${formatBytes(this.pendingMessageBytes)} buffered, instance=${this.instanceId})`,
     );
+    return true;
   }
 
   // ── get_messages ───────────────────────────────────────────
 
-  private drainMessages(): { content: Array<{ type: "text"; text: string }> } {
+  private hasPendingMessage(messageId: string): boolean {
+    return this.pendingMessages.some((message) => message.id === messageId);
+  }
+
+  private armDeliveryRetry(message: MailboxMessage, attempts: number): void {
+    this.cancelDeliveryRetry(message.id);
+    if (!this.hasPendingMessage(message.id)) return;
+    if (attempts >= this.deliveryMaxAttempts) return;
+
+    const exponent = Math.max(0, attempts - 1);
+    const delayMs = Math.min(this.deliveryRetryBaseMs * (2 ** exponent), 2_147_483_647);
+    const entry: PendingDeliveryRetry = { message, attempts };
+    // Register before installing the timer so a scheduler seam that fires the
+    // callback synchronously still finds (and can advance) this entry.
+    this.deliveryRetries.set(message.id, entry);
+    entry.timer = this.deliveryScheduler.setTimeout(() => {
+      delete entry.timer;
+      void this.retryPendingDelivery(entry);
+    }, delayMs);
+    (entry.timer as { unref?: () => void } | undefined)?.unref?.();
+  }
+
+  private async retryPendingDelivery(entry: PendingDeliveryRetry): Promise<void> {
+    const current = this.deliveryRetries.get(entry.message.id);
+    if (current !== entry || !this.hasPendingMessage(entry.message.id)) {
+      if (current === entry) this.deliveryRetries.delete(entry.message.id);
+      return;
+    }
+
+    const nextAttempt = entry.attempts + 1;
+    this.log(`Retrying unacknowledged Channel delivery: ${entry.message.id} (attempt=${nextAttempt})`);
+    // Install the next timer before awaiting transport. This keeps retry
+    // scheduling in FIFO callback order even when Channel promises settle out
+    // of order. ACK still cancels the newly installed timer by delivery ID.
+    this.armDeliveryRetry(entry.message, nextAttempt);
+    await this.pushViaChannel(entry.message);
+
+    if (nextAttempt >= this.deliveryMaxAttempts && this.hasPendingMessage(entry.message.id)) {
+      this.log(
+        `Channel delivery unacknowledged after ${nextAttempt} attempt(s): ${entry.message.id}; ` +
+        "message remains available via get_messages",
+      );
+    }
+  }
+
+  private cancelDeliveryRetry(messageId: string): void {
+    const entry = this.deliveryRetries.get(messageId);
+    if (!entry) return;
+    if (entry.timer !== undefined) {
+      this.deliveryScheduler.clearTimeout(entry.timer);
+    }
+    this.deliveryRetries.delete(messageId);
+  }
+
+  private acknowledgeMessages(
+    messageIds: string[],
+    acknowledgeResumeControl = true,
+  ): { acknowledged: string[]; unknown: string[] } {
+    const requested = [...new Set(messageIds)];
+    const requestedSet = new Set(requested);
+    const resumeIds = new Set(
+      this.pendingMessages
+        .filter((message) => requestedSet.has(message.id) && message.resumeId)
+        .map((message) => message.resumeId!),
+    );
+
+    // A budget resume is one logical directive with potentially several
+    // delivery-attempt IDs. Acknowledging any attempt retires every queued
+    // sibling so a later pull cannot repeat an already processed directive.
+    for (const message of this.pendingMessages) {
+      if (message.resumeId && resumeIds.has(message.resumeId)) {
+        requestedSet.add(message.id);
+      }
+    }
+    const acknowledged: string[] = [];
+    const remainingMessages: MailboxMessage[] = [];
+    const remainingSizes: number[] = [];
+
+    for (let i = 0; i < this.pendingMessages.length; i++) {
+      const message = this.pendingMessages[i]!;
+      const bytes = this.pendingMessageByteSizes[i] ?? utf8ByteLength(message.content);
+      if (requestedSet.has(message.id)) {
+        acknowledged.push(message.id);
+        this.pendingMessageBytes = Math.max(0, this.pendingMessageBytes - bytes);
+        this.cancelDeliveryRetry(message.id);
+      } else {
+        remainingMessages.push(message);
+        remainingSizes.push(bytes);
+      }
+    }
+
+    this.pendingMessages = remainingMessages;
+    this.pendingMessageByteSizes = remainingSizes;
+    if (acknowledgeResumeControl) {
+      for (const resumeId of resumeIds) {
+        if (this.resumeAckHandler) {
+          this.resumeAckHandler(resumeId, "resumed");
+        } else {
+          this.log(`Resume mailbox message acknowledged without a daemon ACK handler (resume_id=${resumeId})`);
+        }
+      }
+    }
+    const acknowledgedSet = new Set(acknowledged);
+    const unknown = requested.filter((id) => !acknowledgedSet.has(id));
+    if (acknowledged.length > 0 || unknown.length > 0) {
+      this.log(
+        `ack_messages (instance=${this.instanceId}, acknowledged=${acknowledged.length}, ` +
+        `unknown=${unknown.length}, pending=${this.pendingMessages.length})`,
+      );
+    }
+    return { acknowledged, unknown };
+  }
+
+  private acknowledgeResume(resumeId: string): number {
+    const ids = this.pendingMessages
+      .filter((message) => message.resumeId === resumeId)
+      .map((message) => message.id);
+    return this.acknowledgeMessages(ids, false).acknowledged.length;
+  }
+
+  private drainMessages(ackIds: string[] = []): { content: Array<{ type: "text"; text: string }> } {
+    const ackResult = ackIds.length > 0
+      ? this.acknowledgeMessages(ackIds)
+      : { acknowledged: [] as string[], unknown: [] as string[] };
     this.log(
       `get_messages called (instance=${this.instanceId}, pending=${this.pendingMessages.length}, ` +
       `bytes=${this.pendingMessageBytes}, dropped=${this.droppedMessageCount}, oversized=${this.oversizedMessageCount})`,
     );
     if (this.pendingMessages.length === 0 && this.droppedMessageCount === 0 && this.oversizedMessageCount === 0) {
+      if (ackResult.acknowledged.length > 0 || ackResult.unknown.length > 0) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: formatAckResult(ackResult) + " No unacknowledged messages from Codex.",
+          }],
+        };
+      }
       return {
         content: [{ type: "text" as const, text: "No new messages from Codex." }],
       };
     }
 
-    // Snapshot and clear atomically to avoid issues with concurrent writes
-    const messages = this.pendingMessages;
-    this.pendingMessages = [];
-    this.pendingMessageByteSizes = [];
-    this.pendingMessageBytes = 0;
+    // Snapshot without clearing. Only an explicit ACK may remove a message.
+    const messages = [...this.pendingMessages];
     const dropped = this.droppedMessageCount;
     this.droppedMessageCount = 0;
     const oversizedSourceCounts = this.oversizedMessageSourceCounts;
@@ -391,17 +702,26 @@ export class ClaudeAdapter extends EventEmitter {
     const formatted = messages
       .map((msg, i) => {
         const ts = new Date(msg.timestamp).toISOString();
-        return `---\n[${i + 1}] ${ts}\nCodex: ${msg.content}`;
+        return `---\n[${i + 1}] ${ts} [id: ${msg.id}]\nCodex: ${msg.content}`;
       })
       .join("\n\n");
 
     const noticeText = notices.map((notice) => `WARNING: ${notice}`).join("\n");
     const parts: string[] = [];
+    if (ackResult.acknowledged.length > 0 || ackResult.unknown.length > 0) {
+      parts.push(formatAckResult(ackResult));
+    }
     if (count > 0) {
-      parts.push(`[${count} new message${count > 1 ? "s" : ""} from Codex]\nchat_id: ${this.sessionId}`);
+      parts.push(`[${count} unacknowledged message${count > 1 ? "s" : ""} from Codex]\nchat_id: ${this.sessionId}`);
     }
     if (noticeText) parts.push(noticeText);
     if (formatted) parts.push(formatted);
+    if (messages.length > 0) {
+      parts.push(
+        `After fully processing these messages, call ack_messages with ack_ids: ` +
+        JSON.stringify(messages.map((message) => message.id)),
+      );
+    }
 
     this.log(
       `get_messages returning ${count} message(s) ` +
@@ -461,11 +781,36 @@ export class ClaudeAdapter extends EventEmitter {
         {
           name: "get_messages",
           description:
-            "Check for new messages from Codex. Call this after sending a reply or when you expect a response from Codex.",
+            "Return all unacknowledged Codex messages in stable order. Messages remain until ack_messages confirms their stable IDs. Optionally acknowledge IDs from a previous result with ack_ids before reading the remaining mailbox.",
           inputSchema: {
             type: "object" as const,
-            properties: {},
+            properties: {
+              ack_ids: {
+                type: "array",
+                items: { type: "string", minLength: 1, maxLength: 512 },
+                maxItems: this.ackIdsCap,
+                description: "Optional stable message IDs from a previous get_messages result to acknowledge before returning the remaining mailbox.",
+              },
+            },
             required: [],
+          },
+        },
+        {
+          name: "ack_messages",
+          description:
+            "Acknowledge Codex messages only after fully processing them. Works for messages received through Channel push or get_messages. Removes only the requested stable IDs and cancels their retries.",
+          inputSchema: {
+            type: "object" as const,
+            properties: {
+              ack_ids: {
+                type: "array",
+                items: { type: "string", minLength: 1, maxLength: 512 },
+                minItems: 1,
+                maxItems: this.ackIdsCap,
+                description: "Stable message IDs to acknowledge, from Channel meta.message_id or get_messages [id: ...] labels.",
+              },
+            },
+            required: ["ack_ids"],
           },
         },
         {
@@ -510,7 +855,13 @@ export class ClaudeAdapter extends EventEmitter {
       }
 
       if (name === "get_messages") {
-        return this.drainMessages();
+        const parsed = parseAckIds((args as Record<string, unknown> | undefined)?.ack_ids, false, this.ackIdsCap);
+        if (!parsed.ok) return ackIdsError(parsed.error);
+        return this.drainMessages(parsed.ids);
+      }
+
+      if (name === "ack_messages") {
+        return this.handleAckMessages(args as Record<string, unknown>);
       }
 
       if (name === "get_budget") {
@@ -526,6 +877,16 @@ export class ClaudeAdapter extends EventEmitter {
         isError: true,
       };
     });
+  }
+
+  private handleAckMessages(args: Record<string, unknown>) {
+    const parsed = parseAckIds(args?.ack_ids, true, this.ackIdsCap);
+    if (!parsed.ok) return ackIdsError(parsed.error);
+
+    const result = this.acknowledgeMessages(parsed.ids);
+    return {
+      content: [{ type: "text" as const, text: formatAckResult(result) }],
+    };
   }
 
   /**
@@ -573,9 +934,15 @@ export class ClaudeAdapter extends EventEmitter {
 
     this.log(`ack_resume received (resume_id=${resumeIdRaw}, status=${status}, instance=${this.instanceId})`);
     this.resumeAckHandler(resumeIdRaw, status);
+    const mailboxAcknowledged = this.acknowledgeResume(resumeIdRaw);
 
     return {
-      content: [{ type: "text" as const, text: `Resume acknowledged (resume_id=${resumeIdRaw}, status=${status}).` }],
+      content: [{
+        type: "text" as const,
+        text:
+          `Resume acknowledged (resume_id=${resumeIdRaw}, status=${status}, ` +
+          `mailbox_messages=${mailboxAcknowledged}).`,
+      }],
     };
   }
 
@@ -716,7 +1083,8 @@ export class ClaudeAdapter extends EventEmitter {
       responseText = "Reply sent to Codex as a new turn (any turn still running was interrupted first; if it had already finished, your message was simply injected).";
     }
     if (pending > 0) {
-      responseText += ` Note: ${pending} unread Codex message${pending > 1 ? "s" : ""} already waiting \u2014 call get_messages to read them.`;
+      responseText += ` Note: ${pending} unacknowledged Codex message${pending > 1 ? "s" : ""} in the mailbox \u2014 ` +
+        "call get_messages if any are unprocessed, and acknowledge processed IDs with ack_messages.";
     }
 
     return {
@@ -727,6 +1095,63 @@ export class ClaudeAdapter extends EventEmitter {
   private log(msg: string) {
     this.logger.log(msg);
   }
+}
+
+type AckIdsParseResult =
+  | { ok: true; ids: string[] }
+  | { ok: false; error: string };
+
+function parseAckIds(value: unknown, required: boolean, maxItems = 100): AckIdsParseResult {
+  if (value === undefined) {
+    return required
+      ? { ok: false, error: "missing required parameter 'ack_ids'" }
+      : { ok: true, ids: [] };
+  }
+  if (!Array.isArray(value)) {
+    return { ok: false, error: "ack_ids must be an array of message ID strings" };
+  }
+  if (required && value.length === 0) {
+    return { ok: false, error: "ack_ids must contain at least one message ID" };
+  }
+  if (value.length > maxItems) {
+    return { ok: false, error: `ack_ids has ${value.length} items; maximum is ${maxItems}` };
+  }
+  for (const id of value) {
+    if (typeof id !== "string" || id.length === 0 || id.length > 512) {
+      return { ok: false, error: "each ack_ids item must be a non-empty string of at most 512 characters" };
+    }
+  }
+  return { ok: true, ids: value as string[] };
+}
+
+function ackIdsError(error: string) {
+  return {
+    content: [{ type: "text" as const, text: `Error: ${error}.` }],
+    isError: true,
+  };
+}
+
+function formatAckResult(result: { acknowledged: string[]; unknown: string[] }): string {
+  const parts = [`Acknowledged ${result.acknowledged.length} message${result.acknowledged.length === 1 ? "" : "s"}.`];
+  if (result.acknowledged.length > 0) {
+    parts.push(`IDs: ${JSON.stringify(result.acknowledged)}.`);
+  }
+  if (result.unknown.length > 0) {
+    parts.push(`Already acknowledged or unknown IDs: ${JSON.stringify(result.unknown)}.`);
+  }
+  return parts.join(" ");
+}
+
+function deliveryFingerprint(message: BridgeMessage): string {
+  return createHash("sha256")
+    .update(JSON.stringify([message.source, message.content, message.resumeId ?? null]))
+    .digest("hex");
+}
+
+function normalizeDeliveryId(id: string): string {
+  if (id.length > 0 && id.length <= 512 && /^[A-Za-z0-9._:-]+$/.test(id)) return id;
+  const digest = createHash("sha256").update(id).digest("hex").slice(0, 32);
+  return `agentbridge_${digest}`;
 }
 
 function parsePositiveIntegerEnv(name: string, fallback: number): number {

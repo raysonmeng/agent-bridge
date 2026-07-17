@@ -53,7 +53,7 @@ Claude Code ── MCP stdio ──▶ bridge.ts (foreground)
 - **`src/bridge.ts`** — foreground MCP server registered as a Claude Code plugin channel. Exits when Claude Code closes.
 - **`src/daemon.ts`** — long-lived background process; owns the Codex app-server proxy and the single source of truth for bridge state. Survives Claude Code restarts; `bridge.ts` reconnects with exponential backoff.
 - **`src/control-protocol.ts`** — message schema for the control WebSocket between foreground and daemon.
-- **`src/claude-adapter.ts`** — MCP tool surface exposed to Claude (`reply`, `get_messages`). Emits `notifications/claude/channel` on inbound messages (push mode).
+- **`src/claude-adapter.ts`** — MCP tool surface exposed to Claude (`reply`, `get_messages`, `ack_messages`). Emits `notifications/claude/channel` on inbound messages (push mode) over an acknowledged in-memory mailbox.
 - **`src/codex-adapter.ts`** — WebSocket proxy in front of Codex app-server; intercepts `agentMessage` items and injects turns via `turn/start`.
 - **`src/message-filter.ts`** — collapses noisy intermediate events so only meaningful `agentMessage` payloads reach Claude.
 - **`src/daemon-lifecycle.ts`** — shared `ensureRunning` / `kill` / startup-lock logic; both the CLI and `bridge.ts` call into this.
@@ -66,7 +66,7 @@ Claude Code ── MCP stdio ──▶ bridge.ts (foreground)
 ### Data flow invariants
 
 - Every `BridgeMessage` carries a `source: "claude" | "codex"` — the bridge **never forwards a message back to its origin** (loop prevention).
-- Message delivery is always push (channel notifications). A failed push falls back to an in-memory queue drained by `get_messages`. (The legacy `AGENTBRIDGE_MODE=pull` mode was removed; the env var is ignored with a one-time warning.)
+- Message delivery is push (channel notifications) over an authoritative in-memory mailbox: every admissible message is queued **before** its Channel push, `get_messages` re-reads pending messages non-destructively under stable delivery IDs, and only `ack_messages` removes them (bounded retries re-push unacknowledged messages). (The legacy `AGENTBRIDGE_MODE=pull` mode was removed; the env var is ignored with a one-time warning.)
 - Ports are allocated per pair from a registry (slot-based, +10 strides from the base 4500/4501/4502); the legacy fixed defaults remain the slot-0 values. Multiple pairs run side-by-side, one per project directory.
 - All state lives in the platform state dir (`AGENTBRIDGE_STATE_DIR`, default `~/Library/Application Support/AgentBridge/` on macOS, `$XDG_STATE_HOME/agentbridge/` on Linux). The daemon uses `startup.lock` + `killed` sentinel to coordinate startup and explicit-kill-don't-restart semantics.
 

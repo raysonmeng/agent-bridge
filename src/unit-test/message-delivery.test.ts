@@ -10,6 +10,12 @@ function createAdapter(
     dedupeCapacity?: number;
     dedupeTtlMs?: number;
     now?: () => number;
+    deliveryRetryBaseMs?: number;
+    deliveryMaxAttempts?: number;
+    deliveryScheduler?: {
+      setTimeout(callback: () => void, delayMs: number): unknown;
+      clearTimeout(handle: unknown): void;
+    };
   },
 ): any {
   const origMode = process.env.AGENTBRIDGE_MODE;
@@ -60,7 +66,13 @@ function withMockedChannel(adapter: any, mode: "success" | "fail" = "success") {
   return notifications;
 }
 
-describe("Push-only delivery: AGENTBRIDGE_MODE is ignored", () => {
+function ackSourceMessage(adapter: any, sourceMessageId: string) {
+  const entry = adapter.pendingMessages.find((message: any) => message.sourceMessageId === sourceMessageId);
+  if (!entry) throw new Error(`No pending delivery for source ID ${sourceMessageId}`);
+  return adapter.handleAckMessages({ ack_ids: [entry.id] });
+}
+
+describe("Channel delivery with an authoritative mailbox: AGENTBRIDGE_MODE is ignored", () => {
   // Pull mode was removed (it could not wake an idle session and silently
   // broke the budget RESUME chain). Any legacy env value must be ignored.
   test("delivers via channel when AGENTBRIDGE_MODE is unset", async () => {
@@ -68,7 +80,7 @@ describe("Push-only delivery: AGENTBRIDGE_MODE is ignored", () => {
     const notifications = withMockedChannel(adapter);
     await adapter.pushNotification(makeBridgeMessage("normal push"));
     expect(notifications).toHaveLength(1);
-    expect(adapter.pendingMessages).toHaveLength(0);
+    expect(adapter.pendingMessages).toHaveLength(1);
   });
 
   test('legacy AGENTBRIDGE_MODE="pull" still delivers via channel', async () => {
@@ -76,7 +88,7 @@ describe("Push-only delivery: AGENTBRIDGE_MODE is ignored", () => {
     const notifications = withMockedChannel(adapter);
     await adapter.pushNotification(makeBridgeMessage("ignored pull env"));
     expect(notifications).toHaveLength(1);
-    expect(adapter.pendingMessages).toHaveLength(0);
+    expect(adapter.pendingMessages).toHaveLength(1);
   });
 
   test("any other AGENTBRIDGE_MODE value is equally ignored", async () => {
@@ -84,7 +96,7 @@ describe("Push-only delivery: AGENTBRIDGE_MODE is ignored", () => {
     const notifications = withMockedChannel(adapter);
     await adapter.pushNotification(makeBridgeMessage("ignored auto env"));
     expect(notifications).toHaveLength(1);
-    expect(adapter.pendingMessages).toHaveLength(0);
+    expect(adapter.pendingMessages).toHaveLength(1);
   });
 
   test("legacy warning is construction-time only — never per message", async () => {
@@ -163,7 +175,7 @@ describe("Message delivery: fallback queue", () => {
     expect(adapter.oversizedMessageBytes).toBe(9);
   });
 
-  test("push meta uses BridgeMessage.id as message_id and a separate delivery_attempt_id", async () => {
+  test("push meta separates source, stable ACK, and delivery-attempt IDs", async () => {
     const adapter = createAdapter();
 
     const notifications: any[] = [];
@@ -181,8 +193,10 @@ describe("Message delivery: fallback queue", () => {
     const firstMeta = notifications[0].params.meta;
     const secondMeta = notifications[1].params.meta;
 
-    expect(firstMeta.message_id).toBe("codex-item-1");
-    expect(secondMeta.message_id).toBe("codex-item-2");
+    expect(firstMeta.source_message_id).toBe("codex-item-1");
+    expect(secondMeta.source_message_id).toBe("codex-item-2");
+    expect(firstMeta.message_id).toMatch(/^codex-item-1_delivery_[a-f0-9]{12}_1$/);
+    expect(secondMeta.message_id).toMatch(/^codex-item-2_delivery_[a-f0-9]{12}_2$/);
     expect(firstMeta.delivery_attempt_id).toMatch(/^codex_msg_[a-f0-9]{12}_1$/);
     expect(secondMeta.delivery_attempt_id).toMatch(/^codex_msg_[a-f0-9]{12}_2$/);
     expect(firstMeta.delivery_attempt_id.replace(/_1$/, "")).toBe(secondMeta.delivery_attempt_id.replace(/_2$/, ""));
@@ -196,12 +210,12 @@ describe("Message delivery: fallback queue", () => {
     adapter.logger = { log: (msg: string) => logs.push(msg) };
 
     await adapter.pushNotification(makeBridgeMessage("first delivery", 1705312200000, "same-id"));
-    await adapter.pushNotification(makeBridgeMessage("duplicate delivery", 1705312201000, "same-id"));
+    await adapter.pushNotification(makeBridgeMessage("first delivery", 1705312201000, "same-id"));
 
     expect(notifications).toHaveLength(1);
-    expect(notifications[0].params.content).toBe("first delivery");
-    expect(adapter.pendingMessages).toHaveLength(0);
-    expect(logs.some((line) => line.includes("Duplicate Codex message suppressed") && line.includes("same-id"))).toBe(true);
+    expect(notifications[0].params.content).toEndWith("first delivery");
+    expect(adapter.pendingMessages).toHaveLength(1);
+    expect(logs.some((line) => line.includes("Duplicate active Codex message suppressed") && line.includes("same-id"))).toBe(true);
   });
 
   test("pushNotification does not enqueue fallback twice for the same BridgeMessage.id", async () => {
@@ -209,7 +223,7 @@ describe("Message delivery: fallback queue", () => {
     withMockedChannel(adapter, "fail");
 
     await adapter.pushNotification(makeBridgeMessage("queued once", 1705312200000, "fallback-id"));
-    await adapter.pushNotification(makeBridgeMessage("queued duplicate", 1705312201000, "fallback-id"));
+    await adapter.pushNotification(makeBridgeMessage("queued once", 1705312201000, "fallback-id"));
 
     expect(adapter.pendingMessages.map((m: any) => m.content)).toEqual(["queued once"]);
     expect(adapter.pendingMessageBytes).toBe(Buffer.byteLength("queued once", "utf8"));
@@ -220,15 +234,15 @@ describe("Message delivery: fallback queue", () => {
     const notifications = withMockedChannel(adapter);
 
     await adapter.pushNotification(makeBridgeMessage("first a", 1705312200000, "id-a"));
+    ackSourceMessage(adapter, "id-a");
     await adapter.pushNotification(makeBridgeMessage("first b", 1705312201000, "id-b"));
+    ackSourceMessage(adapter, "id-b");
     await adapter.pushNotification(makeBridgeMessage("first c", 1705312202000, "id-c"));
+    ackSourceMessage(adapter, "id-c");
     await adapter.pushNotification(makeBridgeMessage("second a", 1705312203000, "id-a"));
 
-    expect(notifications.map((n) => n.params.content)).toEqual([
-      "first a",
-      "first b",
-      "first c",
-      "second a",
+    expect(notifications.map((n) => n.params.content.split("\n\n").at(-1))).toEqual([
+      "first a", "first b", "first c", "second a",
     ]);
   });
 
@@ -241,13 +255,14 @@ describe("Message delivery: fallback queue", () => {
     });
     const notifications = withMockedChannel(adapter);
 
-    await adapter.pushNotification(makeBridgeMessage("first", 1705312200000, "ttl-id"));
+    await adapter.pushNotification(makeBridgeMessage("same payload", 1705312200000, "ttl-id"));
+    ackSourceMessage(adapter, "ttl-id");
     now += 50;
-    await adapter.pushNotification(makeBridgeMessage("duplicate within ttl", 1705312201000, "ttl-id"));
+    await adapter.pushNotification(makeBridgeMessage("same payload", 1705312201000, "ttl-id"));
     now += 101;
-    await adapter.pushNotification(makeBridgeMessage("after ttl", 1705312202000, "ttl-id"));
+    await adapter.pushNotification(makeBridgeMessage("same payload", 1705312202000, "ttl-id"));
 
-    expect(notifications.map((n) => n.params.content)).toEqual(["first", "after ttl"]);
+    expect(notifications).toHaveLength(2);
   });
 
   test("pushNotification dedupe TTL ignores wall-clock jumps", async () => {
@@ -260,10 +275,11 @@ describe("Message delivery: fallback queue", () => {
       const notifications = withMockedChannel(adapter);
 
       await adapter.pushNotification(makeBridgeMessage("first", 1705312200000, "wall-clock-id"));
+      ackSourceMessage(adapter, "wall-clock-id");
       wallNow += 120_000;
-      await adapter.pushNotification(makeBridgeMessage("duplicate after wall jump", 1705312201000, "wall-clock-id"));
+      await adapter.pushNotification(makeBridgeMessage("first", 1705312201000, "wall-clock-id"));
 
-      expect(notifications.map((n) => n.params.content)).toEqual(["first"]);
+      expect(notifications).toHaveLength(1);
     } finally {
       Date.now = originalDateNow;
     }
@@ -288,8 +304,11 @@ describe("Message delivery: fallback queue", () => {
     await adapter.pushNotification(makeBridgeMessage("live after recovery"));
 
     expect(notifications).toHaveLength(1);
-    expect(notifications[0].params.content).toBe("live after recovery");
-    expect(adapter.pendingMessages.map((m: any) => m.content)).toEqual(["queued while push failed"]);
+    expect(notifications[0].params.content).toEndWith("live after recovery");
+    expect(adapter.pendingMessages.map((m: any) => m.content)).toEqual([
+      "queued while push failed",
+      "live after recovery",
+    ]);
   });
 });
 
@@ -301,7 +320,7 @@ describe("Message delivery: drainMessages (get_messages)", () => {
     expect(result.content[0].text).toBe("No new messages from Codex.");
   });
 
-  test("returns formatted messages and clears queue", () => {
+  test("returns stable IDs without clearing messages before acknowledgement", () => {
     const adapter = createAdapter();
 
     const ts = 1705312200000; // fixed timestamp for deterministic output
@@ -311,15 +330,16 @@ describe("Message delivery: drainMessages (get_messages)", () => {
     const result = adapter.drainMessages();
     const text = result.content[0].text;
 
-    expect(text).toContain("[2 new messages from Codex]");
+    expect(text).toContain("[2 unacknowledged messages from Codex]");
     expect(text).toContain("chat_id:");
     expect(text).toContain("[1]");
     expect(text).toContain("first message");
     expect(text).toContain("[2]");
     expect(text).toContain("second message");
 
-    // Queue should be cleared
-    expect(adapter.pendingMessages).toHaveLength(0);
+    expect(text).toContain(`[id: ${adapter.pendingMessages[0].id}]`);
+    expect(adapter.pendingMessages).toHaveLength(2);
+    adapter.handleAckMessages({ ack_ids: adapter.pendingMessages.map((message: any) => message.id) });
     expect(adapter.getPendingMessageCount()).toBe(0);
   });
 
@@ -347,14 +367,14 @@ describe("Message delivery: drainMessages (get_messages)", () => {
     const result = adapter.drainMessages();
     const text = result.content[0].text;
 
-    expect(text).toContain("[1 new message from Codex]");
+    expect(text).toContain("[1 unacknowledged message from Codex]");
     expect(text).toContain("1 older message");
     expect(text).toContain("dropped due to fallback queue overflow");
     expect(text).toContain("1 oversized message from Codex omitted (>10B)");
     expect(text).not.toContain("12345");
     expect(text).not.toContain("xxxxxxxxxxx");
-    expect(adapter.pendingMessages).toHaveLength(0);
-    expect(adapter.pendingMessageBytes).toBe(0);
+    expect(adapter.pendingMessages).toHaveLength(1);
+    expect(adapter.pendingMessageBytes).toBe(6);
     expect(adapter.droppedMessageCount).toBe(0);
     expect(adapter.oversizedMessageCount).toBe(0);
   });
@@ -372,7 +392,7 @@ describe("Message delivery: drainMessages (get_messages)", () => {
     expect(text).toContain("1 oversized message from Codex omitted (>8B)");
   });
 
-  test("drainMessages reports no messages after clearing since-drain drop counters", () => {
+  test("drainMessages resets notices but repeats unacknowledged messages", () => {
     const adapter = createAdapter(undefined, { maxBufferedMessages: 1 });
 
     adapter.queueFallbackMessage(makeBridgeMessage("first"));
@@ -382,7 +402,8 @@ describe("Message delivery: drainMessages (get_messages)", () => {
     expect(firstDrain.content[0].text).toContain("dropped due to fallback queue overflow");
 
     const secondDrain = adapter.drainMessages();
-    expect(secondDrain.content[0].text).toBe("No new messages from Codex.");
+    expect(secondDrain.content[0].text).not.toContain("dropped due to fallback queue overflow");
+    expect(secondDrain.content[0].text).toContain("second");
   });
 
   test("singular message uses correct grammar", () => {
@@ -391,7 +412,7 @@ describe("Message delivery: drainMessages (get_messages)", () => {
     adapter.queueFallbackMessage(makeBridgeMessage("only one"));
 
     const result = adapter.drainMessages();
-    expect(result.content[0].text).toContain("[1 new message from Codex]");
+    expect(result.content[0].text).toContain("[1 unacknowledged message from Codex]");
   });
 });
 
@@ -407,8 +428,9 @@ describe("Message delivery: reply pending hint", () => {
     const text = result.content[0].text;
 
     expect(text).toContain("Reply sent to Codex.");
-    expect(text).toContain("2 unread Codex message");
+    expect(text).toContain("2 unacknowledged Codex message");
     expect(text).toContain("get_messages");
+    expect(text).toContain("ack_messages");
   });
 
   test("handleReply has no hint when queue is empty", async () => {
