@@ -4,11 +4,15 @@ import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, readFileSync } from "node:fs";
 import { createRequire } from "node:module";
 import { resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 const require = createRequire(import.meta.url);
 const { computeCodeHash } = require("./code-hash.cjs");
 
-const repoRoot = resolve(new URL("..", import.meta.url).pathname);
+// fileURLToPath, not URL.pathname (issue #240): on win32 pathname yields
+// "/C:/..." and resolve() then doubles the drive into "C:\C:\...", so every
+// build target dies on ENOENT reading package.json.
+const repoRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
 const pkg = JSON.parse(readFileSync(resolve(repoRoot, "package.json"), "utf-8"));
 
 /**
