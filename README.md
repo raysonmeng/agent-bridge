@@ -82,6 +82,23 @@ Net effect: each side receives a curated stream of meaningful messages, so conte
 
 ## Quick Start
 
+### One-command installer (macOS / Linux / WSL)
+
+For released versions, the installer downloads and verifies the GitHub Release
+package, installs a versioned copy, and activates `agentbridge`/`abg` in
+`~/.local/bin`. It does not require Node.js or npm; Bun is detected or (with
+confirmation) installed using Bun's official installer. Claude Code and Codex
+CLI are checked but remain user-managed.
+
+```bash
+curl -fsSL https://github.com/raysonmeng/agent-bridge/releases/latest/download/install.sh | bash
+```
+
+Use `--yes` for unattended Bun installation, `--version X.Y.Z` to pin a
+release, `--dry-run` to preview actions, or `--force` when replacing an active
+pair. The installer never runs `abg init`; initialize each project explicitly
+after installation.
+
 Five steps from nothing to a running pair:
 
 ```bash

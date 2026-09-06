@@ -82,6 +82,21 @@ English version: [README.md](README.md)
 
 ## Quick Start
 
+### 一键安装（macOS / Linux / WSL）
+
+发布版本可直接使用官方安装脚本。脚本会下载并校验 GitHub Release
+资源，将 AgentBridge 安装到版本化目录，并在 `~/.local/bin` 激活
+`agentbridge`/`abg`。安装过程不需要 Node.js 或 npm；如果缺少 Bun，脚本会在
+确认后调用 Bun 官方安装器。Claude Code 和 Codex CLI 只做检查，仍由用户自行管理。
+
+```bash
+curl -fsSL https://github.com/raysonmeng/agent-bridge/releases/latest/download/install.sh | bash
+```
+
+可通过 `--yes` 允许无人值守安装 Bun，`--version X.Y.Z` 固定版本，
+`--dry-run` 预览动作，或在替换活动 pair 时使用 `--force`。安装器不会运行
+`abg init`；安装后请在每个项目中显式初始化。
+
 从零到一对跑起来，五步：
 
 ```bash
