@@ -29,11 +29,11 @@ function defineNumber(value, fallback) {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 var BUILD_INFO = Object.freeze({
-  version: defineString("0.1.24", "0.0.0-source"),
-  commit: defineString("75095db", "source"),
+  version: defineString("0.1.30", "0.0.0-source"),
+  commit: defineString("7be3bd1", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("1af1631a9dc9", "source")
+  codeHash: defineString("8b7946808ae2", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
