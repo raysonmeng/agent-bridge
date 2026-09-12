@@ -30,6 +30,7 @@ import { spawnSync } from "node:child_process";
 import { mkdirSync, rmSync, chmodSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { resolveCodexCommand } from "./codex-command";
 
 /** How the adapter reaches the Codex app-server. */
 export type CodexTransport = "ws" | "unix";
@@ -79,9 +80,10 @@ export function probeCodexWsSupport(
 
 function defaultRunCodexAppServerHelp(): string | null {
   try {
-    const res = spawnSync("codex", ["app-server", "--help"], {
+    const res = spawnSync(resolveCodexCommand(), ["app-server", "--help"], {
       encoding: "utf-8",
       timeout: 5000,
+      windowsHide: true,
     });
     if (res.error || typeof res.stdout !== "string") return null;
     return res.stdout + (res.stderr ?? "");
