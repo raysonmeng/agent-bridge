@@ -228,6 +228,7 @@ const claudeResumeTracker = new ResumeAckTracker({
 // turnTrackingReset clean up BOTH together (PR B #2).
 interface PendingSteerDispatch {
   requireReply: boolean;
+  turnId?: string;
   idempotencyKey?: string;
   threadId?: string;
 }
@@ -796,6 +797,9 @@ codex.on("steerAccepted", ({ requestId }: { requestId: number }) => {
   // response cannot mis-arm against the wrong dispatch (PR B #3).
   const dispatch = pendingSteerDispatches.get(requestId);
   pendingSteerDispatches.delete(requestId);
+  // A successful local request makes this turn's subsequent replies explicit.
+  // Bind to the dispatch target, never a possibly newer active turn.
+  if (dispatch?.turnId) codexRoomInbox.allowLocalRelay(dispatch.turnId);
   if (dispatch?.requireReply) {
     replyTracker.arm();
     log("Reply required armed on steer-accept (steer-scoped expectation)");
@@ -823,6 +827,7 @@ codex.on("bridgeTurnStarted", ({ requestId, turnId }: { requestId: number; turnI
     return;
   }
   pendingTurnStarts.delete(requestId);
+  codexRoomInbox.allowLocalRelay(turnId); // an accepted local task may have joined a just-starting room turn
   log(`Bridge turn started: injection ${requestId} → turn ${turnId} (request ${pending.requestId})`);
   if (pending.idempotencyKey) {
     idempotencyTracker.markStarted(pending.threadId, pending.idempotencyKey, turnId);
@@ -1520,6 +1525,7 @@ async function handleClaudeToCodex(
       // clean both up together (PR B #2).
       pendingSteerDispatches.set(steerRequestId, {
         requireReply,
+        ...(steerTurnId ? { turnId: steerTurnId } : {}),
         ...(idempotencyKey ? { idempotencyKey } : {}),
         ...(steerThreadId ? { threadId: steerThreadId } : {}),
       });

@@ -24,11 +24,11 @@
 
 ## 1. Install
 
-> The runtime is **Bun**. v3 currently lives on a test branch; after release use the global install, during testing run from the repo.
+> The runtime is **Bun**. Recommended CLI versions for v0.1.31: **Claude Code 2.1.269** and **Codex 0.154.0** (latest stable versions checked on 2026-09-12). See [Codex remote rooms](../CODEX-ROOMS.md) for joining from a Codex-only machine.
 
 **Release install:**
 ```bash
-bun run install:global    # install/update the global abg + agentbridge commands + plugin
+npm install -g @raysonmeng/agentbridge@0.1.31
 ```
 
 **Testing (from the repo):**

@@ -164,10 +164,12 @@ describe("Broker routing (§3.2): DM / broadcast / hop / offline replay", () => 
         }),
       });
       await sleep(40);
-      // bob connects → drains the queued DM on welcome
+      // Authentication alone does not consume the queue; subscription does.
       const bob = await WsClient.connect(url);
       bob.send({ type: "hello", token: token["bob@x.com"]! });
       expect(await bob.next()).toMatchObject({ type: "welcome" });
+      bob.send({ type: "subscribe", topic: "room-1" });
+      expect(await bob.next()).toMatchObject({ type: "subscribed" });
       expect(await bob.next()).toMatchObject({ type: "event", envelope: { messageId: "queued1" } });
       bob.close();
     } finally {
@@ -326,6 +328,8 @@ describe("Broker routing (§3.2): DM / broadcast / hop / offline replay", () => 
       const bob = await WsClient.connect(url);
       bob.send({ type: "hello", token: tokB });
       expect(await bob.next()).toMatchObject({ type: "welcome" });
+      bob.send({ type: "subscribe", topic: "room-1" });
+      expect(await bob.next()).toMatchObject({ type: "subscribed" });
       expect(await bob.next()).toMatchObject({ type: "event", envelope: { messageId: "sql1" } });
       bob.close();
     } finally {

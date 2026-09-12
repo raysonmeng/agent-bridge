@@ -111,6 +111,29 @@ describe("Broker room memory — ledger + whiteboard (§4)", () => {
     expect(alice.frames.filter((f) => f.type === "whiteboard").length).toBe(before);
   });
 
+  test("private completions never reach an unrelated member through the whiteboard", async () => {
+    const { broker, store, tokenA, tokenB, url } = await startBroker();
+    cleanup.push(() => broker.stop());
+    const svc = new IdentityService(store);
+    await svc.registerIdentity("carol@x.com", "Carol");
+    await store.addMember(ROOM, "carol@x.com");
+    const tokenC = await svc.issueToken("carol@x.com");
+    const alice = await WsClient.connect(url);
+    const bob = await WsClient.connect(url);
+    cleanup.push(() => alice.close(), () => bob.close());
+    await alice.helloAndSubscribe(tokenA);
+    await bob.helloAndSubscribe(tokenB);
+    bob.send({ type: "publish", topic: ROOM, envelope: { ...taskEnv("PRIVATE_COMPLETION", "private/v1"), to: ["alice@x.com"] } });
+    await sleep(60);
+    expect(alice.frames.some(f => f.envelope?.payload?.summary === "PRIVATE_COMPLETION")).toBe(true);
+    expect(await store.getWhiteboard(ROOM)).toBeNull();
+    const carol = await WsClient.connect(url);
+    cleanup.push(() => carol.close());
+    await carol.helloAndSubscribe(tokenC);
+    expect(JSON.stringify(carol.frames)).not.toContain("PRIVATE_COMPLETION");
+    expect(JSON.stringify(carol.frames)).not.toContain("private/v1");
+  });
+
   test("a ledger-write failure does NOT block live delivery (best-effort)", async () => {
     const store = new InMemoryStore();
     (store as unknown as { appendEvent: () => Promise<void> }).appendEvent = () => Promise.reject(new Error("ledger down"));

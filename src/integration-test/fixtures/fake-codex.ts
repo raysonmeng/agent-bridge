@@ -164,11 +164,23 @@ function main(): void {
     // here — emitting one would mark the adapter busy and break the multi-injection
     // budget tests; the "start-turn" command drives the busy state explicitly.
     if (msg.method === "turn/start") {
+      if (msg.params?.input?.some((input: any) => input.text?.includes("[force-start-error]"))) {
+        ws.send(JSON.stringify({ id: msg.id, error: { message: "test start rejected" } }));
+        return;
+      }
       if (turnStartLog) {
         appendFileSync(turnStartLog, JSON.stringify(msg.params) + "\n");
       }
-      turnStartCounter += 1;
-      ws.send(JSON.stringify({ id: msg.id, result: { turn: { id: "turn-injected-" + turnStartCounter } } }));
+      const notify = process.env.FAKE_APP_NOTIFY_TURNSTART === "1";
+      const steered = notify && lastStartedTurnId !== null;
+      const turnId = steered ? lastStartedTurnId : "turn-injected-" + (++turnStartCounter);
+      ws.send(JSON.stringify({ id: msg.id, result: { turn: { id: turnId } } }));
+      if (notify && !steered) {
+        lastStartedTurnId = turnId;
+        if (process.env.FAKE_APP_DEFER_TURNSTART !== "1") {
+          ws.send(JSON.stringify({ method: "turn/started", params: { turn: { id: turnId } } }));
+        }
+      }
       return;
     }
 
@@ -277,6 +289,9 @@ function main(): void {
       }
       const ws = appWs;
       if (!ws) return;
+      if (command === "start-injected-turn" && lastStartedTurnId) {
+        ws.send(JSON.stringify({ method: "turn/started", params: { turn: { id: lastStartedTurnId } } }));
+      }
       if (command === "start-turn") {
         lastStartedTurnId = "turn-1";
         ws.send(JSON.stringify({ method: "turn/started", params: { turn: { id: "turn-1" } } }));
@@ -290,7 +305,7 @@ function main(): void {
         const id = "agent-message-" + (++agentMessageCounter);
         ws.send(JSON.stringify({ method: "item/started", params: { item: { id, type: "agentMessage" } } }));
         ws.send(JSON.stringify({ method: "item/agentMessage/delta", params: { itemId: id, delta: content } }));
-        ws.send(JSON.stringify({ method: "item/completed", params: { item: { id, type: "agentMessage" } } }));
+        ws.send(JSON.stringify({ method: "item/completed", params: { turnId: lastStartedTurnId, item: { id, type: "agentMessage" } } }));
       }
       if (command === "close-app-server") {
         ws.close(1011, "test app-server close");

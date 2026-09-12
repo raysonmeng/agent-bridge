@@ -1,0 +1,28 @@
+name: Daily metrics
+
+on:
+  schedule:
+    - cron: "30 15 * * *"   # 23:30 Beijing
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: metrics
+      - name: Collect
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: bash collect-cloud.sh
+      - name: Commit
+        run: |
+          git config user.name "metrics-bot"
+          git config user.email "actions@github.com"
+          git add -A
+          git diff --cached --quiet || git commit -m "metrics: $(TZ=Asia/Shanghai date +%F)"
+          git push

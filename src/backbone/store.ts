@@ -100,8 +100,8 @@ export interface Store {
    * can't grow the backlog without limit (§8.2 resilience).
    */
   enqueuePending(targetAgentId: string, envelope: Envelope): Promise<void>;
-  /** Remove and return the target's pending envelopes (deduped by idempotencyKey). */
-  drainPending(targetAgentId: string): Promise<Envelope[]>;
+  /** Remove and return pending envelopes, optionally for just one subscribed room. */
+  drainPending(targetAgentId: string, roomId?: string): Promise<Envelope[]>;
 
   // --- auth tokens (§6.2): `abg auth login` binds a PSK token to an identity ---
   /** Persist a token → identity binding. Re-issuing the same token re-points it. */

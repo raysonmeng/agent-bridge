@@ -220,6 +220,8 @@ describe("Broker room authorization (§11.2) — closed by default", () => {
     const b = await WsClient.connect(url);
     b.send({ type: "hello", token: bob });
     await b.next(); // welcome
+    b.send({ type: "subscribe", topic: ROOM });
+    expect(await b.next()).toMatchObject({ type: "subscribed" });
     await sleep(40);
     expect(b.drainNow().some((m) => m.type === "event" && m.envelope?.messageId === "off-b")).toBe(true);
 
@@ -227,12 +229,13 @@ describe("Broker room authorization (§11.2) — closed by default", () => {
     const a = await WsClient.connect(url);
     a.send({ type: "hello", token: alice });
     expect(await a.next()).toMatchObject({ type: "welcome" });
+    a.send({ type: "subscribe", topic: ROOM });
+    expect(await a.next()).toMatchObject({ type: "error", reason: "not a room member" });
     await sleep(40);
     expect(a.drainNow().some((m) => m.type === "event")).toBe(false); // nothing leaked to a non-member
-    // The queue WAS consumed (drainPending is destructive regardless of membership)
-    // — this only proves the broker processed the item, NOT that it dropped it. The
-    // real proof of "dropped, not delivered" is the WS-side drainNow assertion above.
-    expect(await store.drainPending("alice@x.com")).toEqual([]);
+    // A denied subscription cannot consume pending data; only an authorized
+    // subscription drains its own room. The WS assertion proves nothing leaked.
+    expect((await store.drainPending("alice@x.com")).map(e => e.messageId)).toEqual(["off-a"]);
     a.close();
     b.close();
   });
@@ -414,10 +417,12 @@ describe("Broker @all owner gate + roster (§5 agent→room)", () => {
     a.send({ type: "publish", topic: ROOM, envelope: { ...chatEnvelope(ROOM, ["*"]), messageId: "chat-off", idempotencyKey: "chat-off" } });
     await sleep(60);
 
-    // bob reconnects → the queued chat drains to him (the headline: an away peer still gets it).
+    // bob reconnects and subscribes → only this room's queued chat drains to him.
     const b = await WsClient.connect(url);
     b.send({ type: "hello", token: bob });
     await b.next(); // welcome
+    b.send({ type: "subscribe", topic: ROOM });
+    expect(await b.next()).toMatchObject({ type: "subscribed" });
     await sleep(60);
     expect(
       b.drainNow().some((m) => m.type === "event" && m.envelope?.kind === "chat" && m.envelope?.messageId === "chat-off"),

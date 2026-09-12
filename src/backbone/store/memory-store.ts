@@ -159,11 +159,13 @@ export class InMemoryStore implements Store {
     }
   }
 
-  async drainPending(targetAgentId: string): Promise<Envelope[]> {
+  async drainPending(targetAgentId: string, roomId?: string): Promise<Envelope[]> {
     const byKey = this.pending.get(targetAgentId);
     if (!byKey) return [];
-    this.pending.delete(targetAgentId);
-    return [...byKey.values()];
+    const drained = [...byKey.values()].filter(env => roomId === undefined || env.roomId === roomId);
+    for (const env of drained) byKey.delete(env.idempotencyKey);
+    if (byKey.size === 0) this.pending.delete(targetAgentId);
+    return drained;
   }
 
   async issueToken(token: string, identityId: string): Promise<void> {

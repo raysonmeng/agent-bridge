@@ -3,7 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CodexAdapter } from "../codex-adapter";
-import { CODEX_ROOM_TOOLS, roomToolResult } from "../codex-room";
+import { CODEX_ROOM_TOOLS, CodexRoomInbox, roomToolResult } from "../codex-room";
 
 function setup() {
   const adapter = new CodexAdapter(4510, 4511, join(mkdtempSync(join(tmpdir(), "abg-room-adapter-")), "test.log")) as any;
@@ -21,6 +21,78 @@ function request(tool = "agentbridge_room_members", threadId = "thread-a") {
 }
 
 describe("Codex room dynamic protocol", () => {
+  test("a correlated terminal releases room input even when started notifications are opted out", () => {
+    const { adapter, replies } = setup();
+    const inbox = new CodexRoomInbox(adapter, () => true, () => {});
+    try {
+      inbox.enqueue("first"); inbox.flush();
+      adapter.handleAppServerPayload(JSON.stringify({ id: replies[0].id, result: { turn: { id: "room-turn" } } }));
+      adapter.handleServerNotification({ method: "turn/completed", params: { threadId: "thread-a", turn: { id: "unrelated" } } });
+      expect(inbox.active).toBe(true);
+      adapter.handleServerNotification({ method: "turn/completed", params: { threadId: "thread-a", turn: { id: "room-turn" } } });
+      expect(inbox.active).toBe(false);
+      inbox.enqueue("second"); inbox.flush();
+      expect(replies).toHaveLength(2);
+    } finally { inbox.stop(); adapter.clearResponseTrackingState(); adapter.resetTurnState("test cleanup"); }
+  });
+
+  for (const source of ["local", "tui"] as const) {
+    test(`room notices wait for a ${source} start through its response and turn completion`, () => {
+      const { adapter, replies } = setup();
+      adapter.tuiWs.data = { connId: 0 };
+      const inbox = new CodexRoomInbox(adapter, () => true, () => {});
+      try {
+        if (source === "local") adapter.injectMessage("explicit local task");
+        else adapter.onTuiMessage(adapter.tuiWs, JSON.stringify({ id: 1, method: "turn/start", params: { threadId: "thread-a", input: [] } }));
+        const start = replies[0];
+        inbox.enqueue("external notice"); inbox.flush();
+        expect(replies).toHaveLength(1); // never turn/start again: native Codex would STEER the user turn
+        adapter.handleAppServerPayload(JSON.stringify({ id: start.id, result: { turn: { id: "user-turn" } } }));
+        inbox.flush(); expect(replies).toHaveLength(1); // response can arrive before turn/started
+        adapter.handleServerNotification({ method: "turn/started", params: { threadId: "thread-a", turn: { id: "user-turn" } } });
+        inbox.flush(); expect(replies).toHaveLength(1);
+        expect(inbox.isRoomTurn("user-turn")).toBe(false);
+        adapter.handleServerNotification({ method: "turn/completed", params: { threadId: "thread-a", turn: { id: "user-turn" } } });
+        inbox.flush(); expect(replies).toHaveLength(2);
+      } finally { inbox.stop(); adapter.clearResponseTrackingState(); adapter.resetTurnState("test cleanup"); }
+    });
+
+    test(`a ${source} rejected start or connection reset releases the automatic notice gate`, () => {
+      const { adapter, replies } = setup();
+      adapter.tuiWs.data = { connId: 0 };
+      const start = () => source === "local" ? adapter.injectMessage("task") :
+        adapter.onTuiMessage(adapter.tuiWs, JSON.stringify({ id: 1, method: "turn/start", params: { threadId: "thread-a", input: [] } }));
+      try {
+        start(); expect(adapter.canInjectRoomNotice()).toBe(false);
+        adapter.handleAppServerPayload(JSON.stringify({ id: replies[0].id, error: { message: "rejected" } }));
+        expect(adapter.canInjectRoomNotice()).toBe(true);
+        start();
+        adapter.handleAppServerPayload(JSON.stringify({ id: replies[1].id, result: { turn: { id: "accepted" } } }));
+        expect(adapter.canInjectRoomNotice()).toBe(false);
+        adapter.clearResponseTrackingState(); adapter.resetTurnState("connection lost");
+        expect(adapter.canInjectRoomNotice()).toBe(true);
+      } finally { adapter.clearResponseTrackingState(); adapter.resetTurnState("test cleanup"); }
+    });
+  }
+
+  test("explicit TUI input can take over a room turn only after its start succeeds", () => {
+    const { adapter, replies } = setup();
+    adapter.tuiWs.data = { connId: 0 };
+    const inbox = new CodexRoomInbox(adapter, () => true, () => {});
+    try {
+      inbox.enqueue("notice"); inbox.flush();
+      adapter.handleAppServerPayload(JSON.stringify({ id: replies[0].id, result: { turn: { id: "room-turn" } } }));
+      expect(inbox.isRoomTurn("room-turn")).toBe(true);
+      adapter.handleServerNotification({ method: "turn/started", params: { threadId: "thread-a", turn: { id: "room-turn" } } });
+      adapter.onTuiMessage(adapter.tuiWs, JSON.stringify({ id: 1, method: "turn/start", params: { threadId: "thread-a", input: [] } }));
+      adapter.handleAppServerPayload(JSON.stringify({ id: replies[1].id, error: { message: "rejected" } }));
+      expect(inbox.isRoomTurn("room-turn")).toBe(true);
+      adapter.onTuiMessage(adapter.tuiWs, JSON.stringify({ id: 2, method: "turn/start", params: { threadId: "thread-a", input: [] } }));
+      adapter.handleAppServerPayload(JSON.stringify({ id: replies[2].id, result: { turn: { id: "room-turn" } } }));
+      expect(inbox.isRoomTurn("room-turn")).toBe(false);
+    } finally { inbox.stop(); adapter.clearResponseTrackingState(); adapter.resetTurnState("test cleanup"); }
+  });
+
   test("temporary TUI helper threads do not steal room calls or end the user turn", async () => {
     const { adapter, replies } = setup();
     adapter.tuiWs.data = { connId: 0 };

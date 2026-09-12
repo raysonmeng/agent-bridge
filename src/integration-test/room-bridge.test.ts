@@ -83,6 +83,32 @@ describe("startRoomBridge — last-mile broker→session injection (§11.1)", ()
     expect(wbLine).toContain("auth/v1");
   });
 
+  test("offline replay stays in the mapped room and preserves other rooms for their own session", async () => {
+    const { dir, store, tokenA, broker, url, dbPath } = await setup();
+    cleanup.push(() => broker.stop(), () => rmSync(dir, { recursive: true, force: true }));
+    await store.addMember("other", "alice@x.com");
+    const makePending = (roomId: string, summary: string) => buildTaskCompletedEnvelope({
+      roomId, from: { agentId: "bob@x.com", agentType: "codex" }, summary,
+    });
+    await store.enqueuePending("alice@x.com", makePending("other", "PRIVATE_OTHER_ROOM"));
+    await store.enqueuePending("alice@x.com", makePending(ROOM, "CURRENT_ROOM"));
+    const emitted: string[] = [];
+    const received: string[] = [];
+    const handle = await startRoomBridge({ cwd: dir, emit: t => emitted.push(t), onEvent: env => received.push(env.roomId), store, dbPath, brokerUrl: url });
+    cleanup.push(() => handle.stop());
+    await waitFor(() => emitted.some(t => t.includes("CURRENT_ROOM")));
+    expect(emitted.some(t => t.includes("PRIVATE_OTHER_ROOM"))).toBe(false);
+    expect(received).toEqual([ROOM]);
+    const other = new BrokerClient({ url, token: tokenA });
+    cleanup.push(() => other.close());
+    const otherEvents: string[] = [];
+    other.onEvent((topic, env) => { if (env.kind === "task_completed") otherEvents.push(topic); });
+    await other.connect();
+    other.subscribe("other");
+    await waitFor(() => otherEvents.length > 0);
+    expect(otherEvents).toEqual(["other"]);
+  });
+
   test("inert when cwd is not mapped to a room", async () => {
     const { dir, store, broker, url, dbPath } = await setup({ mapCwd: false });
     cleanup.push(() => broker.stop(), () => rmSync(dir, { recursive: true, force: true }));

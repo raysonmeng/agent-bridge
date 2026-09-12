@@ -8,6 +8,7 @@ function setup() {
   let available = true;
   let permitted = true;
   codex.canInject = () => available;
+  codex.canInjectRoomNotice = () => available;
   codex.injectMessage = (text: string) => { sent.push(text); return -sent.length; };
   const inbox = new CodexRoomInbox(codex, () => permitted, () => {});
   return { codex, inbox, sent, busy: () => { available = false; }, idle: () => { available = true; }, deny: () => { permitted = false; } };

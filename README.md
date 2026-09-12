@@ -1,3 +1,5 @@
+<p align="center"><img src="site/assets/logo.svg" width="72" alt="AgentBridge logo" /></p>
+
 # AgentBridge
 
 [![CI](https://github.com/raysonmeng/agent-bridge/actions/workflows/ci.yml/badge.svg)](https://github.com/raysonmeng/agent-bridge/actions/workflows/ci.yml)
@@ -5,24 +7,34 @@
 
 [中文文档](README.zh-CN.md)
 
+**🌐 Website: [raysonmeng.github.io/agent-bridge](https://raysonmeng.github.io/agent-bridge/)**, with an animated replay of a real session.
+
+> Discussed on [LINUX DO](https://linux.do) — the developer community. / 在 [LINUX DO](https://linux.do) 开发者社区交流。
+
 Local bridge for bidirectional communication between Claude Code and Codex inside the same working session.
+
+<p align="center">
+  <img src="assets/readme-demo.gif" width="820" alt="Claude Code and Codex reviewing each other in one live session" />
+  <br />
+  <sub>A real session, replayed — Codex's review is pushed into Claude's live session, no human relay. <a href="https://raysonmeng.github.io/agent-bridge/">Full animated demo →</a></sub>
+</p>
 
 What that buys you, concretely:
 
-- **Cross-review, not just cross-talk** — Codex implements; Claude reviews the diff in real time *inside the same session* and pushes its change requests straight back into Codex's thread. Two providers holding each other accountable, no copy-paste.
+- **Cross-review** — Codex implements; Claude reviews the diff *inside the same session* and pushes change requests straight back into Codex's thread. Two providers check each other's work without copy-paste.
 - **Task splits from one prompt** — ask either agent to propose a division of labor with the other, and they negotiate who does what before writing code. You steer; they coordinate.
 - **Quota relay for overnight runs** — when one side's subscription window runs dry, it stops cleanly at a turn boundary and hands the task off to the other side, so a long job keeps moving instead of dying at a limit.
-
-<!-- TODO: assets/demo.gif — see docs/demo/RECORDING.md -->
 
 > **This tool was largely built by Claude Code and Codex collaborating through it.**
 > **Every PR written by one agent was reviewed by the other.** AgentBridge is its own proof of concept.
 
+> ⭐ If AgentBridge is useful to you, a star helps other people running two agents find it.
+
 ## Why not just…
 
-- **…run two terminals and copy-paste?** You can — and you become the message bus, ferrying text by hand and eyeballing when it's safe to interrupt. AgentBridge automates the relay: messages flow on their own, a busy-guard blocks replies during an active turn, and noisy intermediate events are filtered so each side sees only the other's meaningful output.
-- **…use a one-way delegation plugin?** Tools like `openai/codex-plugin-cc` let a host *call* Codex and get one answer back — request in, response out, no standing peer on the other side. AgentBridge keeps **both** agents live as persistent peers, and either side can push a message **mid-turn** (a review comment lands while the other is still working), not only at call boundaries.
-- **…wire up an external orchestrator?** A god-process scheduling dumb terminals is top-down: one brain, N workers that never talk to each other. AgentBridge is peer-to-peer — two full agents converse in-session, propose their own splits, and review each other, with the human steering instead of scripting every hop.
+- **…run two terminals and copy-paste?** You can, but then you are the message bus: you ferry text by hand and guess when it is safe to interrupt. AgentBridge automates the relay: messages flow on their own, a busy-guard blocks replies during an active turn, and the bridge filters noisy intermediate events so each side sees only the other's meaningful output.
+- **…use a one-way delegation plugin?** Tools like `openai/codex-plugin-cc` let a host *call* Codex and get one answer back: request in, response out, no standing peer on the other side. AgentBridge keeps **both** agents live as persistent peers, and either side can push a message **mid-turn** (a review comment lands while the other is still working), not only at call boundaries.
+- **…wire up an external orchestrator?** A god-process scheduling dumb terminals is top-down: one brain, N workers that never talk to each other. AgentBridge is peer-to-peer: two full agents converse in-session, propose their own splits, and review each other, with the human steering instead of scripting every hop.
 
 ## What this project is / is not
 
@@ -40,7 +52,7 @@ What that buys you, concretely:
 
 ## Features
 
-- **Bidirectional Claude ↔ Codex messaging** in one working session — Codex output is intercepted and pushed to Claude as channel notifications; Claude replies via the `reply` MCP tool, injected into the Codex thread as a `turn/start`.
+- **Bidirectional Claude ↔ Codex messaging** in one working session — the daemon intercepts Codex output and pushes it to Claude as channel notifications; Claude replies via the `reply` MCP tool, and the bridge injects the reply into the Codex thread as a `turn/start`.
 - **Push delivery with fallback** — messages arrive as channel notifications; a failed push falls back to an in-memory queue drained by `get_messages`. Loop prevention via the per-message `source` field.
 - **Turn coordination** — a busy-guard rejects replies during an active Codex turn; a per-turn inactivity watchdog stops a lost `turn/completed` from locking injection forever; noisy intermediate events are collapsed so only meaningful `agentMessage` payloads reach Claude.
 - **Multiple pairs side by side** — one Claude+Codex pair per project directory, ports allocated per pair in +10 strides from 4500. Pair-aware `claude` / `codex` / `resume` / `kill` / `doctor` / `budget` via `--pair`.
@@ -48,39 +60,54 @@ What that buys you, concretely:
 - **Thread auto-resume** — bare `abg codex` resumes the pair's last Codex thread; `abg resume` prints/performs the resume commands for both sides.
 - **Budget coordination, slowdown-line & fully-automatic resume** — keep a long task moving across subscription-quota windows instead of dying at a limit. See [Budget Coordination](#budget-coordination--auto-resume).
 
+## Context handling — real-time, without the context blowing up
+
+A common worry about real-time bidirectional messaging is that the two agents' contexts merge and grow without bound. They don't. **The bridge passes messages, not context** — each agent keeps its own context window, and the bridge never copies one agent's full transcript into the other. (And which agent plans vs executes is your call — the roles aren't fixed; Codex can drive Claude just as easily.) Three filters keep what actually crosses small:
+
+1. **Only `agentMessage` crosses.** The bridge forwards an agent's actual conclusions, not its tool-call noise — `commandExecution`, `fileChange`, and reasoning deltas never reach the other side, nor does its full scrollback.
+2. **Three-tier marker routing** (default `filtered` mode). Each message is tagged and the daemon routes by tag: `[IMPORTANT]` forwards immediately, `[STATUS]` is buffered and batched into one periodic summary (default: 3 updates or 15s), `[FYI]` is dropped. The marker rules live once in the project's `AGENTS.md` (written by `abg init`), loaded at agent startup.
+3. **The collaboration contract lives once** in `AGENTS.md`, not appended to every message (which would pollute every thread and its resume title).
+
+Net effect: each side receives a curated stream of meaningful messages, so context grows with the number of real exchanges — not the other agent's raw activity. Set `AGENTBRIDGE_FILTER_MODE=full` (or the config equivalent) when you *do* want the unfiltered stream.
+
 ## Prerequisites
 
-| Dependency | Version | Install |
+| Dependency | Recommended version | Install |
 |-----------|---------|---------|
 | [Bun](https://bun.sh) | v1.3.11+ | `curl -fsSL https://bun.sh/install \| bash` |
-| [Claude Code](https://docs.anthropic.com/en/docs/claude-code) | v2.1.80+ | `npm install -g @anthropic-ai/claude-code` |
-| [Codex CLI](https://github.com/openai/codex) | latest | `npm install -g @openai/codex` |
+| [Claude Code](https://code.claude.com/docs/en/quickstart) | 2.1.269 | `npm install -g @anthropic-ai/claude-code@2.1.269` |
+| [Codex CLI](https://developers.openai.com/codex/cli) | 0.154.0 | `npm install -g @openai/codex@0.154.0` |
 
-> **Bun is required** as the runtime for the AgentBridge daemon and plugin server. Node.js alone is not enough — if `abg` installs but won't run, you're almost certainly missing Bun (see [Troubleshooting](docs/TROUBLESHOOTING.md)).
+Claude Code and Codex recommendations are the publishers' latest stable npm versions checked on 2026-09-12. These recommendations do not change the existing minimum-version checks. Cross-machine Codex messaging, acknowledgements and daemon/session recovery were also verified with Codex 0.153.4. For room setup and the one-time `--new` step after upgrading, see [Codex remote rooms](docs/CODEX-ROOMS.md).
+
+> **Bun is required** as the runtime for the AgentBridge daemon and plugin server. Node.js alone is not enough. If `abg` installs but won't run, install Bun first (see [Troubleshooting](docs/TROUBLESHOOTING.md)).
 
 ## Quick Start
 
-Four steps from nothing to a running pair:
+Five steps from nothing to a running pair:
 
 ```bash
-# 1. Install Bun (the runtime — Node alone won't work)
+# 1. Install Bun (the runtime; Node alone won't work)
 curl -fsSL https://bun.sh/install | bash
 
 # 2. Install the CLI. postinstall auto-registers the Claude Code plugin
 #    marketplace AND installs the plugin (best-effort; needs bun + claude present).
 npm install -g @raysonmeng/agentbridge
 
-# 3. Start Claude Code with the AgentBridge channel enabled
+# 3. Initialize the project (check deps, install plugin if needed, write .agentbridge/config.json)
+abg init
+
+# 4. Start Claude Code with the AgentBridge channel enabled
 abg claude
 
-# 4. In another terminal, start Codex TUI connected to the same bridge
+# 5. In another terminal, start Codex TUI connected to the same bridge
 abg codex
 ```
 
-That's it — the daemon starts automatically when needed and reconnects if restarted. (`abg` is a short alias for `agentbridge`; both are identical.) If the postinstall plugin step was skipped (e.g. Claude Code wasn't installed yet), run `abg init` to retry it, or see the [manual install fallback](#manual-plugin-install-fallback).
+That's it: the daemon starts automatically when needed and reconnects if restarted. (`abg` is a short alias for `agentbridge`; both are identical.) If the postinstall plugin step was skipped (e.g. Claude Code wasn't installed yet), run `abg init` to retry it, or see the [manual install fallback](#manual-plugin-install-fallback).
 
 > [!WARNING]
-> **`abg claude` launches with `--dangerously-skip-permissions` and `abg codex` launches with `--yolo` by default.** This is deliberate — an unattended agent pair can't stop to ask you for each permission — but it means both agents can run commands and edit files **without prompting**. Only do this in a workspace you trust. To launch with normal prompts, add `--safe` (`abg claude --safe`, `abg codex --safe`) or set `AGENTBRIDGE_SAFE=1`. The defaults are also auto-suppressed if you pass your own permission flags.
+> **`abg claude` launches with `--dangerously-skip-permissions` and `abg codex` launches with `--yolo` by default.** This is deliberate: an unattended agent pair can't stop to ask you for each permission. It means both agents can run commands and edit files **without prompting**. Only do this in a workspace you trust. To launch with normal prompts, add `--safe` (`abg claude --safe`, `abg codex --safe`) or set `AGENTBRIDGE_SAFE=1`. The defaults are also auto-suppressed if you pass your own permission flags.
 
 ### Your first collaboration
 
@@ -88,7 +115,7 @@ With both sides running, give Claude a task that wants a second agent, e.g.:
 
 > **Ask Claude:** *"Propose a task split with Codex for &lt;your task&gt;, then have Codex implement its part while you review."*
 
-You should see Claude send a proposed division of labor into Codex's session, Codex accept (or counter) and start working, and Codex's completion push back into Claude's session for review — all without you relaying anything by hand.
+You should see Claude send a proposed division of labor into Codex's session, Codex accept (or counter) and start working, and Codex's completion push back into Claude's session for review, without you relaying anything by hand.
 
 ### Manual plugin install (fallback)
 
@@ -143,19 +170,11 @@ agentbridge codex   # (another terminal) Start Codex TUI connected to the bridge
 | `abg dev` | (Dev only) Register local marketplace + force-sync plugin to cache |
 | `abg --help` / `abg --version` | Show help / version |
 
-### Cross-network collaboration commands *(experimental, v3 preview)*
+### Cross-network collaboration *(v3 preview)*
 
-The v3 collaboration layer (shared rooms across machines/agents over a broker) ships behind these commands. They are usable today but the surface may still change.
+The v3 collaboration layer ships in **0.1.31**: shared rooms across machines over a broker, with `auth`, `broker`, `room`, `join` and `publish` commands. Codex-only machines can use native room tools to exchange messages and acknowledgements. See [Codex remote rooms](docs/CODEX-ROOMS.md) for setup and delivery limits, and the [user manual](docs/manual/manual-en.md) for broker and membership administration.
 
-| Command | Description |
-|---------|-------------|
-| `abg auth issue \| login \| revoke` *(experimental, v3 preview)* | Collaboration identity + PSK token lifecycle: `auth issue` mints a token for someone on the broker and prints it (carry it out-of-band); `auth login --token <PSK>` installs a broker-issued token on an edge machine, or `auth login --id --name` self-signs one for the single-machine case; `auth revoke` revokes an identity's tokens |
-| `abg broker start` *(experimental, v3 preview)* | Run the always-on control-plane broker (name service + room routing, §11.1) plus a loopback-only admin dashboard (view rooms/members, create a room) |
-| `abg room create \| list \| invite \| set-password \| add \| remove` *(experimental, v3 preview)* | Manage collaboration rooms on the broker: create/list rooms, `invite` (issue token + grant membership + print the invitee's one-shot join commands), set/clear a self-service-join password, or directly add/remove a member |
-| `abg join <roomId>` *(experimental, v3 preview)* | Join a room and auto-join this directory next time. `--password`/`--password-stdin` self-joins a password-protected room; `--broker-url` is persisted so `abg claude` auto-connects (no env var needed) |
-| `abg publish` (alias `announce`) *(experimental, v3 preview)* | Push a work/commit summary into the room (Stop-hook driven, throttled ~once per session) so remote peers see progress |
-
-The pair-aware commands (`claude`, `codex`, `resume`, `kill`, `doctor`, `budget`, `logs`) accept `--pair <name>` to target a specific pair — one pair per project directory by default, with ports allocated per pair in +10 strides from 4500.
+The pair-aware commands (`claude`, `codex`, `resume`, `kill`, `doctor`, `budget`, `logs`) accept `--pair <name>` to target a specific pair; one pair per project directory by default, with ports allocated per pair in +10 strides from 4500.
 
 ### Owned flags
 
@@ -254,7 +273,7 @@ Contents: `daemon.pid`, `status.json`, `agentbridge.log`, `killed` (sentinel), `
 
 ## Budget Coordination & Auto-Resume
 
-AgentBridge can keep a long task moving across subscription-quota windows instead of letting it die when one agent hits its limit. The capability is driven by the companion tool **[agent-quota-guard](https://www.npmjs.com/package/agent-quota-guard)** ([repo](https://github.com/raysonmeng/agent-quota-guard) · v0.2.0, 2026-06-13) — install the guard to enable it.
+AgentBridge can keep a long task moving across subscription-quota windows instead of letting it die when one agent hits its limit. The capability is driven by the companion tool **[agent-quota-guard](https://www.npmjs.com/package/agent-quota-guard)** ([repo](https://github.com/raysonmeng/agent-quota-guard) · v0.2.0, 2026-06-13). Install the guard to enable it.
 
 - **Snapshot** — the daemon polls both agents' account-level 5h/weekly quota via the guard's probe; `abg budget [--json]` prints the live snapshot (both windows, drift, pause state). This works with just the guard's probe.
 - **Slowdown-line (no mid-task cut)** — near the quota hard-line the guard does *not* deny mid-tool-call; it lets the current turn finish, stops cleanly at the turn boundary, writes a `.agent/checkpoint.md`, and drops a `pending` record the bridge detects.
@@ -273,10 +292,10 @@ For dormant/disabled bridge states, the Codex `.git` restriction, and other gotc
 
 ## Roadmap
 
-- **More adapters** — AgentBridge wires Claude Code ↔ Codex today. Candidates for the next agent: **OpenCode, OpenClaw, Hermes Agent, Gemini CLI**. Vote in the [adapter roadmap issue](https://github.com/quilin-ai/agent-bridge/issues/212).
-- **Capability mesh** — beyond messaging: connected agents will publish their commands / skills / MCP tools so a peer can invoke them directly — moving from *messaging* to *capability invocation*.
+- **More adapters** — AgentBridge wires Claude Code ↔ Codex today. Candidates for the next agent: **OpenCode, OpenClaw, Hermes Agent, Gemini CLI**. Vote in the [adapter roadmap issue](https://github.com/raysonmeng/agent-bridge/issues/212).
+- **Capability mesh** — beyond messaging: connected agents will publish their commands / skills / MCP tools so a peer can invoke them directly, moving from messaging to capability invocation.
 - **v2 — multi-agent foundation** (partly landed): room-scoped collaboration, stable identity, a formal control protocol, stronger recovery. See [docs/08-v2架构愿景.md](docs/08-v2架构愿景.md).
-- **v3 — cross-network collaboration** (preview, see the experimental CLI above): shared rooms across machines and agents over a broker. See [docs/09-v3协作系统规格.md](docs/09-v3协作系统规格.md).
+- **v3 — cross-network collaboration** (included in 0.1.31, experimental): shared rooms across machines and agents over a broker. See [Codex remote rooms](docs/CODEX-ROOMS.md).
 
 ## Docs
 
@@ -286,12 +305,13 @@ For dormant/disabled bridge states, the Codex `.git` restriction, and other gotc
 
 ## How This Project Was Built
 
-This project was built collaboratively by **Claude Code** (Anthropic) and **Codex** (OpenAI), communicating through AgentBridge itself — the very tool they were building together. A human developer coordinated the effort: assigning tasks, reviewing progress, and directing the two agents to work in parallel and review each other's output. Two AI agents from different providers, connected in real time, shipping code side by side.
+This project was built collaboratively by **Claude Code** (Anthropic) and **Codex** (OpenAI), communicating through AgentBridge itself, the very tool they were building together. A human developer coordinated the effort: assigning tasks, reviewing progress, and directing the two agents to work in parallel and review each other's output. Two AI agents from different providers, connected in real time, shipping code side by side.
 
 ## Contact
 
 This is my first open-source project! I'd love to connect with anyone interested in multi-agent collaboration, AI tooling, or just building cool things together. Feel free to reach out:
 
+- **Website**: [raysonmeng.pages.dev](https://raysonmeng.pages.dev/)
 - **Twitter/X**: [@raysonmeng](https://x.com/raysonmeng)
 - **Xiaohongshu**: [Profile](https://www.xiaohongshu.com/user/profile/62a3709d0000000021028b7e)
 - **WeChat**: Scan the QR code below to add me

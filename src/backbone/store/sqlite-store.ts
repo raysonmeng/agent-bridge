@@ -286,14 +286,17 @@ export class SqliteStore implements Store {
       .run(targetAgentId, targetAgentId, MAX_PENDING_PER_TARGET);
   }
 
-  async drainPending(targetAgentId: string): Promise<Envelope[]> {
-    const rows = this.db
-      .query("SELECT envelope FROM pending_deliveries WHERE target_agent_id=? ORDER BY seq")
-      .all(targetAgentId) as { envelope: string }[];
-    this.db
-      .query("DELETE FROM pending_deliveries WHERE target_agent_id=?")
-      .run(targetAgentId);
-    return rows.map((r) => JSON.parse(r.envelope) as Envelope);
+  async drainPending(targetAgentId: string, roomId?: string): Promise<Envelope[]> {
+    return this.db.transaction(() => {
+      const rows = this.db
+        .query("SELECT seq, envelope FROM pending_deliveries WHERE target_agent_id=? ORDER BY seq")
+        .all(targetAgentId) as { seq: number; envelope: string }[];
+      const drained = rows.map(row => ({ seq: row.seq, env: JSON.parse(row.envelope) as Envelope }))
+        .filter(row => roomId === undefined || row.env.roomId === roomId);
+      const remove = this.db.query("DELETE FROM pending_deliveries WHERE seq=?");
+      for (const row of drained) remove.run(row.seq);
+      return drained.map(row => row.env);
+    })();
   }
 
   // --- auth tokens (stored hashed at rest, §11.3: the raw token lives only in the edge's 0600 file) ---

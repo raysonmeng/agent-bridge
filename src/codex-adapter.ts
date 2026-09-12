@@ -338,6 +338,15 @@ export class CodexAdapter extends EventEmitter {
       !this.turnInProgress
     );
   }
+  private roomNoticeAwaitingTurn: string | null = null;
+
+  /** Automatic notices must not become native turn/start's implicit steer. */
+  canInjectRoomNotice(): boolean {
+    return this.canInject() && this.roomNoticeAwaitingTurn === null &&
+      ![...this.bridgeRequestKinds.values()].includes("turn-start") &&
+      ![...this.pendingRequests.values()].some(request => request.method === "turn/start" &&
+        (!request.threadId || request.threadId === this.threadId));
+  }
   /**
    * Captured Codex app-server identity (P1 #5). null until the first
    * `initialize` handshake response is observed. Read by the daemon's status
@@ -1975,6 +1984,7 @@ export class CodexAdapter extends EventEmitter {
           const result = parsed.result as { turn?: { id?: unknown } } | undefined;
           const turnId = result?.turn?.id;
           if (typeof turnId === "string" && turnId.length > 0) {
+            if (!this.turnInProgress) this.roomNoticeAwaitingTurn = turnId;
             this.emit("bridgeTurnStarted", { requestId: numericId, turnId });
           } else {
             this.log(
@@ -2278,6 +2288,11 @@ export class CodexAdapter extends EventEmitter {
         if (pending.threadId) {
           if (this.threadId === null || this.threadId === pending.threadId) {
             this.setActiveThreadId(pending.threadId, `turn/start response ${key}`);
+            const turnId = message?.result?.turn?.id;
+            if (typeof turnId === "string" && turnId.length > 0) {
+              if (!this.turnInProgress) this.roomNoticeAwaitingTurn = turnId;
+              this.emit("tuiTurnStarted", { turnId });
+            }
           } else {
             this.log(
               `Ignoring turn/start response ${key} threadId=${pending.threadId} (active thread is ${this.threadId})`,
@@ -2299,6 +2314,7 @@ export class CodexAdapter extends EventEmitter {
 
   private setActiveThreadId(threadId: string, reason: string) {
     if (this.threadId === threadId) return;
+    this.roomNoticeAwaitingTurn = null;
 
     const previousThreadId = this.threadId;
     this.threadId = threadId;
@@ -2360,6 +2376,7 @@ export class CodexAdapter extends EventEmitter {
   }
 
   private markTurnStarted(turnId?: string) {
+    this.roomNoticeAwaitingTurn = null;
     const wasInProgress = this.turnInProgress;
     // Compute the key ONCE and use it for both the set and the watchdog so the
     // two never diverge (incl. the no-turn-id `unknown:` fallback).
@@ -2385,6 +2402,7 @@ export class CodexAdapter extends EventEmitter {
   }
 
   private markTurnCompleted(turnId?: string) {
+    if (!turnId || this.roomNoticeAwaitingTurn === turnId) this.roomNoticeAwaitingTurn = null;
     const completedId = typeof turnId === "string" && turnId.length > 0 ? turnId : null;
     if (completedId !== null) {
       // LOW-7: symmetric eviction. A turn STARTED without an id is keyed
@@ -2518,6 +2536,7 @@ export class CodexAdapter extends EventEmitter {
    * clears the ids without also clearing the watchdog timers.
    */
   private resetTurnState(reason: string, emitCompleted = false) {
+    this.roomNoticeAwaitingTurn = null;
     const wasInProgress = this.turnInProgress;
     this.activeTurnIds.clear();
     this.clearAllTurnWatchdogs();

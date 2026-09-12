@@ -13,6 +13,7 @@ export function emptyWhiteboard(roomId: string, now: () => number = Date.now): W
 /** Derive the slot additions for an event. Empty ⇒ the kind doesn't touch the whiteboard. */
 function additionsFor(env: Envelope): Array<{ slot: SlotName; item: WhiteboardItem }> {
   if (env.kind !== "task_completed") return []; // only completions distill today (note/etc. = future)
+  if (env.to !== undefined) return []; // the whiteboard is public to every room member
   const p = (env.payload ?? {}) as {
     summary?: string;
     contract?: string;

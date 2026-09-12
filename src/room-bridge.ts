@@ -255,7 +255,8 @@ export async function startRoomBridge(deps: RoomBridgeDeps): Promise<RoomBridgeH
     log,
   });
 
-  client.onEvent((_topic, env) => {
+  client.onEvent((topic, env) => {
+    if (topic !== room || env.roomId !== room) return;
     // Dedup any redelivery (e.g. offline replay racing a live copy) by idempotency
     // key, so the same event is never injected twice.
     const key = env.idempotencyKey;
@@ -274,7 +275,8 @@ export async function startRoomBridge(deps: RoomBridgeDeps): Promise<RoomBridgeH
     deps.emit(`⚠️ 房间操作被拒绝：${safeField(reason)}`);
   });
   // New-member injection (§4.4): the broker pushes the room whiteboard on join.
-  client.onWhiteboard((_roomId, wb) => {
+  client.onWhiteboard((roomId, wb) => {
+    if (roomId !== room || !wb || typeof wb !== "object" || !("roomId" in wb) || wb.roomId !== room) return;
     const text = renderWhiteboard(wb);
     if (text) deps.emit(text);
   });

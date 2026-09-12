@@ -27,6 +27,15 @@ describe("mergeWhiteboard — zero-LLM mechanical merge (§4.2)", () => {
     expect(wb.updatedAt).toBe(7);
   });
 
+  test("directed completions never enter any public whiteboard slot", () => {
+    const prev = mergeWhiteboard(null, tc({ summary: "public" }))!;
+    for (const to of [[], ["bob@x.com"]]) {
+      const privateCompletion = { ...tc({ summary: "private", contract: "secret/v1" }), to };
+      expect(mergeWhiteboard(prev, privateCompletion)).toBe(prev);
+      expect(mergeWhiteboard(null, privateCompletion)).toBeNull();
+    }
+  });
+
   test("a completion without a contract only touches recentMilestones", () => {
     const wb = mergeWhiteboard(null, tc({ summary: "wip" }))!;
     expect(wb.recentMilestones).toHaveLength(1);

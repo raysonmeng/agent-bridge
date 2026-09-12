@@ -29,11 +29,11 @@ function defineNumber(value, fallback) {
   return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 var BUILD_INFO = Object.freeze({
-  version: defineString("0.1.30", "0.0.0-source"),
-  commit: defineString("0401177", "source"),
+  version: defineString("0.1.31", "0.0.0-source"),
+  commit: defineString("799b9b3", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("a387eef8dc09", "source")
+  codeHash: defineString("c7042ed66f64", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -904,10 +904,15 @@ class SqliteStore {
            SELECT seq FROM pending_deliveries WHERE target_agent_id=? ORDER BY seq DESC LIMIT ?
          )`).run(targetAgentId, targetAgentId, MAX_PENDING_PER_TARGET);
   }
-  async drainPending(targetAgentId) {
-    const rows = this.db.query("SELECT envelope FROM pending_deliveries WHERE target_agent_id=? ORDER BY seq").all(targetAgentId);
-    this.db.query("DELETE FROM pending_deliveries WHERE target_agent_id=?").run(targetAgentId);
-    return rows.map((r) => JSON.parse(r.envelope));
+  async drainPending(targetAgentId, roomId) {
+    return this.db.transaction(() => {
+      const rows = this.db.query("SELECT seq, envelope FROM pending_deliveries WHERE target_agent_id=? ORDER BY seq").all(targetAgentId);
+      const drained = rows.map((row) => ({ seq: row.seq, env: JSON.parse(row.envelope) })).filter((row) => roomId === undefined || row.env.roomId === roomId);
+      const remove = this.db.query("DELETE FROM pending_deliveries WHERE seq=?");
+      for (const row of drained)
+        remove.run(row.seq);
+      return drained.map((row) => row.env);
+    })();
   }
   async issueToken(token, identityId) {
     this.db.query("INSERT INTO auth_tokens(token, identity_id) VALUES(?, ?) ON CONFLICT(token) DO UPDATE SET identity_id=excluded.identity_id").run(hashToken(token), identityId);
@@ -1089,7 +1094,9 @@ async function startRoomBridge(deps) {
     presence: { agentType: "agentbridge" },
     log
   });
-  client.onEvent((_topic, env) => {
+  client.onEvent((topic, env) => {
+    if (topic !== room || env.roomId !== room)
+      return;
     const key = env.idempotencyKey;
     if (typeof key === "string" && key.length > 0) {
       if (seen.has(key))
@@ -1107,7 +1114,9 @@ async function startRoomBridge(deps) {
   client.onError((reason) => {
     deps.emit(`\u26A0\uFE0F \u623F\u95F4\u64CD\u4F5C\u88AB\u62D2\u7EDD\uFF1A${safeField(reason)}`);
   });
-  client.onWhiteboard((_roomId, wb) => {
+  client.onWhiteboard((roomId2, wb) => {
+    if (roomId2 !== room || !wb || typeof wb !== "object" || !("roomId" in wb) || wb.roomId !== room)
+      return;
     const text = renderWhiteboard(wb);
     if (text)
       deps.emit(text);
@@ -1204,6 +1213,7 @@ class CodexRoomInbox {
   log;
   queue = [];
   inFlight = null;
+  flightTurnId = null;
   flightBatch = [];
   retryAfter = 0;
   roomTurns = new Set;
@@ -1214,11 +1224,13 @@ class CodexRoomInbox {
     this.allowed = allowed;
     this.log = log;
     codex.on("turnCompleted", this.finished);
+    codex.on("turnIdCompleted", this.completed);
     codex.on("turnAborted", this.aborted);
     codex.on("turnTrackingReset", this.finished);
     codex.on("threadChanged", this.finished);
     codex.on("bridgeTurnRejected", this.rejected);
     codex.on("bridgeTurnStarted", this.started);
+    codex.on("tuiTurnStarted", this.localStarted);
     this.timer = setInterval(() => this.flush(), 1000);
     this.timer.unref();
   }
@@ -1234,6 +1246,9 @@ class CodexRoomInbox {
   isRoomTurn(turnId) {
     return !!turnId && this.roomTurns.has(turnId);
   }
+  allowLocalRelay(turnId) {
+    this.roomTurns.delete(turnId);
+  }
   enqueue(text) {
     if (this.stopped)
       return;
@@ -1244,7 +1259,7 @@ class CodexRoomInbox {
     this.queue.push({ text: text.slice(0, 6000), attempts: 0 });
   }
   flush() {
-    if (this.stopped || Date.now() < this.retryAfter || this.active || !this.queue.length || !this.allowed() || !this.codex.canInject())
+    if (this.stopped || Date.now() < this.retryAfter || this.active || !this.queue.length || !this.allowed() || !this.codex.canInjectRoomNotice())
       return;
     const batch = this.queue.slice(0, 10);
     const id = this.codex.injectMessage(ROOM_SECURITY_PREAMBLE + `
@@ -1260,7 +1275,15 @@ class CodexRoomInbox {
   }
   finished = () => {
     this.inFlight = null;
+    this.flightTurnId = null;
     this.flightBatch = [];
+  };
+  completed = (turnId) => {
+    if (turnId === null || turnId === this.flightTurnId)
+      this.finished();
+  };
+  localStarted = ({ turnId }) => {
+    this.allowLocalRelay(turnId);
   };
   aborted = () => {
     const id = this.inFlight;
@@ -1271,6 +1294,7 @@ class CodexRoomInbox {
   };
   started = ({ requestId, turnId }) => {
     if (requestId === this.inFlight) {
+      this.flightTurnId = turnId;
       this.roomTurns.add(turnId);
       if (this.roomTurns.size > 500)
         this.roomTurns.delete(this.roomTurns.values().next().value);
@@ -1291,10 +1315,12 @@ class CodexRoomInbox {
     this.queue = [];
     this.codex.off("turnCompleted", this.finished);
     this.codex.off("turnAborted", this.aborted);
+    this.codex.off("turnIdCompleted", this.completed);
     this.codex.off("turnTrackingReset", this.finished);
     this.codex.off("threadChanged", this.finished);
     this.codex.off("bridgeTurnRejected", this.rejected);
     this.codex.off("bridgeTurnStarted", this.started);
+    this.codex.off("tuiTurnStarted", this.localStarted);
   }
 }
 
@@ -2055,6 +2081,10 @@ class CodexAdapter extends EventEmitter {
   }
   canInject() {
     return !!this.threadId && this.appServerWs?.readyState === WebSocket.OPEN && !this.turnInProgress;
+  }
+  roomNoticeAwaitingTurn = null;
+  canInjectRoomNotice() {
+    return this.canInject() && this.roomNoticeAwaitingTurn === null && ![...this.bridgeRequestKinds.values()].includes("turn-start") && ![...this.pendingRequests.values()].some((request) => request.method === "turn/start" && (!request.threadId || request.threadId === this.threadId));
   }
   get capturedAppServerInfo() {
     return this.appServerInfo;
@@ -3147,6 +3177,8 @@ class CodexAdapter extends EventEmitter {
           const result = parsed.result;
           const turnId = result?.turn?.id;
           if (typeof turnId === "string" && turnId.length > 0) {
+            if (!this.turnInProgress)
+              this.roomNoticeAwaitingTurn = turnId;
             this.emit("bridgeTurnStarted", { requestId: numericId, turnId });
           } else {
             this.log(`Bridge-originated turn/start response carried no turn id (id ${responseId}) \u2014 turn_started ACK skipped`);
@@ -3362,6 +3394,12 @@ class CodexAdapter extends EventEmitter {
         if (pending.threadId) {
           if (this.threadId === null || this.threadId === pending.threadId) {
             this.setActiveThreadId(pending.threadId, `turn/start response ${key}`);
+            const turnId = message?.result?.turn?.id;
+            if (typeof turnId === "string" && turnId.length > 0) {
+              if (!this.turnInProgress)
+                this.roomNoticeAwaitingTurn = turnId;
+              this.emit("tuiTurnStarted", { turnId });
+            }
           } else {
             this.log(`Ignoring turn/start response ${key} threadId=${pending.threadId} (active thread is ${this.threadId})`);
           }
@@ -3375,6 +3413,7 @@ class CodexAdapter extends EventEmitter {
   setActiveThreadId(threadId, reason) {
     if (this.threadId === threadId)
       return;
+    this.roomNoticeAwaitingTurn = null;
     const previousThreadId = this.threadId;
     this.threadId = threadId;
     this.emit("threadChanged", { threadId, previousThreadId, reason });
@@ -3412,6 +3451,7 @@ class CodexAdapter extends EventEmitter {
     this.emit("turnPhaseChanged", { phase, previous });
   }
   markTurnStarted(turnId) {
+    this.roomNoticeAwaitingTurn = null;
     const wasInProgress = this.turnInProgress;
     const turnKey = typeof turnId === "string" && turnId.length > 0 ? turnId : `unknown:${Date.now()}`;
     this.activeTurnIds.delete(turnKey);
@@ -3427,6 +3467,8 @@ class CodexAdapter extends EventEmitter {
     this.notifyPhaseIfChanged();
   }
   markTurnCompleted(turnId) {
+    if (!turnId || this.roomNoticeAwaitingTurn === turnId)
+      this.roomNoticeAwaitingTurn = null;
     const completedId = typeof turnId === "string" && turnId.length > 0 ? turnId : null;
     if (completedId !== null) {
       const idWasTracked = this.activeTurnIds.has(completedId);
@@ -3507,6 +3549,7 @@ class CodexAdapter extends EventEmitter {
     });
   }
   resetTurnState(reason, emitCompleted = false) {
+    this.roomNoticeAwaitingTurn = null;
     const wasInProgress = this.turnInProgress;
     this.activeTurnIds.clear();
     this.clearAllTurnWatchdogs();
@@ -8283,6 +8326,8 @@ codex.on("steerAccepted", ({ requestId }) => {
   recordAgentActivity();
   const dispatch = pendingSteerDispatches.get(requestId);
   pendingSteerDispatches.delete(requestId);
+  if (dispatch?.turnId)
+    codexRoomInbox.allowLocalRelay(dispatch.turnId);
   if (dispatch?.requireReply) {
     replyTracker.arm();
     log("Reply required armed on steer-accept (steer-scoped expectation)");
@@ -8301,6 +8346,7 @@ codex.on("bridgeTurnStarted", ({ requestId, turnId }) => {
     return;
   }
   pendingTurnStarts.delete(requestId);
+  codexRoomInbox.allowLocalRelay(turnId);
   log(`Bridge turn started: injection ${requestId} \u2192 turn ${turnId} (request ${pending.requestId})`);
   if (pending.idempotencyKey) {
     idempotencyTracker.markStarted(pending.threadId, pending.idempotencyKey, turnId);
@@ -8748,6 +8794,7 @@ async function handleClaudeToCodex(ws, message) {
       clearAttentionWindow();
       pendingSteerDispatches.set(steerRequestId, {
         requireReply,
+        ...steerTurnId ? { turnId: steerTurnId } : {},
         ...idempotencyKey ? { idempotencyKey } : {},
         ...steerThreadId ? { threadId: steerThreadId } : {}
       });

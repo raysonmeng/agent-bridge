@@ -326,14 +326,8 @@ export class Broker {
       ws.data.presence = sanitizePresence(msg.presence); // reserved meta, best-effort
       this.send(ws, { type: "welcome", identity });
       this.log(`conn #${ws.data.connId} authenticated as ${identity.id}`);
-      // Reconnect replay (§3.2) — OUTSIDE the auth try/catch: a transient store
-      // error during drain must NOT be misreported as an auth failure (which
-      // would close a connection that was already welcomed + resolved client-side).
-      try {
-        await this.drainPendingTo(ws, identity.id);
-      } catch (e) {
-        this.log(`pending drain failed for ${identity.id}: ${String(e)}`);
-      }
+      // Replay waits for subscribe: one identity can have sessions in different
+      // rooms, and authentication alone must not consume another room's backlog.
       return;
     }
 
@@ -409,10 +403,8 @@ export class Broker {
             this.log(`whiteboard inject failed for ${me}@${topic}: ${String(e)}`);
           }
         }
-        // Drain anything queued during the connected-but-not-yet-subscribed gap
-        // (between hello's drain and this subscribe). Safe: drainPending removes,
-        // so an already-drained message is never re-delivered.
-        await this.drainPendingTo(ws, me);
+        // Replay only this subscription, leaving other rooms' queues intact.
+        await this.drainPendingTo(ws, me, topic);
         return;
       }
       case "unsubscribe": {
@@ -777,10 +769,11 @@ export class Broker {
     }
   }
 
-  /** Reconnect replay (§3.2): drain + deliver everything queued for this identity. */
-  private async drainPendingTo(ws: ServerWebSocket<BrokerSocketData>, id: string): Promise<void> {
-    const pending = await this.opts.store.drainPending(id);
+  /** Reconnect replay (§3.2): drain only the room this socket subscribed to. */
+  private async drainPendingTo(ws: ServerWebSocket<BrokerSocketData>, id: string, roomId: string): Promise<void> {
+    const pending = await this.opts.store.drainPending(id, roomId);
     for (const env of pending) {
+      if (!ws.data.subs.has(roomId) || env.roomId !== roomId) continue;
       // §11.2 (revocation symmetry): the live-delivery path re-checks membership,
       // so the offline-replay path must too — otherwise a member removed between
       // enqueue and reconnect would still get the room's queued events drained to

@@ -126,6 +126,14 @@ export function runStoreContract(label: string, makeStore: () => Store) {
       expect((await store.drainPending("ag-3")).length).toBe(1); // other target intact
     });
 
+    test("draining one room leaves the same identity's other room pending", async () => {
+      await store.enqueuePending("ag-2", makeEnvelope({ roomId: "room-a", idempotencyKey: "a" }));
+      await store.enqueuePending("ag-2", makeEnvelope({ roomId: "room-b", idempotencyKey: "b" }));
+      expect((await store.drainPending("ag-2", "room-b")).map(e => e.roomId)).toEqual(["room-b"]);
+      expect(await store.drainPending("ag-2", "room-b")).toEqual([]);
+      expect((await store.drainPending("ag-2", "room-a")).map(e => e.roomId)).toEqual(["room-a"]);
+    });
+
     test("pending deliveries are bounded per target (§8.2): oldest dropped beyond MAX_PENDING_PER_TARGET", async () => {
       const total = MAX_PENDING_PER_TARGET + 5;
       for (let i = 0; i < total; i++) {

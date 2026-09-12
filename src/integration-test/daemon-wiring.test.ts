@@ -21,6 +21,12 @@ import { readControlToken, resolveControlTokenPath } from "../control-token";
 import { CONTRACT_VERSION } from "../contract-version";
 import { installFakeCodex } from "./fixtures/fake-codex-install";
 import { RESUME_PROMPT, claudeResumePrompt } from "../budget/resume-prompt";
+import { Broker } from "../broker";
+import { BrokerClient } from "../broker-client";
+import { SqliteStore } from "../backbone/store/sqlite-store";
+import { IdentityService } from "../backbone/identity-service";
+import { StorePskIdentityProvider } from "../backbone/identity/store-psk-identity-provider";
+import { RoomService } from "../room-service";
 
 const DAEMON_PATH = join(process.cwd(), "src", "daemon.ts");
 const DEFAULT_TEST_SLOT_START = 2500 + (process.pid % 500);
@@ -64,6 +70,83 @@ describe("daemon wiring", () => {
       await harness.close();
     }
   });
+
+  for (const pendingStart of [false, true]) test(`room notice replies stay private until local input is accepted (pending start: ${pendingStart})`, async () => {
+    const dir = mkdtempSync(join(tmpdir(), "agentbridge-room-steer-"));
+    const dbPath = join(dir, "collab.db");
+    const store = new SqliteStore(dbPath);
+    const identities = new IdentityService(store);
+    const rooms = new RoomService(store);
+    await identities.registerIdentity("local", "Local");
+    await identities.registerIdentity("peer", "Peer");
+    writeFileSync(join(dir, "auth-token"), await identities.issueToken("local"), { mode: 0o600 });
+    await rooms.createRoom("test", "Test", "local");
+    await rooms.join("test", "local");
+    await rooms.join("test", "peer");
+    const broker = new Broker({ store, identityProvider: new StorePskIdentityProvider(store), host: "127.0.0.1", port: 0, log: () => {} });
+    const url = `ws://127.0.0.1:${broker.start().port}/ws`;
+    const peer = new BrokerClient({ url, token: await identities.issueToken("peer") });
+    try {
+      const harness = await startHarness({
+        pairId: "main-roomsteer", pairName: "main",
+        prepare: cwd => rooms.mapCwd(cwd, "test"),
+        extraEnv: { AGENTBRIDGE_COLLAB_DB: dbPath, AGENTBRIDGE_BROKER_URL: url, FAKE_APP_NOTIFY_TURNSTART: "1", FAKE_APP_DEFER_TURNSTART: pendingStart ? "1" : "0" },
+      });
+      await harness.attachClaude();
+      await harness.connectTui();
+      await peer.connect();
+      const logText = () => readFileSync(join(harness.stateDir, "agentbridge.log"), "utf8");
+      await waitFor(() => logText().includes("room bridge: subscribed"), "room subscription", 100, 50);
+      const publish = (text: string) => {
+        const id = crypto.randomUUID();
+        peer.publish("test", { roomId: "test", messageId: id, traceId: id, idempotencyKey: id,
+          from: { agentId: "peer", agentType: "codex" }, kind: "chat", payload: { text }, timestamp: Date.now(), deliveryMode: "online_only" });
+      };
+      publish("informational notice");
+      const onBusy = pendingStart ? undefined : "steer";
+      if (pendingStart) {
+        await waitFor(() => logText().includes("Codex room inbox: submitted"), "pending room start", 100, 25);
+        harness.sendClaudeToCodex("rejected", "[force-start-error] ignore this", { onBusy });
+        await waitFor(() => logText().includes("test start rejected"), "local start rejected", 100, 25);
+      } else {
+        await waitForMessage(harness.messages, m => m.id.startsWith("system_turn_started"), "room turn started");
+        harness.sendClaudeToCodex("rejected", "[force-steer-error] ignore this", { onBusy, requireReply: true });
+        await waitForMessage(harness.messages, m => m.id.startsWith("system_steer_failed"), "steer rejected");
+      }
+      harness.sendAppCommand("agent-message:[IMPORTANT] private room output");
+      await waitFor(() => logText().includes("Agent message completed"), "private output processed", 100, 25);
+      expect(harness.messages.some(m => m.content.includes("private room output"))).toBe(false);
+      harness.sendClaudeToCodex("accepted", "Please acknowledge my local task", { onBusy, requireReply: true });
+      await waitFor(() => pendingStart
+        ? harness.statusMessages.some(m => m.type === "turn_started" && m.requestId === "accepted")
+        : logText().includes("Reply required armed on steer-accept"), "local input accepted", 100, 25);
+      if (pendingStart) {
+        harness.sendAppCommand("start-injected-turn");
+        await waitForMessage(harness.messages, m => m.id.startsWith("system_turn_started"), "deferred started notification");
+      }
+      harness.sendAppCommand("agent-message:[IMPORTANT] ACK local task");
+      await waitForMessage(harness.messages, m => m.content.includes("ACK local task"), "explicit local reply");
+      harness.sendAppCommand("complete-turn");
+      await waitForMessage(harness.messages, m => m.id.startsWith("system_turn_completed"), "room turn completed");
+      expect(harness.messages.some(m => m.id.startsWith("system_reply_missing"))).toBe(false);
+      publish("second informational notice");
+      if (pendingStart) {
+        await waitFor(() => (logText().match(/Codex room inbox: submitted/g) ?? []).length === 2, "second room submission", 100, 25);
+        harness.sendAppCommand("start-injected-turn");
+      }
+      await waitFor(() => harness.messages.filter(m => m.id.startsWith("system_turn_started")).length === 2, "second room turn", 100, 50);
+      const messagesBefore = (logText().match(/Agent message completed/g) ?? []).length;
+      harness.sendAppCommand("agent-message:[IMPORTANT] second private output");
+      await waitFor(() => (logText().match(/Agent message completed/g) ?? []).length > messagesBefore, "second output processed", 100, 25);
+      expect(harness.messages.some(m => m.content.includes("second private output"))).toBe(false);
+      await harness.close();
+    } finally {
+      peer.close();
+      await broker.stop();
+      await store.close();
+      rmSync(dir, { recursive: true, force: true });
+    }
+  }, 25000);
 
   test("CSWSH guard: a WS upgrade carrying an Origin header is 403'd on BOTH the control and proxy ports, while no-Origin clients still connect", async () => {
     const harness = await startHarness({ pairId: "main-cswshabcd", pairName: "main" });
@@ -1983,6 +2066,7 @@ async function startHarness(opts: {
   extraEnv?: Record<string, string>;
   /** Optional .agentbridge/config.json content written into the daemon cwd before spawn. */
   projectConfig?: unknown;
+  prepare?: (cwd: string) => Promise<void>;
 }): Promise<Harness> {
   const root = mkdtempSync(join(tmpdir(), "agentbridge-daemon-wiring-"));
   const cwdPath = join(root, "project");
@@ -1993,6 +2077,7 @@ async function startHarness(opts: {
   const cwd = realpathSync(cwdPath);
   mkdirSync(stateDir, { recursive: true });
   mkdirSync(binDir, { recursive: true });
+  await opts.prepare?.(cwd);
 
   if (opts.projectConfig !== undefined) {
     mkdirSync(join(cwd, ".agentbridge"), { recursive: true });
