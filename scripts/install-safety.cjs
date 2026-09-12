@@ -120,7 +120,7 @@ function verifyBuiltArtifacts() {
     }
     const stat = statSync(absolute);
     if (stat.size <= 0) empty.push(rel);
-    if (binTargets.has(rel) && (stat.mode & 0o111) === 0) {
+    if (process.platform !== "win32" && binTargets.has(rel) && (stat.mode & 0o111) === 0) {
       notExecutable.push(rel);
     }
   }

@@ -1,4 +1,7 @@
 import { spawn, execSync, execFileSync } from "node:child_process";
+import { resolveCodexCommand } from "../codex-command";
+import { openStore, resolveDbPath, resolveBrokerUrl } from "../collab-store";
+import { RoomService } from "../room-service";
 import {
   openSync,
   writeSync,
@@ -389,6 +392,19 @@ export async function runCodex(args: string[]) {
 
   // Save terminal state and launch Codex with protection
   console.log(`Connecting Codex TUI to AgentBridge at ${proxyUrl}...`);
+  const collabDb = resolveDbPath();
+  if (existsSync(collabDb)) {
+    try {
+      const store = openStore(collabDb);
+      try {
+        const room = await new RoomService(store).resolveRoomForCwd(process.cwd());
+        if (room) {
+          console.error(`[agentbridge] Room configured: ${room} @ ${resolveBrokerUrl(undefined, collabDb)} (broker validates membership).`);
+          console.error("[agentbridge] Codex room tools: agentbridge_room_members / agentbridge_room_say. After upgrading, use --new once to register them.");
+        }
+      } finally { await store.close(); }
+    } catch (error) { console.error(`[agentbridge] Could not read room configuration: ${String(error)}`); }
+  }
 
   // Save terminal state
   let savedStty: string | null = null;
@@ -469,7 +485,7 @@ export async function runCodex(args: string[]) {
     `spawn: codex ${redactArgv(fullArgs).map((a) => (a.includes(" ") ? JSON.stringify(a) : a)).join(" ")}`,
   );
 
-  const child = spawn("codex", fullArgs, {
+  const child = spawn(resolveCodexCommand(), fullArgs, {
     // inherit stdin + stdout (TUI needs raw TTY), pipe stderr so we can tee.
     stdio: ["inherit", "inherit", "pipe"],
     env: buildChildEnv(),

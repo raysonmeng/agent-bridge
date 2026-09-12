@@ -11,8 +11,12 @@
 
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
+import { readFileSync, writeFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { EventEmitter } from "node:events";
 import { StateDirResolver } from "./state-dir";
+import { resolveCodexCommand } from "./codex-command";
+import { CODEX_ROOM_TOOLS, roomToolResult, type RoomToolResult } from "./codex-room";
 import { cleanupPorts, portPidsCommand } from "./port-cleanup";
 import { createProcessLogger, type ProcessLogger } from "./process-log";
 import type { BridgeMessage } from "./types";
@@ -124,6 +128,36 @@ interface PendingRequest {
  * against.
  */
 export class CodexAdapter extends EventEmitter {
+  private roomToolsEnabled: () => boolean = () => false;
+  private roomToolHandler: ((name: string, args: unknown, valid: () => boolean) => Promise<RoomToolResult>) | null = null;
+  private pendingRoomToolThreads = new Set<number>();
+  private roomToolThreads = new Set<string>();
+  private roomToolThreadsFile = "";
+  private prepareRoomTools: (() => Promise<void>) | null = null;
+  private auxiliaryThreadIds = new Set<string>();
+
+  configureRoomTools(enabled: () => boolean, handler: (name: string, args: unknown, valid: () => boolean) => Promise<RoomToolResult>, prepare?: () => Promise<void>): void {
+    this.roomToolsEnabled = enabled;
+    this.roomToolHandler = handler;
+    this.prepareRoomTools = prepare ?? null;
+  }
+
+  private addRoomTools(raw: string): string {
+    const message = JSON.parse(raw);
+    if (message.method === "initialize" && this.roomToolHandler) {
+      message.params ??= {};
+      message.params.capabilities = { ...message.params.capabilities, experimentalApi: true };
+    } else if (message.method === "thread/start" && this.roomToolsEnabled() &&
+      !(typeof message.id === "string" && message.id.startsWith("temporary-"))) {
+      message.params ??= {};
+      const existing = message.params.dynamicTools ?? [];
+      if (!Array.isArray(existing)) return raw;
+      // Our names are reserved; do not silently replace a caller's tools.
+      if (existing.some((tool: any) => CODEX_ROOM_TOOLS.some(ours => ours.name === tool.name))) return raw;
+      message.params.dynamicTools = [...existing, ...CODEX_ROOM_TOOLS];
+    } else return raw;
+    return JSON.stringify(message);
+  }
   private static readonly RESPONSE_TRACKING_TTL_MS = 30000;
 
   private proc: ChildProcess | null = null;
@@ -277,6 +311,11 @@ export class CodexAdapter extends EventEmitter {
     this.appPort = appPort;
     this.proxyPort = proxyPort;
     this.logFile = logFile;
+    this.roomToolThreadsFile = join(dirname(logFile), "codex-room-threads.json");
+    try {
+      const threads = JSON.parse(readFileSync(this.roomToolThreadsFile, "utf8"));
+      if (Array.isArray(threads)) this.roomToolThreads = new Set(threads.filter(id => typeof id === "string").slice(-500));
+    } catch { /* first run */ }
     this.logger = createProcessLogger({ component: "CodexAdapter", logFile: this.logFile });
   }
 
@@ -364,7 +403,8 @@ export class CodexAdapter extends EventEmitter {
 
   /** Spawn the `codex app-server` child and wire its lifecycle/log handlers. */
   private spawnAppServer(listen: string) {
-    this.proc = spawn("codex", ["app-server", "--listen", listen], {
+    this.proc = spawn(resolveCodexCommand(), ["app-server", "--listen", listen], {
+      windowsHide: true,
       stdio: ["pipe", "pipe", "pipe"],
     });
     // Retain the pid independently of `this.proc` (which stop() nulls): the
@@ -1450,7 +1490,7 @@ export class CodexAdapter extends EventEmitter {
   }
 
   private onTuiMessage(ws: ServerWebSocket<TuiSocketData>, msg: string | Buffer) {
-    const data = typeof msg === "string" ? msg : msg.toString();
+    let data = typeof msg === "string" ? msg : msg.toString();
     const connId = ws.data.connId;
 
     // Route secondary (picker) connection messages to their own app-server WS
@@ -1471,6 +1511,8 @@ export class CodexAdapter extends EventEmitter {
       this.log(`Dropping message from stale TUI conn #${connId} (current is #${this.tuiConnId})`);
       return;
     }
+
+    try { data = this.addRoomTools(data); } catch { /* malformed input remains the upstream's responsibility */ }
 
     // Check if this is a response to a server-originated request
     try {
@@ -1526,7 +1568,13 @@ export class CodexAdapter extends EventEmitter {
         this.log("Detected initialize — reconnecting app-server for fresh session");
         this.reconnectingForNewSession = true;
         this.pendingTuiMessages = [data];
-        this.reconnectAppServerForNewSession(ws);
+        if (this.prepareRoomTools) {
+          // A reused daemon may have started before `abg join`. Refresh before
+          // replaying initialize/thread/start so tool registration sees the new mapping.
+          void this.prepareRoomTools().catch(error => this.log(`Room refresh failed: ${String(error)}`)).then(() => {
+            if (this.tuiWs === ws && this.tuiConnId === connId) this.reconnectAppServerForNewSession(ws);
+          });
+        } else this.reconnectAppServerForNewSession(ws);
         return;
       }
 
@@ -1578,6 +1626,10 @@ export class CodexAdapter extends EventEmitter {
       // Rewrite request id to globally unique proxy id
       if (parsed.id !== undefined && parsed.method) {
         const proxyId = this.nextProxyId++;
+        if (parsed.method === "thread/start" && Array.isArray(parsed.params?.dynamicTools) &&
+          CODEX_ROOM_TOOLS.every(ours => parsed.params.dynamicTools.some((tool: any) => tool.name === ours.name && tool.description === ours.description))) {
+          this.pendingRoomToolThreads.add(proxyId);
+        }
         this.upstreamToClient.set(proxyId, { connId, clientId: parsed.id });
         this.trackPendingRequest(parsed, connId, proxyId);
         // P1 #5: remember initialize request proxy ids so the matching response
@@ -1724,6 +1776,24 @@ export class CodexAdapter extends EventEmitter {
   }
 
   private handleServerRequest(parsed: AppServerRequest, raw: string): void {
+    const toolParams = parsed.params as { tool?: string; namespace?: string | null; arguments?: unknown; threadId?: string } | undefined;
+    if (parsed.method === "item/tool/call" && !toolParams?.namespace && this.roomToolThreads.has(toolParams?.threadId ?? "") && CODEX_ROOM_TOOLS.some(tool => tool.name === toolParams?.tool) && this.roomToolHandler) {
+      const socket = this.appServerWs;
+      const id = parsed.id;
+      const handler = this.roomToolHandler;
+      const tui = this.tuiWs;
+      const stillValid = () => !!tui && this.tuiWs === tui && socket === this.appServerWs && socket?.readyState === WebSocket.OPEN && toolParams?.threadId === this.threadId;
+      void Promise.resolve().then(() => {
+        if (!stillValid()) return roomToolResult(false, "Room tool request belongs to an inactive session");
+        return handler(toolParams!.tool!, toolParams?.arguments, stillValid);
+      }).catch(error => roomToolResult(false, String(error))).then(result => {
+        // Never send a late response to a new connection that may reuse this server id.
+        if (socket && socket === this.appServerWs && socket.readyState === WebSocket.OPEN) {
+          try { socket.send(JSON.stringify({ id, result })); } catch { this.log("Room tool response socket closed"); }
+        }
+      });
+      return;
+    }
     const serverId = parsed.id;
     const method = parsed.method;
     const threadId = this.extractThreadIdFromParams(parsed.params);
@@ -1811,10 +1881,28 @@ export class CodexAdapter extends EventEmitter {
   private handleAppServerResponse(parsed: AppServerResponse, raw: string): string | null {
     const responseId = parsed.id;
     const numericId = this.normalizeNumericId(responseId);
+    if (this.pendingRoomToolThreads.delete(numericId) && !parsed.error) {
+      const threadId = (parsed.result as { thread?: { id?: string } } | undefined)?.thread?.id;
+      if (threadId) {
+        this.roomToolThreads.add(threadId);
+        if (this.roomToolThreads.size > 500) this.roomToolThreads.delete(this.roomToolThreads.values().next().value!);
+        try { writeFileSync(this.roomToolThreadsFile, JSON.stringify([...this.roomToolThreads]), { mode: 0o600 }); }
+        catch { this.log("Could not persist Codex room tool registration; use --new after restarting"); }
+      }
+    }
     const mapping = !isNaN(numericId) ? this.upstreamToClient.get(numericId) : undefined;
 
     if (mapping) {
       this.upstreamToClient.delete(numericId);
+      // Codex TUI uses temporary structured threads for background work.
+      // They share the socket but must not replace the user's active thread.
+      if (typeof mapping.clientId === "string" && mapping.clientId.startsWith("temporary-")) {
+        const auxiliaryId = (parsed.result as { thread?: { id?: string } } | undefined)?.thread?.id;
+        if (auxiliaryId) {
+          this.auxiliaryThreadIds.add(auxiliaryId);
+          if (this.auxiliaryThreadIds.size > 500) this.auxiliaryThreadIds.delete(this.auxiliaryThreadIds.values().next().value!);
+        }
+      }
 
       // P1 #5: capture the initialize response (version / platform) BEFORE the
       // staleness drop below — the server identity is connection-independent, so
@@ -2022,6 +2110,7 @@ export class CodexAdapter extends EventEmitter {
 
   private handleServerNotification(msg: AppServerNotification) {
     const { method, params } = msg;
+    if (typeof params?.threadId === "string" && this.auxiliaryThreadIds.has(params.threadId)) return;
     // Note: the inactivity watchdog is refreshed for ALL inbound messages at
     // the handleAppServerPayload funnel (see #69 there), not here — this method
     // only runs for the modeled subset, which would miss the long-build case.
@@ -2050,6 +2139,8 @@ export class CodexAdapter extends EventEmitter {
             this.log(`Agent message completed (${content.length} chars)`);
             this.emit("agentMessage", {
               id: item.id, source: "codex" as const, content, timestamp: Date.now(),
+              ...(typeof params?.threadId === "string" ? { threadId: params.threadId } : {}),
+              ...(typeof params?.turnId === "string" ? { turnId: params.turnId } : {}),
             } satisfies BridgeMessage);
           }
         }
@@ -2083,6 +2174,7 @@ export class CodexAdapter extends EventEmitter {
 
   private trackPendingRequest(message: AppServerRequest | Record<string, unknown>, connId: number, _proxyId?: number) {
     const rpcId = "id" in message ? message.id : undefined;
+    if (typeof rpcId === "string" && rpcId.startsWith("temporary-")) return;
     const method = "method" in message && typeof message.method === "string" ? message.method : undefined;
     const key = this.pendingKey(rpcId, connId);
 
@@ -2570,6 +2662,7 @@ export class CodexAdapter extends EventEmitter {
   }
 
   private clearResponseTrackingState() {
+    this.pendingRoomToolThreads.clear();
     this.clearTransientResponseTrackingState();
     this.serverRequestToProxy.clear();
     this.pendingServerRequests = [];
@@ -2586,6 +2679,7 @@ export class CodexAdapter extends EventEmitter {
    * be rejected upstream, which is precisely what the A' experiment tests.
    */
   private clearResponseTrackingStateForAppServerReconnect() {
+    this.pendingRoomToolThreads.clear();
     this.clearTransientResponseTrackingState();
     for (const pending of this.serverRequestToProxy.values()) {
       this.pendingServerRequests.push({

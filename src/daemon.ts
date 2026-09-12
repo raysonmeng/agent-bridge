@@ -63,6 +63,7 @@ import { ConnectionSession, type ControlSocketData } from "./connection-session"
 import { AgentRegistry } from "./agent-registry";
 import { RoomManager } from "./room-manager";
 import { startRoomBridge, type RoomBridgeHandle } from "./room-bridge";
+import { CodexRoomInbox, callRoomTool } from "./codex-room";
 
 const stateDir = new StateDirResolver();
 stateDir.ensure();
@@ -916,6 +917,7 @@ codex.on("turnStarted", () => {
 
 codex.on("agentMessage", (msg: BridgeMessage) => {
   if (msg.source !== "codex") return;
+  if (codexRoomInbox.isRoomTurn(msg.turnId)) return; // do not relay room-originated turns to Claude
   recordAgentActivity();
   const route = routeCodexMessage(msg.content, {
     mode: FILTER_MODE,
@@ -2400,6 +2402,7 @@ function shutdown(reason: string, exitCode = 0) {
   controlServer = null;
   codex.stop();
   roomBridge?.stop();
+  codexRoomInbox.stop();
   roomBridge = null;
   removePidFile();
   removeStatusFile();
@@ -2484,7 +2487,6 @@ writeControlTokenPostBind();
 // resolves/rejects), bootCodex's retry/self-exit never runs, so this deadline is
 // the only thing that releases the control port. bootCodex clears it on success.
 armBootDeadline();
-void bootCodex();
 
 // v3 last-mile (§11.1): connect this session to the control-plane broker and
 // inject room events (task_completed / presence) into Claude. Fail-inert — a
@@ -2494,13 +2496,31 @@ void bootCodex();
 // distinct from the trusted local "codex" partner — the channel label itself
 // flags it as untrusted external input) and is structurally ineligible for the
 // Claude→Codex reply path (no loop).
-void startRoomBridge({
-  cwd: process.cwd(),
-  emit: (text) => emitToClaude(systemMessage("system_room_event", text, "room")),
-  log,
-})
-  .then((handle) => {
-    if (shuttingDown) handle.stop(); // a shutdown that raced our async start
-    else roomBridge = handle;
-  })
-  .catch((e) => log(`room bridge start failed: ${String(e)}`));
+const codexRoomInbox = new CodexRoomInbox(codex, () =>
+  !shuttingDown && tuiConnectionState.snapshot().tuiConnected && tuiConnectionState.canReply() && !!roomBridge?.roomId &&
+  evaluateInjectionBudgetGate({}, true, false).allow, log);
+let roomRefresh: Promise<void> | null = null;
+function refreshRoomBridge(): Promise<void> {
+  if (roomRefresh) return roomRefresh;
+  roomBridge?.stop();
+  roomBridge = null;
+  codexRoomInbox.clearPending();
+  roomRefresh = startRoomBridge({
+    cwd: process.cwd(),
+    emit: (text) => emitToClaude(systemMessage("system_room_event", text, "room")),
+    onEvent: (event, text) => {
+      if (event.kind === "chat" || event.kind === "task_completed") codexRoomInbox.enqueue(text);
+    },
+    log,
+  }).then(handle => {
+    if (shuttingDown) handle.stop();
+    else {
+      roomBridge = handle;
+      log(`Codex room tools ${handle.roomId ? `enabled for ${handle.roomId}` : "inactive: no mapped room"}`);
+    }
+  }).finally(() => { roomRefresh = null; });
+  return roomRefresh;
+}
+codex.configureRoomTools(() => !!roomBridge?.roomId, (name, args, valid) => callRoomTool(roomBridge, name, args, valid), refreshRoomBridge);
+void bootCodex();
+void refreshRoomBridge().catch(e => log(`room bridge start failed: ${String(e)}`));

@@ -26,6 +26,8 @@ export interface RoomBridgeDeps {
   cwd: string;
   /** Inject a rendered one-line room-event notice into the live Claude session. */
   emit: (text: string) => void;
+  /** Structured event delivery for Codex; presence/security notices never start model turns. */
+  onEvent?: (envelope: Envelope, text: string) => void;
   log?: (msg: string) => void;
   // --- test seams ---
   dbPath?: string;
@@ -57,7 +59,7 @@ export interface RoomBridgeHandle {
    * wildcard `"*"` mention is @所有人, accepted by the broker ONLY from the room owner. Queues if the
    * broker is offline; the broker re-stamps `from` from the authenticated sender. Inert handle ⇒ ok:false.
    */
-  send(text: string, mentions?: string[]): RoomSendResult;
+  send(text: string, mentions?: string[], options?: { to?: string[]; agentType?: string }): RoomSendResult;
   /**
    * Fetch the room roster (members + ownerId + self) from the broker. Resolves null on an INERT
    * handle (not logged in / no room); rejects on a connection / broker error (e.g. not connected yet).
@@ -249,7 +251,7 @@ export async function startRoomBridge(deps: RoomBridgeDeps): Promise<RoomBridgeH
   const client = new BrokerClient({
     url: brokerUrl,
     token,
-    presence: { agentType: "claude" },
+    presence: { agentType: "agentbridge" },
     log,
   });
 
@@ -263,7 +265,7 @@ export async function startRoomBridge(deps: RoomBridgeDeps): Promise<RoomBridgeH
       if (seen.size > SEEN_CAP) seen.delete(seen.values().next().value as string); // bounded FIFO-ish
     }
     const text = renderRoomEvent(env, client.whoami?.id); // selfId → @你 highlight when targeted
-    if (text) deps.emit(text);
+    if (text) { deps.emit(text); deps.onEvent?.(env, text); }
   });
   // Surface broker-pushed errors (e.g. a non-owner @all denial) as a SYSTEM notice — distinct
   // from the UNTRUSTED member-message marker: this is the broker telling THIS agent its own
@@ -286,7 +288,7 @@ export async function startRoomBridge(deps: RoomBridgeDeps): Promise<RoomBridgeH
   client.connect().catch((e) => log(`room bridge: connect failed — ${String(e)}`));
   log(`room bridge: subscribed to room ${room}`);
 
-  const send = (text: string, mentions?: string[]): RoomSendResult => {
+  const send = (text: string, mentions?: string[], options?: { to?: string[]; agentType?: string }): RoomSendResult => {
     const body = String(text ?? "").trim();
     if (body === "") return { ok: false, info: "消息为空，未发送" };
     const self = client.whoami;
@@ -297,7 +299,7 @@ export async function startRoomBridge(deps: RoomBridgeDeps): Promise<RoomBridgeH
       idempotencyKey: randomUUID(),
       // The broker re-stamps from.agentId from the authenticated socket, so this is only a
       // placeholder for the offline-queued case; agentType is a UI label (routing never reads it).
-      from: { agentId: self?.id ?? "(me)", agentType: "claude" },
+      from: { agentId: self?.id ?? "(me)", agentType: options?.agentType ?? "claude" },
       kind: "chat",
       payload: { text: body },
       timestamp: Date.now(),
@@ -305,6 +307,7 @@ export async function startRoomBridge(deps: RoomBridgeDeps): Promise<RoomBridgeH
       // reconnect — that is what makes a cross-machine @ actually reach a peer who's away.
       deliveryMode: "store_if_offline",
       ...(mentions && mentions.length > 0 ? { mentions } : {}),
+      ...(options?.to ? { to: options.to } : {}),
     };
     client.publish(room, env); // queues if offline; broker enforces @all owner-only + re-stamps from
     const at =
@@ -313,7 +316,7 @@ export async function startRoomBridge(deps: RoomBridgeDeps): Promise<RoomBridgeH
           ? "（@所有人）"
           : `（@${mentions.length}人）`
         : "";
-    return { ok: true, info: `已发送到房间 ${room}${at}` };
+    return { ok: true, info: `${client.connected ? "已提交" : "已加入本地待发送队列"}到房间 ${room}${at}${options?.to ? `（私信：${options.to.join(", ")}）` : ""}；尚无接收回执` };
   };
 
   const listMembers = async (): Promise<RoomMembersResult | null> => {
