@@ -299,6 +299,7 @@ For dormant/disabled bridge states, the Codex `.git` restriction, and other gotc
 
 ## Docs
 
+- **[Release SOP](docs/03-发布上线与Codex协议适配.md#附录当前发布流程-sop)** — one `publish.yml` workflow for automatic patches, recovery, and npm OIDC setup
 - **[Troubleshooting](docs/TROUBLESHOOTING.md)** — disabled-state recovery, the Codex `.git` hang, "installed but won't run", Bun version requirements
 - **[User manual (EN)](docs/manual/manual-en.md)** — end-to-end usage walkthrough
 - **[Project growth timeline](docs/README.md)** — how AgentBridge was built, stage by stage (01–11)

@@ -1,186 +1,50 @@
-name: Publish to npm
+name: Publish release
 
 on:
-  release:
-    types: [published]
+  push:
+    branches: [master]
+  workflow_dispatch:
+    inputs:
+      bump:
+        description: "Create a new patch (false recovers/verifies the current release)"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+concurrency:
+  group: agentbridge-publish
+  cancel-in-progress: false
 
 jobs:
   publish:
+    if: github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
-
+    timeout-minutes: 30
+    environment: release
+    permissions:
+      contents: write
+      pull-requests: write
+      id-token: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1.3.11"
 
-      - name: Install dependencies
-        run: bun install --frozen-lockfile
-
-      # Final integrity gate before publishing: typecheck + full test suite +
-      # plugin-bundle sync + version alignment. Never publish a build that can't
-      # pass `bun run check`. (When #90's release-form smoke lands, add
-      # `bun run smoke:built` + `bun run smoke:pack` here too.)
-      - name: Check (typecheck + tests + plugin sync + version align)
-        run: bun run check
-
-      - name: Build
-        run: bun run prepublishOnly
-
-      - name: Release smoke (built CLI artifacts) — blocks publish if the package can't start a daemon
-        # --skip-build: reuse the exact dist/ from the Build step above (the bytes
-        # that will be published) instead of rebuilding.
-        run: bun scripts/smoke-built-cli.mjs --skip-build
-
-      - name: Release smoke (npm pack completeness) — blocks publish if a shipped artifact is missing
-        run: bun run smoke:pack
-
       - uses: actions/setup-node@v4
         with:
           node-version: "22"
-          registry-url: "https://registry.npmjs.org"
+          # npm uses OIDC directly; do not create an auth-token .npmrc.
 
-      - name: Publish
-        run: npm publish --access=public
+      - name: Install OIDC-capable npm on the runner
+        run: npm install --global npm@11.19.1 --ignore-scripts --registry=https://registry.npmjs.org
+
+      - name: Validate, release and verify using short-lived credentials
+        run: node scripts/publish-release.mjs
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-
-      # ───────────────────────── Post-publish verification ─────────────────────────
-      # These run AFTER `npm publish` has already succeeded. They do NOT roll the
-      # package back — once published, the version is live on npm. They are an
-      # after-the-fact alarm: if registry propagation fails or the shipped dist
-      # bundle carries the wrong version stamp, we want the release to turn RED so
-      # the team sees it (instead of a false-green "publish OK" while users get a
-      # broken/missing/wrong-version install). Failing here intentionally fails the
-      # workflow; the package staying published is expected, not a regression.
-
-      - name: Verify published to npm registry
-        # Confirm the just-published version is actually queryable from the OFFICIAL
-        # npm registry (never a mirror). Guards against the "publish reported success
-        # but the version never propagated" failure mode. Retries because registry
-        # propagation is eventually-consistent (a fresh version can lag a few seconds).
-        run: |
-          set -euo pipefail
-          VERSION="$(node -p "require('./package.json').version")"
-          echo "Verifying @raysonmeng/agentbridge@${VERSION} on registry.npmjs.org"
-
-          # URL-encoded scoped package name: @raysonmeng/agentbridge -> @raysonmeng%2Fagentbridge
-          REGISTRY_URL="https://registry.npmjs.org/@raysonmeng%2Fagentbridge"
-
-          # Propagation budget for the OFFICIAL registry's eventual consistency:
-          #   initial settle  : 10s (give the just-published version a head start)
-          #   per-retry gap    : 15s, applied only BETWEEN attempts (never after the
-          #                      final attempt — a last-attempt failure reports
-          #                      immediately instead of wasting one more sleep)
-          #   total wait window: 10s + (8 - 1) * 15s = 115s (~2 min)
-          # 115s comfortably covers occasional slow propagation without false-FAILing
-          # the release on a normal few-second lag.
-          sleep 10
-          attempt=0
-          max_attempts=8
-          retry_gap=15
-          while [ "${attempt}" -lt "${max_attempts}" ]; do
-            attempt=$((attempt + 1))
-            echo "Attempt ${attempt}/${max_attempts}: GET ${REGISTRY_URL}"
-            # `|| true` so a transient curl failure does not abort the retry loop
-            # (set -e would otherwise kill the step on the first network blip).
-            body="$(curl -fsSL -H 'accept: application/json' "${REGISTRY_URL}" || true)"
-
-            if [ -n "${body}" ]; then
-              # Node parses the registry JSON and exits 0 only when BOTH hold:
-              #   (a) versions[] contains $VERSION
-              #   (b) dist-tags.latest === $VERSION
-              if printf '%s' "${body}" | node -e '
-                const want = process.argv[1];
-                let meta;
-                try {
-                  meta = JSON.parse(require("node:fs").readFileSync(0, "utf-8"));
-                } catch (err) {
-                  console.error("Failed to parse registry JSON: " + err.message);
-                  process.exit(1);
-                }
-                const versions = meta.versions ? Object.keys(meta.versions) : [];
-                const latest = meta["dist-tags"] && meta["dist-tags"].latest;
-                const hasVersion = versions.includes(want);
-                const latestMatches = latest === want;
-                console.log("registry latest=" + latest + " hasVersion=" + hasVersion + " latestMatches=" + latestMatches);
-                process.exit(hasVersion && latestMatches ? 0 : 1);
-              ' "${VERSION}"; then
-                echo "Registry confirms ${VERSION} (present + dist-tags.latest)."
-                exit 0
-              fi
-            fi
-
-            # Only sleep BETWEEN attempts. On the final attempt, fall straight
-            # through to the error below instead of burning one more idle ${retry_gap}s.
-            if [ "${attempt}" -lt "${max_attempts}" ]; then
-              echo "Not yet confirmed (attempt ${attempt}); retrying in ${retry_gap}s..."
-              sleep "${retry_gap}"
-            fi
-          done
-
-          echo "::error::Published version ${VERSION} not confirmed on registry.npmjs.org after ${max_attempts} attempts (missing from versions[] or dist-tags.latest != ${VERSION}). The package may still be published — this is a propagation/visibility alarm."
-          exit 1
-
-      - name: Install published from npm and verify
-        # Install the freshly published package from the OFFICIAL registry (never a
-        # mirror) and assert that the installed CLI reports the SAME version we just
-        # published. This is the direct probe for the real incident: a dist bundle
-        # whose version stamp drifted from package.json, so `agentbridge --version`
-        # shows the wrong number after a clean install. Version mismatch => exit 1.
-        run: |
-          set -euo pipefail
-          VERSION="$(node -p "require('./package.json').version")"
-          echo "Installing @raysonmeng/agentbridge@${VERSION} from registry.npmjs.org"
-
-          npm i -g "@raysonmeng/agentbridge@${VERSION}" --registry=https://registry.npmjs.org
-
-          # `agentbridge --version` prints: "agentbridge v<semver>"
-          raw_version="$(agentbridge --version)"
-          echo "Installed CLI reported: ${raw_version}"
-
-          # Extract the first dotted semver token from the --version output.
-          installed="$(printf '%s' "${raw_version}" | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n1 || true)"
-          if [ -z "${installed}" ]; then
-            echo "::error::Could not parse a version number from 'agentbridge --version' output: '${raw_version}'"
-            exit 1
-          fi
-
-          if [ "${installed}" != "${VERSION}" ]; then
-            echo "::error::Installed CLI version '${installed}' does not match published version '${VERSION}'. The dist bundle's version stamp is out of sync with package.json — users installing this release see the wrong version."
-            exit 1
-          fi
-          echo "Installed CLI version matches published version (${VERSION})."
-
-          # Independent second source of truth. `agentbridge --version` above reads a
-          # version string inlined into the dist bundle at BUILD time (same package.json
-          # origin as $VERSION), so it is weak against "registry drift / wrong artifact"
-          # cases. `npm view ...@<VERSION> version` instead reads the `version` field of
-          # the package.json that the registry actually stored for THIS version — a path
-          # independent of the local build-time snapshot. We assert it equals $VERSION.
-          # Robustness under `set -euo pipefail`: `npm view` exits non-zero (and prints
-          # nothing) when the exact version does not exist, so guard with `|| true` and
-          # treat empty output as a hard failure rather than letting set -e kill the step
-          # on the wrong line.
-          registry_version="$(npm view "@raysonmeng/agentbridge@${VERSION}" version --registry=https://registry.npmjs.org 2>/dev/null || true)"
-          echo "Registry-reported version (npm view): '${registry_version}'"
-          if [ -z "${registry_version}" ]; then
-            echo "::error::'npm view @raysonmeng/agentbridge@${VERSION} version' returned no version from registry.npmjs.org — the registry has no package.json for this exact version (drift or missing artifact)."
-            exit 1
-          fi
-          if [ "${registry_version}" != "${VERSION}" ]; then
-            echo "::error::Registry package.json version '${registry_version}' (npm view) does not match published version '${VERSION}'. Independent registry source disagrees with the build-time version stamp."
-            exit 1
-          fi
-          echo "Registry package.json version matches published version (${VERSION})."
-
-          # Lightweight smoke against the PUBLISHED CLI binary: confirm it can boot
-          # and parse a command without crashing. We deliberately do NOT reuse
-          # scripts/smoke-built-cli.mjs here — that script targets the repo-local
-          # dist/cli.js (built in the Build step), not the globally-installed npm
-          # artifact, and it spins up a real daemon (needs a fake codex on PATH).
-          # `--help` exercises the published bin's startup path and command router
-          # with no daemon/network dependency, so it can't false-FAIL in CI.
-          agentbridge --help >/dev/null
-          echo "Published CLI smoke (agentbridge --help) OK."
+          GH_TOKEN: ${{ github.token }}
