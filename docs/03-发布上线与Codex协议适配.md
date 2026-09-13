@@ -117,114 +117,121 @@ issue #37 的设计稿从 v1 迭代到 v5，跨了 Claude 和 Codex 两个引擎
 
 ## 附录：当前发布流程 SOP
 
-> 发布链是本阶段建立的，这里附上其演进至今的完整操作手册（内容来自 `docs/08-发布流程.md`）。
+**Last updated / 最后更新：2026-09-13**
 
-AgentBridge auto-publishes to npm on every code merge to `master`, so the
-update-notifier always has a fresh, gated source. Every published version is
-gated by `bun run check` — we never publish a build that can't pass.
+本节描述仓库的发布工作流与所需配置。配置文件、tag 或 GitHub Release 的存在，都不能证明 npm OIDC 已实际发布成功；以工作流中的 registry 回读和已发布包安装验证为准。
 
-AgentBridge 在每次代码合并到 `master` 时自动发布到 npm,让 update-notifier 始终有一个
-最新、经门禁把关的源。每个发布版本都被 `bun run check` 卡住——绝不发布无法通过检查的构建。
+发布入口统一为 [`.github/workflows/publish.yml`](../.github/workflows/publish.yml)：代码合并到 `master` 后自动发布 patch，也可手动恢复当前版本。旧的 `release-on-merge.yml` / `auto-release.yml` 接力流程已移除，不再依赖 `RELEASE_PAT` 或 `NPM_TOKEN`。
 
 ### Pipeline / 管线
 
 ```
-merge code PR to master
+master push / workflow_dispatch
         │
         ▼
-release-on-merge.yml   ── gate: bun run check ──▶ (fail → no release)
-        │  (pass)
-        ▼
-bump patch in package.json + plugin.json + marketplace.json  (synced)
-        │
-        ▼  commit "chore(release): vX.Y.Z", push to master  (needs RELEASE_PAT)
-        ▼
-auto-release.yml       ── tag vX.Y.Z + GitHub release ──▶
+publish.yml  ── single concurrency group / environment: release
         │
         ▼
-publish.yml            ── gate: bun run check → build → npm publish
+select version → bump manifests if needed → resolve tag / source
+        │
+        ▼
+install → build:plugin if bump → check → local commit if bump
+        │
+        ▼
+prepublishOnly → pack smoke → built CLI smoke → candidate .tgz
+        │
+        ▼
+if bump: push release branch → PR → squash merge
+        │               GITHUB_TOKEN, contents / pull-requests: write
+        ▼
+verify merge commit / master / version → checkout master → rerun all gates
+        │  fail → stop before tag / GitHub Release / npm publish
+        ▼
+pack canonical .tgz → tag + GitHub Release
+        │
+        ▼
+npm publish checked .tgz     OIDC, id-token: write
+        │
+        ▼
+registry version / latest / hash → isolated install → version / help
 ```
 
-- **`.github/workflows/release-on-merge.yml`** — on each push to `master`, runs
-  the full check and, if green, patch-bumps the version (synced across all three
-  manifests via `scripts/bump-version.mjs`) and pushes a `chore(release): vX.Y.Z`
-  commit.
-- **`.github/workflows/auto-release.yml`** — on a `package.json` version change,
-  creates the `vX.Y.Z` tag and GitHub release.
-- **`.github/workflows/publish.yml`** — on a published release, runs `bun run
-  check` again (final gate), builds, and `npm publish`es.
+| 入口 | 版本行为 |
+|------|----------|
+| `master` push | 自动 patch；比较事件的 `before` 与事件 SHA 中的版本，若此次 push 已人工改版本，则发布该版本，不重复 bump |
+| `workflow_dispatch`，`bump=false`（默认） | 恢复当前版本的发布，不增加版本号；已有 tag 时从该 tag 的固定源码重新构建 |
+| `workflow_dispatch`，`bump=true` | 明确请求新的 patch 版本 |
+
+版本同步复用 [`scripts/bump-version.mjs`](../scripts/bump-version.mjs)，更新 `package.json`、plugin manifest 和 marketplace manifest。plugin bundles 按 [`scripts/bundle-commit.cjs`](../scripts/bundle-commit.cjs) 读取的 tracked commit stamp 重建，避免只有 manifest 涨版本、包内版本仍旧的问题。
+
+自动 bump 使用内置 `GITHUB_TOKEN` 推送专用 release 分支、创建版本 PR，并以 `gh pr merge --squash --match-head-commit` 合并已检查的 PR head；不直推 `master`，不使用 `--admin`、`--auto` 或自动 approve。合并后核对 merge commit、`master` 和版本，再重新检出正式源码、跑完整门禁；tag、GitHub Release 和 npm 包均基于这次重新验证的正式提交。
+
+同一次运行继续创建 tag、GitHub Release 并直接执行 npm 发布。GitHub 对 `GITHUB_TOKEN` 产生的 push / release 事件不会再启动下游工作流，本流程无需用 PAT 绕过该限制。见 [GitHub：从工作流触发工作流](https://docs.github.com/en/actions/how-tos/write-workflows/choose-when-workflows-run/trigger-a-workflow#triggering-a-workflow-from-a-workflow)。
 
 ### Required setup / 必需配置
 
-1. **`RELEASE_PAT` repo secret** — a fine-grained Personal Access Token with
-   `contents: write`. Used at **both** hops of the chain, because pushes/releases
-   made with the default `GITHUB_TOKEN` do **not** trigger other workflows
-   (GitHub's recursion guard):
-   - `release-on-merge.yml` pushes the bump commit with `RELEASE_PAT` → triggers
-     `auto-release.yml`. It **fails loudly** if `RELEASE_PAT` is missing (rather
-     than push an un-publishable bump with `GITHUB_TOKEN`).
-   - `auto-release.yml` creates the GitHub release with `RELEASE_PAT` → triggers
-     `publish.yml`. With only `GITHUB_TOKEN` the release would be created but
-     `npm publish` would never run.
-   必须配置 `RELEASE_PAT`(细粒度 PAT,`contents: write`),发布链的**两跳都用它**:
-   release-on-merge 推 bump commit、auto-release 建 release,都需要 PAT 才能触发下一跳
-   (默认 `GITHUB_TOKEN` 推送/建 release 不触发其它 workflow)。缺 PAT 时 release-on-merge
-   直接 fail,不会产生发不出去的版本 bump。
-2. **`NPM_TOKEN` repo secret** — for `npm publish` (already used by publish.yml).
-3. **Branch protection** — if `master` is protected, allow the PAT identity to push
-   (the `chore(release):` bump commit). 若 `master` 受保护,需允许该 PAT 推送 bump commit。
+以下是首次启用前置条件，须在 npm 和 GitHub 分别完成；仓库内的 workflow 文件不会自动建立这些配置。
+
+1. **npm Trusted Publisher**：维护者在 `@raysonmeng/agentbridge` 的 npm 包设置中添加 GitHub Actions publisher，并完成这次配置所需的个人 2FA 验证。字段须与工作流一致：
+
+   | 字段 | 值 |
+   |------|----|
+   | Organization or user | `raysonmeng` |
+   | Repository | `agent-bridge` |
+   | Workflow filename | `publish.yml`（仅文件名） |
+   | Environment name | `release` |
+   | Allowed actions | 允许直接 `npm publish` |
+
+   后续 CI 通过 OIDC 获取短期发布凭据，不需保存 npm 发布 token，也不需每次交互输入 OTP。个人 2FA 保持开启。若只允许 `npm stage publish`，包仍需逐次人工批准，不符合此处的自动发布流程。字段和权限含义见 [npm Trusted publishing](https://docs.npmjs.com/trusted-publishers/)。
+2. **GitHub environment `release`**：部署分支只允许 `master`；工作流使用同名 environment，npm Trusted Publisher 绑定该名称。`contents: write` 用于 release 分支、tag 和 GitHub Release，`id-token: write` 用于 npm OIDC。
+3. **GitHub Actions 的 PR 权限**：在仓库 Actions 设置中开启 **Allow GitHub Actions to create and approve pull requests**（API 字段 `can_approve_pull_request_reviews=true`），并为发布 job 授予 `pull-requests: write`。该设置允许工作流创建版本 PR；工作流不执行 approve。`master` 的 ruleset `14316672` 要求 PR 和线性历史且没有 bypass，自动版本 PR 按既有规则 squash 合并，不修改 ruleset；创建或合并权限不足时运行失败。
+4. **CI 运行时**：使用 GitHub 托管 runner、Bun **1.3.11**、Node **22** 和固定 npm **11.19.1**。npm 官方要求 Node 至少 22.14.0、npm 至少 11.5.1；这些工具由 Actions 在临时 runner 上准备，不修改维护者本机或服务器的语言环境。见 [npm Trusted publishing 的版本要求](https://docs.npmjs.com/trusted-publishers/)。
 
 ### Skip / opt-out / 跳过
 
-- Put `[skip release]` in a commit message to skip the auto-bump (use for
-  docs-only / chore commits that should not produce a new npm version).
-  提交信息含 `[skip release]` 即跳过自动 bump(用于纯文档/杂务提交)。
-- `chore(release):` commits (the bot's own bumps) and `github-actions[bot]` pushes
-  are skipped automatically (loop guard).
-- If the triggering push already changed the version (a manual bump), the
-  auto-bump is skipped and the existing release flow publishes instead — no
-  double bump.
+- 在触发 push 的最终提交信息中加 `[skip release]`，跳过该次自动发布；例如无需发新版的文档或杂务提交。squash merge 时将标记保留在合并提交信息里。
+- workflow 自己用 `GITHUB_TOKEN` 合并版本 PR 产生的 push 不会触发递归发布；当前运行继续完成合并后的检查和发布。
+- 人工版本变更不等于跳过发布：只有自动 bump 被省略，检查、tag、Release、npm 发布与回读仍在同一次运行内完成。
 
 ### Manual release / 手动发布
 
-If you need to cut a release by hand (e.g. a coordinated minor/major bump):
+minor / major 通过正常版本 PR 发布。从最新 `master` 创建工作分支，准备版本与 tracked plugin bundles：
 
 ```bash
-bun run release:bump minor    # or patch | major — syncs all three manifests
-git commit -am "chore(release): v$(node -p "require('./package.json').version")"
-git push origin master        # triggers auto-release.yml -> publish.yml
+git switch -c chore/release-minor
+bun run release:bump minor    # 或 major；同步三个 manifest
+BUNDLE_COMMIT="$(node scripts/bundle-commit.cjs)"
+AGENTBRIDGE_BUILD_COMMIT_OVERRIDE="$BUNDLE_COMMIT" bun run build:plugin
+bun run check
 ```
+
+按仓库规则完成双 reviewer 审查，再提交版本相关文件、推送该工作分支并创建 PR；经授权正常合并到 `master` 后，`publish.yml` 发布已选定的版本。不要直接推送版本变更到 `master`。
+
+旧的 [`scripts/release.sh`](../scripts/release.sh) 会创建并合并版本 PR，使用时仍须满足项目的 review 与合并授权纪律；本工作流不调用该脚本。脚本末尾只提供 `publish.yml` 状态链接，不再手工创建 GitHub Release，也不把排队状态报告为已发布。
+
+恢复发布用默认的 `bump=false`；只有明确需要另发 patch 时才选 `bump=true`：
+
+```bash
+gh workflow run publish.yml --repo raysonmeng/agent-bridge --ref master -f bump=false
+# 新 patch：将上面的 bump=false 改为 bump=true
+gh run list --repo raysonmeng/agent-bridge --workflow publish.yml --branch master --limit 5
+```
+
+在 GitHub 页面单独创建 Release **不会触发 npm 发布**。如果 tag / Release 已有但 npm 尚未完成，使用上述恢复入口；恢复时仍校验 tag 指向和包体一致性。
 
 ### Artifact integrity / 产物可用性
 
-`bun run check` (typecheck + full test suite + plugin-bundle sync + version
-alignment) gates BOTH the bump and the publish, so a broken build can never be
-released. A stronger **release-form smoke** — launching the built `dist/cli.js`
-daemon and verifying `npm pack` completeness (`smoke:built` / `smoke:pack`) —
-lands with PR #90; once merged, add those as extra gate steps in
-`release-on-merge.yml` and `publish.yml`.
-
-`bun run check` 同时卡住 bump 和 publish,坏构建永远发不出去。更强的**发布形态 smoke**
-(真启打包 daemon + 查 npm 包完整性)随 PR #90 合入,届时把它们加进两处门禁。
+- 需要 bump 时先更新 manifest，再确定 tag / 源码并安装依赖；随后为 bump 重建 plugin bundles，运行 `bun run check`（typecheck、完整测试、plugin bundle 同步、版本对齐），通过后为 bump 创建本地版本提交。接着运行 `prepublishOnly` 构建、npm pack 完整性 smoke、真实 built CLI daemon smoke 并打包候选 `.tgz`，通过后才推送 release 分支、创建并 squash 合并版本 PR。合并后的正式提交重新安装依赖并跑完整检查、构建、smoke 和打包，随后才创建 tag 和 GitHub Release；PR 分支产物不会直接作为最终 npm 发布包。
+- npm 上传已检查的 `.tgz`。同一版本若已存在且包体 hash 一致，则跳过重复上传、继续验证；同版本不同包直接失败，不覆盖已有版本。已有 tag 必须指向正确候选提交，恢复时不会重写或移动 tag。
+- 发布后最多检查官方 registry 30 次、每次间隔 20 秒（等待约 10 分钟，网络请求耗时另计），回读目标版本、`latest` 和包体 hash。恢复开始时若目标版本已存在且 `latest` 更新，会先构建和打包并比对 registry 的同版本包体 hash，一致才保留较新的 `latest` 并结束，不再走后续上传与安装；不同包体则失败。若目标版本尚未发布但已落后于 `latest`，或后续发布阶段出现更新的 `latest`，则失败，防止降级。
+- 在临时隔离 prefix 中安装 registry 上的已发布包，核对 CLI `--version` 与 `--help`。这一步验证 npm 实际分发的内容，不复用仓库内的 `dist/`。
+- **GitHub Release 创建成功与 npm 发布成功是两个状态。** 发布后的传播或安装验证失败会令工作流失败，但不会撤销已经上传的包；修复原因后以 `bump=false` 恢复，不因验证超时盲目再涨版本。
 
 ### Concurrency & limitations / 并发与已知限制
 
-- `release-on-merge.yml` uses a `concurrency` group so only one release runs at a
-  time. Pushing the bump is wrapped in a **retry loop**: on any push failure
-  (non-fast-forward, or a rebase conflict because a concurrent merge edited
-  `package.json` near the version line) it hard-resets to the latest
-  `origin/master` and recomputes the bump from that tip, up to 3 attempts. So a
-  concurrent human merge does not silently drop a release.
-- Edge case: with several merges in quick succession, a later merge's code may be
-  published under the FIRST run's version (it's already on master), and its own
-  run then skips bumping (version already changed). Nothing is lost — the code is
-  on `master` and ships in that release or the next bump. This is acceptable for a
-  patch-on-every-merge cadence; switch to a manual/batched release if you need one
-  npm version per PR exactly.
-  推送 bump 带 3 次重试:任何推送失败(非快进 / 并发改动 package.json 版本行附近导致 rebase
-  冲突)都会硬重置到最新 origin/master 并重算 bump,所以并发合并不会悄悄丢掉发布。
-  快速连续合并时,后一个 PR 的代码可能跟随前一次 run 的版本一起发布(不会丢失,代码已在 master),
-  只是版本归属可能合并。需要"每个 PR 精确一个 npm 版本"时改用手动/批量发布。
+- 自动发布与手动恢复共用单个 concurrency group，同一时间只运行一个发布，不取消正在执行的发布。
+- 并发 `master` 变更导致候选失效时，最多尝试 3 个候选；首次检出、版本 PR 合并后和每次重试切换到新源码后，都按该源码的 `bun.lock` 重新执行 `bun install --frozen-lockfile --ignore-scripts`，随后重跑完整检查、构建和 smoke。旧候选的依赖和检查结果不能替新源码背书。
+- 连续合并可能合并进同一个 patch，不能据一次 push 或一个工作流条目推断“每个 PR 恰好一个 npm 版本”；通过最终 tag、registry 包体和运行日志确认该版实际内容。
 
 ### Installing a build globally (dogfooding) / 本地全局安装
 

@@ -9,7 +9,7 @@ set -euo pipefail
 #   2. Bump version in package.json, plugin.json, marketplace.json
 #   3. Run typecheck + tests
 #   4. Commit on release branch, push, create PR, merge
-#   5. Create GitHub Release (triggers npm publish via Actions)
+#   5. Hand off GitHub Release and npm publishing to the master Actions workflow
 
 REPO="raysonmeng/agent-bridge"
 DRY_RUN=false
@@ -200,57 +200,9 @@ git pull origin master
 RELEASE_SHA=$(git rev-parse HEAD)
 echo "Merged. Release SHA: $RELEASE_SHA"
 
-# ── Step 4: Create GitHub Release ─────────────────────────
+# ── Step 4: Hand off to the single Actions publisher ──────
 
-echo ""
-echo "=== Step 4: Create GitHub Release ==="
-
-LAST_TAG=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
-if [[ -n "$LAST_TAG" ]]; then
-  CHANGELOG=$(git log "$LAST_TAG"..HEAD --oneline --no-merges | grep -v "chore: bump" || true)
-  COMPARE_BASE="$LAST_TAG"
-else
-  CHANGELOG=$(git log --oneline --no-merges | grep -v "chore: bump" || true)
-  COMPARE_BASE=$(git rev-list --max-parents=0 HEAD | head -1)
-fi
-
-FEATS=$(echo "$CHANGELOG" | grep -iE "^[a-f0-9]+ feat" || true)
-FIXES=$(echo "$CHANGELOG" | grep -iE "^[a-f0-9]+ fix" || true)
-OTHERS=$(echo "$CHANGELOG" | grep -ivE "^[a-f0-9]+ (feat|fix|chore)" || true)
-
-append_section() {
-  local heading_en="$1"
-  local heading_zh="$2"
-  local content="$3"
-  if [[ -n "$content" ]]; then
-    NOTES+=$'\n'"### $heading_en / $heading_zh"$'\n'
-    while IFS= read -r line; do
-      [[ -z "$line" ]] && continue
-      NOTES+="- ${line#* }"$'\n'
-    done <<< "$content"
-  fi
-}
-
-NOTES="## What's Changed / 变更内容"$'\n'
-append_section "Bug Fixes" "问题修复" "$FIXES"
-append_section "Features" "新功能" "$FEATS"
-append_section "Other" "其他" "$OTHERS"
-
-NOTES+=$'\n'"### Installation / 安装"$'\n'
-NOTES+='```bash'$'\n'
-NOTES+="npm install -g @raysonmeng/agentbridge"$'\n'
-NOTES+='```'$'\n'
-NOTES+=$'\n'"**Full Changelog / 完整变更记录:** https://github.com/$REPO/compare/$COMPARE_BASE...v$NEW_VERSION"
-
-RELEASE_URL=$(gh release create "v$NEW_VERSION" \
-  --repo "$REPO" \
-  --title "v$NEW_VERSION" \
-  --notes "$NOTES" \
-  --target "$RELEASE_SHA")
-
-echo "Release created: $RELEASE_URL"
-echo "npm publish will be triggered automatically by GitHub Actions."
-echo ""
-echo "=============================="
-echo "  Release complete: v$NEW_VERSION"
-echo "=============================="
+echo "Version PR merged: v$NEW_VERSION ($RELEASE_SHA)"
+echo "GitHub Actions will validate, tag, create the Release and publish to npm."
+echo "Track the result: https://github.com/$REPO/actions/workflows/publish.yml"
+echo "The merge is complete; publication is complete only after registry/install verification passes."

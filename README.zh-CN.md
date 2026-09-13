@@ -299,6 +299,7 @@ AgentBridge 能让长任务跨订阅额度窗口持续推进，而不是某一�
 
 ## 文档
 
+- **[发布 SOP](docs/03-发布上线与Codex协议适配.md#附录当前发布流程-sop)**：统一 `publish.yml` 的自动 patch、恢复发布与 npm OIDC 配置
 - **[排错 / Troubleshooting](docs/TROUBLESHOOTING.md)**：禁用状态恢复、Codex `.git` 挂死、「装了却跑不起来」、Bun 版本要求
 - **[使用手册](docs/manual/使用手册.md)**（[English](docs/manual/manual-en.md)）：端到端使用走查
 - **[项目成长编年史](docs/README.md)**：AgentBridge 是怎么一步步长起来的（阶段 01–11）

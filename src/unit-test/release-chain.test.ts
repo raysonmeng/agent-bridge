@@ -50,11 +50,34 @@ describe("release chain rebuilds plugin bundles on version bump", () => {
     expect(gitAdd).toContain("plugins/agentbridge/server/daemon.js");
   });
 
-  test("release-on-merge workflow does the same", () => {
-    const wf = readFileSync(join(ROOT, ".github/workflows/release-on-merge.yml"), "utf-8");
-    expect(wf).toContain("AGENTBRIDGE_BUILD_COMMIT_OVERRIDE=");
-    expect(wf).toContain("bundle-commit.cjs");
-    expect(wf).toContain("plugins/agentbridge/server/daemon.js");
+  test("the Actions release helper preserves the shared bundle stamp contract", () => {
+    const script = readFileSync(join(ROOT, "scripts/publish-release.mjs"), "utf-8");
+    expect(script).toContain("AGENTBRIDGE_BUILD_COMMIT_OVERRIDE");
+    expect(script).toContain("bundle-commit.cjs");
+    expect(script).toContain("plugins/agentbridge/server/bridge-server.js");
+    expect(script).toContain("plugins/agentbridge/server/daemon.js");
+  });
+});
+
+describe("Actions release authentication contract", () => {
+  test("only master can use the release environment and short-lived write credentials", () => {
+    const workflow = Bun.YAML.parse(readFileSync(join(ROOT, ".github/workflows/publish.yml"), "utf-8")) as {
+      on: { push: unknown; workflow_dispatch: { inputs: { bump: unknown } } };
+      permissions: unknown;
+      jobs: { publish: { if: unknown; environment: unknown; permissions: unknown; steps: unknown } };
+    };
+    expect(Object.keys(workflow.on).sort()).toEqual(["push", "workflow_dispatch"]);
+    expect(workflow.on.push).toEqual({ branches: ["master"] });
+    expect(workflow.on.workflow_dispatch.inputs.bump).toMatchObject({ type: "boolean", default: false });
+    expect(workflow.permissions).toEqual({ contents: "read" });
+    expect(workflow.jobs.publish.if).toBe("github.ref == 'refs/heads/master'");
+    expect(workflow.jobs.publish.environment).toBe("release");
+    expect(workflow.jobs.publish.permissions).toEqual({ contents: "write", "pull-requests": "write", "id-token": "write" });
+    expect(workflow.jobs.publish.steps).toContainEqual(expect.objectContaining({
+      run: "node scripts/publish-release.mjs",
+      env: { GH_TOKEN: "${{ github.token }}" },
+    }));
+    expect(JSON.stringify(workflow)).not.toMatch(/secrets\.|NPM_TOKEN|NODE_AUTH_TOKEN|(?:^|[^A-Z])PAT(?:[^A-Z]|$)/);
   });
 });
 
