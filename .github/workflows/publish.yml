@@ -4,6 +4,9 @@ on:
   release:
     types: [published]
 
+permissions:
+  contents: write
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -36,12 +39,31 @@ jobs:
       - name: Release smoke (npm pack completeness) — blocks publish if a shipped artifact is missing
         run: bun run smoke:pack
 
+      - name: Build native installer release asset
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ github.event.release.tag_name }}
+        run: |
+          set -euo pipefail
+          OUT_DIR="$RUNNER_TEMP/agentbridge-release"
+          mkdir -p "$OUT_DIR"
+          PACKED="$(npm pack --pack-destination "$OUT_DIR" | tail -n 1)"
+          mv "$OUT_DIR/$PACKED" "$OUT_DIR/agentbridge.tgz"
+          (cd "$OUT_DIR" && sha256sum agentbridge.tgz > agentbridge.tgz.sha256)
+          gh release upload "$RELEASE_TAG" \
+            install.sh \
+            "$OUT_DIR/agentbridge.tgz" \
+            "$OUT_DIR/agentbridge.tgz.sha256" \
+            --clobber
+
       - uses: actions/setup-node@v4
+        if: github.repository == 'raysonmeng/agent-bridge'
         with:
           node-version: "22"
           registry-url: "https://registry.npmjs.org"
 
       - name: Publish
+        if: github.repository == 'raysonmeng/agent-bridge'
         run: npm publish --access=public
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
@@ -56,6 +78,7 @@ jobs:
       # workflow; the package staying published is expected, not a regression.
 
       - name: Verify published to npm registry
+        if: github.repository == 'raysonmeng/agent-bridge'
         # Confirm the just-published version is actually queryable from the OFFICIAL
         # npm registry (never a mirror). Guards against the "publish reported success
         # but the version never propagated" failure mode. Retries because registry
@@ -124,6 +147,7 @@ jobs:
           exit 1
 
       - name: Install published from npm and verify
+        if: github.repository == 'raysonmeng/agent-bridge'
         # Install the freshly published package from the OFFICIAL registry (never a
         # mirror) and assert that the installed CLI reports the SAME version we just
         # published. This is the direct probe for the real incident: a dist bundle
