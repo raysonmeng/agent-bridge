@@ -3,6 +3,7 @@ import {
   NOTIFY_COMMANDS,
   PAIR_AWARE_COMMANDS,
   REFRESH_COMMANDS,
+  extractRoomUntrustedFlag,
   parseTopLevel,
 } from "../cli";
 
@@ -112,5 +113,25 @@ describe("parseTopLevel — logs is pair-aware", () => {
     expect(PAIR_AWARE_COMMANDS.has("logs")).toBe(true);
     expect(NOTIFY_COMMANDS.has("logs")).toBe(false);
     expect(REFRESH_COMMANDS.has("logs")).toBe(false);
+  });
+});
+
+describe("extractRoomUntrustedFlag — opt-in room safety for the launched daemon", () => {
+  test("absent ⇒ args unchanged, env untouched", () => {
+    const env: Record<string, string | undefined> = {};
+    expect(extractRoomUntrustedFlag(["codex", "--new"], env)).toEqual(["codex", "--new"]);
+    expect(env.AGENTBRIDGE_ROOM_UNTRUSTED).toBeUndefined();
+  });
+
+  test("present anywhere before `--` ⇒ stripped and AGENTBRIDGE_ROOM_UNTRUSTED=1", () => {
+    const env: Record<string, string | undefined> = {};
+    expect(extractRoomUntrustedFlag(["--pair", "w", "codex", "--room-untrusted", "--new"], env)).toEqual(["--pair", "w", "codex", "--new"]);
+    expect(env.AGENTBRIDGE_ROOM_UNTRUSTED).toBe("1");
+  });
+
+  test("after `--` it belongs to the wrapped tool and is left alone", () => {
+    const env: Record<string, string | undefined> = {};
+    expect(extractRoomUntrustedFlag(["claude", "--", "--room-untrusted"], env)).toEqual(["claude", "--", "--room-untrusted"]);
+    expect(env.AGENTBRIDGE_ROOM_UNTRUSTED).toBeUndefined();
   });
 });

@@ -49,10 +49,10 @@ describe("Codex room tools through a real local broker", () => {
     const { port } = broker.start();
     cleanup.push(() => broker.stop());
     const url = `ws://127.0.0.1:${port}/ws`;
-    const events: Array<{ envelope: Envelope; text: string }> = [];
+    const events: Array<{ envelope: Envelope; text: string; trusted: boolean }> = [];
     const bridge = await startRoomBridge({
       cwd: dir, dbPath: join(dir, "collab.db"), store, brokerUrl: url, emit: () => {},
-      onEvent: (envelope, text) => events.push({ envelope, text }),
+      onEvent: (envelope, text, trusted) => events.push({ envelope, text, trusted }),
     });
     cleanup.push(() => bridge.stop());
     // Membership requires authentication; retry only the initial connection race.
@@ -121,7 +121,9 @@ describe("Codex room tools through a real local broker", () => {
     const delivered = events.find(e => e.envelope.messageId === message.messageId)!;
     expect(delivered.envelope.from.agentId).toBe(BOB);
     expect(delivered.text).toContain("remote peer reply");
-    expect(delivered.text).toContain("房间消息");
+    // Default mode: a member's chat is injected as the local user's instruction.
+    expect(delivered.text).toStartWith("✅[房间成员指令] ");
+    expect(delivered.trusted).toBe(true);
     bob.client.publish(ROOM, message);
     await bob.client.listMembers(ROOM);
     await Bun.sleep(50);

@@ -15,6 +15,7 @@ import type { RoomRecord, Store } from "../backbone/store";
 import { readAuthToken, resolveBrokerUrl, resolveDbPath, openStore, writeBrokerUrl } from "../collab-store";
 import { BrokerClient } from "../broker-client";
 import { hashPassword } from "../backbone/password";
+import { addTrustedSender, listTrustedSenders, removeTrustedSender, trustFilePath } from "../room-trust";
 
 /**
  * Read a single line (the password) from stdin — the non-leaky alternative to `--password <pw>` on the
@@ -228,7 +229,7 @@ export async function removeRoomMember(opts: {
 }
 
 const ROOM_USAGE =
-  "用法：abg room create <name> [--password <口令>|--password-stdin] | abg room list | abg room invite <roomId> <identityId> [--name <displayName>] [--broker-url <ws://…>] | abg room set-password <roomId> --password <口令>|--password-stdin|--clear | abg room add <roomId> <identityId> | abg room remove <roomId> <identityId>";
+  "用法：abg room create <name> [--password <口令>|--password-stdin] | abg room list | abg room invite <roomId> <identityId> [--name <displayName>] [--broker-url <ws://…>] | abg room set-password <roomId> --password <口令>|--password-stdin|--clear | abg room add <roomId> <identityId> | abg room remove <roomId> <identityId> | abg room trust|untrust <roomId> <agentId> | abg room trusted [roomId]";
 
 /** Dispatch `abg room <subcommand>`: `create <name>` / `list`. */
 /**
@@ -422,6 +423,36 @@ export async function runRoom(args: string[]): Promise<void> {
           console.log(`   要真正排除，请同时改/清口令：abg room set-password ${roomId} --password <新口令>  或  abg room set-password ${roomId} --clear`);
         }
       }
+      break;
+    }
+    case "trust":
+    case "untrust": {
+      const roomId = args[1];
+      const agentId = args[2];
+      if (!roomId || !agentId) {
+        console.error(`用法：abg room ${sub} <roomId> <agentId>`);
+        process.exit(1);
+        return;
+      }
+      if (sub === "trust") {
+        const added = addTrustedSender(roomId, agentId);
+        console.log(added ? `已把 ${agentId} 登记为房间 ${roomId} 的可信成员：以 --room-untrusted 启动时，它的房间发言仍按本机用户指令注入` : `${agentId} 已是房间 ${roomId} 的可信成员`);
+      } else {
+        const removed = removeTrustedSender(roomId, agentId);
+        console.log(removed ? `已取消 ${agentId} 在房间 ${roomId} 的可信身份` : `${agentId} 不是房间 ${roomId} 的可信成员`);
+      }
+      console.log(`（仅保存在本机 ${trustFilePath()}，下一条房间消息起生效，无需重启）`);
+      break;
+    }
+    case "trusted": {
+      const roomId = args[1];
+      const all = listTrustedSenders();
+      const rows = Object.entries(all).filter(([r]) => !roomId || r === roomId);
+      if (rows.length === 0) {
+        console.log(roomId ? `房间 ${roomId} 没有可信成员` : "（没有可信成员）");
+        break;
+      }
+      for (const [r, ids] of rows) for (const id of ids) console.log(`${r}\t${id}`);
       break;
     }
     default:

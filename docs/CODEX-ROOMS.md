@@ -18,7 +18,25 @@ Use `--new` once after upgrading: old threads created without the dynamic room t
 
 Ask Codex to use `agentbridge_room_members` to inspect the room. The list includes offline members. Ask it to use `agentbridge_room_say` to send a message authorized by you. `to` contains exact member IDs for a private message; omit `to` to broadcast. Submission is not a recipient acknowledgement. Unlike the existing Claude tool's `to` mention parameter, the Codex tool's `to` is private routing.
 
-Incoming chat and task-completed notices are queued while Codex is busy or a local turn is starting, then injected into an idle connected TUI session. The bounded inbox holds 100 notices and submits up to 10 per turn. An explicitly rejected injection is retried once after a delay. The inbox is in memory and does not promise durable end-to-end delivery. Room text is external, untrusted information; ordinary Codex output is not automatically published to the room or forwarded to the local Claude from a room-notice turn. If local Claude explicitly steers that turn, or the user adds input from the TUI, subsequent replies follow normal local routing after Codex accepts the request. Claude's `require_reply` rules still apply; a rejected request does not enable forwarding.
+Incoming chat and task-completed notices are queued while Codex is busy or a local turn is starting, then injected into an idle connected TUI session. The bounded inbox holds 100 notices and submits up to 10 consecutive entries with the same trust status per turn, preserving arrival order. An explicitly rejected injection is retried once after a delay, retaining each entry's trust status. The inbox is in memory and does not promise durable end-to-end delivery. Ordinary Codex output is not automatically published to the room or forwarded to the local Claude from a room-message turn, including trusted turns. If local Claude explicitly steers that turn, or the user adds input from the TUI, subsequent replies follow normal local routing after Codex accepts the request. Claude's `require_reply` rules still apply; a rejected request does not enable forwarding.
+
+By default, all room members' `chat` messages are treated as local-user instructions. This mode is intended for collaboration among trusted colleagues in the same team. Chat messages start with `✅[房间成员指令]`, and Codex uses `agentbridge_room_say` when a reply is needed. Any member's chat can cause your agent to perform operations: share rooms only with colleagues you trust, and keep broker tokens secret. Task-completed events, join/leave events and whiteboard snapshots always remain `📨` notices in both modes, including for locally trusted members.
+
+This upgrade changes the default room behavior. In projects already initialized with `abg init`, run `abg init` again to update the room rules in `CLAUDE.md`/`AGENTS.md` for both modes; stop any running daemon with `abg kill` before restarting so the launch settings take effect.
+
+To restrict room instructions, start with `abg codex --room-untrusted` or `abg claude --room-untrusted`, or set `AGENTBRIDGE_ROOM_UNTRUSTED=1` in the launch environment. The setting applies to a newly started daemon. If a daemon is already running, first run `abg kill`, then start it with the desired setting. In restricted mode, only chat messages from members on the local trust list are treated as instructions; other members' chat retains the external-untrusted security preamble and prohibition on automatic replies.
+
+In restricted mode, the local operator manages trusted senders for each room with:
+
+```powershell
+abg room trust <roomId> <agentId>
+abg room trusted [roomId]
+abg room untrust <roomId> <agentId>
+```
+
+Use the exact member ID from `agentbridge_room_members`. The list is matched against the broker-authenticated `from.agentId`, never a display name or a claim in message text. Its instruction authority applies only to `chat`. In default mode, removing an entry from the trust list leaves that member's chat eligible as instructions; enable restricted mode to enforce the list.
+
+The trust list is stored only on this machine in `<collab directory>/room-trust.json` with file mode `0600`; it is not sent to the broker and does not grant room membership. In restricted mode, list changes take effect for subsequent arrivals without restarting the daemon. Entries already in the Codex inbox, including retries, retain the trust status assigned when received. Manage the list separately on each machine using restricted mode.
 
 On Windows the launcher resolves a native `codex.exe` from PATH or an installed npm Codex package. If necessary, set `AGENTBRIDGE_CODEX_BIN` to the full native executable path in the terminal before launch. PowerShell `.ps1` and `.cmd` wrappers are not spawned as native executables.
 

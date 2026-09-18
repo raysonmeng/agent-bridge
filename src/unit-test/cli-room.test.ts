@@ -9,6 +9,7 @@ import { StorePskIdentityProvider } from "../backbone/identity/store-psk-identit
 import { SqliteStore } from "../backbone/store/sqlite-store";
 import { verifyPassword } from "../backbone/password";
 import { atomicWriteText } from "../atomic-json";
+import { readTrustedSenders } from "../room-trust";
 
 /** Mimic `abg auth login`: register an identity, issue a token, persist it. */
 async function seedLogin(
@@ -155,6 +156,31 @@ describe("cli/room", () => {
     expect(out).toContain("记住 broker 地址"); // the persistence note (no env var / no restart)
     expect(out).not.toContain("export AGENTBRIDGE_BROKER_URL=");
     expect(out).not.toContain("~/.zshrc");
+  });
+
+  it("trust / trusted / untrust (CLI): edits the local list next to collab.db, no broker or login needed", async () => {
+    dir = mkdtempSync(join(tmpdir(), "agentbridge-room-"));
+    const dbPath = join(dir, "collab.db");
+    const prevDb = process.env.AGENTBRIDGE_COLLAB_DB;
+    process.env.AGENTBRIDGE_COLLAB_DB = dbPath;
+    const logs: string[] = [];
+    const origLog = console.log;
+    console.log = (...a: unknown[]) => void logs.push(a.map(String).join(" "));
+    try {
+      await runRoom(["trust", "tas-dev", "boss@x.com"]);
+      expect([...readTrustedSenders("tas-dev", dbPath)]).toEqual(["boss@x.com"]);
+      await runRoom(["trusted"]);
+      expect(logs.join("\n")).toContain("tas-dev\tboss@x.com");
+      await runRoom(["untrust", "tas-dev", "boss@x.com"]);
+      expect(readTrustedSenders("tas-dev", dbPath).size).toBe(0);
+      logs.length = 0;
+      await runRoom(["trusted", "tas-dev"]);
+      expect(logs.join("\n")).toContain("没有可信成员");
+    } finally {
+      console.log = origLog;
+      if (prevDb === undefined) delete process.env.AGENTBRIDGE_COLLAB_DB;
+      else process.env.AGENTBRIDGE_COLLAB_DB = prevDb;
+    }
   });
 
   it("invite: member issues a broker-verifiable token + grants membership", async () => {

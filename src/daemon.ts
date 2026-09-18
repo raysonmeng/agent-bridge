@@ -2494,14 +2494,11 @@ writeControlTokenPostBind();
 // the only thing that releases the control port. bootCodex clears it on success.
 armBootDeadline();
 
-// v3 last-mile (§11.1): connect this session to the control-plane broker and
-// inject room events (task_completed / presence) into Claude. Fail-inert — a
-// not-logged-in / non-collab user (no auth-token, or this cwd not mapped to a
-// room) starts nothing, so the v1 single-machine flow is untouched. Injected as
-// a `system_room_event` notice stamped source:"room" (renders as user="Room",
-// distinct from the trusted local "codex" partner — the channel label itself
-// flags it as untrusted external input) and is structurally ineligible for the
-// Claude→Codex reply path (no loop).
+// v3 房间接入：连接 broker，将事件以 system_room_event、source:"room" 注入 Claude，
+// 通道显示为 user="Room"。缺少登录凭据或目录房间映射时不启动房间连接。
+// 默认只把成员的 chat 发言作为本机用户指令；task_completed、进出房间和白板始终是 📨 通报。
+// 限制模式下只有本机名单成员的 chat 可信。可信属性由 room-bridge 判定，通道名称仅标识消息来源。
+// 房间事件不进入 Claude→Codex 自动回复路径，避免循环转发。
 const codexRoomInbox = new CodexRoomInbox(codex, () =>
   !shuttingDown && tuiConnectionState.snapshot().tuiConnected && tuiConnectionState.canReply() && !!roomBridge?.roomId &&
   evaluateInjectionBudgetGate({}, true, false).allow, log);
@@ -2514,8 +2511,8 @@ function refreshRoomBridge(): Promise<void> {
   roomRefresh = startRoomBridge({
     cwd: process.cwd(),
     emit: (text) => emitToClaude(systemMessage("system_room_event", text, "room")),
-    onEvent: (event, text) => {
-      if (event.kind === "chat" || event.kind === "task_completed") codexRoomInbox.enqueue(text);
+    onEvent: (event, text, trusted) => {
+      if (event.kind === "chat" || event.kind === "task_completed") codexRoomInbox.enqueue(text, trusted);
     },
     log,
   }).then(handle => {

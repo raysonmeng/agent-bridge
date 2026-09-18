@@ -65,6 +65,20 @@ export function parseTopLevel(args: string[]): { command: string | undefined; re
   return { command, restArgs: tail };
 }
 
+/**
+ * Strip `--room-untrusted` (anywhere before a `--` separator) and record it as
+ * AGENTBRIDGE_ROOM_UNTRUSTED=1, which the daemon launched by this command inherits.
+ * Default (flag absent): room members' chat messages are injected as the user's instructions.
+ */
+export function extractRoomUntrustedFlag(args: string[], env: Record<string, string | undefined>): string[] {
+  const sep = args.indexOf("--");
+  const head = sep === -1 ? args : args.slice(0, sep);
+  const tail = sep === -1 ? [] : args.slice(sep);
+  if (!head.includes("--room-untrusted")) return args;
+  env.AGENTBRIDGE_ROOM_UNTRUSTED = "1";
+  return [...head.filter((a) => a !== "--room-untrusted"), ...tail];
+}
+
 async function main(command: string | undefined, restArgs: string[]) {
   // Best-effort update notice. On an interactive TTY it may prompt before the
   // launcher starts; non-interactive/suppressed runs keep the pure notice path.
@@ -206,6 +220,10 @@ Commands:
   room add <roomId> <identityId> | room remove <roomId> <identityId>
                      On the broker: directly grant/revoke a member (members only). "remove"
                      pairs with "auth revoke" to evict a live session
+  room trust <roomId> <agentId> | room untrust <roomId> <agentId> | room trusted [roomId]
+                     On THIS machine, for daemons started with --room-untrusted: members on this
+                     list still instruct you; everyone else is an untrusted notice. Local file
+                     only (never sent to the broker); applies from the next message
   join <roomId> [--password <pw> | --password-stdin] [--broker-url <ws://…>]
                      Join a room and auto-join this directory next time (§2.4). For a remote
                      room (no local record) it maps the cwd; the broker enforces membership.
@@ -228,6 +246,11 @@ Options:
                      the current directory, so the same name in another directory
                      is a separate pair. Goes BEFORE the command. Without it, the
                      pair name defaults to "main" for the current directory.
+  --room-untrusted   Restrict the collaboration room for the daemon this command launches:
+                     chat messages become untrusted notices except from "room trust" members
+                     (same as AGENTBRIDGE_ROOM_UNTRUSTED=1). Default: every room member's chat
+                     message is injected as your instruction (task completions and join/leave
+                     are always notices). A running daemon keeps its mode — "abg kill" first.
   --safe             Disable the max-permission defaults for this launch.
                      Goes AFTER the command (abg claude --safe); also auto-
                      suppressed when you pass any explicit permission flag
@@ -285,7 +308,7 @@ function printVersion() {
 // module (e.g. claude.ts/codex.ts pull MARKETPLACE_NAME, tests pull parseTopLevel);
 // in those cases import.meta.main is false and we must NOT run the command switch.
 if (import.meta.main) {
-  const { command, restArgs } = parseTopLevel(process.argv.slice(2));
+  const { command, restArgs } = parseTopLevel(extractRoomUntrustedFlag(process.argv.slice(2), process.env));
   main(command, restArgs).catch((err) => {
     console.error(`Error: ${err.message}`);
     process.exit(1);
