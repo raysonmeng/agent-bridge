@@ -1,4 +1,5 @@
 import { derivePairId } from "./pair-registry";
+import { posix as posixPath, win32 as win32Path } from "node:path";
 
 export type EnvGuardMode = "off" | "warn" | "fix" | "strict";
 
@@ -59,11 +60,11 @@ export function inspectAgentBridgeEnv(opts: {
     reasons.push(`AGENTBRIDGE_PAIR_ID=${actualPairId} does not match cwd-derived ${expectedPairId}`);
   }
 
-  if (actualPairId && stateDir && !stateDir.endsWith(`/pairs/${actualPairId}`)) {
+  if (actualPairId && stateDir && !stateDirMatchesPair(stateDir, actualPairId)) {
     reasons.push(`AGENTBRIDGE_STATE_DIR does not end with /pairs/${actualPairId}`);
   }
 
-  if (actualPairId && baseDir && stateDir && !stateDir.startsWith(`${baseDir}/`)) {
+  if (actualPairId && baseDir && stateDir && !isPathWithin(stateDir, baseDir)) {
     reasons.push("AGENTBRIDGE_BASE_DIR and AGENTBRIDGE_STATE_DIR disagree");
   }
 
@@ -114,4 +115,30 @@ export function guardAgentBridgeEnv(opts: {
 
 function nonEmpty(value: string | undefined): string | null {
   return value && value.length > 0 ? value : null;
+}
+
+/** Normalize paths independently of the host OS so Windows paths can be checked in tests on POSIX too. */
+function normalizePathForComparison(value: string): { path: string; windows: boolean } {
+  const windows = /^[A-Za-z]:[\\/]/.test(value) || value.startsWith("\\\\");
+  const normalized = windows
+    ? win32Path.normalize(value).replaceAll("\\", "/")
+    : posixPath.normalize(value);
+  return { path: windows ? normalized.toLowerCase() : normalized, windows };
+}
+
+function stateDirMatchesPair(stateDir: string, pairId: string): boolean {
+  const normalizedPath = normalizePathForComparison(stateDir);
+  const normalized = normalizedPath.path.replace(/\/+$/, "");
+  const normalizedPairId = normalizedPath.windows ? pairId.toLowerCase() : pairId;
+  return normalized.endsWith(`/pairs/${normalizedPairId}`);
+}
+
+function isPathWithin(candidate: string, parent: string): boolean {
+  const normalizedCandidate = normalizePathForComparison(candidate);
+  const normalizedParent = normalizePathForComparison(parent);
+  if (normalizedCandidate.windows !== normalizedParent.windows) return false;
+
+  const parentPath = normalizedParent.path.replace(/\/+$/, "");
+  const prefix = parentPath === "" ? "/" : `${parentPath}/`;
+  return normalizedCandidate.path.startsWith(prefix);
 }
