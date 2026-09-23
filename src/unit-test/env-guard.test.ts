@@ -41,6 +41,38 @@ describe("AgentBridge env guard", () => {
     expect(inspectAgentBridgeEnv({ cwd, env }).ok).toBe(true);
   });
 
+  test("accepts native Windows state paths and preserves valid generated env in fix mode", () => {
+    const cwd = tempCwd("windows-path");
+    const pairId = derivePairId(cwd, "main");
+    const env = {
+      AGENTBRIDGE_PAIR_ID: pairId,
+      AGENTBRIDGE_PAIR_NAME: "main",
+      AGENTBRIDGE_BASE_DIR: "C:\\Users\\Trevor\\.agentbridge",
+      AGENTBRIDGE_STATE_DIR: `C:\\Users\\Trevor\\.agentbridge\\pairs\\${pairId}`,
+      AGENTBRIDGE_CONTROL_PORT: "4502",
+    } as NodeJS.ProcessEnv;
+
+    const result = guardAgentBridgeEnv({ cwd, env, mode: "fix" });
+
+    expect(result.action).toBe("none");
+    expect(result.ok).toBe(true);
+    expect(env.AGENTBRIDGE_PAIR_ID).toBe(pairId);
+    expect(env.AGENTBRIDGE_STATE_DIR).toBe(`C:\\Users\\Trevor\\.agentbridge\\pairs\\${pairId}`);
+  });
+
+  test("accepts mixed separators and case differences in Windows path comparisons", () => {
+    const cwd = tempCwd("windows-path-case");
+    const pairId = derivePairId(cwd, "main");
+    const env = {
+      AGENTBRIDGE_PAIR_ID: pairId,
+      AGENTBRIDGE_PAIR_NAME: "main",
+      AGENTBRIDGE_BASE_DIR: "c:/users/trevor/.AgentBridge/",
+      AGENTBRIDGE_STATE_DIR: `C:\\Users\\Trevor\\.agentbridge/pairs/${pairId.toUpperCase()}`,
+    } as NodeJS.ProcessEnv;
+
+    expect(inspectAgentBridgeEnv({ cwd, env }).ok).toBe(true);
+  });
+
   test("fix mode clears stale generated env before pair resolution can enter manual mode", () => {
     const cwd = tempCwd("fix");
     const oldCwd = tempCwd("old");
