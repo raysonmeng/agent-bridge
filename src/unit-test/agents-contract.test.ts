@@ -2,20 +2,13 @@ import { describe, expect, test } from "bun:test";
 import { existsSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { AGENTS_MD_SECTION } from "../collaboration-content";
 import {
   checkAgentsMdContract,
   isFreshAgentsMdContract,
 } from "../agents-contract";
 
-const FRESH_BODY = [
-  "<!-- AgentBridge:start -->",
-  "AgentBridge is a transparent proxy.",
-  "Do not bypass it.",
-  "Use sendToClaude to talk back.",
-  "Git operations are handled by Claude.",
-  "Roles: Implementer, Executor, Verifier.",
-  "<!-- AgentBridge:end -->",
-].join("\n");
+const FRESH_BODY = `<!-- AgentBridge:start -->\n${AGENTS_MD_SECTION}\n<!-- AgentBridge:end -->`;
 
 describe("agents contract (read-only)", () => {
   test("missing AGENTS.md is never created and reports not-fresh", () => {
@@ -59,6 +52,14 @@ describe("agents contract (read-only)", () => {
     } finally {
       rmSync(root, { recursive: true, force: true });
     }
+  });
+
+  test("old implicit-output guidance is stale", () => {
+    expect(isFreshAgentsMdContract([
+      "<!-- AgentBridge:start -->", "AgentBridge is a transparent proxy.", "Do not bypass it.",
+      "Use sendToClaude to talk back.", "Git operations are handled by Claude.",
+      "Roles: Implementer, Executor, Verifier.", "<!-- AgentBridge:end -->",
+    ].join("\n"))).toBe(false);
   });
 
   test("isFreshAgentsMdContract recognizes a complete contract block", () => {

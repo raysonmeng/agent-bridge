@@ -475,10 +475,10 @@ describe("Message delivery: reply pending hint", () => {
     adapter.queueFallbackMessage(makeBridgeMessage("waiting msg 1"));
     adapter.queueFallbackMessage(makeBridgeMessage("waiting msg 2"));
 
-    const result = await adapter.handleReply({ chat_id: "test", text: "hello codex" });
+    const result = await adapter.handleReply({ to: "codex", chat_id: "test", text: "hello codex" });
     const text = result.content[0].text;
 
-    expect(text).toContain("Reply sent to Codex.");
+    expect(text).toContain("Message accepted by daemon for the explicit recipient; not a read receipt.");
     expect(text).toContain("2 unread Codex message");
     expect(text).toContain("get_messages");
   });
@@ -488,15 +488,15 @@ describe("Message delivery: reply pending hint", () => {
 
     adapter.replySender = async () => ({ success: true });
 
-    const result = await adapter.handleReply({ chat_id: "test", text: "hello codex" });
-    expect(result.content[0].text).toBe("Reply sent to Codex.");
+    const result = await adapter.handleReply({ to: "codex", chat_id: "test", text: "hello codex" });
+    expect(result.content[0].text).toBe("Message accepted by daemon for the explicit recipient; not a read receipt.");
   });
 
   test("handleReply failures do not enqueue fallback messages", async () => {
     const adapter = createAdapter();
     adapter.replySender = async () => ({ success: false, error: "busy", code: "busy_reject" });
 
-    const result = await adapter.handleReply({ text: "hello codex" });
+    const result = await adapter.handleReply({ to: "codex", text: "hello codex" });
 
     expect(result.isError).toBe(true);
     expect(adapter.pendingMessages).toHaveLength(0);
@@ -514,209 +514,36 @@ describe("Message delivery: reply pending hint", () => {
   test("handleReply returns error when replySender is not set", async () => {
     const adapter = createAdapter();
 
-    const result = await adapter.handleReply({ text: "hello" });
+    const result = await adapter.handleReply({ to: "codex", text: "hello" });
     expect(result.isError).toBe(true);
     expect(result.content[0].text).toContain("bridge not initialized");
   });
 });
 
-describe("Reply on_busy option (protocol v2 B0/B)", () => {
-  function withCapturingSender(adapter: any, result: Record<string, unknown> = { success: true }) {
-    const calls: Array<{ content: string; requireReply?: boolean; onBusy?: string; idempotencyKey?: string }> = [];
-    adapter.replySender = async (msg: any, requireReply?: boolean, onBusy?: string, idempotencyKey?: string) => {
-      calls.push({ content: msg.content, requireReply, onBusy, idempotencyKey });
-      return result;
-    };
-    return calls;
-  }
-
-  test("on_busy defaults to reject when omitted", async () => {
+describe("Explicit local reply controls", () => {
+  for (const option of [
+    { on_busy: "reject" }, { on_busy: "steer" }, { on_busy: "interrupt" }, { on_busy: "abort" },
+    { require_reply: true }, { require_reply: false }, { wrap_up: true },
+    { idempotency_key: "task-42" }, { idempotency_key: "" }, { idempotency_key: 42 },
+    { idempotency_key: "x".repeat(129) },
+  ]) test(`rejects unsupported legacy control ${JSON.stringify(option)}`, async () => {
     const adapter = createAdapter();
-    const calls = withCapturingSender(adapter);
-
-    const result = await adapter.handleReply({ text: "hello codex" });
-
-    expect(result.isError).toBeUndefined();
-    expect(calls).toHaveLength(1);
-    expect(calls[0].onBusy).toBe("reject");
-    expect(result.content[0].text).toBe("Reply sent to Codex.");
-  });
-
-  test("on_busy=steer is passed through and the result text says so", async () => {
-    const adapter = createAdapter();
-    const calls = withCapturingSender(adapter);
-
-    const result = await adapter.handleReply({ text: "mid-course fix", on_busy: "steer" });
-
-    expect(result.isError).toBeUndefined();
-    expect(calls).toHaveLength(1);
-    expect(calls[0].onBusy).toBe("steer");
-    expect(result.content[0].text).toContain("steered into the running turn");
-    expect(result.content[0].text).toContain("system_steer_failed");
-  });
-
-  test("on_busy=interrupt is accepted and passed through (protocol v2 PR B)", async () => {
-    const adapter = createAdapter();
-    const calls = withCapturingSender(adapter);
-
-    const result = await adapter.handleReply({ text: "drop everything, new priority", on_busy: "interrupt" });
-
-    expect(result.isError).toBeUndefined();
-    expect(calls).toHaveLength(1);
-    expect(calls[0].onBusy).toBe("interrupt");
-    expect(result.content[0].text).toContain("new turn");
-    // Recommend #1: the wording must NOT unconditionally assert an interrupt
-    // happened (the race-degrade path injects without interrupting anything).
-    expect(result.content[0].text).toContain("interrupted first");
-    expect(result.content[0].text).toContain("already finished");
-  });
-
-  test("invalid on_busy value errors before sending anything", async () => {
-    const adapter = createAdapter();
-    const calls = withCapturingSender(adapter);
-
-    const result = await adapter.handleReply({ text: "hello", on_busy: "abort" });
-
+    let sent = false;
+    adapter.replySender = async () => { sent = true; return { success: true }; };
+    const result = await adapter.handleReply({ to: "codex", text: "hello", ...option });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("invalid on_busy value");
-    expect(result.content[0].text).toContain('"abort"');
-    expect(calls).toHaveLength(0);
+    expect(result.content[0].text).toContain("legacy turn controls are unsupported");
+    expect(sent).toBe(false);
   });
 
-  test("require_reply combined with on_busy=steer is now allowed (PR B real semantics)", async () => {
-    // The B0 loud rejection is gone: the daemon arms the reply expectation
-    // when the steer is ACCEPTED into the running turn.
+  test("explicit messages preserve sender error codes", async () => {
     const adapter = createAdapter();
-    const calls = withCapturingSender(adapter);
-
-    const result = await adapter.handleReply({ text: "hello", on_busy: "steer", require_reply: true });
-
-    expect(result.isError).toBeUndefined();
-    expect(calls).toHaveLength(1);
-    expect(calls[0].onBusy).toBe("steer");
-    expect(calls[0].requireReply).toBe(true);
-  });
-
-  test("require_reply combined with on_busy=interrupt is allowed (starts a NEW turn)", async () => {
-    const adapter = createAdapter();
-    const calls = withCapturingSender(adapter);
-
-    const result = await adapter.handleReply({ text: "hello", on_busy: "interrupt", require_reply: true });
-
-    expect(result.isError).toBeUndefined();
-    expect(calls).toHaveLength(1);
-    expect(calls[0].onBusy).toBe("interrupt");
-    expect(calls[0].requireReply).toBe(true);
-  });
-
-  test("on_busy=reject explicit value behaves like the default", async () => {
-    const adapter = createAdapter();
-    const calls = withCapturingSender(adapter);
-
-    const result = await adapter.handleReply({ text: "hello", on_busy: "reject", require_reply: true });
-
-    expect(result.isError).toBeUndefined();
-    expect(calls).toHaveLength(1);
-    expect(calls[0].onBusy).toBe("reject");
-    expect(calls[0].requireReply).toBe(true);
-  });
-
-  test("a failure result's machine-readable code is surfaced in the error text", async () => {
-    const adapter = createAdapter();
-    withCapturingSender(adapter, { success: false, error: "Codex is busy executing a turn.", code: "busy_reject" });
-
-    const result = await adapter.handleReply({ text: "hello" });
-
+    adapter.replySender = async () => ({ success: false, error: "Codex is busy", code: "busy_reject" });
+    const result = await adapter.handleReply({ to: "codex", text: "hello" });
     expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("[busy_reject]");
-    expect(result.content[0].text).toContain("Codex is busy");
-  });
-
-  test("a failure result without a code keeps the legacy error shape", async () => {
-    const adapter = createAdapter();
-    withCapturingSender(adapter, { success: false, error: "plain failure" });
-
-    const result = await adapter.handleReply({ text: "hello" });
-
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toBe("Error: plain failure");
-  });
-});
-
-describe("Reply idempotency_key option (protocol v2 PR B)", () => {
-  function withCapturingSender(adapter: any) {
-    const calls: Array<{ idempotencyKey?: string }> = [];
-    adapter.replySender = async (_msg: any, _requireReply?: boolean, _onBusy?: string, idempotencyKey?: string) => {
-      calls.push({ idempotencyKey });
-      return { success: true };
-    };
-    return calls;
-  }
-
-  test("idempotency_key is passed through to the sender", async () => {
-    const adapter = createAdapter();
-    const calls = withCapturingSender(adapter);
-
-    const result = await adapter.handleReply({ text: "hello", idempotency_key: "task-42-attempt-1" });
-
-    expect(result.isError).toBeUndefined();
-    expect(calls).toHaveLength(1);
-    expect(calls[0].idempotencyKey).toBe("task-42-attempt-1");
-  });
-
-  test("omitted idempotency_key sends undefined (bypasses the machine)", async () => {
-    const adapter = createAdapter();
-    const calls = withCapturingSender(adapter);
-
-    await adapter.handleReply({ text: "hello" });
-
-    expect(calls).toHaveLength(1);
-    expect(calls[0].idempotencyKey).toBeUndefined();
-  });
-
-  test("empty idempotency_key errors before sending", async () => {
-    const adapter = createAdapter();
-    const calls = withCapturingSender(adapter);
-
-    const result = await adapter.handleReply({ text: "hello", idempotency_key: "" });
-
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("non-empty string");
-    expect(calls).toHaveLength(0);
-  });
-
-  test("non-string idempotency_key errors before sending", async () => {
-    const adapter = createAdapter();
-    const calls = withCapturingSender(adapter);
-
-    const result = await adapter.handleReply({ text: "hello", idempotency_key: 42 });
-
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("non-empty string");
-    expect(calls).toHaveLength(0);
-  });
-
-  test("idempotency_key longer than 128 chars errors before sending", async () => {
-    const adapter = createAdapter();
-    const calls = withCapturingSender(adapter);
-
-    const result = await adapter.handleReply({ text: "hello", idempotency_key: "x".repeat(129) });
-
-    expect(result.isError).toBe(true);
-    expect(result.content[0].text).toContain("too long");
-    expect(result.content[0].text).toContain("max 128");
-    expect(calls).toHaveLength(0);
-  });
-
-  test("a 128-char idempotency_key is exactly at the limit and accepted", async () => {
-    const adapter = createAdapter();
-    const calls = withCapturingSender(adapter);
-
-    const result = await adapter.handleReply({ text: "hello", idempotency_key: "k".repeat(128) });
-
-    expect(result.isError).toBeUndefined();
-    expect(calls).toHaveLength(1);
-    expect(calls[0].idempotencyKey).toBe("k".repeat(128));
+    expect(result.content[0].text).toBe("Error [busy_reject]: Codex is busy");
+    adapter.replySender = async () => ({ success: false, error: "plain failure" });
+    expect((await adapter.handleReply({ to: "codex", text: "hello" })).content[0].text).toBe("Error: plain failure");
   });
 });
 

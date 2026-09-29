@@ -53,9 +53,9 @@ export function checkAgentsMdContract(cwd: string): AgentsContractCheck {
 export function isFreshAgentsMdContract(content: string): boolean {
   if (!content.includes(`<!-- ${MARKER_ID}:start -->`)) return false;
   return (
-    content.includes("transparent proxy") &&
-    content.includes("Do not") &&
-    content.includes("sendToClaude") &&
+    content.includes("agentbridge_local_send") &&
+    content.includes("in_reply_to") &&
+    content.includes("ordinary output is never forwarded") &&
     content.includes("Git operations") &&
     content.includes("Implementer, Executor, Verifier")
   );

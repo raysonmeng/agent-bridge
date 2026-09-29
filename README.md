@@ -32,7 +32,7 @@ What that buys you, concretely:
 
 ## Why not just…
 
-- **…run two terminals and copy-paste?** You can, but then you are the message bus: you ferry text by hand and guess when it is safe to interrupt. AgentBridge automates the relay: messages flow on their own, a busy-guard blocks replies during an active turn, and the bridge filters noisy intermediate events so each side sees only the other's meaningful output.
+- **…run two terminals and copy-paste?** You can, but then you are the message bus: you ferry text by hand and guess when it is safe to interrupt. AgentBridge automates the relay: an agent explicitly addresses a message to another agent, the daemon validates and delivers it into the recipient's native session, and nothing else crosses.
 - **…use a one-way delegation plugin?** Tools like `openai/codex-plugin-cc` let a host *call* Codex and get one answer back: request in, response out, no standing peer on the other side. AgentBridge keeps **both** agents live as persistent peers, and either side can push a message **mid-turn** (a review comment lands while the other is still working), not only at call boundaries.
 - **…wire up an external orchestrator?** A god-process scheduling dumb terminals is top-down: one brain, N workers that never talk to each other. AgentBridge is peer-to-peer: two full agents converse in-session, propose their own splits, and review each other, with the human steering instead of scripting every hop.
 
@@ -52,9 +52,9 @@ What that buys you, concretely:
 
 ## Features
 
-- **Bidirectional Claude ↔ Codex messaging** in one working session — the daemon intercepts Codex output and pushes it to Claude as channel notifications; Claude replies via the `reply` MCP tool, and the bridge injects the reply into the Codex thread as a `turn/start`.
+- **Explicit local messaging between Claude, Codex and agy** — an agent sends only when it explicitly names a recipient (Claude: `reply(to=…)`; Codex: `agentbridge_local_send`; agy or a terminal: `abg chat`). Replies must cite the original `in_reply_to`. Ordinary model output is never collected or forwarded. See [Explicit local messaging](docs/antigravity.md).
 - **Push delivery with fallback** — messages arrive as channel notifications; a failed push falls back to an in-memory queue drained by `get_messages`. Loop prevention via the per-message `source` field.
-- **Turn coordination** — a busy-guard rejects replies during an active Codex turn; a per-turn inactivity watchdog stops a lost `turn/completed` from locking injection forever; noisy intermediate events are collapsed so only meaningful `agentMessage` payloads reach Claude.
+- **Turn coordination** — messages to a busy Codex wait for a safe idle turn (and budget gates) before injection; a per-turn inactivity watchdog stops a lost `turn/completed` from locking injection forever.
 - **Multiple pairs side by side** — one Claude+Codex pair per project directory, ports allocated per pair in +10 strides from 4500. Pair-aware `claude` / `codex` / `resume` / `kill` / `doctor` / `budget` via `--pair`.
 - **Resilient lifecycle** — a persistent background daemon survives Claude Code restarts (auto-reconnect with backoff); orphan-process cleanup; `abg doctor` read-only diagnostics; `abg pairs prune` reclaims stranded state.
 - **Thread auto-resume** — bare `abg codex` resumes the pair's last Codex thread; `abg resume` prints/performs the resume commands for both sides.
@@ -62,13 +62,12 @@ What that buys you, concretely:
 
 ## Context handling — real-time, without the context blowing up
 
-A common worry about real-time bidirectional messaging is that the two agents' contexts merge and grow without bound. They don't. **The bridge passes messages, not context** — each agent keeps its own context window, and the bridge never copies one agent's full transcript into the other. (And which agent plans vs executes is your call — the roles aren't fixed; Codex can drive Claude just as easily.) Three filters keep what actually crosses small:
+A common worry about real-time bidirectional messaging is that the two agents' contexts merge and grow without bound. They don't. **The bridge passes messages, not context** — each agent keeps its own context window, and the bridge never copies one agent's full transcript into the other. (And which agent plans vs executes is your call — the roles aren't fixed; Codex can drive Claude just as easily.) What crosses is small by construction:
 
-1. **Only `agentMessage` crosses.** The bridge forwards an agent's actual conclusions, not its tool-call noise — `commandExecution`, `fileChange`, and reasoning deltas never reach the other side, nor does its full scrollback.
-2. **Three-tier marker routing** (default `filtered` mode). Each message is tagged and the daemon routes by tag: `[IMPORTANT]` forwards immediately, `[STATUS]` is buffered and batched into one periodic summary (default: 3 updates or 15s), `[FYI]` is dropped. The marker rules live once in the project's `AGENTS.md` (written by `abg init`), loaded at agent startup.
-3. **The collaboration contract lives once** in `AGENTS.md`, not appended to every message (which would pollute every thread and its resume title).
+1. **Only explicit messages cross.** An agent's ordinary answers, tool output, reasoning and scrollback stay in its own session. Only a message the agent deliberately addresses with a recipient (and, for a reply, the original message ID) is delivered.
+2. **The collaboration contract lives once** in `AGENTS.md` / `CLAUDE.md` (written by `abg init`), not appended to every message (which would pollute every thread and its resume title).
 
-Net effect: each side receives a curated stream of meaningful messages, so context grows with the number of real exchanges — not the other agent's raw activity. Set `AGENTBRIDGE_FILTER_MODE=full` (or the config equivalent) when you *do* want the unfiltered stream.
+Net effect: context grows with the number of real, intentional exchanges — not the other agent's raw activity.
 
 ## Prerequisites
 
@@ -220,12 +219,13 @@ AgentBridge is a **two-process** local bridge:
 
 | Direction | Path |
 |-----------|------|
-| **Codex -> Claude** | `daemon.ts` captures `agentMessage` -> control WS -> `bridge.ts` -> `notifications/claude/channel` |
-| **Claude -> Codex** | Claude calls the `reply` tool -> `bridge.ts` -> control WS -> `daemon.ts` -> `turn/start` injects into the Codex thread |
+| **Codex -> Claude** | Codex calls `agentbridge_local_send(to="claude")` -> `daemon.ts` validates -> control WS -> `bridge.ts` -> `notifications/claude/channel` |
+| **Claude -> Codex** | Claude calls `reply(to="codex")` -> `bridge.ts` -> control WS -> `daemon.ts` -> `turn/start` injects into the Codex thread when idle |
+| **agy <-> others** | `abg chat --from agy --to …` inside agy -> daemon; inbound via the `abg agy attach` adapter -> native `agentapi send-message` |
 
 ### Loop prevention
 
-Each message carries a `source` field (`"claude"` or `"codex"`). The bridge never forwards a message back to its origin.
+Every message names an explicit sender and recipient; the daemon rejects a message whose recipient is its own sender, and a reply is accepted only once, from the original recipient back to the original sender.
 
 ## Project Config
 
@@ -283,7 +283,7 @@ AgentBridge can keep a long task moving across subscription-quota windows instea
 
 ## Current Limitations
 
-- Only forwards `agentMessage` items, not intermediate `commandExecution`, `fileChange`, or similar events
+- Only explicitly addressed messages are delivered; ordinary output, `commandExecution`, `fileChange` and similar events are never forwarded
 - Single Codex thread per pair, no multi-session support within a pair yet
 - Single Claude foreground connection per pair; a new Claude session replaces the previous one
 - Multiple pairs run side-by-side on one machine (one per project directory); Windows is not an officially supported platform yet

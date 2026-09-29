@@ -103,7 +103,7 @@ export class ConnectionSession {
    * and is tracked in pendingBackpressure so detach can re-buffer it. (Treating
    * -1 as failure would re-buffer an already-queued message and deliver twice.)
    */
-  send(message: BridgeMessage): boolean {
+  send(message: BridgeMessage, replayOnReconnect = true): boolean {
     try {
       const result = this.ws.send(
         JSON.stringify({ type: "codex_to_claude", message } satisfies ControlServerMessage),
@@ -116,7 +116,8 @@ export class ConnectionSession {
         // Enqueued but not on the wire: Bun owns the bytes until `drain`
         // confirms delivery, and drops them if the socket closes first. Track
         // the message so detach can re-buffer it for the next attach.
-        this.ws.data.pendingBackpressure.push(message);
+        // Explicit local messages belong to this socket, not its replacement.
+        if (replayOnReconnect) this.ws.data.pendingBackpressure.push(message);
       }
       return true;
     } catch (err: any) {

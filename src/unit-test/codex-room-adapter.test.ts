@@ -3,7 +3,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { CodexAdapter } from "../codex-adapter";
-import { CODEX_ROOM_TOOLS, CodexRoomInbox, roomToolResult } from "../codex-room";
+import { CODEX_LOCAL_TOOLS, CODEX_ROOM_TOOLS, CodexRoomInbox, roomToolResult } from "../codex-room";
 
 function setup() {
   const adapter = new CodexAdapter(4510, 4511, join(mkdtempSync(join(tmpdir(), "abg-room-adapter-")), "test.log")) as any;
@@ -209,5 +209,29 @@ describe("Codex room dynamic protocol", () => {
     expect(valid()).toBe(false);
     resolve(roomToolResult(true, "done")); await tick();
     expect(replies).toHaveLength(0); expect(replacement).toHaveLength(0);
+  });
+});
+
+
+describe("explicit local tool boundary", () => {
+  test("unaddressed or malformed bodies never invoke the daemon handler", async () => {
+    const { adapter, replies } = setup();
+    const calls: unknown[] = [];
+    adapter.configureRoomTools(() => false, async (_name: string, args: unknown) => {
+      calls.push(args); return roomToolResult(true, "accepted");
+    }, undefined, CODEX_LOCAL_TOOLS);
+    for (const args of [{ text: "ordinary" }, { text: "reply", in_reply_to: "12345678-1234-1234-1234-123456789abc" }, { to: [], text: "x" },
+      { to: "claude", text: "x", in_reply_to: "not-a-uuid" }, { to: "claude", text: 123 }, { to: "claude", text: "x", in_reply_to: "" }, { to: "claude", text: "x", require_reply: true }]) {
+      const req = request("agentbridge_local_send"); req.params.arguments = args;
+      adapter.handleServerRequest(req, JSON.stringify(req)); await tick();
+      expect(replies.at(-1).result.success).toBe(false);
+    }
+    expect(calls).toEqual([]);
+    const args = { to: "claude", text: "answer", in_reply_to: "12345678-1234-1234-1234-123456789abc" };
+    const req = request("agentbridge_local_send"); req.params.arguments = args;
+    adapter.handleServerRequest(req, JSON.stringify(req)); await tick();
+    expect(calls).toEqual([args]);
+    expect(replies.at(-1).result.success).toBe(true);
+    expect(CODEX_LOCAL_TOOLS.find(tool => tool.name === "agentbridge_local_send")!.inputSchema.required).toEqual(["text", "to"]);
   });
 });

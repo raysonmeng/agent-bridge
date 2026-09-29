@@ -1,3 +1,4 @@
+import { isLocalMessageId } from "./local-chat";
 import { EventEmitter } from "node:events";
 import type { BridgeMessage } from "./types";
 import type { BudgetSnapshot } from "./budget/types";
@@ -67,6 +68,7 @@ export interface DaemonClientOptions {
 }
 
 export class DaemonClient extends EventEmitter<DaemonClientEvents> {
+  private localChatVersion: number | undefined;
   private ws: WebSocket | null = null;
   private wsId: number = 0; // Track socket identity for debugging
   private nextRequestId = 1;
@@ -107,6 +109,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       this.log(`connect() skipped — ws#${this.wsId} already OPEN`);
       return;
     }
+    this.localChatVersion = undefined;
 
     // Close any lingering socket in non-OPEN state to avoid orphans
     if (this.ws) {
@@ -251,6 +254,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
     if (!this.ws || this.ws.readyState !== WebSocket.OPEN) {
       return { success: false, error: "AgentBridge daemon is not connected." };
     }
+
     const requestId = `room_${Date.now()}_${this.nextRequestId++}`;
     const pending = this.pendingRoomSays.register(requestId, {
       timeoutMs,
@@ -386,15 +390,20 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       return { success: false, error: "AgentBridge daemon is not connected." };
     }
 
+    if (typeof message.to !== "string" || !message.to.trim() || message.to.length > 128 ||
+      typeof message.content !== "string" || !message.content.trim() || message.content.length > 4000 ||
+      (message.inReplyTo !== undefined && !isLocalMessageId(message.inReplyTo))) {
+      return { success: false, error: "Explicit recipient and valid text are required; message was NOT sent." };
+    }
+    if (requireReply !== undefined || onBusy !== undefined || idempotencyKey !== undefined || wrapUp !== undefined) {
+      return { success: false, error: "Legacy turn controls are unsupported; message was NOT sent." };
+    }
+    if (this.localChatVersion !== 2) {
+      return { success: false, code: "unsupported_routing", error: "This daemon does not support explicit local routing; message was NOT sent. Upgrade/restart only this pair when safe." };
+    }
+
     const requestId = `reply_${Date.now()}_${this.nextRequestId++}`;
-    // CLIENT_REPLY_TIMEOUT_MS applies to the daemon's IMMEDIATE result. The
-    // interrupt path can legitimately defer the result until the daemon-side
-    // terminal-wait budget elapses — that budget is CLAMPED below this value
-    // (see interrupt-timing.ts: clampInterruptTimeoutMs), so the daemon always
-    // answers before this timer fires. INVARIANT: do not shrink this timeout
-    // without also lowering MAX_INTERRUPT_TIMEOUT_MS, or an over-large
-    // AGENTBRIDGE_INTERRUPT_TIMEOUT_MS could outlast it and a false timeout +
-    // Claude retry would double-turn.
+    // This bounds the immediate daemon admission result, not an agent reply.
     const pending = this.pendingReplies.register(requestId, {
       timeoutMs: CLIENT_REPLY_TIMEOUT_MS,
       onTimeout: ({ resolve }) =>
@@ -404,10 +413,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
       type: "claude_to_codex",
       requestId,
       message,
-      ...(requireReply ? { requireReply: true } : {}),
-      ...(onBusy && onBusy !== "reject" ? { onBusy } : {}),
-      ...(idempotencyKey ? { idempotencyKey } : {}),
-      ...(wrapUp ? { wrapUp: true } : {}),
+
     });
     return pending;
   }
@@ -461,6 +467,7 @@ export class DaemonClient extends EventEmitter<DaemonClientEvents> {
           });
           return;
         case "status":
+          this.localChatVersion = message.status.localChatVersion;
           this.emit("status", message.status);
           return;
         case "incumbent_status":

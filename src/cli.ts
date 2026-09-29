@@ -22,7 +22,7 @@ export const REFRESH_COMMANDS = new Set(["claude", "codex", "resume"]);
 export const NOTIFY_COMMANDS = new Set(["claude", "codex", "init", "dev", "resume"]);
 
 /** Subcommands that accept a `--pair <name>` selector. */
-export const PAIR_AWARE_COMMANDS = new Set(["claude", "codex", "kill", "doctor", "budget", "resume", "logs"]);
+export const PAIR_AWARE_COMMANDS = new Set(["claude", "codex", "agy", "chat", "kill", "doctor", "budget", "resume", "logs"]);
 
 /**
  * Split argv into the subcommand and its args, allowing a leading `--pair <name>`
@@ -109,6 +109,15 @@ async function main(command: string | undefined, restArgs: string[]) {
       const { runCodex } = await import("./cli/codex");
       await runCodex(restArgs);
       break;
+    case "agy":
+      await (await import("./cli/agy")).runAgy(restArgs);
+      break;
+    case "chat":
+      await (await import("./cli/agy")).runChat(restArgs);
+      break;
+    case "agy-hook":
+      await (await import("./antigravity-hook")).runAntigravityHook();
+      break;
     case "resume":
       const { runResume } = await import("./cli/resume");
       await runResume(restArgs);
@@ -188,6 +197,10 @@ Commands:
   claude [args...]   Start Claude Code with push channel enabled
   codex [args...]    Start Codex TUI connected to AgentBridge daemon
                      (bare command auto-resumes the last thread; --new starts fresh)
+  agy [args...]      Start native Antigravity CLI with a separate local chat adapter
+  chat --list        List local Claude/Codex routes and attached Antigravity sessions
+  chat --from agy --to claude --message TEXT
+                     Explicit pair-local messages; submission is not a read receipt
   resume [claude|codex]
                      No target: print resume commands for this directory's last
                      Claude session + this pair's current Codex thread.

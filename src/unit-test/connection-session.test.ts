@@ -76,6 +76,17 @@ describe("ConnectionSession.send — Bun -1/0/throw semantics", () => {
     expect(ctx.session.pendingBackpressureSize).toBe(1);
   });
 
+  test("explicit local delivery never replays into a replacement session", () => {
+    const backlog = new BoundedMessageBuffer({ cap: 100, overflowLabel: "test", log: () => {} });
+    ctx.ws.sendResult = -1;
+    expect(ctx.session.send(msg("local"), false)).toBe(true);
+    expect(ctx.session.drainPendingBackpressureInto(backlog)).toBe(0);
+    expect(backlog.length).toBe(0);
+    ctx.ws.sendResult = 0;
+    expect(ctx.session.send(msg("dropped"), false)).toBe(false);
+    expect(ctx.session.pendingBackpressureSize).toBe(0);
+  });
+
   test("dropped (0) returns false and tracks nothing", () => {
     ctx.ws.sendResult = 0;
     expect(ctx.session.send(msg("a"))).toBe(false);

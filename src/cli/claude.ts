@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import { launchAgentProfile } from "./agent-profile";
 import { existsSync } from "node:fs";
 import { constants as osConstants } from "node:os";
 import { MARKETPLACE_NAME, PLUGIN_NAME } from "../cli";
@@ -109,9 +110,13 @@ export async function runClaude(args: string[]) {
     ...rest,
   ];
 
+  const profile = launchAgentProfile(rest, "Claude", process.env.ANTHROPIC_MODEL);
   const child = spawn("claude", fullArgs, {
     stdio: "inherit",
-    env: process.env,
+    env: { ...process.env,
+      AGENTBRIDGE_CLAUDE_NAME: profile.name,
+      AGENTBRIDGE_CLAUDE_MODEL: profile.model ?? "",
+    },
   });
 
   child.on("exit", (code, signal) => {

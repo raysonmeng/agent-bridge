@@ -14,6 +14,8 @@ export interface RoomManagerDeps {
   getClaude: () => ConnectionSession | null;
   /** Whether the Codex TUI is connected, resolved at CALL time. */
   isTuiConnected: () => boolean;
+  /** Third-party native adapters keep the pair alive without claiming a TUI slot. */
+  hasAdditionalClients?: () => boolean;
   /** Self-shutdown trigger (daemon `shutdown(reason)`). */
   onIdleShutdown: (reason: string) => void;
 }
@@ -93,13 +95,14 @@ export class RoomManager {
     this.cancelIdleShutdown();
     if (this.deps.getClaude()) return; // still has a client
     if (this.deps.isTuiConnected()) return; // TUI still connected
+    if (this.deps.hasAdditionalClients?.()) return;
 
     this.deps.log(
       `No clients connected. Daemon will shut down in ${this.deps.idleShutdownMs}ms if no one reconnects.`,
     );
     this.idleShutdownTimer = setTimeout(() => {
       // Re-check CURRENT state before shutting down (never the scheduled-time value).
-      if (this.deps.getClaude() || this.deps.isTuiConnected()) {
+      if (this.deps.getClaude() || this.deps.isTuiConnected() || this.deps.hasAdditionalClients?.()) {
         this.deps.log("Idle shutdown cancelled: client reconnected during grace period");
         return;
       }

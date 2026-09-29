@@ -27,6 +27,8 @@ export interface MaxPermissionPlan {
 }
 
 export const CLAUDE_MAX_PERMISSION_FLAG = "--dangerously-skip-permissions";
+export const AGY_MAX_PERMISSION_FLAG = "--dangerously-skip-permissions";
+export const AGY_MAX_PERMISSION_SUPPRESSORS = [AGY_MAX_PERMISSION_FLAG, "--mode", "--sandbox"];
 /** Explicit permission preferences that suppress the claude injection. */
 export const CLAUDE_MAX_PERMISSION_SUPPRESSORS = [
   CLAUDE_MAX_PERMISSION_FLAG,

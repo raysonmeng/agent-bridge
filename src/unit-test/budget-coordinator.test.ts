@@ -1426,7 +1426,9 @@ describe("admission directive emission — v3 P3 (M3b, turnPhase-aware)", () => 
     expect(ads).toHaveLength(1);
     expect(ads[0]!.content).toContain("收尾保护");
     expect(ads[0]!.content).toContain("budget_admission");
-    expect(ads[0]!.content).toContain("wrap_up");
+    // Local routing v2 rejects wrap_up/steer, so the directive must not advise them.
+    expect(ads[0]!.content).not.toContain("wrap_up");
+    expect(ads[0]!.content).not.toContain("steer");
   });
 
   test("defers the directive while a Codex turn runs, flushes on idle", async () => {
