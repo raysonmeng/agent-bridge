@@ -16,9 +16,10 @@ describe("role-aware collaboration guidance", () => {
   });
 
   test("claude instructions include turn coordination guidance", () => {
-    expect(CLAUDE_INSTRUCTIONS).toContain("Codex is working");
-    expect(CLAUDE_INSTRUCTIONS).toContain("Codex finished");
-    expect(CLAUDE_INSTRUCTIONS).toContain("busy error");
+    expect(CLAUDE_INSTRUCTIONS).toContain("Codex working/finished notices report only Codex turn state");
+    expect(CLAUDE_INSTRUCTIONS).toContain("explicit to and optional in_reply_to");
+    expect(CLAUDE_INSTRUCTIONS).toContain("do not block explicitly addressed messages to other local agents");
+    expect(CLAUDE_INSTRUCTIONS).not.toContain("reply` only reaches the local Codex");
   });
 
   // The Codex-side bridge contract (message markers / git-forbidden / role
@@ -34,12 +35,12 @@ describe("role-aware collaboration guidance", () => {
     expect(AGENTS_MD_SECTION).toContain("My independent view is:");
   });
 
-  test("AGENTS.md collaboration section requires the marker at the very start", () => {
-    expect(AGENTS_MD_SECTION).toContain("very start");
-    expect(AGENTS_MD_SECTION).toContain("must be the first text");
-    expect(AGENTS_MD_SECTION).toContain("[IMPORTANT]");
-    expect(AGENTS_MD_SECTION).toContain("[STATUS]");
-    expect(AGENTS_MD_SECTION).toContain("[FYI]");
+  test("AGENTS.md collaboration section requires explicit tools, never normal output markers", () => {
+    expect(AGENTS_MD_SECTION).toContain("agentbridge_local_send");
+    expect(AGENTS_MD_SECTION).toContain("in_reply_to");
+    expect(AGENTS_MD_SECTION).toContain("ordinary output is never forwarded");
+    expect(AGENTS_MD_SECTION).toContain("do not send anything");
+    expect(AGENTS_MD_SECTION).not.toContain("No tool call needed");
   });
 
   test("AGENTS.md collaboration section forbids git write operations", () => {

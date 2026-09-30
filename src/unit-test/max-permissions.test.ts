@@ -1,11 +1,22 @@
 import { describe, expect, test } from "bun:test";
 import {
+  AGY_MAX_PERMISSION_SUPPRESSORS,
   CLAUDE_MAX_PERMISSION_SUPPRESSORS,
   CODEX_MAX_PERMISSION_SUPPRESSORS,
   planMaxPermissions,
 } from "../cli/max-permissions";
 
 describe("planMaxPermissions", () => {
+  test("agy defaults to skip permissions, respects safe and native restrictions", () => {
+    expect(planMaxPermissions([], AGY_MAX_PERMISSION_SUPPRESSORS, {}).inject).toBe(true);
+    expect(planMaxPermissions(["--safe"], AGY_MAX_PERMISSION_SUPPRESSORS, {})).toEqual({ args: [], inject: false, safeMode: true });
+    expect(planMaxPermissions([], AGY_MAX_PERMISSION_SUPPRESSORS, { AGENTBRIDGE_SAFE: "1" }).inject).toBe(false);
+    for (const args of [["--dangerously-skip-permissions"], ["--dangerously-skip-permissions=false"], ["--mode", "plan"], ["--mode=accept-edits"], ["--sandbox"]]) {
+      const plan = planMaxPermissions(args, AGY_MAX_PERMISSION_SUPPRESSORS, {});
+      expect(plan.inject).toBe(false);
+      expect(plan.args).toEqual(args);
+    }
+  });
   test("injects by default and passes args through", () => {
     const plan = planMaxPermissions(["--resume", "abc"], CLAUDE_MAX_PERMISSION_SUPPRESSORS, {});
     expect(plan.inject).toBe(true);

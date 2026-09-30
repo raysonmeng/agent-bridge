@@ -4,6 +4,7 @@ import type { BudgetSnapshot } from "./budget/types";
 import type { AppServerInfo } from "./app-server-protocol";
 
 export interface ControlClientIdentity {
+  agentProfile?: { sessionId?: string; name?: string; model?: string; modelSource?: "configured" | "runtime" | "unknown" };
   pairId?: string | null;
   pairName?: string | null;
   cwd?: string;
@@ -30,6 +31,8 @@ export interface ControlClientIdentity {
 export type TurnPhase = "idle" | "running" | "stalled" | "aborted";
 
 export interface DaemonStatus {
+  /** Independent native Antigravity local-chat protocol support. */
+  localChatVersion?: number;
   bridgeReady: boolean;
   tuiConnected: boolean;
   threadId: string | null;

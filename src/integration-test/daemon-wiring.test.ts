@@ -21,12 +21,6 @@ import { readControlToken, resolveControlTokenPath } from "../control-token";
 import { CONTRACT_VERSION } from "../contract-version";
 import { installFakeCodex } from "./fixtures/fake-codex-install";
 import { RESUME_PROMPT, claudeResumePrompt } from "../budget/resume-prompt";
-import { Broker } from "../broker";
-import { BrokerClient } from "../broker-client";
-import { SqliteStore } from "../backbone/store/sqlite-store";
-import { IdentityService } from "../backbone/identity-service";
-import { StorePskIdentityProvider } from "../backbone/identity/store-psk-identity-provider";
-import { RoomService } from "../room-service";
 
 const DAEMON_PATH = join(process.cwd(), "src", "daemon.ts");
 const DEFAULT_TEST_SLOT_START = 2500 + (process.pid % 500);
@@ -71,82 +65,76 @@ describe("daemon wiring", () => {
     }
   });
 
-  for (const pendingStart of [false, true]) test(`room notice replies stay private until local input is accepted (pending start: ${pendingStart})`, async () => {
-    const dir = mkdtempSync(join(tmpdir(), "agentbridge-room-steer-"));
-    const dbPath = join(dir, "collab.db");
-    const store = new SqliteStore(dbPath);
-    const identities = new IdentityService(store);
-    const rooms = new RoomService(store);
-    await identities.registerIdentity("local", "Local");
-    await identities.registerIdentity("peer", "Peer");
-    writeFileSync(join(dir, "auth-token"), await identities.issueToken("local"), { mode: 0o600 });
-    await rooms.createRoom("test", "Test", "local");
-    await rooms.join("test", "local");
-    await rooms.join("test", "peer");
-    const broker = new Broker({ store, identityProvider: new StorePskIdentityProvider(store), host: "127.0.0.1", port: 0, log: () => {} });
-    const url = `ws://127.0.0.1:${broker.start().port}/ws`;
-    const peer = new BrokerClient({ url, token: await identities.issueToken("peer") });
+  test("local joins announce profiles to Claude, Codex and other native agents", async () => {
+    const h = await startHarness({ pairId: "main-localjoins", pairName: "main" });
+    const identity = { pairId: "main-localjoins", cwd: h.cwd, controlToken: readControlToken(resolveControlTokenPath(h.stateDir)), contractVersion: CONTRACT_VERSION };
+    const received: any[] = [];
+    const native = await connectControlSocket(h.controlPort);
+    native.onmessage = event => { const m = JSON.parse(String(event.data)); received.push(m);
+      if (m.type === "agy_message") native.send(JSON.stringify({ type: "agy_ack", deliveryId: m.deliveryId, accepted: true })); };
     try {
-      const harness = await startHarness({
-        pairId: "main-roomsteer", pairName: "main",
-        prepare: cwd => rooms.mapCwd(cwd, "test"),
-        extraEnv: { AGENTBRIDGE_COLLAB_DB: dbPath, AGENTBRIDGE_BROKER_URL: url, FAKE_APP_NOTIFY_TURNSTART: "1", FAKE_APP_DEFER_TURNSTART: pendingStart ? "1" : "0" },
-      });
-      await harness.attachClaude();
-      await harness.connectTui();
-      await peer.connect();
-      const logText = () => readFileSync(join(harness.stateDir, "agentbridge.log"), "utf8");
-      await waitFor(() => logText().includes("room bridge: subscribed"), "room subscription", 100, 50);
-      const publish = (text: string) => {
-        const id = crypto.randomUUID();
-        peer.publish("test", { roomId: "test", messageId: id, traceId: id, idempotencyKey: id,
-          from: { agentId: "peer", agentType: "codex" }, kind: "chat", payload: { text }, timestamp: Date.now(), deliveryMode: "online_only" });
-      };
-      publish("informational notice");
-      const onBusy = pendingStart ? undefined : "steer";
-      if (pendingStart) {
-        await waitFor(() => logText().includes("Codex room inbox: submitted"), "pending room start", 100, 25);
-        harness.sendClaudeToCodex("rejected", "[force-start-error] ignore this", { onBusy });
-        await waitFor(() => logText().includes("test start rejected"), "local start rejected", 100, 25);
-      } else {
-        await waitForMessage(harness.messages, m => m.id.startsWith("system_turn_started"), "room turn started");
-        harness.sendClaudeToCodex("rejected", "[force-steer-error] ignore this", { onBusy, requireReply: true });
-        await waitForMessage(harness.messages, m => m.id.startsWith("system_steer_failed"), "steer rejected");
+      native.send(JSON.stringify({ type: "agy_attach", routingVersion: 2, identity, conversationId: "ab9da612-66aa-4195-91ba-881369f93e8b", profile: { name: "Local A", model: "model-a", modelSource: "configured" } }));
+      await waitFor(() => received.some(m => m.success), "native attached");
+      await h.attachClaude(); await h.connectTui();
+      await waitFor(() => received.filter(m => m.kind === "notice").length === 2, "Claude and Codex joins reached native");
+      expect(received.filter(m => m.kind === "notice").every(m => m.from === "daemon")).toBe(true);
+      await waitFor(() => h.messages.some(m => m.content.includes('"id":"codex"')), "Codex join reached Claude");
+      native.send(JSON.stringify({ type: "local_chat_members", requestId: "roster", identity }));
+      await waitFor(() => received.some(m => m.requestId === "roster"), "roster collected");
+      const agents = received.find(m => m.requestId === "roster").agents;
+      expect(agents.map((a: any) => a.id).sort()).toEqual(["agy:ab9da612-66aa-4195-91ba-881369f93e8b", "claude", "codex"]);
+      expect(agents[0]).toMatchObject({ name: "Local A", model: "model-a", modelSource: "configured" });
+      const other = await connectControlSocket(h.controlPort);
+      try {
+        other.send(JSON.stringify({ type: "agy_attach", routingVersion: 2, identity, conversationId: "c647e404-6a5c-4eca-aae9-ff62ca5e4b5b", profile: { name: "Local B", model: "model-b", modelSource: "configured" } }));
+        await waitFor(() => received.some(m => m.kind === "notice" && m.text.includes("Local B")), "new native reaches other native");
+        await waitFor(() => h.messages.some(m => m.content.includes("Local B")), "new native reaches Claude");
+        await waitFor(() => readFileSync(join(h.stateDir, "agentbridge.log"), "utf8").includes("Codex room inbox: submitted"), "join notice queued into native Codex");
+      } finally { other.close(); }
+    } finally { native.close(); }
+  }, 20000);
+
+  test("explicit policy rejects unaddressed Claude bodies and never forwards normal Codex output", async () => {
+    const dir = mkdtempSync(join(tmpdir(), "abg-explicit-policy-"));
+    const turnLog = join(dir, "turns.jsonl");
+    try {
+      const h = await startHarness({ pairId: "main-explicitpolicy", pairName: "main", extraEnv: { FAKE_APP_TURNSTART_LOG: turnLog } });
+      await h.attachClaude(); await h.connectTui();
+      const result = (id: string) => h.statusMessages.find(m => m.type === "claude_to_codex_result" && m.requestId === id) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }> | undefined;
+      h.controlWs!.send(JSON.stringify({ type: "claude_to_codex", requestId: "missing-to",
+        message: { id: "missing-to", source: "claude", content: "ordinary body must not reach Codex", timestamp: Date.now() } }));
+      await waitFor(() => !!result("missing-to"), "unaddressed body rejected");
+      expect(result("missing-to")!.success).toBe(false);
+      expect(existsSync(turnLog) ? readFileSync(turnLog, "utf8").trim() : "").toBe("");
+      // These removed protocols must fail before injection, not silently degrade.
+      for (const [index, control] of [{ onBusy: "steer" }, { onBusy: "interrupt" }, { requireReply: true }, { wrapUp: true }, { idempotencyKey: "legacy-key" }].entries()) {
+        const id = `unsupported-${index}`;
+        h.controlWs!.send(JSON.stringify({ type: "claude_to_codex", requestId: id,
+          message: { id, source: "claude", to: "codex", content: "must not inject", timestamp: Date.now() }, ...control }));
+        await waitFor(() => !!result(id), "legacy control rejected");
+        expect(result(id)!.success).toBe(false);
+        expect(result(id)!.error).toContain("Legacy turn controls");
       }
-      harness.sendAppCommand("agent-message:[IMPORTANT] private room output");
-      await waitFor(() => logText().includes("Agent message completed"), "private output processed", 100, 25);
-      expect(harness.messages.some(m => m.content.includes("private room output"))).toBe(false);
-      harness.sendClaudeToCodex("accepted", "Please acknowledge my local task", { onBusy, requireReply: true });
-      await waitFor(() => pendingStart
-        ? harness.statusMessages.some(m => m.type === "turn_started" && m.requestId === "accepted")
-        : logText().includes("Reply required armed on steer-accept"), "local input accepted", 100, 25);
-      if (pendingStart) {
-        harness.sendAppCommand("start-injected-turn");
-        await waitForMessage(harness.messages, m => m.id.startsWith("system_turn_started"), "deferred started notification");
-      }
-      harness.sendAppCommand("agent-message:[IMPORTANT] ACK local task");
-      await waitForMessage(harness.messages, m => m.content.includes("ACK local task"), "explicit local reply");
-      harness.sendAppCommand("complete-turn");
-      await waitForMessage(harness.messages, m => m.id.startsWith("system_turn_completed"), "room turn completed");
-      expect(harness.messages.some(m => m.id.startsWith("system_reply_missing"))).toBe(false);
-      publish("second informational notice");
-      if (pendingStart) {
-        await waitFor(() => (logText().match(/Codex room inbox: submitted/g) ?? []).length === 2, "second room submission", 100, 25);
-        harness.sendAppCommand("start-injected-turn");
-      }
-      await waitFor(() => harness.messages.filter(m => m.id.startsWith("system_turn_started")).length === 2, "second room turn", 100, 50);
-      const messagesBefore = (logText().match(/Agent message completed/g) ?? []).length;
-      harness.sendAppCommand("agent-message:[IMPORTANT] second private output");
-      await waitFor(() => (logText().match(/Agent message completed/g) ?? []).length > messagesBefore, "second output processed", 100, 25);
-      expect(harness.messages.some(m => m.content.includes("second private output"))).toBe(false);
-      await harness.close();
-    } finally {
-      peer.close();
-      await broker.stop();
-      await store.close();
-      rmSync(dir, { recursive: true, force: true });
-    }
-  }, 25000);
+      expect(existsSync(turnLog) ? readFileSync(turnLog, "utf8").trim() : "").toBe("");
+      h.sendAppCommand("agent-message:[IMPORTANT] ordinary output must remain private");
+      const logs = () => readFileSync(join(h.stateDir, "agentbridge.log"), "utf8");
+      await waitFor(() => logs().includes("Agent message completed"), "ordinary output processed");
+      expect(h.messages.some(m => m.content.includes("ordinary output must remain private"))).toBe(false);
+      h.controlWs!.send(JSON.stringify({ type: "claude_to_codex", requestId: "explicit-send",
+        message: { id: "explicit-send", source: "claude", to: "codex", content: "explicit question", timestamp: Date.now() } }));
+      await waitFor(() => !!result("explicit-send"), "explicit message accepted");
+      expect(result("explicit-send")!.success).toBe(true);
+      await waitFor(() => existsSync(turnLog) && readFileSync(turnLog, "utf8").includes("explicit question"), "explicit input injected");
+      const injection = readFileSync(turnLog, "utf8");
+      expect(injection).toContain('to=\\"claude\\"');
+      expect(injection).toContain("in_reply_to=");
+      h.sendAppCommand("agent-message:normal answer to correlated local request");
+      await waitFor(() => (logs().match(/Agent message completed/g) ?? []).length >= 2, "correlated normal output processed");
+      expect(h.messages.some(m => m.content.includes("normal answer to correlated local request"))).toBe(false);
+      const status = await (await fetch(`http://127.0.0.1:${h.controlPort}/healthz`)).json() as DaemonStatus;
+      expect(status.localChatVersion).toBe(2);
+    } finally { rmSync(dir, { recursive: true, force: true }); }
+  }, 20000);
 
   test("CSWSH guard: a WS upgrade carrying an Origin header is 403'd on BOTH the control and proxy ports, while no-Origin clients still connect", async () => {
     const harness = await startHarness({ pairId: "main-cswshabcd", pairName: "main" });
@@ -301,66 +289,6 @@ describe("daemon wiring", () => {
     expect(exitWarning.content).toContain("Codex app-server exited");
     expect(exitWarning.content).toContain("agentbridge codex");
   }, 45000);
-
-  test("filtered routing buffers STATUS, flushes it on IMPORTANT, then buffers STATUS during attention", async () => {
-    const harness = await startHarness({
-      pairId: "main-routeabcd",
-      pairName: "main",
-      extraEnv: { AGENTBRIDGE_ATTENTION_WINDOW_MS: "1000" },
-    });
-
-    await harness.attachClaude();
-    await harness.connectTui();
-
-    harness.sendAppCommand("agent-message:[STATUS] buffered before important");
-    await sleep(200);
-    expect(harness.messages.some((m) => m.content.includes("buffered before important"))).toBe(false);
-
-    harness.sendAppCommand("agent-message:[IMPORTANT] important flush trigger");
-    const summary = await waitForMessage(
-      harness.messages,
-      (message) => message.content.includes("buffered before important"),
-      "status summary flushed by IMPORTANT",
-    );
-    const important = await waitForMessage(
-      harness.messages,
-      (message) => message.content.includes("important flush trigger"),
-      "forwarded IMPORTANT message",
-    );
-
-    expect(summary.content).toContain("[STATUS summary");
-    expect(important.content).toContain("[IMPORTANT] important flush trigger");
-
-    harness.sendAppCommand("agent-message:[STATUS] buffered during attention");
-    await sleep(200);
-    expect(harness.messages.some((m) => m.content.includes("buffered during attention"))).toBe(false);
-  }, 20000);
-
-  test("full mode forwards IMPORTANT without opening an attention window", async () => {
-    const harness = await startHarness({
-      pairId: "main-fullroute",
-      pairName: "main",
-      extraEnv: {
-        AGENTBRIDGE_FILTER_MODE: "full",
-        AGENTBRIDGE_ATTENTION_WINDOW_MS: "1000",
-      },
-    });
-
-    await harness.attachClaude();
-    await harness.connectTui();
-
-    harness.sendAppCommand("agent-message:[IMPORTANT] full mode important");
-    await waitForMessage(
-      harness.messages,
-      (message) => message.content.includes("full mode important"),
-      "full-mode IMPORTANT",
-    );
-
-    const res = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
-    expect(res.ok).toBe(true);
-    const status = (await res.json()) as DaemonStatus;
-    expect(status.attentionWindowActive).toBe(false);
-  }, 20000);
 
   test("budget pause gate: STOP directive, reply rejected, RESUME reopens", async () => {
     // Fixture probe driven by per-agent JSON files the test rewrites at runtime
@@ -866,6 +794,7 @@ describe("daemon wiring", () => {
           AGENTBRIDGE_QUOTA_PROBE: probePath,
           AGENTBRIDGE_BUDGET_POLL_SECONDS: "5",
           FAKE_APP_TURNSTART_LOG: turnStartLog,
+          FAKE_APP_NOTIFY_TURNSTART: "1",
         },
       });
 
@@ -890,6 +819,7 @@ describe("daemon wiring", () => {
       const first = readTurnStarts()[0]!;
       expect(first.effort).toBe("low");
 
+      harness.sendAppCommand("complete-turn");
       // Tier returns to full → explicit restore override on the next injection.
       writeUsage("codex", 10);
       await waitFor(async () => {
@@ -907,6 +837,7 @@ describe("daemon wiring", () => {
       const second = readTurnStarts()[1]!;
       expect(second.effort).toBe("high"); // configured codexTiers.full restore value
 
+      harness.sendAppCommand("complete-turn");
       // Pending consumed: a further injection carries NO override.
       harness.sendClaudeToCodex("req-tier-3", "steady state");
       await waitFor(() => readTurnStarts().length >= 3, "third recorded turn/start", 100, 100);
@@ -918,7 +849,7 @@ describe("daemon wiring", () => {
     }
   }, 60000);
 
-  test("v3 P3 admission gate: new turns rejected with budget_admission; wrap-up allowed", async () => {
+  test("v3 P3 admission gate: addressed new turns rejected and legacy wrap-up cannot bypass", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-budget-admission-fixture-"));
     const probePath = join(fixtureRoot, "probe.sh");
     const turnStartLog = join(fixtureRoot, "turn-starts.jsonl");
@@ -986,51 +917,18 @@ describe("daemon wiring", () => {
       expect(rejected.error).toContain("收尾保护");
       expect(readTurnStarts().length).toBe(0); // new task did NOT inject
 
-      // 2. A wrap-up reply is let through the admission gate → injects a turn.
-      harness.sendClaudeToCodex("req-adm-wrap", "wrap the current work to a checkpoint", { wrapUp: true });
-      await waitFor(() => readTurnStarts().length >= 1, "wrap-up turn injected past admission gate", 100, 100);
-
-      // The wrap-up slot is consumed ONLY on the confirmed injection (deferred from
-      // the gate). So after exactly one injected wrap-up the count is 1 — and the
-      // earlier rejected new-turn (step 1) consumed nothing.
-      const quotaFile = join(harness.stateDir, "admission-quota.json");
-      await waitFor(() => existsSync(quotaFile), "admission-quota.json persisted", 100, 100);
-      const quota = JSON.parse(readFileSync(quotaFile, "utf-8"));
-      expect(quota.wrapUpUsed).toBe(1);
-      // The checkpoint baton is a CLOSED-state action only; admission-closed must
-      // never fire it (M3b). The single turn-start so far is the wrap-up, not a baton.
-      expect(quota.checkpointBatonUsed).toBe(false);
-      expect(
-        readTurnStarts().some((p) => {
-          const input = (p.input as Array<{ text?: string }> | undefined) ?? [];
-          return input.some((i) => typeof i.text === "string" && i.text.includes("系统发起"));
-        }),
-      ).toBe(false);
-
-      // 3. FAIL CLOSED (M3a round-2 REAL): make the quota file unwritable (replace
-      // it with a directory so atomicWriteJson's rename throws at commit) → a
-      // further wrap-up is REJECTED with budget_admission and does NOT inject — the
-      // gate never lets an UNCOUNTED turn through on a write failure.
-      rmSync(quotaFile, { force: true });
-      mkdirSync(quotaFile);
-      const turnsBefore = readTurnStarts().length;
-      harness.sendClaudeToCodex("req-adm-wrapfail", "wrap up again (commit write fails)", { wrapUp: true });
-      await waitFor(
-        () => harness.statusMessages.some((m) => m.type === "claude_to_codex_result" && m.requestId === "req-adm-wrapfail"),
-        "result for req-adm-wrapfail",
-      );
-      const wrapFail = harness.statusMessages.find(
-        (m) => m.type === "claude_to_codex_result" && m.requestId === "req-adm-wrapfail",
-      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
-      expect(wrapFail.success).toBe(false);
-      expect(wrapFail.code).toBe("budget_admission");
-      expect(readTurnStarts().length).toBe(turnsBefore); // fail-closed: NOT injected
+      harness.sendClaudeToCodex("req-adm-wrap", "legacy wrap-up cannot bypass", { wrapUp: true });
+      await waitFor(() => harness.statusMessages.some(m => m.type === "claude_to_codex_result" && m.requestId === "req-adm-wrap"), "wrap-up rejected");
+      const wrap = harness.statusMessages.find(m => m.type === "claude_to_codex_result" && m.requestId === "req-adm-wrap") as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
+      expect(wrap.success).toBe(false);
+      expect(wrap.error).toContain("Legacy turn controls");
+      expect(readTurnStarts()).toEqual([]);
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
   }, 45000);
 
-  test("v3 P3 admission gate: weekly-runway trigger (no fresh 5h) still COUNTS wrap-ups (cap not bypassed)", async () => {
+  test("v3 P3 admission gate: weekly-runway trigger (no fresh 5h) rejects addressed tasks", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-budget-admweekly-fixture-"));
     const probePath = join(fixtureRoot, "probe.sh");
     const turnStartLog = join(fixtureRoot, "turn-starts.jsonl");
@@ -1084,15 +982,12 @@ describe("daemon wiring", () => {
         }
       }, "gateState=admission-closed (weekly trigger) on /healthz", 200, 100);
 
-      // A wrap-up is let through AND counted on the weekly-window key (not uncounted):
-      // the 5h key would be 0 here, so the daemon must fall back to the weekly reset.
-      harness.sendClaudeToCodex("req-admwk-wrap", "wrap up under weekly-triggered admission", { wrapUp: true });
-      await waitFor(() => readTurnStarts().length >= 1, "wrap-up injected under weekly admission", 100, 100);
-      const quotaFile = join(harness.stateDir, "admission-quota.json");
-      await waitFor(() => existsSync(quotaFile), "admission-quota.json persisted on the weekly key", 100, 100);
-      const quota = JSON.parse(readFileSync(quotaFile, "utf-8"));
-      expect(quota.wrapUpUsed).toBe(1); // COUNTED (cap not bypassed)
-      expect(quota.fiveHourResetEpoch).toBe(now + 3600); // keyed on the weekly reset
+      harness.sendClaudeToCodex("req-admwk", "new work under weekly-triggered admission");
+      await waitFor(() => harness.statusMessages.some(m => m.type === "claude_to_codex_result" && m.requestId === "req-admwk"), "weekly admission rejection");
+      const result = harness.statusMessages.find(m => m.type === "claude_to_codex_result" && m.requestId === "req-admwk") as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
+      expect(result.success).toBe(false);
+      expect(result.code).toBe("budget_admission");
+      expect(readTurnStarts()).toEqual([]);
     } finally {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
@@ -1176,100 +1071,6 @@ describe("daemon wiring", () => {
     }
   }, 45000);
 
-  test("v3 P3 (round-4): interrupt RE-CHECKS the gate after the await — a flip to admission-closed during the wait rejects the injection", async () => {
-    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-int-gateflip-"));
-    const probePath = join(fixtureRoot, "probe.sh");
-    const turnStartLog = join(fixtureRoot, "turn-starts.jsonl");
-    const interruptLog = join(fixtureRoot, "turninterrupt.jsonl");
-    const writeUsage = (agent: "claude" | "codex", util: number) => {
-      writeFileSync(
-        join(fixtureRoot, `usage-${agent}.json`),
-        JSON.stringify({
-          ok: true,
-          util,
-          warn_util: util,
-          fetched_at: Math.floor(Date.now() / 1000),
-          buckets: [{ id: "five_hour", util, reset_epoch: Math.floor(Date.now() / 1000) + 7200 }],
-        }),
-      );
-    };
-    const readTurnStarts = () =>
-      existsSync(turnStartLog)
-        ? readFileSync(turnStartLog, "utf-8").trim().split("\n").filter(Boolean).map((l) => JSON.parse(l))
-        : [];
-    writeUsage("claude", 10);
-    writeUsage("codex", 20); // gate OPEN initially → interrupt is admitted into the await
-    writeFileSync(probePath, `#!/bin/sh\ncat "${fixtureRoot}/usage-$2.json"\n`, "utf-8");
-    chmodSync(probePath, 0o755);
-
-    try {
-      const harness = await startHarness({
-        pairId: "main-gateflip",
-        pairName: "main",
-        extraEnv: {
-          AGENTBRIDGE_BUDGET_ENABLED: "1",
-          AGENTBRIDGE_QUOTA_PROBE: probePath,
-          AGENTBRIDGE_BUDGET_POLL_SECONDS: "5",
-          // Raise the interrupt terminal-boundary timeout to its 13s ceiling so the
-          // fake's deferred boundary (9s, below) is NOT pre-empted by interrupt_timeout.
-          AGENTBRIDGE_INTERRUPT_TIMEOUT_MS: "13000",
-          FAKE_APP_TURNSTART_LOG: turnStartLog,
-          FAKE_APP_TURNINTERRUPT_LOG: interruptLog,
-          // Defer the interrupt terminal boundary 9s: comfortably ABOVE the 5s budget
-          // poll (so the gate reliably flips to admission-closed mid-await, ~3s margin)
-          // and BELOW the 13s interrupt timeout (so the boundary fires normally rather
-          // than timing out, ~4s margin). gateState propagates to the coordinator's
-          // in-memory value that both /healthz and the post-await re-check read.
-          FAKE_APP_INTERRUPT_DELAY_MS: "9000",
-        },
-      });
-      await harness.attachClaude();
-      await harness.connectTui();
-
-      const gateState = async () => {
-        const res = await fetch(`http://127.0.0.1:${harness.controlPort}/healthz`);
-        return res.ok ? (await res.json() as DaemonStatus).budget?.gateState : undefined;
-      };
-      await waitFor(async () => (await gateState()) === "open", "gateState=open initially", 200, 100);
-
-      // Drive a running turn so the interrupt path (not direct inject) activates.
-      harness.sendAppCommand("start-turn");
-      await waitForMessage(harness.messages, (m) => m.id.startsWith("system_turn_started"), "system_turn_started");
-
-      // Interrupt + inject a NEW task. Gate is OPEN at the top → admitted; the fake
-      // defers the terminal boundary, so the daemon now parks in waitForInterruptOutcome.
-      harness.sendClaudeToCodex("req-gateflip", "new task via interrupt", { onBusy: "interrupt" });
-      await waitFor(
-        () => existsSync(interruptLog) && readFileSync(interruptLog, "utf-8").trim() !== "",
-        "interrupt dispatched (daemon parked in the await)",
-        100,
-        100,
-      );
-
-      // FLIP the gate to admission-closed DURING the await, and confirm the poll landed.
-      writeUsage("codex", 86);
-      await waitFor(async () => (await gateState()) === "admission-closed", "gate flipped to admission-closed mid-await", 200, 100);
-
-      // When the terminal boundary fires, the post-await re-check must REJECT (the
-      // top-of-handler check ran against the now-stale OPEN gate). Without the re-check
-      // the new turn would inject past the gate.
-      await waitFor(
-        () => harness.statusMessages.some((m) => m.type === "claude_to_codex_result" && m.requestId === "req-gateflip"),
-        "result for req-gateflip after the terminal boundary",
-        250,
-        100,
-      );
-      const result = harness.statusMessages.find(
-        (m) => m.type === "claude_to_codex_result" && m.requestId === "req-gateflip",
-      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }>;
-      expect(result.success).toBe(false);
-      expect(result.code).toBe("budget_admission"); // gate re-checked AFTER the await
-      expect(readTurnStarts().length).toBe(0); // the new turn was NOT injected (no bypass)
-    } finally {
-      rmSync(fixtureRoot, { recursive: true, force: true });
-    }
-  }, 60000);
-
   test("budget status broadcasts follow coordinator snapshot polls, not the daemon interval", async () => {
     const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-budget-snapshot-fixture-"));
     const probePath = join(fixtureRoot, "probe.sh");
@@ -1347,470 +1148,6 @@ describe("daemon wiring", () => {
       rmSync(fixtureRoot, { recursive: true, force: true });
     }
   }, 30000);
-
-  test("on_busy=steer feeds the message into a running turn via turn/steer (protocol v2 B0)", async () => {
-    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-steer-fixture-"));
-    const steerLog = join(fixtureRoot, "turnsteer.jsonl");
-    const readSteers = (): Array<{ threadId: string; expectedTurnId?: string; input: Array<{ type: string; text: string }> }> =>
-      existsSync(steerLog)
-        ? readFileSync(steerLog, "utf-8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
-        : [];
-    const resultFor = (requestId: string) =>
-      harness.statusMessages.find(
-        (m) => m.type === "claude_to_codex_result" && m.requestId === requestId,
-      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }> | undefined;
-    const waitForResult = async (requestId: string) => {
-      await waitFor(() => resultFor(requestId) !== undefined, `claude_to_codex_result for ${requestId}`);
-      return resultFor(requestId)!;
-    };
-
-    const harness = await startHarness({
-      pairId: "main-steerabcd",
-      pairName: "main",
-      extraEnv: { FAKE_APP_TURNSTEER_LOG: steerLog },
-    });
-
-    try {
-      await harness.attachClaude();
-      await harness.connectTui();
-
-      // Drive the adapter into a running turn so the busy path is active.
-      harness.sendAppCommand("start-turn");
-      await waitForMessage(
-        harness.messages,
-        (message) => message.id.startsWith("system_turn_started"),
-        "system_turn_started",
-      );
-
-      // Default policy unchanged: a plain reply during the turn is rejected,
-      // and the busy error advertises both escape hatches. The structured
-      // result fields (PR B) ride alongside the legacy error string.
-      harness.sendClaudeToCodex("req-steer-0", "plain message during turn");
-      const rejected = await waitForResult("req-steer-0");
-      expect(rejected.success).toBe(false);
-      expect(rejected.error).toContain('on_busy="steer"');
-      expect(rejected.error).toContain('on_busy="interrupt"');
-      expect(rejected.ok).toBe(false);
-      expect(rejected.code).toBe("busy_reject");
-      expect(rejected.phase).toBe("running");
-      expect(typeof rejected.retryAfterMs).toBe("number");
-
-      // The steer path: message reaches the app-server as turn/steer with the
-      // explicit [STEER from Claude] framing, on the live thread.
-      harness.sendClaudeToCodex("req-steer-1", "course correction: use approach B", { onBusy: "steer" });
-      const accepted = await waitForResult("req-steer-1");
-      expect(accepted.success).toBe(true);
-      expect(accepted.ok).toBe(true);
-      await waitFor(() => readSteers().length >= 1, "recorded turn/steer", 100, 100);
-      const steer = readSteers()[0]!;
-      expect(steer.threadId).toBe("thread-fake-1");
-      // This assertion is the real regression gate: `accepted.success` above is
-      // only the daemon's SYNCHRONOUS transport-accept (sent before the fake's
-      // JSON-RPC verdict arrives), so a strict-fake rejection would NOT flip it
-      // — it would surface later as an async system_steer_failed.
-      expect(steer.expectedTurnId).toBe("turn-1");
-      expect(steer.input[0]!.type).toBe("text");
-      expect(steer.input[0]!.text.startsWith("[STEER from Claude]\n")).toBe(true);
-      expect(steer.input[0]!.text).toContain("course correction: use approach B");
-
-      // An app-server rejection after transport-accept surfaces as
-      // system_steer_failed (the original turn is NOT reported aborted).
-      harness.sendClaudeToCodex("req-steer-2", "[force-steer-error] doomed", { onBusy: "steer" });
-      const failedNotice = await waitForMessage(
-        harness.messages,
-        (message) => message.id.startsWith("system_steer_failed"),
-        "system_steer_failed",
-      );
-      expect(failedNotice.content).toContain("did NOT reach Codex");
-      expect(failedNotice.content).toContain("ActiveTurnNotSteerable");
-      expect(harness.messages.some((m) => m.id.startsWith("system_turn_aborted"))).toBe(false);
-
-      // require_reply × steer is now ALLOWED (PR B real semantics): the steer
-      // is accepted, the body carries the reply-required instruction, and the
-      // daemon arms the expectation on steer-accept.
-      harness.sendClaudeToCodex("req-steer-rr", "needs ack", { onBusy: "steer", requireReply: true });
-      const rrResult = await waitForResult("req-steer-rr");
-      expect(rrResult.success).toBe(true);
-      await waitFor(() => readSteers().length >= 3, "recorded require_reply steer", 100, 100);
-      const rrSteer = readSteers()[2]!;
-      expect(rrSteer.input[0]!.text).toContain("needs ack");
-      expect(rrSteer.input[0]!.text).toContain("[⚠️ REPLY REQUIRED]");
-
-      // Completing the turn WITHOUT any agentMessage must fire the
-      // reply-missing warning — proof the expectation armed on steer-accept.
-      await sleep(300); // let the fake's steer-success verdict arrive and arm the tracker
-      harness.sendAppCommand("complete-turn");
-      const replyMissing = await waitForMessage(
-        harness.messages,
-        (message) => message.id.startsWith("system_reply_missing"),
-        "system_reply_missing after require_reply steer",
-      );
-      expect(replyMissing.content).toContain("require_reply");
-      expect(harness.messages.some((m) => m.id.startsWith("system_turn_completed"))).toBe(true);
-    } finally {
-      rmSync(fixtureRoot, { recursive: true, force: true });
-    }
-  }, 60000);
-
-  test("on_busy=interrupt stops the running turn, injects as a new turn, and turn_started ACK correlates (protocol v2 PR B)", async () => {
-    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-interrupt-fixture-"));
-    const interruptLog = join(fixtureRoot, "turninterrupt.jsonl");
-    const turnStartLog = join(fixtureRoot, "turn-starts.jsonl");
-    const readJsonl = (path: string): Array<Record<string, any>> =>
-      existsSync(path)
-        ? readFileSync(path, "utf-8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
-        : [];
-    const resultFor = (requestId: string) =>
-      harness.statusMessages.find(
-        (m) => m.type === "claude_to_codex_result" && m.requestId === requestId,
-      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }> | undefined;
-    const waitForResult = async (requestId: string) => {
-      await waitFor(() => resultFor(requestId) !== undefined, `claude_to_codex_result for ${requestId}`);
-      return resultFor(requestId)!;
-    };
-
-    const harness = await startHarness({
-      pairId: "main-intrabcde",
-      pairName: "main",
-      extraEnv: {
-        FAKE_APP_TURNINTERRUPT_LOG: interruptLog,
-        FAKE_APP_TURNSTART_LOG: turnStartLog,
-      },
-    });
-
-    try {
-      await harness.attachClaude();
-      await harness.connectTui();
-
-      // Drive the adapter into a running turn so the interrupt path is active.
-      harness.sendAppCommand("start-turn");
-      await waitForMessage(
-        harness.messages,
-        (message) => message.id.startsWith("system_turn_started"),
-        "system_turn_started",
-      );
-
-      // Interrupt + inject, carrying an idempotency key.
-      harness.sendClaudeToCodex("req-int-1", "drop everything: new priority task", {
-        onBusy: "interrupt",
-        idempotencyKey: "key-int-1",
-      });
-      const result = await waitForResult("req-int-1");
-      expect(result.success).toBe(true);
-      expect(result.ok).toBe(true);
-
-      // The fake app-server received turn/interrupt with the RIGHT ids.
-      expect(readJsonl(interruptLog)).toEqual([{ threadId: "thread-fake-1", turnId: "turn-1" }]);
-
-      // The message was then injected as a NORMAL turn/start (no steer framing).
-      await waitFor(() => readJsonl(turnStartLog).length >= 1, "recorded post-interrupt turn/start", 100, 100);
-      const injected = readJsonl(turnStartLog)[0]!;
-      expect(injected.threadId).toBe("thread-fake-1");
-      expect(injected.input[0].type).toBe("text");
-      expect(injected.input[0].text).toContain("drop everything: new priority task");
-      expect(injected.input[0].text).not.toContain("[STEER from Claude]");
-
-      // turn_started control event correlates requestId + idempotencyKey.
-      await waitFor(
-        () => harness.statusMessages.some((m) => m.type === "turn_started" && m.requestId === "req-int-1"),
-        "turn_started control event for req-int-1",
-      );
-      const ack = harness.statusMessages.find(
-        (m) => m.type === "turn_started" && m.requestId === "req-int-1",
-      ) as Extract<ControlServerMessage, { type: "turn_started" }>;
-      expect(ack.idempotencyKey).toBe("key-int-1");
-      expect(ack.threadId).toBe("thread-fake-1");
-      expect(ack.turnId).toMatch(/^turn-injected-/);
-
-      // A duplicate idempotencyKey while the key is in flight (started, no
-      // terminal yet) is NOT re-injected and reports duplicate_in_flight.
-      harness.sendClaudeToCodex("req-int-2", "same message retried", { idempotencyKey: "key-int-1" });
-      const dup = await waitForResult("req-int-2");
-      expect(dup.success).toBe(false);
-      expect(dup.ok).toBe(false);
-      expect(dup.code).toBe("duplicate_in_flight");
-      expect(dup.error).toContain("Duplicate idempotency_key");
-
-      // ...and the fake never saw a second turn/start.
-      await sleep(200);
-      expect(readJsonl(turnStartLog)).toHaveLength(1);
-    } finally {
-      rmSync(fixtureRoot, { recursive: true, force: true });
-    }
-  }, 60000);
-
-  // --- Security: interrupt-path attach-convergence TOCTOU (HIGH fix) ---
-  //
-  // The top-of-handler attach guard (#283) only proves the socket held the slot
-  // at DISPATCH time. The interrupt path then awaits the terminal boundary; if
-  // the originating socket detaches and another attaches DURING that await, the
-  // post-wait re-check must reject — otherwise the detached socket's message is
-  // injected and turn_started is emitted to the NEW (innocent) session.
-  test("interrupt TOCTOU: if the originating socket loses the attach slot during the terminal-boundary wait, the message is NOT injected and reports not_attached", async () => {
-    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-int-toctou-"));
-    const interruptLog = join(fixtureRoot, "turninterrupt.jsonl");
-    const turnStartLog = join(fixtureRoot, "turn-starts.jsonl");
-    const readJsonl = (path: string): Array<Record<string, any>> =>
-      existsSync(path)
-        ? readFileSync(path, "utf-8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
-        : [];
-
-    const harness = await startHarness({
-      pairId: "main-toctouabc",
-      pairName: "main",
-      extraEnv: {
-        FAKE_APP_TURNINTERRUPT_LOG: interruptLog,
-        FAKE_APP_TURNSTART_LOG: turnStartLog,
-        // Defer the interrupt terminal boundary so the daemon's await stays
-        // open while we detach socket A and attach socket B.
-        FAKE_APP_INTERRUPT_DELAY_MS: "500",
-      },
-    });
-
-    // Socket A: the legit attached frontend. Its onmessage (set by attachClaude)
-    // records into harness.statusMessages — we read A's result from there. A is
-    // only DETACHED (claude_disconnect), not closed, so it can still receive the
-    // daemon's rejection result.
-    const resultForA = (requestId: string) =>
-      harness.statusMessages.find(
-        (m) => m.type === "claude_to_codex_result" && m.requestId === requestId,
-      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }> | undefined;
-
-    // Socket B: a SEPARATE control socket that will steal the attach slot mid-wait.
-    const bMessages: ControlServerMessage[] = [];
-    let socketB: WebSocket | null = null;
-
-    try {
-      await harness.attachClaude();
-      await harness.connectTui();
-
-      // Drive into a running turn so the interrupt path is active.
-      harness.sendAppCommand("start-turn");
-      await waitForMessage(
-        harness.messages,
-        (message) => message.id.startsWith("system_turn_started"),
-        "system_turn_started",
-      );
-
-      // A issues interrupt+inject. The fake records turn/interrupt immediately
-      // but defers the terminal boundary by FAKE_APP_INTERRUPT_DELAY_MS, so the
-      // daemon is now parked inside waitForInterruptOutcome.
-      harness.sendClaudeToCodex("req-toctou-1", "message from the OLD session", {
-        onBusy: "interrupt",
-        idempotencyKey: "key-toctou-1",
-      });
-
-      // Confirm the daemon entered the await: the fake logged turn/interrupt.
-      await waitFor(() => readJsonl(interruptLog).length >= 1, "recorded turn/interrupt (await entered)", 100, 100);
-
-      // While the daemon is awaiting: A detaches (slot freed) ...
-      harness.controlWs!.send(JSON.stringify({ type: "claude_disconnect" }));
-
-      // ... and B connects + wins the attach slot, becoming attachedClaude.
-      socketB = await connectControlSocket(harness.controlPort);
-      socketB.onmessage = (event) => {
-        const raw = typeof event.data === "string" ? event.data : event.data.toString();
-        bMessages.push(JSON.parse(raw) as ControlServerMessage);
-      };
-      const controlToken = readControlToken(resolveControlTokenPath(harness.stateDir));
-      socketB.send(JSON.stringify({
-        type: "claude_connect",
-        identity: {
-          pairId: "main-toctouabc",
-          pairName: "main",
-          cwd: harness.cwd,
-          stateDir: harness.stateDir,
-          clientPid: process.pid,
-          contractVersion: 1,
-          ...(controlToken ? { controlToken } : {}),
-        },
-      }));
-      // Wait until B's attachClaude completed: attachClaude unconditionally
-      // sends a `status` message to the freshly-attached socket, so receiving
-      // one on B proves attachedClaude === B (the slot was stolen mid-wait).
-      await waitFor(
-        () => bMessages.some((m) => m.type === "status"),
-        "socket B became the attached frontend (received status)",
-        100,
-        50,
-      );
-
-      // Now let the deferred terminal boundary fire (delay is 500ms).
-      const result = await waitFor(
-        () => resultForA("req-toctou-1") !== undefined,
-        "claude_to_codex_result for req-toctou-1 (delivered to detached socket A)",
-        120,
-        50,
-      ).then(() => resultForA("req-toctou-1")!);
-
-      // GREEN: the detached origin socket is rejected, NOT injected.
-      expect(result.success).toBe(false);
-      expect(result.code).toBe("not_attached");
-      expect(result.error).toContain("disconnected");
-
-      // No turn/start ever reached the app-server for this interrupt+inject.
-      await sleep(300);
-      expect(readJsonl(turnStartLog)).toHaveLength(0);
-
-      // The new session (B) never received a turn_started for req-toctou-1 — the
-      // old session's message was never injected on its behalf.
-      expect(
-        bMessages.some((m) => m.type === "turn_started" && m.requestId === "req-toctou-1"),
-      ).toBe(false);
-      // ... and A (the origin) likewise never saw a turn_started.
-      expect(
-        harness.statusMessages.some((m) => m.type === "turn_started" && m.requestId === "req-toctou-1"),
-      ).toBe(false);
-    } finally {
-      try { socketB?.close(); } catch {}
-      rmSync(fixtureRoot, { recursive: true, force: true });
-    }
-  }, 60000);
-
-  test("a rejected keyed steer RELEASES its idempotency key — a same-key retry is allowed (PR B REAL #2)", async () => {
-    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-steerfail-fixture-"));
-    const steerLog = join(fixtureRoot, "turnsteer.jsonl");
-    const readSteers = (): Array<{ threadId: string; expectedTurnId?: string; input: Array<{ type: string; text: string }> }> =>
-      existsSync(steerLog)
-        ? readFileSync(steerLog, "utf-8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
-        : [];
-    const resultFor = (requestId: string) =>
-      harness.statusMessages.find(
-        (m) => m.type === "claude_to_codex_result" && m.requestId === requestId,
-      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }> | undefined;
-    const waitForResult = async (requestId: string) => {
-      await waitFor(() => resultFor(requestId) !== undefined, `claude_to_codex_result for ${requestId}`);
-      return resultFor(requestId)!;
-    };
-
-    const harness = await startHarness({
-      pairId: "main-strflabcd",
-      pairName: "main",
-      extraEnv: { FAKE_APP_TURNSTEER_LOG: steerLog },
-    });
-
-    try {
-      await harness.attachClaude();
-      await harness.connectTui();
-
-      // Drive into a running turn so the steer path is active.
-      harness.sendAppCommand("start-turn");
-      await waitForMessage(
-        harness.messages,
-        (message) => message.id.startsWith("system_turn_started"),
-        "system_turn_started",
-      );
-
-      // A KEYED steer that the fake app-server REJECTS ([force-steer-error]).
-      // The daemon transport-accepts it (so the sync result is success) and
-      // accept()+markStarted-binds the key to the running original turn; the
-      // async rejection then fires steerFailed.
-      harness.sendClaudeToCodex("req-sf-1", "[force-steer-error] doomed steer", {
-        onBusy: "steer",
-        idempotencyKey: "key-sf-1",
-      });
-      const first = await waitForResult("req-sf-1");
-      expect(first.success).toBe(true); // transport-accepted
-      await waitFor(() => readSteers().length >= 1, "recorded the doomed turn/steer", 100, 100);
-
-      // The async rejection surfaces as system_steer_failed (the key is released here).
-      await waitForMessage(
-        harness.messages,
-        (message) => message.id.startsWith("system_steer_failed"),
-        "system_steer_failed for the doomed steer",
-      );
-
-      // The SAME key is now retryable: a fresh steer with key-sf-1 must NOT be
-      // rejected as duplicate_in_flight — it reaches the wire as a real steer.
-      harness.sendClaudeToCodex("req-sf-2", "second attempt, same key", {
-        onBusy: "steer",
-        idempotencyKey: "key-sf-1",
-      });
-      const second = await waitForResult("req-sf-2");
-      expect(second.success).toBe(true);
-      // Critically NOT duplicate_in_flight — the release made the key retryable.
-      expect(second.code).not.toBe("duplicate_in_flight");
-      await waitFor(() => readSteers().length >= 2, "recorded the retried turn/steer", 100, 100);
-      const retried = readSteers()[1]!;
-      expect(retried.input[0]!.text).toContain("second attempt, same key");
-    } finally {
-      rmSync(fixtureRoot, { recursive: true, force: true });
-    }
-  }, 60000);
-
-  test("a lost-response (orphaned) require_reply steer cannot mis-arm a LATER steer's reply expectation (PR B REAL #3)", async () => {
-    const fixtureRoot = mkdtempSync(join(tmpdir(), "agentbridge-steerorphan-fixture-"));
-    const steerLog = join(fixtureRoot, "turnsteer.jsonl");
-    const readSteers = (): Array<{ input: Array<{ type: string; text: string }> }> =>
-      existsSync(steerLog)
-        ? readFileSync(steerLog, "utf-8").trim().split("\n").filter(Boolean).map((line) => JSON.parse(line))
-        : [];
-    const resultFor = (requestId: string) =>
-      harness.statusMessages.find(
-        (m) => m.type === "claude_to_codex_result" && m.requestId === requestId,
-      ) as Extract<ControlServerMessage, { type: "claude_to_codex_result" }> | undefined;
-    const waitForResult = async (requestId: string) => {
-      await waitFor(() => resultFor(requestId) !== undefined, `claude_to_codex_result for ${requestId}`);
-      return resultFor(requestId)!;
-    };
-
-    const harness = await startHarness({
-      pairId: "main-strorabcd",
-      pairName: "main",
-      extraEnv: { FAKE_APP_TURNSTEER_LOG: steerLog },
-    });
-
-    try {
-      await harness.attachClaude();
-      await harness.connectTui();
-
-      harness.sendAppCommand("start-turn");
-      await waitForMessage(
-        harness.messages,
-        (message) => message.id.startsWith("system_turn_started"),
-        "system_turn_started",
-      );
-
-      // 1) A require_reply steer whose app-server verdict is LOST ([hang-steer]).
-      // It orphans a dispatch entry carrying requireReply=true. Under the OLD
-      // FIFO pairing, a LATER steerAccepted would shift() this orphan and arm
-      // the reply expectation against the wrong turn.
-      harness.sendClaudeToCodex("req-orphan-1", "[hang-steer] never answered", {
-        onBusy: "steer",
-        requireReply: true,
-      });
-      await waitForResult("req-orphan-1"); // transport-accepted, but no verdict
-      await waitFor(() => readSteers().length >= 1, "recorded the hung steer", 100, 100);
-
-      // 2) A SECOND steer (NO require_reply) that the fake ACCEPTS → steerAccepted.
-      // Id-keyed correlation must consume THIS dispatch (req-orphan-2), never the
-      // orphaned require_reply one.
-      harness.sendClaudeToCodex("req-orphan-2", "plain steer that gets accepted", {
-        onBusy: "steer",
-      });
-      await waitForResult("req-orphan-2");
-      await waitFor(() => readSteers().length >= 2, "recorded the accepted steer", 100, 100);
-
-      // Give the accepted steer's verdict time to (wrongly, under the old bug)
-      // arm the orphaned require_reply expectation.
-      await sleep(300);
-
-      // 3) Complete the turn WITHOUT any agentMessage. If the orphan had mis-armed
-      // the reply expectation, a system_reply_missing warning would fire. With the
-      // id-keyed fix it must NOT — the orphan was never consumed by req-orphan-2.
-      harness.sendAppCommand("complete-turn");
-      await waitForMessage(
-        harness.messages,
-        (message) => message.id.startsWith("system_turn_completed"),
-        "system_turn_completed",
-      );
-      expect(harness.messages.some((m) => m.id.startsWith("system_reply_missing"))).toBe(false);
-    } finally {
-      rmSync(fixtureRoot, { recursive: true, force: true });
-    }
-  }, 60000);
-
-  // --- Security: attach-convergence guard + capability token (arch-review P1 #283) ---
 
   test("attach guard: a NON-attached socket's claude_to_codex is rejected with not_attached, even with a valid token", async () => {
     const harness = await startHarness({ pairId: "main-attachgrd", pairName: "main" });
@@ -2210,7 +1547,7 @@ async function startHarness(opts: {
       harness.controlWs?.send(JSON.stringify({
         type: "claude_to_codex",
         requestId,
-        message: { id: requestId, source: "claude", content: text, timestamp: Date.now() },
+        message: { id: requestId, source: "claude", to: "codex", content: text, timestamp: Date.now() },
         ...(sendOpts?.requireReply ? { requireReply: true } : {}),
         ...(sendOpts?.onBusy && sendOpts.onBusy !== "reject" ? { onBusy: sendOpts.onBusy } : {}),
         ...(sendOpts?.idempotencyKey ? { idempotencyKey: sendOpts.idempotencyKey } : {}),

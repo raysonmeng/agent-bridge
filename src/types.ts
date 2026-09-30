@@ -15,6 +15,11 @@ export interface BridgeMessage {
   /** App-server attribution used to prevent room-originated turns entering the local relay. */
   threadId?: string;
   turnId?: string;
+  /** Native assistant phase; only final_answer is eligible for multiparty routing. */
+  phase?: string;
+  /** Explicit local routing metadata, interpreted only by the daemon. */
+  to?: string;
+  inReplyTo?: string;
   /**
    * Stable budget-resume correlation id (PR4, additive). Present ONLY on Claude
    * channel resume pushes (system_budget_resume directives). When set, the

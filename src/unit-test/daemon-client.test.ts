@@ -53,6 +53,12 @@ function sendToClient(data: Record<string, unknown>) {
   }
 }
 
+async function enableExplicitRouting() {
+  const status = new Promise<void>(resolve => client.once("status", () => resolve()));
+  sendToClient({ type: "status", status: { localChatVersion: 2 } });
+  await status;
+}
+
 describe("DaemonClient", () => {
   beforeEach(() => {
     onServerMessage = () => {};
@@ -250,11 +256,11 @@ describe("DaemonClient", () => {
 
   test("pending replies rejected on rejected close (code 4001)", async () => {
     await client.connect();
+    await enableExplicitRouting();
 
     // Send a message that expects a reply — it will never be answered
     const replyPromise = client.sendReply(
-      { id: "test-pending", source: "claude", content: "hello", timestamp: Date.now() },
-      false,
+      { id: "test-pending", source: "claude", to: "codex", content: "hello", timestamp: Date.now() },
     );
 
     // Close with 4001 before any response
@@ -333,10 +339,11 @@ describe("DaemonClient", () => {
     };
 
     await client.connect();
+    await enableExplicitRouting();
 
     const result = await client.sendReply({
       id: "r2",
-      source: "claude",
+      source: "claude", to: "codex",
       content: "reply text",
       timestamp: Date.now(),
     });
@@ -361,10 +368,11 @@ describe("DaemonClient", () => {
     };
 
     await client.connect();
+    await enableExplicitRouting();
 
     const result = await client.sendReply({
       id: "r-structured",
-      source: "claude",
+      source: "claude", to: "codex",
       content: "structured fields",
       timestamp: Date.now(),
     });
@@ -375,7 +383,7 @@ describe("DaemonClient", () => {
     expect(result.error).toContain("busy");
   });
 
-  test("sendReply serializes onBusy=interrupt and idempotencyKey onto the control message", async () => {
+  test("sendReply rejects legacy controls before any network call", async () => {
     const seen: any[] = [];
     onServerMessage = (ws: any, raw: any) => {
       const msg = JSON.parse(typeof raw === "string" ? raw : raw.toString());
@@ -386,16 +394,17 @@ describe("DaemonClient", () => {
     };
 
     await client.connect();
+    await enableExplicitRouting();
 
-    await client.sendReply(
-      { id: "r-int", source: "claude", content: "interrupt me", timestamp: Date.now() },
+    const result = await client.sendReply(
+      { id: "r-int", source: "claude", to: "codex", content: "interrupt me", timestamp: Date.now() },
       false,
       "interrupt",
       "key-77",
     );
-    expect(seen).toHaveLength(1);
-    expect(seen[0].onBusy).toBe("interrupt");
-    expect(seen[0].idempotencyKey).toBe("key-77");
+    expect(result.success).toBe(false);
+    expect(result.error).toContain("Legacy turn controls");
+    expect(seen).toHaveLength(0);
   });
 
   test("emits turnStarted on a turn_started control event", async () => {
@@ -424,10 +433,11 @@ describe("DaemonClient", () => {
 
   test("pending replies rejected on disconnect", async () => {
     await client.connect();
+    await enableExplicitRouting();
 
     const replyPromise = client.sendReply({
       id: "r3",
-      source: "claude",
+      source: "claude", to: "codex",
       content: "will be rejected",
       timestamp: Date.now(),
     });

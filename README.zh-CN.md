@@ -32,7 +32,7 @@ English version: [README.md](README.md)
 
 ## Why not just…（换个方案不行吗)
 
-- **……开两个终端手动复制粘贴?** 可以，但你就成了消息总线：手动搬运文本，靠肉眼判断什么时候能插话。AgentBridge 把这套中转自动化了:消息自己流动,busy-guard 在活跃 turn 期间挡住回复,噪声中间事件被过滤,每一侧只看到对方有意义的输出。
+- **……开两个终端手动复制粘贴?** 可以，但你就成了消息总线：手动搬运文本，靠肉眼判断什么时候能插话。AgentBridge 把这套中转自动化了：agent 显式指定收件人发消息，daemon 校验后投递进对方的原生会话，其余内容一概不过桥。
 - **……用一个单向委派插件?** 像 `openai/codex-plugin-cc` 这类工具,是宿主**调用** Codex、拿回一个答案：问进去、答出来，对面没有常驻的对等体。AgentBridge 让**两个** agent 都作为常驻对等体活着,任一侧都能在**回合中途**推消息(review 意见在对方还在干活时就落进它会话),而不只是在调用边界。
 - **……接一个外部编排器?** 一个上帝进程调度哑终端是自上而下的:一个大脑、N 个互不说话的 worker。AgentBridge 是对等的：两个完整 agent 在会话内对话、自己提分工、互相 review,人在旁边把舵,而不是脚本化每一跳。
 
@@ -52,9 +52,9 @@ English version: [README.md](README.md)
 
 ## 功能
 
-- **Claude ↔ Codex 双向消息**（同一工作会话）：拦截 Codex 输出并以 channel 通知推给 Claude；Claude 用 `reply` MCP tool 回复，作为 `turn/start` 注入 Codex thread。
+- **Claude、Codex、agy 之间的显式本地消息**：agent 只有显式指定收件人时才发送（Claude 用 `reply(to=…)`，Codex 用 `agentbridge_local_send`，agy 或终端用 `abg chat`）；回复必须带原消息的 `in_reply_to`。普通模型输出从不被收集或转发。见 [显式本地消息](docs/antigravity.md)。
 - **Push 投递 + 兜底**：消息以 channel 通知投递；推送失败回退到内存队列，由 `get_messages` 排空。靠每条消息的 `source` 字段防循环。
-- **回合协调**：busy-guard 在 Codex 活跃 turn 期间拒绝回复；单 turn 非活动看门狗避免丢失 `turn/completed` 永久锁死注入；折叠噪声中间事件，只把有意义的 `agentMessage` 送达 Claude。
+- **回合协调**：发给忙碌中 Codex 的消息会等到安全的空闲回合（并通过额度闸门）再注入；单 turn 非活动看门狗避免丢失 `turn/completed` 永久锁死注入。
 - **多对并行**：每个项目目录一对 Claude+Codex，端口按 +10 步长从 4500 分配；`claude` / `codex` / `resume` / `kill` / `doctor` / `budget` 支持 `--pair` 指定。
 - **韧性生命周期**：常驻后台 daemon 跨 Claude Code 重启存活（指数退避自动重连）；孤儿进程清理；`abg doctor` 只读诊断；`abg pairs prune` 回收滞留状态。
 - **Thread 自动续接**：裸 `abg codex` 续接该对上次的 Codex thread；`abg resume` 打印/执行两侧的续接命令。
@@ -62,14 +62,12 @@ English version: [README.md](README.md)
 
 ## 上下文处理 —— 实时双向，但上下文不会爆
 
-很多人对"实时双向通信"最大的担心是：两个 agent 的上下文会不会合并、越滚越大。不会。**桥传的是消息，不是上下文** —— 每个 agent 各自维护自己的上下文窗口，桥从不会把一方的完整对话历史拷进另一方。（而且谁规划、谁执行完全由你定，角色不写死，让 Codex 指挥 Claude 也一样。）在这个前提上，三层过滤让真正跨过桥的东西尽量少：
+很多人对"实时双向通信"最大的担心是：两个 agent 的上下文会不会合并、越滚越大。不会。**桥传的是消息，不是上下文** —— 每个 agent 各自维护自己的上下文窗口，桥从不会把一方的完整对话历史拷进另一方。（而且谁规划、谁执行完全由你定，角色不写死，让 Codex 指挥 Claude 也一样。）在这个前提上，真正跨过桥的东西天然就少：
 
-1. **只转发 `agentMessage`。** 桥只转发 agent 真正说出来的结论，它执行命令的输出、`commandExecution`、`fileChange`、推理过程这些中间噪声和完整 scrollback 都不过桥。每一方看到的是对方的结论，不是干活的流水账。
-2. **三级标签路由**（默认 `filtered` 模式）。每条消息带标签，daemon 按标签决定去留：`[IMPORTANT]` 立刻转发，`[STATUS]` 先缓冲、攒几条（默认 3 条或 15 秒）合并成一条摘要，`[FYI]` 直接丢。标签规则一次性写在项目的 `AGENTS.md` 里（`abg init` 注入），agent 启动读一次。
-3. **协作契约只存一份**在 `AGENTS.md`，不附带在每条消息上（否则每个 thread 和它的 resume 标题都会被污染）。
+1. **只有显式消息过桥。** agent 的普通回答、工具输出、推理过程和 scrollback 都留在它自己的会话里。只有 agent 明确指定了收件人（回复还要带原消息 ID）的消息才会被投递。
+2. **协作契约只存一份**在 `AGENTS.md` / `CLAUDE.md`（`abg init` 注入），不附带在每条消息上（否则每个 thread 和它的 resume 标题都会被污染）。
 
-最终效果：每一方收到的是对方精选过的有意义消息，上下文的增长跟的是"有效交流的条数"，不是"对方活动的原始量"。需要看完整原文时，设 `AGENTBRIDGE_FILTER_MODE=full` 即可关掉过滤。
-
+最终效果：上下文的增长跟的是"有意为之的交流条数"，不是"对方活动的原始量"。
 ## 前置条件
 
 | 依赖 | 推荐版本 | 安装方式 |
@@ -220,12 +218,13 @@ AgentBridge 是一个**两进程**本地 Bridge：
 
 | 方向 | 链路 |
 |------|------|
-| **Codex -> Claude** | `daemon.ts` 捕获 `agentMessage` -> 控制 WS -> `bridge.ts` -> `notifications/claude/channel` |
-| **Claude -> Codex** | Claude 调用 `reply` tool -> `bridge.ts` -> 控制 WS -> `daemon.ts` -> `turn/start` 注入 Codex thread |
+| **Codex -> Claude** | Codex 调用 `agentbridge_local_send(to="claude")` -> `daemon.ts` 校验 -> 控制 WS -> `bridge.ts` -> `notifications/claude/channel` |
+| **Claude -> Codex** | Claude 调用 `reply(to="codex")` -> `bridge.ts` -> 控制 WS -> `daemon.ts` -> Codex 空闲时以 `turn/start` 注入 thread |
+| **agy <-> 其他** | agy 内执行 `abg chat --from agy --to …` -> daemon；入站经 `abg agy attach` 适配器 -> 原生 `agentapi send-message` |
 
 ### 防循环
 
-每条消息都携带 `source` 字段（`"claude"` 或 `"codex"`），Bridge 永远不会把消息转发回它的来源。
+每条消息都显式指明发送方和收件人；收件人等于发送方的消息会被 daemon 拒绝，回复只接受一次，且只能由原收件人发回原发送方。
 
 ## 项目配置
 
@@ -283,7 +282,7 @@ AgentBridge 能让长任务跨订阅额度窗口持续推进，而不是某一�
 
 ## 当前限制
 
-- 目前只转发 `agentMessage`，不转发 `commandExecution`、`fileChange` 等中间过程事件
+- 只投递显式指定收件人的消息；普通输出、`commandExecution`、`fileChange` 等事件一律不转发
 - 每对只有单个 Codex thread，对内暂不支持多会话
 - 每对只有单个 Claude 前台连接；新的 Claude 会话会替换旧连接
 - 多对可在同机并行（每个项目目录一对）；Windows 暂非官方支持平台

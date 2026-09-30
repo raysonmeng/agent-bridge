@@ -292,8 +292,7 @@ export function renderBudgetAdmissionDirective(
     head,
     `触发原因：${reason}。`,
     `${usageSummary("claude", claude)}；${usageSummary("codex", codex)}。`,
-    `闸门已收紧：新的 Codex 任务会被拒（budget_admission），但仍可用 reply 带 wrap_up=true 把当前协作收尾到 checkpoint` +
-      `（每窗口至多 ${cfg.maximize.wrapUpQuota} 个），steer 修正不受限；${resetText}。`,
+    `闸门已收紧：新的 Codex 任务会被拒（budget_admission）；${resetText}。`,
     "建议：不要再向 Codex 派新任务；把当前 Codex 协作收尾、写 checkpoint，可独立推进的部分 Claude 可 solo 继续。",
   ].join("\n");
 }

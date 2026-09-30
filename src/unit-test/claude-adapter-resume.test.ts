@@ -189,7 +189,7 @@ describe("ack_resume does not regress reply / get_messages / get_budget", () => 
       return { success: true };
     });
 
-    const res = await callTool(adapter, "reply", { chat_id: "c1", text: "hi codex" });
+    const res = await callTool(adapter, "reply", { chat_id: "c1", to: "codex", text: "hi codex" });
     expect(res.isError).toBeFalsy();
     expect(sent).toBe(true);
   });

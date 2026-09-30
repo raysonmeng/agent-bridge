@@ -1,6 +1,7 @@
 #!/usr/bin/env bun
 
 import { existsSync } from "node:fs";
+import { randomUUID } from "node:crypto";
 import { ClaudeAdapter } from "./claude-adapter";
 import { BUILD_INFO } from "./build-info";
 import { DaemonClient } from "./daemon-client";
@@ -24,6 +25,7 @@ import type { ControlClientIdentity } from "./control-protocol";
 import type { BridgeMessage } from "./types";
 
 const originalEnv = { ...process.env };
+const localSessionId = randomUUID();
 const bootstrapLogger = createProcessLogger({ component: "AgentBridgeFrontend" });
 const envGuardResult = guardAgentBridgeEnv({
   cwd: process.cwd(),
@@ -634,6 +636,9 @@ function currentClientIdentity(): ControlClientIdentity {
   // disabled — the daemon then admits us on pair/cwd alone (compat-degraded).
   const controlToken = readControlToken(resolveControlTokenPath(stateDir.dir));
   return {
+    agentProfile: { sessionId: localSessionId, name: process.env.AGENTBRIDGE_CLAUDE_NAME || "Claude",
+      model: process.env.AGENTBRIDGE_CLAUDE_MODEL || process.env.ANTHROPIC_MODEL || undefined,
+      modelSource: "configured" },
     pairId: process.env.AGENTBRIDGE_PAIR_ID ?? null,
     pairName: process.env.AGENTBRIDGE_PAIR_NAME ?? null,
     cwd: process.cwd(),

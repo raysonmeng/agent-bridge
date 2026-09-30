@@ -38,7 +38,7 @@ The bridge can enter several dormant states when it cannot accept new MCP replie
 
 Codex runs in a sandboxed environment that **blocks all writes to the `.git` directory**. `git commit`, `git push`, `git pull`, `git checkout -b`, `git merge` — anything that modifies git metadata — will cause the Codex session to **hang indefinitely**.
 
-**Fix / workflow:** let Claude Code handle all git operations (branching, committing, pushing, PRs). Codex should focus on code changes and report completed work via `agentMessage`, then Claude does the git workflow.
+**Fix / workflow:** let Claude Code handle all git operations (branching, committing, pushing, PRs). Codex should focus on code changes and report completed work with an explicit `agentbridge_local_send(to="claude")`, then Claude does the git workflow.
 
 ### More diagnostics
 
@@ -80,7 +80,7 @@ Bridge 在无法接受新 MCP 回复时会进入若干休眠状态。每种都�
 
 Codex 运行在沙箱里,**禁止对 `.git` 目录的任何写操作**。`git commit`、`git push`、`git pull`、`git checkout -b`、`git merge` 等任何修改 git 元数据的命令都会让 Codex 会话**无限期挂起**。
 
-**修法 / 工作流：** 让 Claude Code 负责所有 git 操作（分支、提交、推送、PR）。Codex 专注代码修改,通过 `agentMessage` 汇报完成的工作,由 Claude 走 git 流程。
+**修法 / 工作流：** 让 Claude Code 负责所有 git 操作（分支、提交、推送、PR）。Codex 专注代码修改,通过显式的 `agentbridge_local_send(to="claude")` 汇报完成的工作,由 Claude 走 git 流程。
 
 ### 更多诊断
 

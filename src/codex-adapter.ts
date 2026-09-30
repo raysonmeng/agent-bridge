@@ -3,12 +3,13 @@
  *
  * Spawns `codex app-server --listen ws://127.0.0.1:<port>` and runs a proxy
  * on a second port. Codex TUI connects to the proxy; Bridge forwards all
- * traffic while intercepting agentMessages for Claude.
+ * traffic; business messages require explicit local tool calls.
  *
  * Key design: app-server connection is PERSISTENT (never closed on TUI
  * disconnect), because TUI rapidly reconnects between bootstrap phases.
  */
 
+import { isLocalMessageId } from "./local-chat";
 import { spawn, execFileSync, type ChildProcess } from "node:child_process";
 import { createInterface } from "node:readline";
 import { readFileSync, writeFileSync } from "node:fs";
@@ -128,6 +129,7 @@ interface PendingRequest {
  * against.
  */
 export class CodexAdapter extends EventEmitter {
+  private localTools: Array<{ type: string; name: string; description: string; inputSchema: Record<string, unknown> }> = [];
   private roomToolsEnabled: () => boolean = () => false;
   private roomToolHandler: ((name: string, args: unknown, valid: () => boolean) => Promise<RoomToolResult>) | null = null;
   private pendingRoomToolThreads = new Set<number>();
@@ -136,25 +138,28 @@ export class CodexAdapter extends EventEmitter {
   private prepareRoomTools: (() => Promise<void>) | null = null;
   private auxiliaryThreadIds = new Set<string>();
 
-  configureRoomTools(enabled: () => boolean, handler: (name: string, args: unknown, valid: () => boolean) => Promise<RoomToolResult>, prepare?: () => Promise<void>): void {
+  configureRoomTools(enabled: () => boolean, handler: (name: string, args: unknown, valid: () => boolean) => Promise<RoomToolResult>, prepare?: () => Promise<void>, localTools: Array<{ type: string; name: string; description: string; inputSchema: Record<string, unknown> }> = []): void {
+    this.localTools = localTools;
     this.roomToolsEnabled = enabled;
     this.roomToolHandler = handler;
     this.prepareRoomTools = prepare ?? null;
   }
+
+  private availableTools() { return [...(this.roomToolsEnabled() ? CODEX_ROOM_TOOLS : []), ...this.localTools]; }
 
   private addRoomTools(raw: string): string {
     const message = JSON.parse(raw);
     if (message.method === "initialize" && this.roomToolHandler) {
       message.params ??= {};
       message.params.capabilities = { ...message.params.capabilities, experimentalApi: true };
-    } else if (message.method === "thread/start" && this.roomToolsEnabled() &&
+    } else if (message.method === "thread/start" && this.availableTools().length > 0 &&
       !(typeof message.id === "string" && message.id.startsWith("temporary-"))) {
       message.params ??= {};
       const existing = message.params.dynamicTools ?? [];
       if (!Array.isArray(existing)) return raw;
       // Our names are reserved; do not silently replace a caller's tools.
-      if (existing.some((tool: any) => CODEX_ROOM_TOOLS.some(ours => ours.name === tool.name))) return raw;
-      message.params.dynamicTools = [...existing, ...CODEX_ROOM_TOOLS];
+      if (existing.some((tool: any) => this.availableTools().some(ours => ours.name === tool.name))) return raw;
+      message.params.dynamicTools = [...existing, ...this.availableTools()];
     } else return raw;
     return JSON.stringify(message);
   }
@@ -173,6 +178,7 @@ export class CodexAdapter extends EventEmitter {
   private socketPath: string | null = null;
   private relay: TcpToUnixRelay | null = null;
   private threadId: string | null = null;
+  private model: string | null = null;
   // Reserve negative ids for bridge-originated requests so they never collide
   // with proxy-rewritten TUI request ids.
   private nextInjectionId = -1;
@@ -322,6 +328,7 @@ export class CodexAdapter extends EventEmitter {
   get appServerUrl() { return `ws://127.0.0.1:${this.appPort}`; }
   get proxyUrl() { return `ws://127.0.0.1:${this.proxyPort}`; }
   get activeThreadId() { return this.threadId; }
+  get activeModel(): string | null { return this.model; }
   /**
    * True iff {@link injectMessage} would currently reach the wire — i.e. its three
    * synchronous pre-send guards (active thread, app-server socket OPEN, no turn in
@@ -1326,6 +1333,7 @@ export class CodexAdapter extends EventEmitter {
     // Reset threadId to prevent premature message injection before TUI completes
     // its handshake (initialize → thread/start or thread/resume).
     this.threadId = null;
+    this.model = null;
     this.log(`TUI connected (conn #${this.tuiConnId})`);
     this.emit("tuiConnected", this.tuiConnId);
     if (previousConnId !== null) {
@@ -1636,7 +1644,7 @@ export class CodexAdapter extends EventEmitter {
       if (parsed.id !== undefined && parsed.method) {
         const proxyId = this.nextProxyId++;
         if (parsed.method === "thread/start" && Array.isArray(parsed.params?.dynamicTools) &&
-          CODEX_ROOM_TOOLS.every(ours => parsed.params.dynamicTools.some((tool: any) => tool.name === ours.name && tool.description === ours.description))) {
+          this.availableTools().length > 0 && this.availableTools().every(ours => parsed.params.dynamicTools.some((tool: any) => tool.name === ours.name && tool.description === ours.description))) {
           this.pendingRoomToolThreads.add(proxyId);
         }
         this.upstreamToClient.set(proxyId, { connId, clientId: parsed.id });
@@ -1786,7 +1794,7 @@ export class CodexAdapter extends EventEmitter {
 
   private handleServerRequest(parsed: AppServerRequest, raw: string): void {
     const toolParams = parsed.params as { tool?: string; namespace?: string | null; arguments?: unknown; threadId?: string } | undefined;
-    if (parsed.method === "item/tool/call" && !toolParams?.namespace && this.roomToolThreads.has(toolParams?.threadId ?? "") && CODEX_ROOM_TOOLS.some(tool => tool.name === toolParams?.tool) && this.roomToolHandler) {
+    if (parsed.method === "item/tool/call" && !toolParams?.namespace && this.roomToolThreads.has(toolParams?.threadId ?? "") && [...CODEX_ROOM_TOOLS, ...this.localTools].some(tool => tool.name === toolParams?.tool) && this.roomToolHandler) {
       const socket = this.appServerWs;
       const id = parsed.id;
       const handler = this.roomToolHandler;
@@ -1794,6 +1802,17 @@ export class CodexAdapter extends EventEmitter {
       const stillValid = () => !!tui && this.tuiWs === tui && socket === this.appServerWs && socket?.readyState === WebSocket.OPEN && toolParams?.threadId === this.threadId;
       void Promise.resolve().then(() => {
         if (!stillValid()) return roomToolResult(false, "Room tool request belongs to an inactive session");
+        if (toolParams!.tool === "agentbridge_local_send") {
+          const args = toolParams?.arguments;
+          if (!args || typeof args !== "object" || Array.isArray(args)) return roomToolResult(false, "Expected an object");
+          const { to, text, in_reply_to } = args as Record<string, unknown>;
+          if (Object.keys(args).some(key => !["to", "text", "in_reply_to"].includes(key)) ||
+            typeof to !== "string" || !to.trim() || to.length > 128 ||
+            typeof text !== "string" || !text.trim() || text.length > 4000 ||
+            (in_reply_to !== undefined && !isLocalMessageId(in_reply_to))) {
+            return roomToolResult(false, "Explicit recipient and valid text are required");
+          }
+        }
         return handler(toolParams!.tool!, toolParams?.arguments, stillValid);
       }).catch(error => roomToolResult(false, String(error))).then(result => {
         // Never send a late response to a new connection that may reuse this server id.
@@ -2149,6 +2168,7 @@ export class CodexAdapter extends EventEmitter {
             this.log(`Agent message completed (${content.length} chars)`);
             this.emit("agentMessage", {
               id: item.id, source: "codex" as const, content, timestamp: Date.now(),
+              ...(typeof item.phase === "string" ? { phase: item.phase } : {}),
               ...(typeof params?.threadId === "string" ? { threadId: params.threadId } : {}),
               ...(typeof params?.turnId === "string" ? { turnId: params.turnId } : {}),
             } satisfies BridgeMessage);
@@ -2251,7 +2271,9 @@ export class CodexAdapter extends EventEmitter {
         }
         const threadId = message?.result?.thread?.id;
         if (typeof threadId === "string" && threadId.length > 0) {
+          this.model = typeof message.result.model === "string" && message.result.model.trim() ? message.result.model.trim() : null;
           this.setActiveThreadId(threadId, `thread/start response ${key}`);
+          this.emit("localProfileChanged", { threadId, model: this.model });
         }
         // User started a brand-new session — any buffered server requests
         // belong to a thread the user has abandoned. Drop them so they do
@@ -2270,7 +2292,9 @@ export class CodexAdapter extends EventEmitter {
         }
         const threadId = message?.result?.thread?.id;
         if (typeof threadId === "string" && threadId.length > 0) {
+          this.model = typeof message.result.model === "string" && message.result.model.trim() ? message.result.model.trim() : null;
           this.setActiveThreadId(threadId, `thread/resume response ${key}`);
+          this.emit("localProfileChanged", { threadId, model: this.model });
           if (this.tuiWs) {
             this.replayPendingForThread(threadId, this.tuiWs);
           }
