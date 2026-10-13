@@ -5,6 +5,7 @@ import {
   type ControlClientIdentity,
 } from "./control-protocol";
 import { validateControlToken } from "./control-token";
+import { sameCwd } from "./cwd-identity";
 
 export interface ClaudeIdentityValidationInput {
   expectedPairId: string | null;
@@ -94,7 +95,7 @@ export function validateClaudeClientIdentity(
       reason: `pair mismatch: expected ${input.expectedPairId}, got ${input.identity.pairId ?? "<none>"}`,
     };
   }
-  if (!input.identity.cwd || input.identity.cwd !== input.daemonCwd) {
+  if (!input.identity.cwd || !sameCwd(input.identity.cwd, input.daemonCwd)) {
     return {
       ok: false,
       closeCode: CLOSE_CODE_PAIR_MISMATCH,

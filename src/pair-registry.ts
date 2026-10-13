@@ -17,6 +17,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { hostname, userInfo } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { atomicWriteJson } from "./atomic-json";
+import { realCwdForHash, sameCwd } from "./cwd-identity";
 import { isAgentBridgeDaemon, pidLooksAlive } from "./process-lifecycle";
 
 /**
@@ -177,18 +178,15 @@ export function validatePairId(raw: string): string {
   return id;
 }
 
+export { realCwdForHash, sameCwd } from "./cwd-identity";
+
 /**
  * Derive a stable, fs-safe pairId from the current working directory.
  * Uses realpath so symlinked cwds map to the same id; appends a short hash
  * of the real path to guarantee uniqueness across same-basename projects.
  */
 export function derivePairIdFromCwd(cwd: string): string {
-  let real: string;
-  try {
-    real = realpathSync(cwd);
-  } catch {
-    real = cwd;
-  }
+  const real = realCwdForHash(cwd);
   const hash = createHash("sha256").update(real).digest("hex").slice(0, 8);
   const rawBase = basename(real) || "root";
   // Slugify the basename through the allowed charset; collapse runs of illegal chars.
@@ -215,12 +213,7 @@ export function derivePairIdFromCwd(cwd: string): string {
  * so the composite always satisfies {@link PAIR_ID_REGEX} (≤ 41 chars).
  */
 export function derivePairId(cwd: string, name: string): string {
-  let real: string;
-  try {
-    real = realpathSync(cwd);
-  } catch {
-    real = cwd;
-  }
+  const real = realCwdForHash(cwd);
   // Hash BOTH the cwd AND the (already validated) name. Hashing the name is what
   // makes two distinct names in the same directory provably distinct even when
   // their cosmetic slug sanitises to the same string — e.g. "main" vs "-main-"
@@ -689,7 +682,7 @@ export async function resolvePair(base: string, opts: ResolvePairOptions): Promi
     if (hasFlag) {
       const raw = reg.pairs.find((p) => p.pairId.toLowerCase() === flagLower);
       if (raw) {
-        if (raw.cwd === opts.cwd) {
+        if (sameCwd(raw.cwd, opts.cwd)) {
           return { slot: raw.slot, entry: raw, isNew: false, matchedRaw: true };
         }
         return { crossCwd: raw };

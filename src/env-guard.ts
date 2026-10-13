@@ -36,6 +36,8 @@ export function normalizeEnvGuardMode(raw: string | undefined, fallback: EnvGuar
 export function inspectAgentBridgeEnv(opts: {
   cwd: string;
   env?: NodeJS.ProcessEnv;
+  /** Injectable for tests; defaults to process.platform. */
+  platform?: NodeJS.Platform;
 }): EnvGuardInspection {
   const env = opts.env ?? process.env;
   const actualPairId = nonEmpty(env.AGENTBRIDGE_PAIR_ID);
@@ -59,11 +61,18 @@ export function inspectAgentBridgeEnv(opts: {
     reasons.push(`AGENTBRIDGE_PAIR_ID=${actualPairId} does not match cwd-derived ${expectedPairId}`);
   }
 
-  if (actualPairId && stateDir && !stateDir.endsWith(`/pairs/${actualPairId}`)) {
+  // Compare on a separator-normalised form: on win32 `applyPairEnv` writes
+  // `C:\...\pairs\<id>`, and a literal "/" check flagged every healthy pair env
+  // as stale, so `fix` mode wiped it and the plugin frontend fell back to the
+  // default control port (a different daemon than `abg codex` attached to).
+  const normStateDir = stateDir ? normalizeEnvPath(stateDir, opts.platform) : null;
+  const normBaseDir = baseDir ? normalizeEnvPath(baseDir, opts.platform) : null;
+
+  if (actualPairId && normStateDir && !normStateDir.endsWith(normalizeEnvPath(`/pairs/${actualPairId}`, opts.platform))) {
     reasons.push(`AGENTBRIDGE_STATE_DIR does not end with /pairs/${actualPairId}`);
   }
 
-  if (actualPairId && baseDir && stateDir && !stateDir.startsWith(`${baseDir}/`)) {
+  if (actualPairId && normBaseDir && normStateDir && !normStateDir.startsWith(`${normBaseDir}/`)) {
     reasons.push("AGENTBRIDGE_BASE_DIR and AGENTBRIDGE_STATE_DIR disagree");
   }
 
@@ -82,11 +91,12 @@ export function guardAgentBridgeEnv(opts: {
   mode?: EnvGuardMode;
   allowStrict?: boolean;
   log?: (message: string) => void;
+  platform?: NodeJS.Platform;
 }): EnvGuardResult {
   const env = opts.env ?? process.env;
   const mode = normalizeEnvGuardMode(opts.mode, "fix");
   const effectiveMode = mode === "strict" && opts.allowStrict === false ? "fix" : mode;
-  const inspection = inspectAgentBridgeEnv({ cwd: opts.cwd, env });
+  const inspection = inspectAgentBridgeEnv({ cwd: opts.cwd, env, platform: opts.platform });
 
   if (effectiveMode === "off" || inspection.ok) {
     return { ...inspection, action: "none" };
@@ -110,6 +120,17 @@ export function guardAgentBridgeEnv(opts: {
   }
   opts.log?.("[agentbridge] cleared stale AgentBridge environment variables");
   return { ...inspection, action: "fixed" };
+}
+
+/**
+ * Path form used only for the guard's prefix/suffix checks: "/" separators, no
+ * trailing separator, and case-folded on win32 (NTFS paths are case-insensitive,
+ * so `c:\x` and `C:\X` name the same dir). POSIX keeps exact case.
+ */
+export function normalizeEnvPath(value: string, platform: NodeJS.Platform = process.platform): string {
+  let out = value.replace(/\\/g, "/");
+  if (out.length > 1) out = out.replace(/\/+$/, "");
+  return platform === "win32" ? out.toLowerCase() : out;
 }
 
 function nonEmpty(value: string | undefined): string | null {

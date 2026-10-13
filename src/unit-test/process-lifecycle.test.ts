@@ -8,6 +8,10 @@ import {
   isProcessAlive,
   isAgentBridgeDaemon,
   isAgentBridgeProcess,
+  invokesCodexBinary,
+  listBridgeFrontendProcessesFromList,
+  processListCommand,
+  pidCommandLineCommand,
 } from "../process-lifecycle";
 
 describe("process lifecycle helpers", () => {
@@ -244,5 +248,72 @@ describe("isAgentBridgeProcess (general loose matcher)", () => {
 
   test("rejects when the command lookup fails", () => {
     expect(isAgentBridgeProcess(1, cmd(null))).toBe(false);
+  });
+});
+
+
+describe("win32 process identity", () => {
+  test("recognises a quoted codex.exe path with spaces", () => {
+    const cmd = String.raw`"C:\Program Files\nodejs\node_modules\@openai\codex\vendor\bin\codex.exe" --enable tui_app_server --remote ws://127.0.0.1:4531`;
+    expect(invokesCodexBinary(cmd, "win32")).toBe(true);
+  });
+
+  test("recognises an unquoted, mixed-case Codex.EXE", () => {
+    expect(invokesCodexBinary(String.raw`C:\Users\u\AppData\Roaming\npm\Codex.EXE --remote ws://x`, "win32")).toBe(true);
+  });
+
+  test("recognises node launching the codex.js shim", () => {
+    expect(invokesCodexBinary(String.raw`"C:\nodejs\node.exe" C:\npm\node_modules\@openai\codex\bin\codex.js --remote ws://x`, "win32")).toBe(true);
+  });
+
+  test("does not match a process that merely mentions codex in its args", () => {
+    expect(invokesCodexBinary(String.raw`"C:\Users\u\.bun\bin\bun.exe" C:\tools\agentbridge\dist\cli.js codex --safe`, "win32")).toBe(false);
+    expect(invokesCodexBinary(String.raw`C:\Windows\notepad.exe codex.exe`, "win32")).toBe(false);
+  });
+
+  test("POSIX matching is unchanged (no .exe stripping)", () => {
+    expect(invokesCodexBinary("/usr/local/bin/codex --remote ws://x", "linux")).toBe(true);
+    expect(invokesCodexBinary("/usr/local/bin/codex.exe --remote ws://x", "linux")).toBe(false);
+  });
+
+  test("process listing uses PowerShell CIM on win32 and ps elsewhere", () => {
+    expect(processListCommand("win32").cmd).toBe("powershell.exe");
+    expect(processListCommand("win32").args.join(" ")).toContain("Win32_Process");
+    expect(processListCommand("darwin")).toEqual({ cmd: "ps", args: ["-axo", "pid=,command="] });
+  });
+
+  test("pid command-line lookup is integer-only on win32", () => {
+    expect(pidCommandLineCommand(1234, "win32").args.join(" ")).toContain("ProcessId = 1234");
+    expect(pidCommandLineCommand(1234, "linux")).toEqual({ cmd: "ps", args: ["-p", "1234", "-o", "command="] });
+  });
+
+  test("parsePsProcessList parses the win32 CIM output shape", () => {
+    const out =
+      String.raw`27944 C:\Users\u\.bun\bin\bun.exe run C:\x\agentbridge\server\daemon.js` +
+      "\r\n" +
+      String.raw`24148 "C:\p\codex.exe" app-server --listen ws://127.0.0.1:4500` +
+      "\r\n";
+    expect(parsePsProcessList(out).map((e) => e.pid)).toEqual([27944, 24148]);
+  });
+
+  test("PowerShell newline-strip regex reaches PowerShell as an escape, not raw CR/LF", () => {
+    const script = processListCommand("win32").args.at(-1)!;
+    expect(script).not.toMatch(/[\r\n]/);
+    expect(script).toContain(String.raw`'[\r\n]+'`);
+  });
+
+  test("commandMatchesManagedCodexTui honours an explicit platform", () => {
+    const cmd = String.raw`"C:\p\codex.exe" --enable tui_app_server --remote ws://127.0.0.1:4531`;
+    expect(commandMatchesManagedCodexTui(cmd, "ws://127.0.0.1:4531", "win32")).toBe(true);
+  });
+
+  test("isAgentBridgeDaemon accepts a quoted win32 daemon path containing spaces", () => {
+    const cmd = String.raw`"C:\Program Files\nodejs\node.exe" "C:\Users\John Smith\AppData\Roaming\npm\node_modules\@raysonmeng\agentbridge\plugins\agentbridge\server\daemon.js"`;
+    expect(isAgentBridgeDaemon(1, () => cmd)).toBe(true);
+  });
+
+  test("bridge-server frontend matcher accepts a quoted win32 path", () => {
+    const command = String.raw`"C:\bun.exe" run "C:\Users\John Smith\npm\node_modules\@raysonmeng\agentbridge\plugins\agentbridge\server\bridge-server.js"`;
+    expect(listBridgeFrontendProcessesFromList([{ pid: 7, command }]).map((e) => e.pid)).toEqual([7]);
   });
 });

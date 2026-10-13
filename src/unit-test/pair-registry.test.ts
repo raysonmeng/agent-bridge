@@ -10,6 +10,7 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
+import { createHash } from "node:crypto";
 import { createServer, type Server } from "node:net";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -43,6 +44,8 @@ import {
   type EntryReclaimSignals,
   type PairEntry,
   type RegistryFile,
+  realCwdForHash,
+  sameCwd,
 } from "../pair-registry";
 import { StateDirResolver } from "../state-dir";
 
@@ -1149,5 +1152,36 @@ describe("pairDirDaemonAlive — unified daemon.json + legacy compat (#536)", ()
   test("nothing on disk → not alive", () => {
     dirFor("p-empty");
     expect(pairDirDaemonAlive(base, "p-empty")).toBe(false);
+  });
+});
+
+describe("win32 cwd canonicalisation", () => {
+  test("realCwdForHash upper-cases the drive letter so c: and C: derive the same pair", () => {
+    // Non-existent path → falls back to the literal, which must still be normalised.
+    const lower = realCwdForHash(String.raw`c:\definitely\missing\dir`, "win32");
+    const upper = realCwdForHash(String.raw`C:\definitely\missing\dir`, "win32");
+    expect(lower).toBe(upper);
+    expect(lower.startsWith("C:")).toBe(true);
+  });
+
+  test("sameCwd is case-insensitive on win32 only", () => {
+    expect(sameCwd(String.raw`C:\Proj\App`, String.raw`c:\proj\app`, "win32")).toBe(true);
+    expect(sameCwd("/home/u/App", "/home/u/app", "linux")).toBe(false);
+    expect(sameCwd("/home/u/app", "/home/u/app", "linux")).toBe(true);
+  });
+
+  test("only the drive letter is normalised — other path components keep their case (no id churn)", () => {
+    const p = realCwdForHash(String.raw`c:\definitely\Missing\MixedCase`, "win32");
+    expect(p).toBe(String.raw`C:\definitely\Missing\MixedCase`);
+  });
+
+  test("an already-canonical cwd derives the same id as before the change", () => {
+    const dir = mkdtempSync(join(tmpdir(), "abg-pair-canon-"));
+    try {
+      const legacy = createHash("sha256").update(realpathSync(dir)).update("\0").update("main").digest("hex").slice(0, 8);
+      expect(derivePairId(dir, "main")).toBe(`main-${legacy}`);
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });

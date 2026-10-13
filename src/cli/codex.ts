@@ -47,6 +47,7 @@ import {
   CODEX_MAX_PERMISSION_FLAG,
   planMaxPermissions,
 } from "./max-permissions";
+import { sameCwd } from "../cwd-identity";
 
 /**
  * Write a timestamped entry to the codex wrapper log.
@@ -189,7 +190,7 @@ export function resolveCodexResumeArgs(
       // would cross-wire projects.
       const raw = readRawCurrentThread(identity.stateDir);
       const pending =
-        raw && raw.status === "pending" && raw.pairId === identity.pairId && raw.cwd === identity.cwd
+        raw && raw.status === "pending" && raw.pairId === identity.pairId && sameCwd(raw.cwd, identity.cwd)
           ? raw
           : null;
       return {
