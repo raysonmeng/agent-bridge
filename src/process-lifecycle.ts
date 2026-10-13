@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import { basename } from "node:path";
+import { basename, win32 as win32Path } from "node:path";
 
 export interface ProcessListEntry {
   pid: number;
@@ -33,7 +33,18 @@ export function parsePsProcessList(output: string): ProcessListEntry[] {
  * mis-report and, worse, the kill scanner could mis-target. Accepts both the
  * native `codex` binary and a `node|bun .../codex` script launcher.
  */
-function invokesCodexBinary(command: string): boolean {
+export function invokesCodexBinary(command: string, platform: NodeJS.Platform = process.platform): boolean {
+  if (platform === "win32") {
+    // win32 command lines quote argv[0] when it has spaces
+    // (`"C:\Program Files\...\codex.exe" --remote ...`), use `\`, carry an
+    // `.exe`/`.cmd`/`.js` suffix, and are case-insensitive — none of which the
+    // POSIX split below handles, so a real Codex TUI was never recognised.
+    const [first, second] = splitWin32Argv(command);
+    const exe = win32Stem(first);
+    if (exe === "codex") return true;
+    if ((exe === "node" || exe === "bun") && second) return win32Stem(second) === "codex";
+    return false;
+  }
   const tokens = command.trim().split(/\s+/);
   const exe = tokens[0] ? basename(tokens[0]) : "";
   if (exe === "codex") return true;
@@ -41,6 +52,23 @@ function invokesCodexBinary(command: string): boolean {
     return basename(tokens[1]) === "codex";
   }
   return false;
+}
+
+/** First two argv tokens of a win32 command line, honouring double quotes. */
+function splitWin32Argv(command: string): [string, string] {
+  const tokens: string[] = [];
+  const re = /"([^"]*)"|(\S+)/g;
+  let m: RegExpExecArray | null;
+  while (tokens.length < 2 && (m = re.exec(command)) !== null) {
+    tokens.push(m[1] ?? m[2] ?? "");
+  }
+  return [tokens[0] ?? "", tokens[1] ?? ""];
+}
+
+/** Lower-cased basename with a launcher extension stripped (`codex.exe` → `codex`). */
+function win32Stem(token: string): string {
+  if (!token) return "";
+  return win32Path.basename(token).toLowerCase().replace(/\.(?:exe|cmd|bat|ps1|js|mjs|cjs)$/, "");
 }
 
 export function commandMatchesManagedCodexTui(command: string, proxyUrl?: string): boolean {
@@ -64,7 +92,7 @@ export function findManagedCodexTuiProcessesFromList(
 
 export function findManagedCodexTuiProcesses(proxyUrl: string): ProcessListEntry[] {
   try {
-    const output = execFileSync("ps", ["-axo", "pid=,command="], { encoding: "utf-8" });
+    const output = listProcessesRaw();
     return findManagedCodexTuiProcessesFromList(parsePsProcessList(output), proxyUrl)
       .filter((entry) => entry.pid !== process.pid);
   } catch {
@@ -91,7 +119,7 @@ export function listManagedCodexTuiProcessesFromList(processes: ProcessListEntry
  */
 export function listManagedCodexTuiProcesses(): ManagedCodexTuiProcess[] {
   try {
-    const output = execFileSync("ps", ["-axo", "pid=,command="], { encoding: "utf-8" });
+    const output = listProcessesRaw();
     return listManagedCodexTuiProcessesFromList(parsePsProcessList(output))
       .filter((entry) => entry.pid !== process.pid);
   } catch {
@@ -116,7 +144,7 @@ export function listBridgeFrontendProcessesFromList(processes: ProcessListEntry[
 
 export function listBridgeFrontendProcesses(): ProcessListEntry[] {
   try {
-    const output = execFileSync("ps", ["-axo", "pid=,command="], { encoding: "utf-8" });
+    const output = listProcessesRaw();
     return listBridgeFrontendProcessesFromList(parsePsProcessList(output)).filter(
       (entry) => entry.pid !== process.pid,
     );
@@ -126,11 +154,63 @@ export function listBridgeFrontendProcesses(): ProcessListEntry[] {
 }
 
 export function commandForPid(pid: number): string | null {
+  if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
-    return execFileSync("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
+    const { cmd, args } = pidCommandLineCommand(pid);
+    const out = execFileSync(cmd, args, { encoding: "utf-8", windowsHide: true }).trim();
+    // win32 prints nothing for a gone pid (ps exits non-zero instead); keep the
+    // "null = no such process" contract on both.
+    return out.length > 0 ? out : null;
   } catch {
     return null;
   }
+}
+
+/**
+ * Whole-machine process listing as `<pid> <command line>` lines (the shape
+ * {@link parsePsProcessList} parses).
+ *
+ * POSIX: `ps -axo pid=,command=`. win32: there is no `ps` (Git Bash ships an
+ * MSYS `ps` that rejects `-axo`, so every caller silently got `[]` — `abg kill`
+ * reported "nothing running" while daemons held the ports, and `abg doctor`
+ * never saw the Codex TUI). PowerShell CIM is on every supported Windows and
+ * yields the full command line; processes without one (system/protected) are
+ * skipped.
+ */
+export function processListCommand(platform: NodeJS.Platform = process.platform): { cmd: string; args: string[] } {
+  if (platform === "win32") {
+    return {
+      cmd: "powershell.exe",
+      args: [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        "[Console]::OutputEncoding = [Text.Encoding]::UTF8; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine } | ForEach-Object { \"$($_.ProcessId) $($_.CommandLine -replace '[\r\n]+', ' ')\" }",
+      ],
+    };
+  }
+  return { cmd: "ps", args: ["-axo", "pid=,command="] };
+}
+
+/** Command that prints one pid's command line (empty / non-zero exit when gone). */
+export function pidCommandLineCommand(pid: number, platform: NodeJS.Platform = process.platform): { cmd: string; args: string[] } {
+  if (platform === "win32") {
+    return {
+      cmd: "powershell.exe",
+      args: [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `[Console]::OutputEncoding = [Text.Encoding]::UTF8; $p = Get-CimInstance Win32_Process -Filter "ProcessId = ${Math.trunc(pid)}" -ErrorAction SilentlyContinue; if ($p -and $p.CommandLine) { $p.CommandLine }`,
+      ],
+    };
+  }
+  return { cmd: "ps", args: ["-p", String(pid), "-o", "command="] };
+}
+
+function listProcessesRaw(): string {
+  const { cmd, args } = processListCommand();
+  return execFileSync(cmd, args, { encoding: "utf-8", windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
 }
 
 // ---------------------------------------------------------------------------

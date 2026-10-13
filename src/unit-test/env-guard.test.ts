@@ -122,3 +122,66 @@ describe("AgentBridge env guard", () => {
     expect(env.AGENTBRIDGE_PAIR_ID).toBe(stalePairId);
   });
 });
+
+describe("AgentBridge env guard — win32 paths", () => {
+  const BS = String.fromCharCode(92);
+  const win = (p: string) => p.replace(/\//g, BS);
+
+  test("backslash state dir written by applyPairEnv on Windows is NOT flagged stale", () => {
+    const cwd = tempCwd("win-clean");
+    const pairId = derivePairId(cwd, "main");
+    const env = {
+      AGENTBRIDGE_PAIR_ID: pairId,
+      AGENTBRIDGE_PAIR_NAME: "main",
+      AGENTBRIDGE_BASE_DIR: win("C:/Users/u/.local/state/agentbridge"),
+      AGENTBRIDGE_STATE_DIR: win(`C:/Users/u/.local/state/agentbridge/pairs/${pairId}`),
+      AGENTBRIDGE_CONTROL_PORT: "4532",
+      CODEX_WS_PORT: "4530",
+      CODEX_PROXY_PORT: "4531",
+    } as NodeJS.ProcessEnv;
+
+    const result = guardAgentBridgeEnv({ cwd, env, mode: "fix", platform: "win32" });
+
+    expect(result.reasons).toEqual([]);
+    expect(result.action).toBe("none");
+    expect(env.AGENTBRIDGE_CONTROL_PORT).toBe("4532");
+  });
+
+  test("drive-letter / case differences between base and state dir are tolerated on win32", () => {
+    const cwd = tempCwd("win-case");
+    const pairId = derivePairId(cwd, "main");
+    const env = {
+      AGENTBRIDGE_PAIR_ID: pairId,
+      AGENTBRIDGE_BASE_DIR: "c:/users/u/state",
+      AGENTBRIDGE_STATE_DIR: win(`C:/Users/U/State/pairs/${pairId}`) + BS,
+    } as NodeJS.ProcessEnv;
+
+    expect(inspectAgentBridgeEnv({ cwd, env, platform: "win32" }).ok).toBe(true);
+  });
+
+  test("a state dir for a DIFFERENT pair is still flagged on win32", () => {
+    const cwd = tempCwd("win-stale");
+    const pairId = derivePairId(cwd, "main");
+    const env = {
+      AGENTBRIDGE_PAIR_ID: pairId,
+      AGENTBRIDGE_BASE_DIR: win("C:/state"),
+      AGENTBRIDGE_STATE_DIR: win("C:/state/pairs/main-deadbeef"),
+    } as NodeJS.ProcessEnv;
+
+    const inspection = inspectAgentBridgeEnv({ cwd, env, platform: "win32" });
+    expect(inspection.ok).toBe(false);
+    expect(inspection.reasons.join(" ")).toContain(`/pairs/${pairId}`);
+  });
+
+  test("POSIX keeps case-sensitive comparison", () => {
+    const cwd = tempCwd("posix-case");
+    const pairId = derivePairId(cwd, "main");
+    const env = {
+      AGENTBRIDGE_PAIR_ID: pairId,
+      AGENTBRIDGE_BASE_DIR: "/tmp/Base",
+      AGENTBRIDGE_STATE_DIR: `/tmp/base/pairs/${pairId}`,
+    } as NodeJS.ProcessEnv;
+
+    expect(inspectAgentBridgeEnv({ cwd, env, platform: "linux" }).ok).toBe(false);
+  });
+});

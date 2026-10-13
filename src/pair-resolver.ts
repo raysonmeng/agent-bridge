@@ -10,6 +10,7 @@ import {
   readRegistry,
   removePairEntry,
   resolvePair,
+  sameCwd,
   validatePairId,
 } from "./pair-registry";
 
@@ -282,7 +283,7 @@ export function findPairForFlag(base: string, cwd: string, flag: string): PairEn
   // the registry entry belongs to THIS cwd; cross-cwd raw matches are treated as
   // not found so pair operations stay directory-scoped.
   const raw = findPair(base, name);
-  return raw && raw.cwd === cwd ? raw : null;
+  return raw && sameCwd(raw.cwd, cwd) ? raw : null;
 }
 
 /** Ports for a pair entry (convenience for kill/pairs). */

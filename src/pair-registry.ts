@@ -178,17 +178,54 @@ export function validatePairId(raw: string): string {
 }
 
 /**
+ * The realpath string that pair ids are hashed from.
+ *
+ * win32: `realpathSync` echoes the caller's drive-letter case, so a process
+ * started in `c:\proj` and one in `C:\proj` (both common — shells, IDEs and
+ * Claude Code disagree) derived DIFFERENT pair ids for the same directory and
+ * never met. `realpathSync.native` returns the on-disk case, and the drive letter
+ * is upper-cased as a final normaliser. For an already-canonical `C:\...` input
+ * this is identical to the old result, so existing registry ids are unchanged.
+ * POSIX keeps the historical `realpathSync` exactly.
+ */
+export function realCwdForHash(cwd: string, platform: NodeJS.Platform = process.platform): string {
+  if (platform === "win32") {
+    let real: string;
+    try {
+      real = realpathSync.native(cwd);
+    } catch {
+      try {
+        real = realpathSync(cwd);
+      } catch {
+        real = cwd;
+      }
+    }
+    return real.replace(/^([a-z]):/, (_m, d: string) => `${d.toUpperCase()}:`);
+  }
+  try {
+    return realpathSync(cwd);
+  } catch {
+    return cwd;
+  }
+}
+
+/**
+ * Same-directory test for two cwd strings (registry entry vs. caller). win32
+ * compares case-insensitively after canonicalising; POSIX stays exact.
+ */
+export function sameCwd(a: string, b: string, platform: NodeJS.Platform = process.platform): boolean {
+  if (a === b) return true;
+  if (platform !== "win32") return false;
+  return realCwdForHash(a, platform).toLowerCase() === realCwdForHash(b, platform).toLowerCase();
+}
+
+/**
  * Derive a stable, fs-safe pairId from the current working directory.
  * Uses realpath so symlinked cwds map to the same id; appends a short hash
  * of the real path to guarantee uniqueness across same-basename projects.
  */
 export function derivePairIdFromCwd(cwd: string): string {
-  let real: string;
-  try {
-    real = realpathSync(cwd);
-  } catch {
-    real = cwd;
-  }
+  const real = realCwdForHash(cwd);
   const hash = createHash("sha256").update(real).digest("hex").slice(0, 8);
   const rawBase = basename(real) || "root";
   // Slugify the basename through the allowed charset; collapse runs of illegal chars.
@@ -215,12 +252,7 @@ export function derivePairIdFromCwd(cwd: string): string {
  * so the composite always satisfies {@link PAIR_ID_REGEX} (≤ 41 chars).
  */
 export function derivePairId(cwd: string, name: string): string {
-  let real: string;
-  try {
-    real = realpathSync(cwd);
-  } catch {
-    real = cwd;
-  }
+  const real = realCwdForHash(cwd);
   // Hash BOTH the cwd AND the (already validated) name. Hashing the name is what
   // makes two distinct names in the same directory provably distinct even when
   // their cosmetic slug sanitises to the same string — e.g. "main" vs "-main-"
@@ -689,7 +721,7 @@ export async function resolvePair(base: string, opts: ResolvePairOptions): Promi
     if (hasFlag) {
       const raw = reg.pairs.find((p) => p.pairId.toLowerCase() === flagLower);
       if (raw) {
-        if (raw.cwd === opts.cwd) {
+        if (sameCwd(raw.cwd, opts.cwd)) {
           return { slot: raw.slot, entry: raw, isNew: false, matchedRaw: true };
         }
         return { crossCwd: raw };
