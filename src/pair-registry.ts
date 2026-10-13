@@ -17,6 +17,7 @@ import { createHash, randomUUID } from "node:crypto";
 import { hostname, userInfo } from "node:os";
 import { basename, join, resolve, sep } from "node:path";
 import { atomicWriteJson } from "./atomic-json";
+import { realCwdForHash, sameCwd } from "./cwd-identity";
 import { isAgentBridgeDaemon, pidLooksAlive } from "./process-lifecycle";
 
 /**
@@ -177,47 +178,7 @@ export function validatePairId(raw: string): string {
   return id;
 }
 
-/**
- * The realpath string that pair ids are hashed from.
- *
- * win32: `realpathSync` echoes the caller's drive-letter case, so a process
- * started in `c:\proj` and one in `C:\proj` (both common — shells, IDEs and
- * Claude Code disagree) derived DIFFERENT pair ids for the same directory and
- * never met. `realpathSync.native` returns the on-disk case, and the drive letter
- * is upper-cased as a final normaliser. For an already-canonical `C:\...` input
- * this is identical to the old result, so existing registry ids are unchanged.
- * POSIX keeps the historical `realpathSync` exactly.
- */
-export function realCwdForHash(cwd: string, platform: NodeJS.Platform = process.platform): string {
-  if (platform === "win32") {
-    let real: string;
-    try {
-      real = realpathSync.native(cwd);
-    } catch {
-      try {
-        real = realpathSync(cwd);
-      } catch {
-        real = cwd;
-      }
-    }
-    return real.replace(/^([a-z]):/, (_m, d: string) => `${d.toUpperCase()}:`);
-  }
-  try {
-    return realpathSync(cwd);
-  } catch {
-    return cwd;
-  }
-}
-
-/**
- * Same-directory test for two cwd strings (registry entry vs. caller). win32
- * compares case-insensitively after canonicalising; POSIX stays exact.
- */
-export function sameCwd(a: string, b: string, platform: NodeJS.Platform = process.platform): boolean {
-  if (a === b) return true;
-  if (platform !== "win32") return false;
-  return realCwdForHash(a, platform).toLowerCase() === realCwdForHash(b, platform).toLowerCase();
-}
+export { realCwdForHash, sameCwd } from "./cwd-identity";
 
 /**
  * Derive a stable, fs-safe pairId from the current working directory.

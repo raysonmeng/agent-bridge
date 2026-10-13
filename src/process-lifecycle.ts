@@ -71,11 +71,15 @@ function win32Stem(token: string): string {
   return win32Path.basename(token).toLowerCase().replace(/\.(?:exe|cmd|bat|ps1|js|mjs|cjs)$/, "");
 }
 
-export function commandMatchesManagedCodexTui(command: string, proxyUrl?: string): boolean {
+export function commandMatchesManagedCodexTui(
+  command: string,
+  proxyUrl?: string,
+  platform: NodeJS.Platform = process.platform,
+): boolean {
   // Anchor on argv[0] being codex itself before trusting any substring in the
   // rest of the command line (prevents false positives from unrelated processes
   // that merely mention codex/tui_app_server/--remote in their arguments).
-  if (!invokesCodexBinary(command)) return false;
+  if (!invokesCodexBinary(command, platform)) return false;
   if (!command.includes("tui_app_server")) return false;
   const remoteUrl = extractRemoteUrl(command);
   if (!remoteUrl) return false;
@@ -137,7 +141,9 @@ export function listManagedCodexTuiProcesses(): ManagedCodexTuiProcess[] {
 export function listBridgeFrontendProcessesFromList(processes: ProcessListEntry[]): ProcessListEntry[] {
   return processes.filter(
     (entry) =>
-      /(?:^|[\s/\\])bridge-server\.js(?:\s|$)/.test(entry.command) &&
+      // `"` on both sides: win32 quotes argv entries that contain spaces
+      // (`"C:\Users\John Smith\...\bridge-server.js"`).
+      /(?:^|[\s/\\"])bridge-server\.js(?:[\s"]|$)/.test(entry.command) &&
       (entry.command.includes("agentbridge") || entry.command.includes("agent_bridge")),
   );
 }
@@ -157,7 +163,11 @@ export function commandForPid(pid: number): string | null {
   if (!Number.isInteger(pid) || pid <= 0) return null;
   try {
     const { cmd, args } = pidCommandLineCommand(pid);
-    const out = execFileSync(cmd, args, { encoding: "utf-8", windowsHide: true }).trim();
+    const out = execFileSync(cmd, args, {
+      encoding: "utf-8",
+      windowsHide: true,
+      timeout: PROCESS_QUERY_TIMEOUT_MS,
+    }).trim();
     // win32 prints nothing for a gone pid (ps exits non-zero instead); keep the
     // "null = no such process" contract on both.
     return out.length > 0 ? out : null;
@@ -185,7 +195,7 @@ export function processListCommand(platform: NodeJS.Platform = process.platform)
         "-NoProfile",
         "-NonInteractive",
         "-Command",
-        "[Console]::OutputEncoding = [Text.Encoding]::UTF8; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine } | ForEach-Object { \"$($_.ProcessId) $($_.CommandLine -replace '[\r\n]+', ' ')\" }",
+        "[Console]::OutputEncoding = [Text.Encoding]::UTF8; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine } | ForEach-Object { \"$($_.ProcessId) $($_.CommandLine -replace '[\\r\\n]+', ' ')\" }",
       ],
     };
   }
@@ -208,9 +218,22 @@ export function pidCommandLineCommand(pid: number, platform: NodeJS.Platform = p
   return { cmd: "ps", args: ["-p", String(pid), "-o", "command="] };
 }
 
+/**
+ * Upper bound for one process-table query. On win32 each query spawns
+ * PowerShell + a CIM call; a wedged WMI provider would otherwise block the
+ * caller (daemon startup, `abg kill`) synchronously forever. On timeout the
+ * callers' existing catch → "unknown / not found" path applies.
+ */
+const PROCESS_QUERY_TIMEOUT_MS = 15_000;
+
 function listProcessesRaw(): string {
   const { cmd, args } = processListCommand();
-  return execFileSync(cmd, args, { encoding: "utf-8", windowsHide: true, maxBuffer: 64 * 1024 * 1024 });
+  return execFileSync(cmd, args, {
+    encoding: "utf-8",
+    windowsHide: true,
+    maxBuffer: 64 * 1024 * 1024,
+    timeout: PROCESS_QUERY_TIMEOUT_MS,
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -285,7 +308,11 @@ export function isAgentBridgeDaemon(pid: number, lookup: CommandLookup = command
   if (cmd === null) return false;
   // Match .../<anything>-daemon.js or .../<anything>-daemon.ts as a runnable
   // argument (preceded by whitespace/path-sep, followed by whitespace or EOL).
-  const hasDaemonEntry = /(?:^|[\s/\\])[\w.-]*-?daemon\.(?:ts|js)(?:\s|$)/.test(cmd);
+  // A closing `"` also ends the script token: win32 quotes argv entries that
+  // contain spaces, and now that commandForPid returns real win32 command lines
+  // a profile like `C:\Users\John Smith\...` must not make kill() refuse (and
+  // drop the pid file of) a live daemon.
+  const hasDaemonEntry = /(?:^|[\s/\\"])[\w.-]*-?daemon\.(?:ts|js)(?:[\s"]|$)/.test(cmd);
   const hasAgentbridge = cmd.includes("agentbridge") || cmd.includes("agent_bridge");
   return hasDaemonEntry && hasAgentbridge;
 }

@@ -7,6 +7,7 @@ import { homedir } from "node:os";
 import { basename, join } from "node:path";
 import { atomicWriteJson } from "./atomic-json";
 import type { StateDirResolver } from "./state-dir";
+import { sameCwd } from "./cwd-identity";
 
 export type CurrentThreadStatus = "pending" | "current";
 
@@ -201,7 +202,7 @@ export function readUsableCurrentThread(
   // Identity checks come FIRST: a record from another pair or cwd is never
   // usable here and must never be promoted/repaired by this reader.
   if (state.pairId !== identity.pairId) return null;
-  if (state.cwd !== identity.cwd) return null;
+  if (!sameCwd(state.cwd, identity.cwd)) return null;
 
   if (state.status === "pending") {
     // The daemon's rollout-retry window is short (~5s); Codex often writes the

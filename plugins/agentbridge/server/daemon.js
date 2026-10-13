@@ -3,7 +3,7 @@
 var __require = import.meta.require;
 
 // src/daemon.ts
-import { existsSync as existsSync8, realpathSync as realpathSync3, rmSync as rmSync2 } from "fs";
+import { existsSync as existsSync8, realpathSync as realpathSync4, rmSync as rmSync2 } from "fs";
 import { homedir as homedir5 } from "os";
 import { join as join13 } from "path";
 import { randomUUID as randomUUID5 } from "crypto";
@@ -30,10 +30,10 @@ function defineNumber(value, fallback) {
 }
 var BUILD_INFO = Object.freeze({
   version: defineString("0.1.31", "0.0.0-source"),
-  commit: defineString("799b9b3", "source"),
+  commit: defineString("93e6d99", "source"),
   bundle: defineBundle("plugin"),
   contractVersion: defineNumber(1, CONTRACT_VERSION),
-  codeHash: defineString("c7042ed66f64", "source")
+  codeHash: defineString("67e96be4a076", "source")
 });
 function daemonStatusBuildInfo() {
   return { ...BUILD_INFO };
@@ -305,7 +305,7 @@ import { statSync } from "fs";
 import { win32 } from "path";
 var CODEX_BIN_ENV = "AGENTBRIDGE_CODEX_BIN";
 function resolveCodexCommand(options = {}) {
-  const platform2 = options.platform ?? process.platform;
+  const platform = options.platform ?? process.platform;
   const arch = options.arch ?? process.arch;
   const env = options.env ?? process.env;
   const isFile = options.isFile ?? ((path) => {
@@ -317,14 +317,14 @@ function resolveCodexCommand(options = {}) {
   });
   const override = env[CODEX_BIN_ENV]?.trim();
   if (override) {
-    if (platform2 === "win32" && !/\.exe$/i.test(override)) {
+    if (platform === "win32" && !/\.exe$/i.test(override)) {
       throw new Error(`${CODEX_BIN_ENV} must point to a native codex.exe on Windows.`);
     }
     if (!isFile(override))
       throw new Error(`${CODEX_BIN_ENV} executable not found: ${override}`);
     return override;
   }
-  if (platform2 !== "win32")
+  if (platform !== "win32")
     return "codex";
   const pathKey = Object.keys(env).find((key) => key.toLowerCase() === "path");
   const dirs = (pathKey ? env[pathKey] ?? "" : "").split(";").map((dir) => dir.trim().replace(/^"(.*)"$/, "$1")).filter(Boolean);
@@ -1114,8 +1114,8 @@ async function startRoomBridge(deps) {
   client.onError((reason) => {
     deps.emit(`\u26A0\uFE0F \u623F\u95F4\u64CD\u4F5C\u88AB\u62D2\u7EDD\uFF1A${safeField(reason)}`);
   });
-  client.onWhiteboard((roomId2, wb) => {
-    if (roomId2 !== room || !wb || typeof wb !== "object" || !("roomId" in wb) || wb.roomId !== room)
+  client.onWhiteboard((roomId, wb) => {
+    if (roomId !== room || !wb || typeof wb !== "object" || !("roomId" in wb) || wb.roomId !== room)
       return;
     const text = renderWhiteboard(wb);
     if (text)
@@ -1325,8 +1325,8 @@ class CodexRoomInbox {
 }
 
 // src/port-cleanup.ts
-function portPidsCommand(port, platform2 = process.platform) {
-  if (platform2 === "win32") {
+function portPidsCommand(port, platform = process.platform) {
+  if (platform === "win32") {
     return {
       cmd: "powershell.exe",
       args: [
@@ -1338,8 +1338,8 @@ function portPidsCommand(port, platform2 = process.platform) {
   }
   return { cmd: "lsof", args: ["-ti", `tcp:${port}`, "-sTCP:LISTEN"] };
 }
-function processCommandLineCommand(pid, platform2 = process.platform) {
-  if (platform2 === "win32") {
+function processCommandLineCommand(pid, platform = process.platform) {
+  if (platform === "win32") {
     return {
       cmd: "powershell.exe",
       args: [
@@ -1351,8 +1351,8 @@ function processCommandLineCommand(pid, platform2 = process.platform) {
   }
   return { cmd: "ps", args: ["-p", pid, "-o", "args="] };
 }
-function killPidCommand(pid, platform2 = process.platform) {
-  if (platform2 === "win32") {
+function killPidCommand(pid, platform = process.platform) {
+  if (platform === "win32") {
     return {
       cmd: "powershell.exe",
       args: ["-NoProfile", "-Command", `Stop-Process -Id ${pid} -Force -ErrorAction Stop`]
@@ -1376,15 +1376,15 @@ function parsePids(output) {
   }
   return pids;
 }
-function isCodexAppServerCommandLine(cmdline, platform2 = process.platform) {
-  const s = platform2 === "win32" ? cmdline.toLowerCase() : cmdline;
+function isCodexAppServerCommandLine(cmdline, platform = process.platform) {
+  const s = platform === "win32" ? cmdline.toLowerCase() : cmdline;
   return s.includes("codex") && s.includes("app-server");
 }
 async function cleanupPorts(options) {
-  const platform2 = options.platform ?? process.platform;
+  const platform = options.platform ?? process.platform;
   const listPids = (port) => {
     try {
-      return parsePids(options.run(portPidsCommand(port, platform2)));
+      return parsePids(options.run(portPidsCommand(port, platform)));
     } catch {
       return [];
     }
@@ -1397,8 +1397,8 @@ async function cleanupPorts(options) {
     const foreignPids = [];
     for (const pid of pidList) {
       try {
-        const cmdline = options.run(processCommandLineCommand(pid, platform2)).trim();
-        if (isCodexAppServerCommandLine(cmdline, platform2)) {
+        const cmdline = options.run(processCommandLineCommand(pid, platform)).trim();
+        if (isCodexAppServerCommandLine(cmdline, platform)) {
           staleCodexPids.push(pid);
         } else {
           foreignPids.push(pid);
@@ -1409,7 +1409,7 @@ async function cleanupPorts(options) {
       options.log(`Cleaning up stale codex app-server on port ${port}: PID(s) ${staleCodexPids.join(", ")}`);
       for (const pid of staleCodexPids) {
         try {
-          options.run(killPidCommand(pid, platform2));
+          options.run(killPidCommand(pid, platform));
         } catch {}
       }
       await options.sleep(500);
@@ -3743,6 +3743,30 @@ function constantTimeEquals(a, b) {
   return diff === 0;
 }
 
+// src/cwd-identity.ts
+import { realpathSync as realpathSync2 } from "fs";
+function realCwdForHash(cwd, platform = process.platform) {
+  let real;
+  try {
+    real = realpathSync2(cwd);
+  } catch {
+    real = cwd;
+  }
+  return platform === "win32" ? upperDriveLetter(real) : real;
+}
+function sameCwd(a, b, platform = process.platform) {
+  if (!a || !b)
+    return false;
+  if (a === b)
+    return true;
+  if (platform !== "win32")
+    return false;
+  return realCwdForHash(a, platform).toLowerCase() === realCwdForHash(b, platform).toLowerCase();
+}
+function upperDriveLetter(path) {
+  return path.replace(/^([a-z]):/, (_m, drive) => `${drive.toUpperCase()}:`);
+}
+
 // src/daemon-identity.ts
 function validateClaudeClientIdentity(input) {
   if (input.expectedControlToken && input.identity) {
@@ -3771,7 +3795,7 @@ function validateClaudeClientIdentity(input) {
       reason: `pair mismatch: expected ${input.expectedPairId}, got ${input.identity.pairId ?? "<none>"}`
     };
   }
-  if (!input.identity.cwd || input.identity.cwd !== input.daemonCwd) {
+  if (!input.identity.cwd || !sameCwd(input.identity.cwd, input.daemonCwd)) {
     return {
       ok: false,
       closeCode: CLOSE_CODE_PAIR_MISMATCH,
@@ -4043,12 +4067,35 @@ import { fileURLToPath } from "url";
 // src/process-lifecycle.ts
 import { execFileSync as execFileSync2 } from "child_process";
 function commandForPid(pid) {
+  if (!Number.isInteger(pid) || pid <= 0)
+    return null;
   try {
-    return execFileSync2("ps", ["-p", String(pid), "-o", "command="], { encoding: "utf-8" }).trim();
+    const { cmd, args } = pidCommandLineCommand(pid);
+    const out = execFileSync2(cmd, args, {
+      encoding: "utf-8",
+      windowsHide: true,
+      timeout: PROCESS_QUERY_TIMEOUT_MS
+    }).trim();
+    return out.length > 0 ? out : null;
   } catch {
     return null;
   }
 }
+function pidCommandLineCommand(pid, platform = process.platform) {
+  if (platform === "win32") {
+    return {
+      cmd: "powershell.exe",
+      args: [
+        "-NoProfile",
+        "-NonInteractive",
+        "-Command",
+        `[Console]::OutputEncoding = [Text.Encoding]::UTF8; $p = Get-CimInstance Win32_Process -Filter "ProcessId = ${Math.trunc(pid)}" -ErrorAction SilentlyContinue; if ($p -and $p.CommandLine) { $p.CommandLine }`
+      ]
+    };
+  }
+  return { cmd: "ps", args: ["-p", String(pid), "-o", "command="] };
+}
+var PROCESS_QUERY_TIMEOUT_MS = 15000;
 function pidLooksAlive(pid) {
   if (!Number.isInteger(pid) || pid <= 0)
     return false;
@@ -4064,7 +4111,7 @@ function isAgentBridgeDaemon(pid, lookup = commandForPid) {
   const cmd = lookup(pid);
   if (cmd === null)
     return false;
-  const hasDaemonEntry = /(?:^|[\s/\\])[\w.-]*-?daemon\.(?:ts|js)(?:\s|$)/.test(cmd);
+  const hasDaemonEntry = /(?:^|[\s/\\"])[\w.-]*-?daemon\.(?:ts|js)(?:[\s"]|$)/.test(cmd);
   const hasAgentbridge = cmd.includes("agentbridge") || cmd.includes("agent_bridge");
   return hasDaemonEntry && hasAgentbridge;
 }
@@ -5728,11 +5775,11 @@ function classifyPoll(prev, state, cfg) {
     const nextResumeRaw = resumeAfterEpoch2(currentSide, state, cfg);
     const resumeEpoch = previousSide === currentSide ? nextResumeRaw ?? prev.resumeEpoch : nextResumeRaw;
     const uncertain = previousSide === currentSide && activeSideProbeUncertain(currentSide, state) && prev.fingerprint;
-    const fingerprint2 = uncertain ? prev.fingerprint : directiveFingerprint(state, currentSide);
+    const fingerprint = uncertain ? prev.fingerprint : directiveFingerprint(state, currentSide);
     const pauseChanged = !previousSide;
-    const emit = !previousSide || previousSide !== currentSide || fingerprint2 !== prev.fingerprint;
+    const emit = !previousSide || previousSide !== currentSide || fingerprint !== prev.fingerprint;
     return {
-      next: { side: currentSide, fingerprint: fingerprint2, resumeEpoch, reason },
+      next: { side: currentSide, fingerprint, resumeEpoch, reason },
       effect: {
         kind: uncertain ? "hold-uncertain" : "enter",
         side: currentSide,
@@ -6769,8 +6816,8 @@ function cwdMatches(entryCwd, optsCwd) {
   if (entryCwd === optsCwd)
     return true;
   try {
-    const fs2 = nodeFs2();
-    return fs2.realpathSync(entryCwd) === fs2.realpathSync(optsCwd);
+    const fs = nodeFs2();
+    return fs.realpathSync(entryCwd) === fs.realpathSync(optsCwd);
   } catch {
     return false;
   }
@@ -6865,7 +6912,7 @@ function readGuardPending(opts) {
 
 // src/budget/resume-injection-queue.ts
 import { createHash as createHash3 } from "crypto";
-import { closeSync as closeSync3, existsSync as existsSync6, mkdirSync as mkdirSync6, openSync as openSync3, readdirSync, readFileSync as readFileSync8, realpathSync as realpathSync2, unlinkSync as unlinkSync4, writeFileSync as writeFileSync5 } from "fs";
+import { closeSync as closeSync3, existsSync as existsSync6, mkdirSync as mkdirSync6, openSync as openSync3, readdirSync, readFileSync as readFileSync8, realpathSync as realpathSync3, unlinkSync as unlinkSync4, writeFileSync as writeFileSync5 } from "fs";
 import { join as join10 } from "path";
 
 // src/budget/resume-prompt.ts
@@ -7097,7 +7144,7 @@ class ResumeInjectionQueue {
 }
 function realpathOrRaw(path) {
   try {
-    return realpathSync2(path);
+    return realpathSync3(path);
   } catch {
     return path;
   }
@@ -8064,7 +8111,7 @@ var budgetCoordinator = null;
 function pairCwd() {
   const raw = process.cwd();
   try {
-    return realpathSync3(raw);
+    return realpathSync4(raw);
   } catch {
     return raw;
   }
@@ -8213,8 +8260,8 @@ function evaluateInjectionBudgetGate(message, willInject, isSteer) {
   const gateState = budgetCoordinator?.gateState() ?? "open";
   if (gateState === "closed") {
     log(`Injection rejected by budget pause gate`);
-    const resumeAfterEpoch3 = budgetCoordinator?.getSnapshot()?.resumeAfterEpoch ?? null;
-    const retryAfterMs = retryAfterMsForResume(resumeAfterEpoch3, Date.now());
+    const resumeAfterEpoch = budgetCoordinator?.getSnapshot()?.resumeAfterEpoch ?? null;
+    const retryAfterMs = retryAfterMsForResume(resumeAfterEpoch, Date.now());
     return {
       allow: false,
       code: "budget_paused",
@@ -8528,7 +8575,7 @@ function startControlServer() {
     server = Bun.serve({
       port: CONTROL_PORT,
       hostname: "127.0.0.1",
-      fetch(req, server2) {
+      fetch(req, server) {
         const url = new URL(req.url);
         if (url.pathname === "/healthz") {
           return Response.json(currentStatus());
@@ -8541,7 +8588,7 @@ function startControlServer() {
             log("Rejected WS upgrade on control port: Origin header present (possible CSWSH)");
             return wsOriginRejectedResponse();
           }
-          if (server2.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now(), pongCount: 0, pendingBackpressure: createPendingBackpressureBuffer() } })) {
+          if (server.upgrade(req, { data: { clientId: 0, attached: false, lastPongAt: Date.now(), pongCount: 0, pendingBackpressure: createPendingBackpressureBuffer() } })) {
             return;
           }
         }
